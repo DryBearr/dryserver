@@ -27,7 +27,8 @@ const (
 	suProbe setupState = iota
 	suWelcome
 	suWifi
-	suBusy // waiting on a background call (WiFi connect, precheck)
+	suBusy  // waiting on a background call (WiFi scan/connect)
+	suCheck // prechecks with a live log
 	suForm
 	suConfirm
 	suInstall
@@ -94,9 +95,10 @@ type Setup struct {
 	cancel context.CancelFunc
 	armed  bool // first ctrl+c during install pressed
 
-	code    string
-	hostNum int
-	joinErr error
+	code     string
+	hostNum  int
+	joinErr  error
+	checkErr error
 
 	err    error
 	notice string
@@ -174,10 +176,10 @@ func (s Setup) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case checkMsg:
 		if msg.err != nil {
-			s.state = suForm
-			s.notice = "Check failed: " + msg.err.Error()
-			return s.openForm()
+			s.checkErr = msg.err
+			return s, nil
 		}
+		s.steps, s.lines = nil, nil
 		s.state = suConfirm
 		s.confirm.SetValue("")
 		return s, s.confirm.Focus()
@@ -230,6 +232,20 @@ func (s Setup) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch s.state {
 	case suProbe, suBusy:
 		if k.String() == "ctrl+c" {
+			return s, tea.Quit
+		}
+		return s, nil
+
+	case suCheck:
+		switch {
+		case s.checkErr == nil && k.String() == "ctrl+c":
+			s.cancel()
+		case s.checkErr != nil && k.String() == "r":
+			return s.startCheck()
+		case s.checkErr != nil && (k.String() == "enter" || k.String() == "esc"):
+			s.notice = "Check failed: " + s.checkErr.Error()
+			return s.openForm()
+		case s.checkErr != nil && k.String() == "ctrl+c":
 			return s, tea.Quit
 		}
 		return s, nil
@@ -394,14 +410,28 @@ func (s Setup) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 			s.ch.DiskPassphrase = ""
 		}
 		s.ch.DataDisks = slices.DeleteFunc(s.ch.DataDisks, func(p string) bool { return p == s.ch.SystemDisk })
-		s.state, s.busy = suBusy, "Checking packages and coordinator…"
 		s.notice = ""
-		be, cfg, ch := s.be, s.cfg, *s.ch
-		return s, tea.Batch(s.spin.Tick, func() tea.Msg {
-			return checkMsg{be.Precheck(context.Background(), cfg, ch)}
-		})
+		return s.startCheck()
 	}
 	return s, cmd
+}
+
+// startCheck runs the prechecks in the background, streaming steps and log
+// lines to the screen.
+func (s Setup) startCheck() (tea.Model, tea.Cmd) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	s.events = make(chan tea.Msg, 64)
+	s.state = suCheck
+	s.checkErr = nil
+	s.steps, s.lines = nil, nil
+	events, be, cfg, ch := s.events, s.be, s.cfg, *s.ch
+	go func() {
+		defer cancel()
+		err := be.Precheck(ctx, cfg, ch, func(st install.Step) { events <- stepMsg(st) })
+		events <- checkMsg{err}
+	}()
+	return s, tea.Batch(wait(s.events), s.spin.Tick)
 }
 
 func encTitle(e install.Encryption, recommended bool) string {
@@ -517,6 +547,7 @@ func (s Setup) startInstall() (tea.Model, tea.Cmd) {
 	s.cancel = cancel
 	s.events = make(chan tea.Msg, 64)
 	s.state = suInstall
+	s.steps, s.lines = nil, nil
 	s.confirm.Blur()
 	events, be, cfg, ch := s.events, s.be, s.cfg, *s.ch
 	go func() {
@@ -570,6 +601,15 @@ func (s Setup) View() string {
 		b.WriteString(s.spin.View() + " Looking at this machine…\n")
 	case suBusy:
 		b.WriteString(s.spin.View() + " " + s.busy + "\n")
+	case suCheck:
+		b.WriteString("Checking before anything is erased:\n\n")
+		s.viewInstall(&b)
+		if s.checkErr != nil {
+			b.WriteString("\n" + errStyle.Render(s.checkErr.Error()) + "\n")
+			b.WriteString(dimStyle.Render("r retry · enter back to the answers · full log: /tmp/dryserver-install.log") + "\n")
+		} else {
+			b.WriteString("\n" + dimStyle.Render("Nothing has been changed yet. ctrl+c stops the check.") + "\n")
+		}
 	case suWelcome:
 		s.viewWelcome(&b)
 	case suForm, suWifi:

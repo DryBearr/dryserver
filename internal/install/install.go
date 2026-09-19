@@ -72,9 +72,10 @@ type Backend interface {
 	Probe(ctx context.Context) (Machine, error)
 	ScanWiFi(ctx context.Context) ([]string, error)
 	ConnectWiFi(ctx context.Context, ssid, pass string) (Machine, error)
-	// Precheck runs before anything is written: packages exist, the
-	// coordinator answers (node role).
-	Precheck(ctx context.Context, cfg config.Config, ch Choices) error
+	// Precheck runs before anything is written: clock, package mirrors,
+	// extra packages, coordinator (node role). It reports steps and log
+	// lines like Install.
+	Precheck(ctx context.Context, cfg config.Config, ch Choices, progress func(Step)) error
 	Install(ctx context.Context, cfg config.Config, ch Choices, progress func(Step)) error
 	// Join sends the join request, reports the pairing code and blocks
 	// until the coordinator approves (returns the mesh host number) or

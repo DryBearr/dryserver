@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DryBearr/dryserver/internal/config"
@@ -35,15 +36,24 @@ type Real struct {
 
 	// LogFile receives every command and its output.
 	LogFile io.Writer
+	// MirrorList is the live system's pacman mirror list.
+	MirrorList string
 
 	machine Machine
 	state   installState
 	sink    func(string) // current step's log, set during Install
+	mu      sync.Mutex
+	dlTotal string // "758.70 MiB", from pacman's output
 }
 
 // Log records one line: always to LogFile, and to the setup screen while
 // installing. Use it as the ExecRunner's Log.
 func (r *Real) Log(line string) {
+	if total, ok := strings.CutPrefix(line, "Total Download Size:"); ok {
+		r.mu.Lock()
+		r.dlTotal = strings.TrimSpace(total)
+		r.mu.Unlock()
+	}
 	if r.LogFile != nil {
 		io.WriteString(r.LogFile, line+"\n")
 	}
@@ -65,7 +75,8 @@ type installState struct {
 }
 
 func NewReal(cfg config.Config, run Runner, rootfs fs.FS, self, registryKey string) *Real {
-	return &Real{Cfg: cfg, Run: run, Rootfs: rootfs, Self: self, RegistryKey: registryKey, Target: "/mnt", KeyDir: "/run"}
+	return &Real{Cfg: cfg, Run: run, Rootfs: rootfs, Self: self, RegistryKey: registryKey, Target: "/mnt", KeyDir: "/run",
+		MirrorList: "/etc/pacman.d/mirrorlist"}
 }
 
 func (r *Real) Probe(ctx context.Context) (Machine, error) {
@@ -215,25 +226,6 @@ func (r *Real) ConnectWiFi(ctx context.Context, ssid, pass string) (Machine, err
 	}
 	r.machine.Online, r.machine.Net = true, desc
 	return r.machine, nil
-}
-
-var missingPkg = regexp.MustCompile(`package '([^']+)' was not found`)
-
-func (r *Real) Precheck(ctx context.Context, cfg config.Config, ch Choices) error {
-	if _, err := r.Run.Run(ctx, Cmd{Name: "pacman", Args: []string{"-Sy"}}); err != nil {
-		return fmt.Errorf("cannot reach the package mirrors: %w", err)
-	}
-	if extra := cfg.ExtraList(); len(extra) > 0 {
-		out, err := r.Run.Run(ctx, Cmd{Name: "pacman", Args: append([]string{"-Si"}, extra...), Quiet: true})
-		if err != nil {
-			var missing []string
-			for _, m := range missingPkg.FindAllStringSubmatch(out, -1) {
-				missing = append(missing, m[1])
-			}
-			return fmt.Errorf("unknown extra packages: %s (fix EXTRA_PACKAGES in the desktop config)", strings.Join(missing, " "))
-		}
-	}
-	return nil
 }
 
 func (r *Real) Reboot() error {

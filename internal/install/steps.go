@@ -141,6 +141,9 @@ func (r *Real) Install(ctx context.Context, cfg config.Config, ch Choices, progr
 			if ch.Encryption == EncTPM {
 				pkgs = append(pkgs, "tpm2-tss")
 			}
+			done := make(chan struct{})
+			go r.reportDownloads(done, 5*time.Second)
+			defer close(done)
 			return run("pacstrap", append([]string{"-K", r.Target}, pkgs...)...)
 		}},
 		{"Configure system", func() error { return r.configure(ctx, cfg, ch, plan, dataMounts, chroot) }},

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -66,6 +67,38 @@ func TestEncryptionOptions(t *testing.T) {
 				t.Errorf("%+v must not offer TPM unlock", m)
 			}
 		}
+	}
+}
+
+func TestCheckShowsStepsAndLogs(t *testing.T) {
+	s, _ := demoSetup(t, sysconf.Node, install.EncTPM)
+	next, _ := s.startCheck()
+	s = next.(Setup)
+	for s.state == suCheck {
+		s = stepSetup(s, <-s.events)
+	}
+	if s.state != suConfirm {
+		t.Fatalf("state=%v err=%v", s.state, s.checkErr)
+	}
+	if len(s.steps) != 0 || len(s.lines) != 0 {
+		t.Error("check log must be cleared before the install screen")
+	}
+}
+
+func TestCheckFailureOffersRetry(t *testing.T) {
+	s, _ := demoSetup(t, sysconf.Node, install.EncTPM)
+	s.state = suCheck
+	s = stepSetup(s, stepMsg{Name: "Update package lists"}, stepMsg{Log: "error: failed retrieving file"})
+	s = stepSetup(s, checkMsg{err: errors.New("cannot reach the package mirrors")})
+	v := s.View()
+	for _, want := range []string{"Update package lists", "failed retrieving file", "cannot reach the package mirrors", "r retry"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("check screen missing %q:\n%s", want, v)
+		}
+	}
+	s = stepSetup(s, tea.KeyMsg{Type: tea.KeyEnter})
+	if s.state != suForm || !strings.Contains(s.notice, "cannot reach") {
+		t.Fatalf("enter must go back to the answers: state=%v notice=%q", s.state, s.notice)
 	}
 }
 

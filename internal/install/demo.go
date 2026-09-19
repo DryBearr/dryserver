@@ -68,8 +68,16 @@ func (d *Demo) ConnectWiFi(ctx context.Context, ssid, pass string) (Machine, err
 	return d.Machine, nil
 }
 
-func (d *Demo) Precheck(ctx context.Context, cfg config.Config, ch Choices) error {
-	return d.sleep(ctx)
+func (d *Demo) Precheck(ctx context.Context, cfg config.Config, ch Choices, progress func(Step)) error {
+	for _, name := range []string{"Check the clock", "Pick package mirrors", "Update package lists", "Check the coordinator"} {
+		progress(Step{Name: name})
+		progress(Step{Name: name, Log: "demo: " + name})
+		if err := d.sleep(ctx); err != nil {
+			return err
+		}
+		progress(Step{Name: name, Done: true})
+	}
+	return nil
 }
 
 var demoSteps = []string{
