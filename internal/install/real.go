@@ -101,8 +101,22 @@ func (r *Real) Probe(ctx context.Context) (Machine, error) {
 			m.Online, m.Net = r.waitOnline(ctx, 25*time.Second)
 		}
 	}
+	if m.Online {
+		m.CoordFound = coordinatorAnswers(ctx, r.Cfg.CoordLanIP, 3*time.Second)
+	}
 	r.machine = m
 	return m, nil
+}
+
+// coordinatorAnswers reports whether the coordinator's SSH port answers.
+func coordinatorAnswers(ctx context.Context, ip string, timeout time.Duration) bool {
+	d := net.Dialer{Timeout: timeout}
+	c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, "22"))
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
 }
 
 func (r *Real) online(ctx context.Context) (bool, string) {
@@ -225,6 +239,7 @@ func (r *Real) ConnectWiFi(ctx context.Context, ssid, pass string) (Machine, err
 		return r.machine, errors.New("connected to WiFi but no internet")
 	}
 	r.machine.Online, r.machine.Net = true, desc
+	r.machine.CoordFound = coordinatorAnswers(ctx, r.Cfg.CoordLanIP, 3*time.Second)
 	return r.machine, nil
 }
 

@@ -183,3 +183,37 @@ func TestValidators(t *testing.T) {
 		t.Errorf("default hostname %q", h)
 	}
 }
+
+func TestRoleDefaultsFromNetwork(t *testing.T) {
+	for _, tc := range []struct {
+		found bool
+		want  sysconf.Role
+	}{{false, sysconf.Coordinator}, {true, sysconf.Node}} {
+		d := install.NewDemo()
+		d.Delay = 0
+		d.Machine.CoordFound = tc.found
+		cfg := config.Default()
+		cfg.CoordLanIP = "10.1.0.60"
+		s := NewSetup(d, cfg)
+		m, _ := d.Probe(t.Context())
+		s = stepSetup(s, probeMsg{m: m})
+		next, _ := s.openForm()
+		if got := next.(Setup).ch.Role; got != tc.want {
+			t.Errorf("coordinator found=%v: default role %s, want %s", tc.found, got, tc.want)
+		}
+	}
+}
+
+func TestConfirmWarnsAboutRole(t *testing.T) {
+	s, _ := demoSetup(t, sysconf.Node, install.EncNone)
+	s.m.CoordFound = false
+	s = stepSetup(s, checkMsg{})
+	if v := s.View(); !strings.Contains(v, "choose coordinator") || !strings.Contains(v, "SERVER") {
+		t.Errorf("server without coordinator must warn:\n%s", v)
+	}
+	s, _ = demoSetup(t, sysconf.Coordinator, install.EncNone)
+	s = stepSetup(s, checkMsg{})
+	if v := s.View(); !strings.Contains(v, "separate mesh") {
+		t.Errorf("second coordinator must warn:\n%s", v)
+	}
+}

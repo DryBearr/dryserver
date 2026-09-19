@@ -30,6 +30,9 @@ type Machine struct {
 	Disks   []disks.Disk // install targets: internal disks, live USB excluded
 	Online  bool
 	Net     string // e.g. "WiFi Home (192.168.1.23)"
+	// CoordFound: something answers SSH at the configured coordinator
+	// address, so this laptop is most likely not the first one.
+	CoordFound bool
 }
 
 type Encryption string

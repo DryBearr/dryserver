@@ -33,8 +33,9 @@ func NewDemo() *Demo {
 					Parts: []disks.Part{{Path: "/dev/nvme0n1p1", Size: 272_629_760, FSType: "vfat"}, {Path: "/dev/nvme0n1p3", Size: 255_000_000_000, FSType: "ntfs", Label: "Windows"}}},
 				{Name: "sda", Path: "/dev/sda", Size: 500_107_862_016, Model: "ST500LM021", Tran: "sata"},
 			},
-			Online: true,
-			Net:    "WiFi Home (192.168.1.23)",
+			Online:     true,
+			Net:        "WiFi Home (192.168.1.23)",
+			CoordFound: true,
 		},
 	}
 }

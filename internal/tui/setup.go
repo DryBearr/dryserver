@@ -113,7 +113,7 @@ func NewSetup(be install.Backend, cfg config.Config) Setup {
 	return Setup{
 		be:      be,
 		cfg:     cfg,
-		ch:      &install.Choices{Role: sysconf.Node},
+		ch:      &install.Choices{},
 		spin:    spinner.New(spinner.WithSpinner(spinner.Dot)),
 		confirm: in,
 		height:  24,
@@ -371,6 +371,14 @@ func (s *Setup) initForm() tea.Cmd {
 }
 
 func (s Setup) openForm() (tea.Model, tea.Cmd) {
+	if s.ch.Role == "" {
+		// First laptop (nobody answers at the coordinator address) is the
+		// coordinator; later ones are servers.
+		s.ch.Role = sysconf.Node
+		if !s.m.CoordFound {
+			s.ch.Role = sysconf.Coordinator
+		}
+	}
 	if s.ch.Encryption == "" || !slices.Contains(s.m.EncryptionOptions(), s.ch.Encryption) {
 		s.ch.Encryption = s.m.EncryptionOptions()[0]
 	}
@@ -434,6 +442,25 @@ func (s Setup) startCheck() (tea.Model, tea.Cmd) {
 	return s, tea.Batch(wait(s.events), s.spin.Tick)
 }
 
+// roleNote explains the role question with what the network says.
+func roleNote(m install.Machine, cfg config.Config) string {
+	if m.CoordFound {
+		return "A coordinator answers at " + cfg.CoordLanIP + ", so this laptop is most likely a server."
+	}
+	return "No coordinator answers at " + cfg.CoordLanIP + ". If this is your first laptop, choose\ncoordinator. If you already installed one, check it is on and its IP is\nreserved in the router, then choose server."
+}
+
+// roleWarning flags a role that does not match the network.
+func roleWarning(m install.Machine, cfg config.Config, role sysconf.Role) string {
+	switch {
+	case role == sysconf.Node && !m.CoordFound:
+		return "No coordinator answers at " + cfg.CoordLanIP + ". If this is your first laptop,\npress esc and choose coordinator."
+	case role == sysconf.Coordinator && m.CoordFound:
+		return "A coordinator already answers at " + cfg.CoordLanIP + ". A second one would start a\nseparate mesh. Press esc and choose server unless you replace it."
+	}
+	return ""
+}
+
 func encTitle(e install.Encryption, recommended bool) string {
 	t := map[install.Encryption]string{
 		install.EncTPM:        "Encrypted, unlocks itself with the TPM chip",
@@ -479,10 +506,13 @@ func newSetupForm(m install.Machine, cfg config.Config, ch *install.Choices, dis
 	return huh.NewForm(
 		huh.NewGroup(
 			huh.NewSelect[sysconf.Role]().Title("What is this machine?").
+				Description(roleNote(m, cfg)).
 				Options(
-					huh.NewOption("Server that joins the mesh", sysconf.Node),
-					huh.NewOption("First machine: coordinator (needs LAN IP "+cfg.CoordLanIP+")", sysconf.Coordinator),
+					huh.NewOption("Coordinator: the first machine, approves the others", sysconf.Coordinator),
+					huh.NewOption("Server: joins the mesh after your approval", sysconf.Node),
 				).Value(&ch.Role),
+		),
+		huh.NewGroup(
 			huh.NewInput().Title("Hostname").
 				DescriptionFunc(func() string {
 					if ch.Role == sysconf.Coordinator {
@@ -665,6 +695,11 @@ func (s Setup) viewWelcome(b *strings.Builder) {
 	} else {
 		row("Network", errStyle.Render("not connected"))
 	}
+	if m.CoordFound {
+		row("Mesh", okStyle.Render("coordinator "+s.cfg.CoordLanIP+" answers: install this laptop as a server"))
+	} else if m.Online {
+		row("Mesh", dimStyle.Render("no coordinator at "+s.cfg.CoordLanIP+" yet: the first laptop becomes the coordinator"))
+	}
 	b.WriteString("\n  Disks:\n")
 	if len(m.Disks) == 0 {
 		b.WriteString(errStyle.Render("    none found") + "\n")
@@ -701,16 +736,19 @@ func (s Setup) viewConfirm(b *strings.Builder) {
 	b.WriteString(warnBox.Render(strings.TrimRight(w.String(), "\n")) + "\n\n")
 
 	row := func(name, value string) { fmt.Fprintf(b, "  %-11s %s\n", name, value) }
-	role := "server (joins the mesh after your approval)"
+	role := "SERVER (joins the mesh after your approval)"
 	if ch.Role == sysconf.Coordinator {
-		role = "coordinator (first machine)"
+		role = "COORDINATOR (first machine)"
 	}
-	row("Role", role)
+	row("Role", selStyle.Render(role))
 	row("Hostname", ch.Hostname)
 	row("Encryption", encTitle(ch.Encryption, false))
 	row("User", s.cfg.Username+" (password set)")
 	tools := strings.Join(append(s.cfg.ToolList(), s.cfg.ExtraList()...), " ")
 	row("Tools", "basics "+tools)
+	if w := roleWarning(s.m, s.cfg, ch.Role); w != "" {
+		b.WriteString("\n" + errStyle.Render(w) + "\n")
+	}
 	b.WriteString("\n")
 	fmt.Fprintf(b, "Type %s to erase and install: %s\n", selStyle.Render("YES"), s.confirm.View())
 	b.WriteString("\n" + dimStyle.Render("enter confirm · esc change answers") + "\n")
