@@ -99,6 +99,7 @@ type Setup struct {
 	hostNum  int
 	joinErr  error
 	checkErr error
+	canRetry bool // the install failed; r runs it again
 
 	err    error
 	notice string
@@ -191,6 +192,7 @@ func (s Setup) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case installDoneMsg:
 		if msg.err != nil {
 			s.state, s.err = suFailed, msg.err
+			s.canRetry = true
 			return s, nil
 		}
 		if s.ch.Role == sysconf.Coordinator {
@@ -321,7 +323,15 @@ func (s Setup) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return s, nil
 
 	case suFailed:
-		if k.String() == "q" || k.String() == "ctrl+c" || k.String() == "enter" {
+		switch k.String() {
+		case "r":
+			if s.canRetry {
+				// Same answers; leftovers of the failed attempt are
+				// released by the partition step.
+				s.canRetry, s.err, s.notice = false, nil, ""
+				return s.startInstall()
+			}
+		case "q", "ctrl+c", "enter":
 			return s, tea.Quit
 		}
 	}
@@ -660,7 +670,11 @@ func (s Setup) View() string {
 			}
 			b.WriteString("\n")
 		}
-		b.WriteString(dimStyle.Render("enter/q: leave to a shell (log: /tmp/dryserver-install.log) · run 'dryserver install' to start over") + "\n")
+		if s.canRetry {
+			b.WriteString(dimStyle.Render("r: retry the install with the same answers · enter/q: leave to a shell (log: /tmp/dryserver-install.log)") + "\n")
+		} else {
+			b.WriteString(dimStyle.Render("enter/q: leave to a shell (log: /tmp/dryserver-install.log) · run 'dryserver install' to start over") + "\n")
+		}
 	}
 
 	if s.notice != "" {

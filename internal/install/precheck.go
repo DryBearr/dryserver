@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -144,29 +145,32 @@ func (r *Real) waitKeyring(ctx context.Context) error {
 	}
 }
 
-// trimMirrors keeps the first mirrors of the live system's list (Arch's
-// worldwide CDN comes first). With hundreds of entries, pacman walks the
-// whole list when the network is bad, which looks like a hang.
+// Preferred mirrors: geo picks a mirror near the laptop, fastly is a
+// worldwide CDN. They go first; the live system's list is only fallback.
+var preferredMirrors = []string{
+	"Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+	"Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch",
+}
+
+// trimMirrors puts the preferred mirrors first and keeps a few fallbacks
+// from the live system's list. That list has hundreds of entries in
+// alphabetical country order, and pacman walks all of them when the
+// network is bad, which looks like a hang.
 func (r *Real) trimMirrors() error {
 	b, err := os.ReadFile(r.MirrorList)
 	if err != nil {
 		return err
 	}
-	var servers []string
+	servers := slices.Clone(preferredMirrors)
 	for _, l := range strings.Split(string(b), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(l), "Server") {
-			servers = append(servers, strings.TrimSpace(l))
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(l, "Server") && !slices.Contains(servers, l) && len(servers) < keepMirrors {
+			servers = append(servers, l)
 		}
 	}
-	if len(servers) == 0 {
-		return errors.New("no package mirrors configured")
-	}
-	if len(servers) > keepMirrors {
-		servers = servers[:keepMirrors]
-		out := "# dryserver: the first mirrors of the live system's list.\n" + strings.Join(servers, "\n") + "\n"
-		if err := os.WriteFile(r.MirrorList, []byte(out), 0o644); err != nil {
-			return err
-		}
+	out := "# dryserver: nearby and CDN mirrors first, a few fallbacks after.\n" + strings.Join(servers, "\n") + "\n"
+	if err := os.WriteFile(r.MirrorList, []byte(out), 0o644); err != nil {
+		return err
 	}
 	r.Log(fmt.Sprintf("using %d mirrors, first: %s", len(servers), strings.TrimSpace(strings.SplitN(servers[0], "=", 2)[1])))
 	return nil

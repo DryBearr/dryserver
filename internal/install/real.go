@@ -44,6 +44,9 @@ type Real struct {
 	sink    func(string) // current step's log, set during Install
 	mu      sync.Mutex
 	dlTotal string // "758.70 MiB", from pacman's output
+	// netCheck reports whether the mirrors can be reached; nil means a
+	// real connection test (tests replace it).
+	netCheck func(context.Context) bool
 }
 
 // Log records one line: always to LogFile, and to the setup screen while

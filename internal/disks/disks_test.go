@@ -1,6 +1,9 @@
 package disks
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const sample = `{"blockdevices":[
  {"name":"zram0","path":"/dev/zram0","size":8341946368,"model":null,"vendor":null,"tran":null,"rm":false,"ro":false,"type":"disk","fstype":"swap","label":"zram0","mountpoints":["[SWAP]"]},
@@ -82,9 +85,14 @@ func TestInstallable(t *testing.T) {
 		{Name: "mmcblk0", Path: "/dev/mmcblk0", Size: 8e9},
 		{Name: "zram0", Path: "/dev/zram0", Size: 50e9},
 		{Name: "nvme0n1", Path: "/dev/nvme0n1", Size: 256e9, Tran: "nvme"},
+		// left mounted by a failed install attempt: still offered
+		{Name: "vda", Path: "/dev/vda", Size: 21e9, Parts: []Part{
+			{Path: "/dev/vda1", Mountpoints: []string{"/mnt/boot"}}, {Path: "/dev/mapper/root", Mountpoints: []string{"/mnt"}}}},
+		// mounted elsewhere: not offered
+		{Name: "vdb", Path: "/dev/vdb", Size: 21e9, Parts: []Part{{Path: "/dev/vdb1", Mountpoints: []string{"/run/media/x"}}}},
 	}
 	got := names(Installable(all))
-	if len(got) != 2 || got[0] != "sda" || got[1] != "nvme0n1" {
-		t.Fatalf("Installable = %v, want [sda nvme0n1] (live USB, small eMMC and zram excluded)", got)
+	if strings.Join(got, " ") != "sda nvme0n1 vda" {
+		t.Fatalf("Installable = %v, want [sda nvme0n1 vda] (live USB, small eMMC, zram and mounted vdb excluded)", got)
 	}
 }

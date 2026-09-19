@@ -74,6 +74,9 @@ func TestPrecheck(t *testing.T) {
 	if n := strings.Count(string(b), "Server ="); n != keepMirrors {
 		t.Errorf("mirrorlist has %d servers", n)
 	}
+	if !strings.HasPrefix(strings.SplitN(string(b), "\n", 2)[1], "Server = https://geo.mirror.pkgbuild.com/") {
+		t.Errorf("geo mirror must come first:\n%s", b)
+	}
 	var pacman []string
 	for _, c := range cr.cmds {
 		if c.Name == "pacman" {

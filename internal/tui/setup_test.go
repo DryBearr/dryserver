@@ -217,3 +217,20 @@ func TestConfirmWarnsAboutRole(t *testing.T) {
 		t.Errorf("second coordinator must warn:\n%s", v)
 	}
 }
+
+func TestInstallFailureOffersRetry(t *testing.T) {
+	s, _ := demoSetup(t, sysconf.Node, install.EncNone)
+	s.state = suInstall
+	s = stepSetup(s, installDoneMsg{err: errors.New("Install packages: downloads failed")})
+	if !strings.Contains(s.View(), "r: retry the install") {
+		t.Fatalf("no retry offered:\n%s", s.View())
+	}
+	s = stepSetup(s, press("r"))
+	if s.state != suInstall {
+		t.Fatalf("r must restart the install, state=%v", s.state)
+	}
+	s = drain(t, s)
+	if s.state != suDone {
+		t.Fatalf("retry did not finish: state=%v err=%v", s.state, s.err)
+	}
+}

@@ -64,7 +64,7 @@ const MinInstallSize = 16_000_000_000
 
 // Installable returns the disks the installer may use: real, writable
 // disks of at least MinInstallSize, excluding the USB the installer booted
-// from and anything mounted.
+// from and disks mounted anywhere but the installer's /mnt.
 func Installable(all []Disk) []Disk {
 	var out []Disk
 	for _, d := range all {
@@ -74,12 +74,23 @@ func Installable(all []Disk) []Disk {
 				virtual = true
 			}
 		}
-		if virtual || d.ReadOnly || d.Size < MinInstallSize || d.isLiveMedia() || len(d.Mounts()) > 0 {
+		if virtual || d.ReadOnly || d.Size < MinInstallSize || d.isLiveMedia() || d.mountedOutsideTarget() {
 			continue
 		}
 		out = append(out, d)
 	}
 	return out
+}
+
+// mountedOutsideTarget: something other than the installer's own target
+// (/mnt, left over from a failed attempt) is mounted from the disk.
+func (d Disk) mountedOutsideTarget() bool {
+	for _, m := range d.Mounts() {
+		if m != "/mnt" && !strings.HasPrefix(m, "/mnt/") {
+			return true
+		}
+	}
+	return false
 }
 
 func (d Disk) isLiveMedia() bool {

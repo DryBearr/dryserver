@@ -2,6 +2,7 @@ package install
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -334,4 +335,80 @@ func (s *stuckRunner) Run(ctx context.Context, c Cmd) (string, error) {
 		delete(s.partitioned, c.Args[len(c.Args)-1])
 	}
 	return out, err
+}
+
+// flakyRunner fails pacstrap with the given outputs, then succeeds.
+type flakyRunner struct {
+	*fakeRunner
+	failures []string
+}
+
+func (f *flakyRunner) Run(ctx context.Context, c Cmd) (string, error) {
+	out, err := f.fakeRunner.Run(ctx, c)
+	if c.Name == "pacstrap" && len(f.failures) > 0 {
+		out := f.failures[0]
+		f.failures = f.failures[1:]
+		return out, errors.New("exit status 1")
+	}
+	return out, err
+}
+
+func TestPacstrapRetries(t *testing.T) {
+	r, _ := testReal(t, true)
+	fr := &flakyRunner{fakeRunner: &fakeRunner{}, failures: []string{
+		"error: failed retrieving file 'go-1.26.pkg.tar.zst' from fastly.mirror.pkgbuild.com : Operation too slow\nerror: failed to commit transaction (failed to retrieve some files)\nErrors occurred, no packages were upgraded.",
+		"error: go: signature from \"Someone\" is unknown trust\nerror: failed to commit transaction (invalid or corrupted package (PGP signature))\nErrors occurred, no packages were upgraded.",
+	}}
+	r.Run = fr
+	var logs []string
+	r.sink = func(l string) { logs = append(logs, l) }
+	down := 2 // the network is down for the first two checks
+	r.netCheck = func(context.Context) bool { down--; return down < 0 }
+	if err := r.pacstrap(t.Context(), []string{"base"}); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	keyring := false
+	for _, c := range fr.cmds {
+		if c.Name == "pacstrap" {
+			n++
+		}
+		if c.String() == "pacman -Sy --noconfirm archlinux-keyring" {
+			keyring = true
+		}
+	}
+	if n != 3 || !keyring {
+		t.Fatalf("pacstrap runs=%d keyring refresh=%v", n, keyring)
+	}
+	all := strings.Join(logs, "\n")
+	if !strings.Contains(all, "downloads failed") || !strings.Contains(all, "attempt 3 of 3") || !strings.Contains(all, "waiting for the network") {
+		t.Errorf("logs:\n%s", all)
+	}
+}
+
+func TestPacstrapGivesUp(t *testing.T) {
+	r, _ := testReal(t, true)
+	full := "error: could not extract /mnt/usr/lib/libfoo.so (No space left on device)\nErrors occurred, no packages were upgraded."
+	r.Run = &flakyRunner{fakeRunner: &fakeRunner{}, failures: []string{full, full, full}}
+	r.netCheck = func(context.Context) bool { return true }
+	err := r.pacstrap(t.Context(), []string{"base"})
+	if err == nil || !strings.Contains(err.Error(), "the disk is full (after 3 attempts)") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestPacmanProblem(t *testing.T) {
+	list := "Packages (238) acl-2.4.0-1  archlinux-keyring-20260909-1  attr-2.6.0-1\n"
+	for out, want := range map[string]string{
+		list + "error: failed retrieving file 'x' from m : Could not resolve host: m\nerror: failed to commit transaction (failed to retrieve some files)": "downloads failed",
+		list + "error: x: signature from \"A\" is unknown trust":         "signatures",
+		list + "error: failed to commit transaction (conflicting files)": "packages conflict",
+	} {
+		if got := pacmanProblem(out); !strings.Contains(got, want) {
+			t.Errorf("pacmanProblem = %q, want %q", got, want)
+		}
+	}
+	if signatureProblem(list + "error: failed to retrieve some files") {
+		t.Error("a package list mentioning archlinux-keyring is not a signature problem")
+	}
 }
