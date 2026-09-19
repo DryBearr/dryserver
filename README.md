@@ -257,7 +257,8 @@ TPM refuses (firmware update, changed boot settings).
 | Problem | What to do |
 |---|---|
 | Laptop does not boot the USB | turn Secure Boot off; use the boot menu key (F12, F9, F2 or Esc) |
-| Setup fails | press `q` for a shell; the full log is in `/tmp/dryserver-install.log` |
+| Setup shows no disk | in the BIOS setup, set the storage/SATA mode from RAID or Intel RST to AHCI (turn off VMD if listed) |
+| Setup fails | press `q` for a shell; the full log is in `/tmp/dryserver-install.log`. Old LVM, RAID, swap or encrypted volumes on the disk are released automatically |
 | New server cannot reach the coordinator | coordinator switched on? IP reserved in the router and matching the config? same WiFi? The server keeps retrying and shows its code on the login screen |
 | TPM laptop asks for the passphrase at boot | firmware or boot settings changed: type the passphrase, then `sudo dryserver tpm-enroll` |
 | `ssh node-a` asks for a password or fails | run `./dryserver ssh-config` again; check `Include config.d/*` in `~/.ssh/config` |

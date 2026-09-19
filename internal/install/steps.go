@@ -46,8 +46,15 @@ func (r *Real) Install(ctx context.Context, cfg config.Config, ch Choices, progr
 	var dataMounts []dataDisk
 	steps := []step{
 		{"Partition disks", func() error {
-			run("umount", "-R", r.Target) // leftovers from an earlier attempt
-			for _, d := range append([]string{ch.SystemDisk}, ch.DataDisks...) {
+			// Leftovers from an earlier attempt; not mounted is fine.
+			r.Run.Run(ctx, Cmd{Name: "umount", Args: []string{"-R", r.Target}, Quiet: true})
+			all := append([]string{ch.SystemDisk}, ch.DataDisks...)
+			for _, d := range all {
+				if err := r.releaseDisk(ctx, d); err != nil {
+					return err
+				}
+			}
+			for _, d := range all {
 				if err := run("wipefs", "--all", "--force", d); err != nil {
 					return err
 				}
@@ -56,10 +63,21 @@ func (r *Real) Install(ctx context.Context, cfg config.Config, ch Choices, progr
 					script = lay.Script
 				}
 				if _, err := r.Run.Run(ctx, Cmd{Name: "sfdisk", Args: []string{"--wipe", "always", "--wipe-partitions", "always", d}, Stdin: script}); err != nil {
+					return fmt.Errorf("%w (something still uses %s; reboot from the USB and run the setup again)", err, d)
+				}
+			}
+			if err := run("udevadm", "settle"); err != nil {
+				return err
+			}
+			if err := r.checkLayout(ctx, ch.SystemDisk, 2, 1<<30); err != nil {
+				return err
+			}
+			for _, d := range ch.DataDisks {
+				if err := r.checkLayout(ctx, d, 1, 0); err != nil {
 					return err
 				}
 			}
-			return run("udevadm", "settle")
+			return nil
 		}},
 		{"Set up encryption and filesystems", func() error {
 			rootDev := lay.Root

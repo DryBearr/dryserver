@@ -628,6 +628,7 @@ func (s Setup) viewWelcome(b *strings.Builder) {
 	b.WriteString("\n  Disks:\n")
 	if len(m.Disks) == 0 {
 		b.WriteString(errStyle.Render("    none found") + "\n")
+		b.WriteString(dimStyle.Render("    If the laptop has a disk: in its BIOS setup, set the storage/SATA mode\n    from RAID or Intel RST to AHCI (and turn off VMD if listed).") + "\n")
 	}
 	for _, d := range m.Disks {
 		b.WriteString("    " + diskTitle(d) + "\n")

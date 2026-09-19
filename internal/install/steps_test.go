@@ -13,14 +13,39 @@ import (
 	"github.com/DryBearr/dryserver/internal/sysconf"
 )
 
-// fakeRunner records commands and returns canned output.
+// fakeRunner records commands and returns canned output. lsblk answers
+// with old[disk] until sfdisk has written that disk, then with the new
+// layout.
 type fakeRunner struct {
-	cmds []Cmd
+	cmds        []Cmd
+	old         map[string]string
+	partitioned map[string]string // disk -> sfdisk script
 }
 
 func (f *fakeRunner) Run(ctx context.Context, c Cmd) (string, error) {
 	f.cmds = append(f.cmds, c)
+	if f.partitioned == nil {
+		f.partitioned = map[string]string{}
+	}
 	switch {
+	case c.Name == "sfdisk":
+		f.partitioned[c.Args[len(c.Args)-1]] = c.Stdin
+		return "", nil
+	case c.Name == "lsblk":
+		dev := c.Args[len(c.Args)-1]
+		script, done := f.partitioned[dev]
+		switch {
+		case done && strings.Contains(script, "size=1GiB"):
+			return `{"blockdevices":[{"name":"` + dev + `","type":"disk","size":21474836480,"children":[` +
+				`{"name":"` + PartPath(dev, 1) + `","type":"part","size":1073741824},` +
+				`{"name":"` + PartPath(dev, 2) + `","type":"part","size":20400000000}]}]}`, nil
+		case done:
+			return `{"blockdevices":[{"name":"` + dev + `","type":"disk","size":21474836480,"children":[` +
+				`{"name":"` + PartPath(dev, 1) + `","type":"part","size":21474000000}]}]}`, nil
+		case f.old[dev] != "":
+			return f.old[dev], nil
+		}
+		return `{"blockdevices":[{"name":"` + dev + `","type":"disk","size":21474836480,"mountpoints":[null]}]}`, nil
 	case c.Name == "blkid":
 		return "1111-uuid\n", nil
 	case c.Name == "wg" && c.Args[0] == "genkey":
@@ -242,4 +267,71 @@ func TestParseNetworks(t *testing.T) {
 	if strings.Join(got, "|") != "Home|My Neighbor 5G|Cafe" {
 		t.Fatalf("got %q", got)
 	}
+}
+
+// A used laptop: an old LVM volume (mounted), swap, and a LUKS mapping left
+// open by an earlier setup attempt. All must be released before sfdisk.
+func TestInstallReleasesOldDisk(t *testing.T) {
+	r, fr := testReal(t, true)
+	fr.old = map[string]string{"/dev/nvme0n1": `{"blockdevices":[{"name":"/dev/nvme0n1","type":"disk","size":256060514304,"mountpoints":[null],"children":[
+		{"name":"/dev/nvme0n1p1","type":"part","size":536870912,"mountpoints":[null]},
+		{"name":"/dev/nvme0n1p2","type":"part","size":8589934592,"mountpoints":["[SWAP]"]},
+		{"name":"/dev/nvme0n1p3","type":"part","size":200000000000,"mountpoints":[null],"children":[
+			{"name":"/dev/mapper/oldvg-root","type":"lvm","size":100000000000,"mountpoints":["/run/old"]}]},
+		{"name":"/dev/nvme0n1p4","type":"part","size":40000000000,"mountpoints":[null],"children":[
+			{"name":"/dev/mapper/root","type":"crypt","size":39000000000,"mountpoints":["/mnt"]}]}]}]}`}
+	ch := Choices{Role: sysconf.Node, Hostname: "node-x", SystemDisk: "/dev/nvme0n1", Encryption: EncNone, UserPassword: userPass}
+	if err := r.Install(t.Context(), r.Cfg, ch, func(Step) {}); err != nil {
+		t.Fatal(err)
+	}
+	order := []string{
+		"swapoff /dev/nvme0n1p2",
+		"umount -R /run/old",
+		"dmsetup remove --retry /dev/mapper/oldvg-root",
+		"umount -R /mnt",
+		"dmsetup remove --retry /dev/mapper/root",
+		"wipefs --all --force /dev/nvme0n1",
+		"sfdisk --wipe always",
+	}
+	last := -1
+	for _, prefix := range order {
+		i := -1
+		for j, c := range fr.cmds {
+			if j > last && strings.HasPrefix(c.String(), prefix) {
+				i = j
+				break
+			}
+		}
+		if i < 0 {
+			t.Fatalf("%q missing or out of order", prefix)
+		}
+		last = i
+	}
+}
+
+func TestInstallStopsWhenKernelKeepsOldPartitions(t *testing.T) {
+	r, _ := testReal(t, true)
+	stuck := &stuckRunner{fakeRunner: &fakeRunner{}}
+	r.Run = stuck
+	ch := Choices{Role: sysconf.Node, Hostname: "node-x", SystemDisk: "/dev/sda", Encryption: EncNone, UserPassword: userPass}
+	err := r.Install(t.Context(), r.Cfg, ch, func(Step) {})
+	if err == nil || !strings.Contains(err.Error(), "still sees the old partitions") {
+		t.Fatalf("err = %v", err)
+	}
+	for _, c := range stuck.cmds {
+		if c.Name == "mkfs.ext4" || c.Name == "cryptsetup" {
+			t.Fatalf("formatted despite a stale partition table: %s", c)
+		}
+	}
+}
+
+// stuckRunner pretends sfdisk worked but the kernel kept the old table.
+type stuckRunner struct{ *fakeRunner }
+
+func (s *stuckRunner) Run(ctx context.Context, c Cmd) (string, error) {
+	out, err := s.fakeRunner.Run(ctx, c)
+	if c.Name == "sfdisk" {
+		delete(s.partitioned, c.Args[len(c.Args)-1])
+	}
+	return out, err
 }
