@@ -14,7 +14,7 @@ func valid() Config {
 	c.WifiSSID = "home"
 	c.WifiPass = `it's "tricky" $HOME`
 	c.CoordLanIP = "192.168.1.50"
-	c.AdminSSHPubkey = "ssh-ed25519 AAAAC3Nza me@pc"
+	c.AdminSSHPubkey = "ssh-ed25519 AAAAC3Nza"
 	return c
 }
 
@@ -55,7 +55,7 @@ func TestLoadExample(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.AdminSSHPubkey != "ssh-ed25519 AAAA... you@desktop" || c.WGPort != "51820" {
+	if c.AdminSSHPubkey != "ssh-ed25519 AAAA..." || c.AdminKeyLabel != "desktop" || c.WGPort != "51820" {
 		t.Fatalf("parsed %+v", c)
 	}
 }
@@ -164,6 +164,30 @@ func TestParsePorts(t *testing.T) {
 	for _, bad := range []string{"0/tcp", "70000", "80/sctp", "http"} {
 		if _, err := ParsePorts(bad); err == nil {
 			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+// The comment after a pasted key (often an email) never reaches the file.
+func TestPubkeyCommentDropped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.env")
+	c := valid()
+	c.AdminSSHPubkey = "ssh-ed25519 AAAAC3NzaKEY someone@example.com"
+	if err := c.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	if strings.Contains(string(b), "example.com") {
+		t.Fatalf("email saved:\n%s", b)
+	}
+	os.WriteFile(path, []byte("ADMIN_SSH_PUBKEY='ssh-ed25519 AAAAC3NzaKEY old@example.com'\n"), 0o600)
+	got, _ := Load(path)
+	if got.AdminSSHPubkey != "ssh-ed25519 AAAAC3NzaKEY" {
+		t.Errorf("loaded %q", got.AdminSSHPubkey)
+	}
+	for _, bad := range []string{"me@example.com", "two words", strings.Repeat("x", 33)} {
+		if ValidKeyLabel(bad) == nil {
+			t.Errorf("label %q accepted", bad)
 		}
 	}
 }

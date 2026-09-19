@@ -15,7 +15,9 @@ sudo ./dryserver     # 3 flash USB (writing to a USB drive needs root)
 ```
 
 1. **Config** (desktop menu): WiFi, coordinator LAN IP, mesh settings, tools,
-   your admin username and SSH public key. Saved to `config.env`.
+   your admin username and SSH public key (paste the output of
+   `cat ~/.ssh/id_ed25519.pub`; the email at its end is removed and a short
+   label like `desktop` is used instead). Saved to `config.env`.
 2. **Build installer ISO**: about 6 minutes (the first build downloads ~1 GB).
 3. **Flash USB**: only USB drives are listed; type the device name to confirm.
 4. Reserve an IP for the first laptop in your router (the coordinator), e.g.

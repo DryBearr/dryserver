@@ -84,7 +84,7 @@ func Render(p Params) ([]File, error) {
 			MeshUDP: portsOf(meshPorts, "udp"),
 		})},
 		{"/etc/ssh/sshd_config.d/10-dryserver.conf", 0o644, sshd(c.Username, p.Role)},
-		{"/home/" + c.Username + "/.ssh/authorized_keys", 0o600, strings.TrimSpace(c.AdminSSHPubkey) + "\n"},
+		{"/home/" + c.Username + "/.ssh/authorized_keys", 0o600, strings.TrimSpace(config.NormalizePubkey(c.AdminSSHPubkey)+" "+c.AdminKeyLabel) + "\n"},
 		{"/etc/sudoers.d/10-wheel", 0o440, "# Members of wheel may use sudo after typing their password.\n%wheel ALL=(ALL:ALL) ALL\n"},
 		{"/etc/sysctl.d/90-dryserver.conf", 0o644, sysctl},
 		{"/etc/systemd/network/20-wired.network", 0o644, wired},

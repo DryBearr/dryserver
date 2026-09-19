@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -41,19 +40,21 @@ type Config struct {
 	Tools          string // space-separated optional bundle IDs, see packages.Optional
 	ExtraPackages  string // space-separated extra Arch packages
 	Username       string
-	AdminSSHPubkey string
+	AdminSSHPubkey string // key type and key only, no comment
+	AdminKeyLabel  string // short name shown after the key on servers
 	Timezone       string
 }
 
 func Default() Config {
 	return Config{
-		WGSubnet:     "10.66.0.0/24",
-		WGPort:       "51820",
-		WGTransport:  TransportAuto,
-		SwitchSubnet: "172.16.66.0/24",
-		Tools:        strings.Join(packages.DefaultTools(), " "),
-		Username:     "admin",
-		Timezone:     "UTC",
+		WGSubnet:      "10.66.0.0/24",
+		WGPort:        "51820",
+		WGTransport:   TransportAuto,
+		SwitchSubnet:  "172.16.66.0/24",
+		Tools:         strings.Join(packages.DefaultTools(), " "),
+		Username:      "admin",
+		AdminKeyLabel: "desktop",
+		Timezone:      "UTC",
 	}
 }
 
@@ -78,6 +79,7 @@ func (c *Config) fields() []struct {
 		{"EXTRA_PACKAGES", &c.ExtraPackages},
 		{"USERNAME", &c.Username},
 		{"ADMIN_SSH_PUBKEY", &c.AdminSSHPubkey},
+		{"ADMIN_KEY_LABEL", &c.AdminKeyLabel},
 		{"TIMEZONE", &c.Timezone},
 	}
 }
@@ -110,6 +112,7 @@ func Load(path string) (Config, error) {
 			*dst = unquote(strings.TrimSpace(v))
 		}
 	}
+	c.AdminSSHPubkey = NormalizePubkey(c.AdminSSHPubkey)
 	return c, sc.Err()
 }
 
@@ -127,6 +130,7 @@ func (c Config) Save(path string) error {
 
 // Write writes the config in env-file form.
 func (c Config) Write(w io.Writer) error {
+	c.AdminSSHPubkey = NormalizePubkey(c.AdminSSHPubkey)
 	var b strings.Builder
 	b.WriteString("# dryserver config. Keep private: may contain the WiFi password.\n")
 	for _, fl := range c.fields() {
@@ -158,6 +162,7 @@ func (c Config) Validate() error {
 	check("extra packages", packages.ValidExtra(c.ExtraList()))
 	check("username", ValidUsername(c.Username))
 	check("SSH key", ValidPubkey(c.AdminSSHPubkey))
+	check("key label", ValidKeyLabel(c.AdminKeyLabel))
 	check("timezone", ValidTimezone(c.Timezone))
 	return errors.Join(errs...)
 }
@@ -289,7 +294,7 @@ func ValidUsername(s string) error {
 func ValidPubkey(s string) error {
 	f := strings.Fields(s)
 	if len(f) < 2 || !(strings.HasPrefix(f[0], "ssh-") || strings.HasPrefix(f[0], "ecdsa-") || strings.HasPrefix(f[0], "sk-")) {
-		return errors.New("paste a public key line like 'ssh-ed25519 AAAA... you@pc'")
+		return errors.New("paste the line from ~/.ssh/id_ed25519.pub (starts with ssh-ed25519)")
 	}
 	if strings.Contains(s, "PRIVATE KEY") {
 		return errors.New("that is a private key, use the .pub file")
@@ -307,36 +312,23 @@ func ValidTimezone(s string) error {
 	return nil
 }
 
-// DefaultPubkey returns the invoking user's ed25519 or RSA public key, if
-// any. Under sudo it looks in the original user's home, not root's.
-func DefaultPubkey() string {
-	home, _ := os.UserHomeDir()
-	if u := os.Getenv("SUDO_USER"); u != "" && os.Geteuid() == 0 {
-		if pw, err := lookupHome(u); err == nil {
-			home = pw
-		}
+// NormalizePubkey keeps only the key type and key of an OpenSSH public key
+// line and drops the trailing comment, which is often an email address.
+func NormalizePubkey(s string) string {
+	if f := strings.Fields(s); len(f) >= 2 {
+		return f[0] + " " + f[1]
 	}
-	for _, name := range []string{"id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"} {
-		if b, err := os.ReadFile(filepath.Join(home, ".ssh", name)); err == nil {
-			return strings.TrimSpace(string(b))
-		}
-	}
-	return ""
+	return strings.TrimSpace(s)
 }
 
-// lookupHome reads /etc/passwd directly so the binary stays cgo-free.
-func lookupHome(user string) (string, error) {
-	b, err := os.ReadFile("/etc/passwd")
-	if err != nil {
-		return "", err
+var labelRe = regexp.MustCompile(`^[A-Za-z0-9._-]{0,32}$`)
+
+// ValidKeyLabel allows a short name like "desktop"; no spaces or @.
+func ValidKeyLabel(s string) error {
+	if !labelRe.MatchString(s) {
+		return errors.New("letters, digits, . _ - only (up to 32), e.g. desktop")
 	}
-	for _, line := range strings.Split(string(b), "\n") {
-		f := strings.Split(line, ":")
-		if len(f) >= 6 && f[0] == user {
-			return f[5], nil
-		}
-	}
-	return "", fmt.Errorf("user %s not in /etc/passwd", user)
+	return nil
 }
 
 func quote(s string) string {

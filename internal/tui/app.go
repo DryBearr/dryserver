@@ -165,9 +165,6 @@ func (a App) choose(k string) (tea.Model, tea.Cmd) {
 
 func (a App) openForm() (tea.Model, tea.Cmd) {
 	c := a.cfg
-	if c.AdminSSHPubkey == "" {
-		c.AdminSSHPubkey = config.DefaultPubkey()
-	}
 	tools := c.ToolList()
 	a.formCfg, a.formTools = &c, &tools
 	a.form = newConfigForm(a.formCfg, a.formTools)
@@ -187,6 +184,7 @@ func (a App) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case huh.StateCompleted:
 		a.formCfg.Tools = strings.Join(packages.SortTools(*a.formTools), " ")
 		a.formCfg.ExtraPackages = strings.Join(a.formCfg.ExtraList(), " ")
+		a.formCfg.AdminSSHPubkey = config.NormalizePubkey(a.formCfg.AdminSSHPubkey)
 		notice := "Config saved to " + a.paths.Config + "."
 		if err := a.formCfg.Save(a.paths.Config); err != nil {
 			notice = "Saving config failed: " + err.Error()
@@ -254,8 +252,12 @@ func newConfigForm(c *config.Config, tools *[]string) *huh.Form {
 			huh.NewNote().Title("Admin access").
 				Description("SSH key login only, password login is off."),
 			huh.NewInput().Title("Username").Value(&c.Username).Validate(config.ValidUsername),
-			huh.NewInput().Title("SSH public key").Placeholder("ssh-ed25519 AAAA... you@pc").
+			huh.NewInput().Title("SSH public key").Placeholder("ssh-ed25519 AAAA...").
+				Description("Paste the output of: cat ~/.ssh/id_ed25519.pub\nThe text after the key (often your email) is removed.").
 				Value(&c.AdminSSHPubkey).Validate(config.ValidPubkey),
+			huh.NewInput().Title("Key label").Placeholder("desktop").
+				Description("Short name for this key on the servers, instead of an email.").
+				Value(&c.AdminKeyLabel).Validate(config.ValidKeyLabel),
 			huh.NewInput().Title("Timezone").Placeholder("Europe/Berlin").
 				Value(&c.Timezone).Validate(config.ValidTimezone),
 		),

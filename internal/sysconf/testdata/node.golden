@@ -76,7 +76,7 @@ AllowTcpForwarding yes
 ClientAliveInterval 300
 ClientAliveCountMax 2
 ===== /home/admin/.ssh/authorized_keys (0600)
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest admin@desktop
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest desktop
 ===== /etc/sudoers.d/10-wheel (0440)
 # Members of wheel may use sudo after typing their password.
 %wheel ALL=(ALL:ALL) ALL
@@ -175,7 +175,8 @@ MESH_PORTS='8080/tcp 53/udp 9000/tcp'
 TOOLS='docker go rust cpp neovim'
 EXTRA_PACKAGES=''
 USERNAME='admin'
-ADMIN_SSH_PUBKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest admin@desktop'
+ADMIN_SSH_PUBKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest'
+ADMIN_KEY_LABEL='desktop'
 TIMEZONE='UTC'
 ===== /etc/dryserver/role (0644)
 node
