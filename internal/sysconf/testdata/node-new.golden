@@ -1,0 +1,238 @@
+===== /etc/hostname (0644)
+node-9c1d
+===== /etc/hosts (0644)
+127.0.0.1 localhost
+::1       localhost
+127.0.1.1 node-9c1d
+===== /etc/nftables.conf (0600)
+#!/usr/bin/nft -f
+# dryserver firewall, generated from config.env. To open more ports to the
+# mesh, change MESH_PORTS there. Only this table is touched, so Docker's own
+# rules survive reloads.
+
+destroy table inet dryserver
+
+table inet dryserver {
+	# Addresses that opened too many SSH connections in the last minute.
+	set ssh_meter4 {
+		type ipv4_addr
+		flags dynamic
+		timeout 1m
+	}
+	set ssh_meter6 {
+		type ipv6_addr
+		flags dynamic
+		timeout 1m
+	}
+
+	chain input {
+		type filter hook input priority filter; policy drop;
+		ct state vmap { established : accept, related : accept, invalid : drop }
+		iif lo accept
+
+		icmp type echo-request limit rate 10/second accept
+		icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
+		icmpv6 type echo-request limit rate 10/second accept
+
+		iifname "wg0" jump mesh
+
+		# WireGuard from the WiFi/router network and the switch.
+		udp dport 51820 accept
+
+		# Switch network: WireGuard only.
+		ip saddr 172.16.66.0/24 drop
+
+		# SSH from the WiFi/router network, at most 10 new connections a
+		# minute per address. Logins need the admin SSH key.
+		tcp dport 22 ct state new add @ssh_meter4 { ip saddr limit rate over 10/minute burst 20 packets } drop
+		tcp dport 22 ct state new add @ssh_meter6 { ip6 saddr limit rate over 10/minute burst 20 packets } drop
+		tcp dport 22 accept
+	}
+
+	# Traffic from other servers over WireGuard.
+	chain mesh {
+		tcp dport { 22, 8080, 9000 } accept
+		udp dport { 53 } accept
+		icmp type echo-request accept
+		icmpv6 type echo-request accept
+	}
+}
+===== /etc/ssh/sshd_config.d/10-dryserver.conf (0644)
+# dryserver SSH hardening. Login with the admin SSH key only.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+PermitRootLogin no
+PermitEmptyPasswords no
+AllowUsers admin
+MaxAuthTries 3
+LoginGraceTime 30
+X11Forwarding no
+PermitTunnel no
+# Agent forwarding lets you hop between servers with your desktop key;
+# TCP forwarding is needed for ProxyJump through a server.
+AllowAgentForwarding yes
+AllowTcpForwarding yes
+ClientAliveInterval 300
+ClientAliveCountMax 2
+===== /home/admin/.ssh/authorized_keys (0600)
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest admin@desktop
+===== /etc/sudoers.d/10-wheel (0440)
+# Members of wheel may use sudo after typing their password.
+%wheel ALL=(ALL:ALL) ALL
+===== /etc/sysctl.d/90-dryserver.conf (0644)
+# dryserver kernel hardening
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.unprivileged_bpf_disabled = 1
+net.core.bpf_jit_harden = 2
+kernel.yama.ptrace_scope = 1
+fs.protected_fifos = 2
+fs.protected_regular = 2
+
+# Loose reverse-path filter: strict mode breaks machines with WiFi and a
+# cable in the same network.
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+net.ipv4.tcp_syncookies = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+===== /etc/systemd/network/20-wired.network (0644)
+# Ethernet ports: DHCP when the cable reaches a router (then the cable
+# also carries internet). The switch port has its own file, 10-switch.network.
+[Match]
+Type=ether
+Kind=!*
+
+[Network]
+DHCP=yes
+
+[DHCPv4]
+RouteMetric=100
+
+[IPv6AcceptRA]
+RouteMetric=100
+===== /etc/systemd/network/25-wireless.network (0644)
+# WiFi (iwd connects, networkd does DHCP). Higher metric than Ethernet,
+# so a cable to the router wins for internet when present.
+[Match]
+Type=wlan
+
+[Network]
+DHCP=yes
+
+[DHCPv4]
+RouteMetric=600
+
+[IPv6AcceptRA]
+RouteMetric=600
+===== /etc/systemd/system/systemd-networkd-wait-online.service.d/any.conf (0644)
+# Boot does not wait for every link: an isolated switch or missing WiFi
+# must not hold up startup.
+[Service]
+ExecStart=
+ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any --timeout=30
+===== /etc/systemd/logind.conf.d/10-lid.conf (0644)
+# Laptop as server: keep running with the lid closed.
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+===== /etc/systemd/resolved.conf.d/10-dryserver.conf (0644)
+# No LLMNR or mDNS: both answer name lookups from anyone on the network
+# and are a common way to poison names on a LAN.
+[Resolve]
+LLMNR=no
+MulticastDNS=no
+===== /etc/systemd/zram-generator.conf (0644)
+# Compressed swap in RAM. No swap partition, so nothing from memory is
+# written unencrypted to disk.
+[zram0]
+zram-size = min(ram / 2, 8192)
+compression-algorithm = zstd
+===== /etc/dryserver/config.env (0600)
+# dryserver config. Keep private: may contain the WiFi password.
+WIFI_SSID='Home Net!'
+WIFI_PASS=''
+COORD_LAN_IP='192.168.1.50'
+WG_SUBNET='10.66.0.0/24'
+WG_PORT='51820'
+WG_TRANSPORT='auto'
+SWITCH_SUBNET='172.16.66.0/24'
+MESH_PORTS='8080/tcp 53/udp 9000/tcp'
+TOOLS='docker go rust cpp neovim'
+EXTRA_PACKAGES=''
+USERNAME='admin'
+ADMIN_SSH_PUBKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest admin@desktop'
+TIMEZONE='UTC'
+===== /etc/dryserver/role (0644)
+node
+===== /etc/systemd/system/dryserver-join.service (0644)
+[Unit]
+Description=Ask the coordinator to let this server join the mesh
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dryserver join
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+===== /etc/systemd/system/dryserver-sync.service (0644)
+[Unit]
+Description=Update the WireGuard mesh from the coordinator's member list
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dryserver sync
+===== /etc/systemd/system/dryserver-sync.timer (0644)
+[Unit]
+Description=Update the WireGuard mesh every minute
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=60s
+
+[Install]
+WantedBy=timers.target
+===== /etc/systemd/system/dryserver-tpm-enroll.service (0644)
+[Unit]
+Description=Let the TPM unlock the disk from now on
+ConditionPathExists=/etc/cryptsetup-keys.d/tpm-enroll.key
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dryserver tpm-enroll --first-boot
+
+[Install]
+WantedBy=multi-user.target
+===== /var/lib/iwd/=486f6d65204e657421.psk (0600)
+[Security]
+Passphrase=correct horse
+
+[Settings]
+AutoConnect=true
+===== /etc/docker/daemon.json (0644)
+{
+  "ip": "127.0.0.1",
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}

@@ -1,0 +1,7 @@
+
+# dryserver: open the setup screen once on the first console.
+if [[ $(tty) == /dev/tty1 && ! -e /run/dryserver-setup ]]; then
+    touch /run/dryserver-setup
+    dryserver install
+    print "\nSetup closed. Run 'dryserver install' to open it again.\n"
+fi

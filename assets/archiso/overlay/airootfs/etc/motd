@@ -1,0 +1,8 @@
+
+dryserver installer live system
+
+  dryserver install   open the setup screen
+  dryserver disks     list disks in this machine
+
+Incoming connections are blocked (nftables). SSH server is off.
+
