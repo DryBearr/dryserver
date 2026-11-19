@@ -9,7 +9,7 @@ to join a WireGuard mesh with your other servers. Nothing joins without your
 approval.
 
 ![license: MIT](https://img.shields.io/badge/license-MIT-blue)
-![go](https://img.shields.io/badge/go-1.26%2B-00ADD8)
+![rust](https://img.shields.io/badge/rust-1.88%2B-B7410E)
 ![arch linux](https://img.shields.io/badge/installs-Arch%20Linux-1793D1)
 
 > **Status: early.** Tested end to end in QEMU virtual machines (UEFI with a
@@ -58,7 +58,10 @@ approval.
 
 **Desktop (to build and flash)**
 - Linux with `podman` (the ISO is built inside an Arch Linux container)
-- Go 1.26 or newer (see `go.mod`), `make`, `ssh-keygen`, `lsblk`
+- Rust 1.88 or newer (`cargo`), `make`, `ssh-keygen`, `lsblk`. The binary
+  must be static: `make` builds it for musl, with the local
+  `x86_64-unknown-linux-musl` target if installed, else inside a Rust Alpine
+  container (podman)
 - About 5 GB free disk space; `sudo` only for writing the USB stick
 
 **Laptops (to become servers)**
@@ -266,7 +269,7 @@ TPM refuses (firmware update, changed boot settings).
 ## Development
 
 ```sh
-make test                           # unit tests
+make test                           # unit tests (cargo test)
 test/validate-sysconf.sh            # check generated firewall/SSH/sudo files with real nft and sshd
 test/qemu.sh coord                  # boot out/dryserver.iso in a UEFI VM with a blank disk
 BIOS=1 test/qemu.sh node            # legacy BIOS
@@ -274,10 +277,12 @@ TPM=1 OVMF_CODE=... test/qemu.sh    # TPM tests need firmware that measures boot
 SWITCH=1 SSH_PORT=2201 ...          # shared switch NIC between VMs, SSH on localhost:2201
 ```
 
-Layout: `cmd/dryserver` (CLI), `internal/tui` (screens), `internal/install`
-(installer), `internal/sysconf` (generated system files), `internal/registry`
-and `internal/node` (joining and sync), `internal/mesh` (WireGuard and SSH
-config), `assets/` (files embedded into the ISO and servers).
+Layout: `src/main.rs` (CLI), `src/tui` (screens), `src/install`
+(installer), `src/sysconf.rs` (generated system files), `src/registry.rs`
+and `src/node.rs` (joining and sync), `src/mesh.rs` (WireGuard and SSH
+config), `assets/` (files embedded into the ISO and servers by `build.rs`).
+Golden files for the generated system files are in `testdata/sysconf`;
+`UPDATE_GOLDEN=1 cargo test` rewrites them.
 
 | Path | What |
 |---|---|
