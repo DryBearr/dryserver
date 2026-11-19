@@ -1,6 +1,7 @@
 # build output
 /dryserver
 /out/
+/target/
 
 # local config and generated keys (contain WiFi password and private keys)
 /config.env

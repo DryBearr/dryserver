@@ -1,0 +1,547 @@
+//! dryserver builds and flashes the Arch + WireGuard installer USB, and runs
+//! the setup screen and mesh tools on the servers it installs.
+
+mod assets;
+mod cidr;
+mod config;
+mod ctx;
+mod disks;
+mod err;
+mod flash;
+mod fsx;
+mod gotime;
+mod install;
+mod iso;
+mod mesh;
+mod node;
+mod owner;
+mod packages;
+mod registry;
+mod runner;
+mod sysconf;
+#[cfg(test)]
+mod testutil;
+mod tui;
+
+use std::collections::HashMap;
+use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::cidr::Cidr;
+use crate::config::Config;
+use crate::ctx::Ctx;
+use crate::err::{Context, Result};
+use crate::gotime::Time;
+use crate::node::Node;
+use crate::runner::{Cmd, ExecRunner, Runner};
+use crate::sysconf::{Params, Role};
+
+const USAGE: &str = r#"usage: dryserver [command] [flags]
+
+Run without a command for the interactive menu (config, build, flash).
+Use sudo when you want to flash: sudo dryserver
+
+commands:
+  install [--demo]    laptop setup screen (runs from the installer USB);
+                      --demo only shows the screens, nothing is changed
+  build               build out/dryserver.iso from config.env, log to stdout
+  disks               list disks and show which ones may be flashed
+  flash --iso FILE    select a USB drive and write FILE to it (needs root)
+  sysconf --out DIR   write the system files a server would get (for review)
+  ssh-config          write ~/.ssh/config.d/dryserver so "ssh <server>" works
+
+on servers:
+  approve             coordinator: approve or reject machines, remove members
+  join                ask the coordinator to join (runs at boot until approved)
+  sync                update the mesh from the member list (runs every minute)
+  scan                coordinator: report unknown devices on the network
+  tpm-enroll          let the TPM unlock the disk again (after a firmware change)
+  registry            coordinator: SSH forced command for joining machines
+"#;
+
+/// Where the ISO build puts the config.
+const LIVE_CONFIG: &str = "/etc/dryserver/config.env";
+const INSTALL_LOG: &str = "/tmp/dryserver-install.log";
+
+fn paths() -> tui::app::Paths {
+    tui::app::Paths { config: "config.env".into(), out_dir: "out".into(), secrets: "secrets".into() }
+}
+
+fn main() -> ExitCode {
+    // Die quietly when the reader of our output goes away (`| head`),
+    // instead of panicking on the failed write.
+    // SAFETY: setting a signal disposition before any threads start.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(cmd) = args.first() else {
+        return finish(run_app());
+    };
+    let rest = &args[1..];
+    let res = match cmd.as_str() {
+        "install" => run_install(rest),
+        "build" => run_build(rest),
+        "disks" => run_disks(rest),
+        "flash" => run_flash(rest),
+        "sysconf" => run_sysconf(rest),
+        "ssh-config" => run_ssh_config(rest),
+        "registry" => run_registry(rest),
+        "join" => run_join(rest),
+        "sync" => run_sync(rest),
+        "scan" => run_scan(rest),
+        "approve" => run_approve(rest),
+        "tpm-enroll" => run_tpm_enroll(rest),
+        "help" | "-h" | "--help" => {
+            print!("{USAGE}");
+            Ok(())
+        }
+        other => {
+            eprint!("unknown command {other:?}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    finish(res)
+}
+
+fn finish(res: Result<()>) -> ExitCode {
+    match res {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("dryserver: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+// ---- flags ----
+
+/// Parses Go-style flags: -name value, --name=value, -bool. Unknown flags
+/// and stray arguments print the command's usage and exit with status 2.
+struct Flags {
+    values: HashMap<&'static str, String>,
+}
+
+impl Flags {
+    /// spec: (name, default, help); a default of "false" makes a bool flag.
+    fn parse(cmd: &str, args: &[String], spec: &[(&'static str, &str, &str)]) -> Flags {
+        let usage = || {
+            let mut u = format!("Usage of {cmd}:\n");
+            for (name, def, help) in spec {
+                if *def == "false" {
+                    u += &format!("  -{name}\n    \t{help}\n");
+                } else {
+                    u += &format!("  -{name} string\n    \t{help} (default {def:?})\n");
+                }
+            }
+            u
+        };
+        let fail = |msg: String| -> ! {
+            eprint!("{msg}\n{}", usage());
+            std::process::exit(2);
+        };
+        let mut values: HashMap<&'static str, String> = spec.iter().map(|(n, d, _)| (*n, d.to_string())).collect();
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            if a == "-h" || a == "--help" {
+                print!("{}", usage());
+                std::process::exit(0);
+            }
+            let Some(body) = a.strip_prefix("--").or_else(|| a.strip_prefix('-')) else {
+                fail(format!("unexpected argument {a:?}"));
+            };
+            let (name, inline) = match body.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (body, None),
+            };
+            let Some((key, def, _)) = spec.iter().find(|(n, _, _)| *n == name) else {
+                fail(format!("flag provided but not defined: -{name}"));
+            };
+            let v = if *def == "false" {
+                inline.unwrap_or_else(|| "true".into())
+            } else if let Some(v) = inline {
+                v
+            } else {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => v.clone(),
+                    None => fail(format!("flag needs an argument: -{name}")),
+                }
+            };
+            values.insert(key, v);
+            i += 1;
+        }
+        Flags { values }
+    }
+
+    fn get(&self, name: &str) -> &str {
+        self.values.get(name).map(String::as_str).unwrap_or("")
+    }
+
+    fn on(&self, name: &str) -> bool {
+        matches!(self.get(name), "true" | "1" | "t" | "T" | "TRUE" | "True")
+    }
+}
+
+// ---- desktop commands ----
+
+fn run_app() -> Result<()> {
+    tui::run(&mut tui::app::App::new(paths()))
+}
+
+fn run_install(args: &[String]) -> Result<()> {
+    let f = Flags::parse("install", args, &[("demo", "false", "show the setup screens without changing anything")]);
+    let live = Config::load(LIVE_CONFIG);
+    let (be, cfg): (Arc<dyn install::Backend>, Config) = if f.on("demo") {
+        let cfg = live
+            .or_else(|_| Config::load(paths().config))
+            .unwrap_or_else(|_| Config { coord_lan_ip: "192.168.1.50".into(), ..Config::default() });
+        (Arc::new(install::Demo::new()), cfg)
+    } else {
+        let cfg = live.map_err(|e| errf!("this is not the installer USB ({e}); try: dryserver install --demo"))?;
+        if !fsx::is_root() {
+            bail!("the installer must run as root");
+        }
+        (Arc::new(new_real_backend(&cfg)?), cfg)
+    };
+    tui::run(&mut tui::setup::Setup::new(be, cfg))
+}
+
+fn new_real_backend(cfg: &Config) -> Result<install::Real> {
+    let me = std::env::current_exe()?;
+    let rootfs = assets::ROOTFS.iter().map(|(p, d)| (p.to_string(), d.to_vec())).collect();
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode_600()
+        .open(INSTALL_LOG)
+        .map_err(|e| err::Error::from(e).wrap(format!("open {INSTALL_LOG}")))?;
+    let r = install::Real::new(cfg.clone(), rootfs, me, "/etc/dryserver/registry_ed25519");
+    *r.log.file.lock().unwrap() = Some(log);
+    Ok(r)
+}
+
+trait Mode600 {
+    fn mode_600(&mut self) -> &mut Self;
+}
+
+impl Mode600 for std::fs::OpenOptions {
+    fn mode_600(&mut self) -> &mut Self {
+        std::os::unix::fs::OpenOptionsExt::mode(self, 0o600)
+    }
+}
+
+fn run_build(args: &[String]) -> Result<()> {
+    Flags::parse("build", args, &[]);
+    let p = paths();
+    let cfg = Config::load(&p.config).map_err(|e| errf!("load {}: {e} (create it with the menu: dryserver)", p.config.display()))?;
+    let ctx = Ctx::on_signals();
+    let mut out = std::io::stdout();
+    iso::run(&ctx, &iso::Options { config: cfg, out_dir: p.out_dir, secrets_dir: p.secrets }, &mut out)
+}
+
+fn run_disks(args: &[String]) -> Result<()> {
+    Flags::parse("disks", args, &[]);
+    let all = disks::list()?;
+    let usb: Vec<String> = disks::usb(&all).into_iter().map(|d| d.path).collect();
+    for d in &all {
+        let tag = if usb.contains(&d.path) {
+            "USB   "
+        } else if d.is_system() {
+            "system"
+        } else {
+            "other "
+        };
+        print!("[{tag}] {}", d.title());
+        let m = d.mounts();
+        if !m.is_empty() {
+            print!("  mounted: {}", m.join(", "));
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn run_flash(args: &[String]) -> Result<()> {
+    let f = Flags::parse("flash", args, &[("iso", "", "installer image to write")]);
+    let iso = f.get("iso");
+    if iso.is_empty() {
+        bail!("flash: --iso is required");
+    }
+    let st = std::fs::metadata(iso).wrap(format!("stat {iso}"))?;
+    if !st.is_file() || st.len() == 0 {
+        bail!("{iso} is not an image file");
+    }
+    if !fsx::is_root() {
+        let me = std::env::args().next().unwrap_or_else(|| "dryserver".into());
+        bail!("flash writes to raw disks and needs root:\n  sudo {me} flash --iso {iso}");
+    }
+    let mut screen = tui::flash::Flash::new(iso, st.len());
+    tui::run(&mut screen)?;
+    screen.result()
+}
+
+fn run_sysconf(args: &[String]) -> Result<()> {
+    let f = Flags::parse(
+        "sysconf",
+        args,
+        &[
+            ("out", "", "directory to write the files into"),
+            ("config", "config.env", "config file"),
+            ("role", "node", "node or coordinator"),
+            ("hostname", "node-0000", "machine hostname"),
+            ("host", "0", "mesh host number (0 = not approved yet)"),
+        ],
+    );
+    let out = f.get("out");
+    if out.is_empty() {
+        bail!("sysconf: --out is required");
+    }
+    let role = Role::parse(f.get("role")).ok_or_else(|| errf!("sysconf: --role must be node or coordinator"))?;
+    let host: u32 = f.get("host").parse().map_err(|_| errf!("sysconf: --host must be a number"))?;
+    let cfg = Config::load(f.get("config"))?;
+    let plan = packages::resolve(&cfg.tool_list(), &cfg.extra_list())?;
+    let files = sysconf::render(&Params {
+        config: cfg,
+        plan,
+        hostname: f.get("hostname").into(),
+        role,
+        host_num: host,
+        switch_mac: String::new(),
+    })?;
+    for file in files {
+        let dst = fsx::under(out, &file.path);
+        fsx::mkdir_all(fsx::dir(&dst), 0o755)?;
+        fsx::write_file(&dst, &file.content, file.mode)?;
+        println!("{:04o} {}", file.mode, file.path);
+    }
+    Ok(())
+}
+
+fn run_ssh_config(args: &[String]) -> Result<()> {
+    let f = Flags::parse(
+        "ssh-config",
+        args,
+        &[
+            ("config", "config.env", "config file"),
+            ("host", "", "coordinator address (default: COORD_LAN_IP)"),
+            ("port", "22", "coordinator SSH port"),
+        ],
+    );
+    if fsx::is_root() {
+        bail!("run ssh-config as your normal user, not with sudo");
+    }
+    let cfg = Config::load(f.get("config"))?;
+    let host = if f.get("host").is_empty() { cfg.coord_lan_ip.clone() } else { f.get("host").to_string() };
+    let port = f.get("port");
+    let out = Command::new("ssh")
+        .args([
+            "-p",
+            port,
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            &format!("{}@{host}", cfg.username),
+            "cat /etc/hosts /etc/ssh/ssh_known_hosts",
+        ])
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| err::Error::from(e).wrap("ssh"))?;
+    if !out.status.success() {
+        bail!("cannot read the server list from the coordinator {host}: {}", runner::exit_text(out.status));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let servers = mesh::parse_hosts_block(&text);
+    let coord_ip = mesh::ip(&cfg.wg_subnet, 1);
+    let Some(coord_name) = servers.iter().find(|s| s.mesh_ip == coord_ip).map(|s| s.name.clone()) else {
+        bail!("the coordinator has no mesh list yet (is dryserver-sync running?)");
+    };
+    let home = PathBuf::from(std::env::var("HOME").map_err(|_| errf!("$HOME is not defined"))?);
+    let conf_path = home.join(".ssh/config.d/dryserver");
+    let kh_path = home.join(".ssh/known_hosts.d/dryserver");
+    for p in [&conf_path, &kh_path] {
+        fsx::mkdir_all(fsx::dir(p), 0o700)?;
+    }
+    fsx::write_file(&kh_path, mesh::desktop_known_hosts(&text, &coord_name, &host, port), 0o644)?;
+    let conf = mesh::desktop_ssh_config(&cfg.username, &coord_name, &host, port, "~/.ssh/known_hosts.d/dryserver", &servers);
+    fsx::write_file(&conf_path, conf, 0o600)?;
+    println!("Wrote {} ({} servers) and {}.", conf_path.display(), servers.len(), kh_path.display());
+    if !fsx::read_or_empty(home.join(".ssh/config")).contains("config.d/") {
+        println!("Add this line at the top of ~/.ssh/config to use it:\n  Include config.d/*");
+    }
+    for s in &servers {
+        println!("  ssh {}", s.name);
+    }
+    Ok(())
+}
+
+// ---- server commands ----
+
+/// What the node commands need on an installed server.
+fn server_node() -> Result<(Node, Config)> {
+    if !fsx::is_root() {
+        bail!("run as root (sudo)");
+    }
+    let cfg = Config::load(LIVE_CONFIG).map_err(|e| e.wrap("not a dryserver server"))?;
+    let host = fsx::read_or_empty("/proc/sys/kernel/hostname").trim().to_string();
+    let n = Node { cfg: cfg.clone(), hostname: host, root: PathBuf::from("/"), run: Arc::new(ExecRunner::silent()), tmp_dir: None };
+    Ok((n, cfg))
+}
+
+fn is_coordinator() -> bool {
+    fsx::read_or_empty("/etc/dryserver/role").trim() == Role::Coordinator.as_str()
+}
+
+fn run_registry(args: &[String]) -> Result<()> {
+    let f = Flags::parse("registry", args, &[("subnet", "", "mesh subnet")]);
+    let host_key = fsx::read_string("/etc/ssh/ssh_host_ed25519_key.pub")?;
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    registry::serve(
+        &registry::Store::default_path(),
+        &mesh::Subnet(f.get("subnet").to_string()),
+        &host_key,
+        &env("SSH_ORIGINAL_COMMAND"),
+        &env("SSH_CLIENT"),
+        &mut std::io::stdin(),
+        &mut std::io::stdout(),
+        Time::now(),
+    )
+}
+
+fn run_join(args: &[String]) -> Result<()> {
+    Flags::parse("join", args, &[]);
+    let (n, cfg) = server_node()?;
+    let plan = packages::resolve(&cfg.tool_list(), &cfg.extra_list())?;
+    let ctx = Ctx::on_signals();
+    let params = Params { config: cfg, plan, hostname: n.hostname.clone(), role: Role::Node, host_num: 0, switch_mac: String::new() };
+    node::join_loop(&ctx, &n, &params, &mut std::io::stdout())
+}
+
+fn run_sync(args: &[String]) -> Result<()> {
+    Flags::parse("sync", args, &[]);
+    let (n, _) = server_node()?;
+    let ctx = Ctx::on_signals().with_timeout(Duration::from_secs(50));
+    node::sync(&ctx, &n, is_coordinator(), &registry::Store::default_path())
+}
+
+fn run_scan(args: &[String]) -> Result<()> {
+    Flags::parse("scan", args, &[]);
+    let (n, cfg) = server_node()?;
+    if !is_coordinator() {
+        bail!("scan runs on the coordinator");
+    }
+    let ctx = Ctx::on_signals().with_timeout(Duration::from_secs(120));
+    let mut found = Vec::new();
+    let mut ports: Vec<String> = std::fs::read_dir("/sys/class/net")
+        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    ports.sort();
+    for name in ports {
+        // Only physical ports: WiFi/router and switch.
+        if !Path::new("/sys/class/net").join(&name).join("device").exists() {
+            continue;
+        }
+        let c = Cmd::new("arp-scan", &["--localnet", "--plain", "--quiet", "--interface", &name, "--format", "${ip}\t${mac}\t${vendor}"])
+            .quiet();
+        let (out, _) = n.run.run(&ctx, &c);
+        found.extend(registry::parse_arp_scan(&out));
+    }
+    let store = registry::Store::default_path();
+    let st = store.read()?;
+    let mut known = Vec::new();
+    for m in &st.members {
+        known.extend([m.lan_ip.clone(), mesh::ip(&cfg.switch_subnet, m.host), mesh::ip(&cfg.wg_subnet, m.host)]);
+    }
+    let mut unknown = registry::unknown(&found, &known, Time::now());
+    for d in unknown.iter_mut() {
+        if let Ok(ip) = d.ip.parse::<std::net::IpAddr>() {
+            d.ssh = TcpStream::connect_timeout(&SocketAddr::new(ip, 22), Duration::from_secs(1)).is_ok();
+        }
+    }
+    store.update(|s| {
+        s.unknown = unknown;
+        s.scanned = Time::now();
+        Ok(())
+    })
+}
+
+fn run_approve(args: &[String]) -> Result<()> {
+    Flags::parse("approve", args, &[]);
+    let (_, cfg) = server_node()?;
+    if !is_coordinator() {
+        bail!("approve runs on the coordinator ({})", cfg.coord_lan_ip);
+    }
+    let subnet = Cidr::parse(&cfg.wg_subnet).ok_or_else(|| errf!("invalid CIDR address: {}", cfg.wg_subnet))?;
+    let max_host = (subnet.size() - 2) as u32;
+    tui::run(&mut tui::approve::Approve::new(registry::Store::default_path(), &cfg.wg_subnet, max_host))
+}
+
+/// The LUKS container of the root filesystem, from /etc/crypttab.
+fn root_device() -> Result<String> {
+    let text = fsx::read_string("/etc/crypttab").map_err(|e| e.wrap("no encrypted disk here"))?;
+    for l in text.lines() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() >= 2
+            && f[0] == install::ROOT_MAPPER
+            && let Some(uuid) = f[1].strip_prefix("UUID=")
+        {
+            return Ok(format!("/dev/disk/by-uuid/{uuid}"));
+        }
+    }
+    bail!("no root entry in /etc/crypttab")
+}
+
+fn run_tpm_enroll(args: &[String]) -> Result<()> {
+    let f = Flags::parse("tpm-enroll", args, &[("first-boot", "false", "use the one-time key from the installer, then remove it")]);
+    let first_boot = f.on("first-boot");
+    if !fsx::is_root() {
+        bail!("run as root (sudo)");
+    }
+    let dev = root_device()?;
+    let mut enroll = install::tpm_enroll_args(&dev);
+    if first_boot {
+        enroll.insert(0, format!("--unlock-key-file={}", install::FIRST_BOOT_KEY));
+    } else {
+        println!("Enter the disk passphrase to let the TPM unlock this boot's configuration.");
+    }
+    let st = Command::new("systemd-cryptenroll").args(&enroll).status().map_err(|e| err::Error::from(e).wrap("systemd-cryptenroll"))?;
+    if !st.success() {
+        bail!("systemd-cryptenroll: {}", runner::exit_text(st));
+    }
+    if !first_boot {
+        return Ok(());
+    }
+    // The one-time key has done its job: remove its key slot and the file.
+    let ctx = Ctx::new();
+    ExecRunner::silent()
+        .output(&ctx, &Cmd::new("cryptsetup", &["luksRemoveKey", "--batch-mode", &dev, install::FIRST_BOOT_KEY]))
+        .map_err(|e| e.wrap("remove one-time key"))?;
+    fsx::remove(install::FIRST_BOOT_KEY)?;
+    let _ = Command::new("systemctl").args(["disable", "dryserver-tpm-enroll.service"]).status();
+    println!("TPM enrolled; the disk now unlocks by itself.");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(l: &[&str]) -> Vec<String> {
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flags_like_go() {
+        let spec: &[(&'static str, &str, &str)] = &[("out", "", "dir"), ("host", "0", "n"), ("demo", "false", "b")];
+        let f = Flags::parse("x", &args(&["--out", "/tmp/a", "-host=5", "-demo"]), spec);
+        assert_eq!(f.get("out"), "/tmp/a");
+        assert_eq!(f.get("host"), "5");
+        assert!(f.on("demo"));
+        let f = Flags::parse("x", &args(&["--demo=false"]), spec);
+        assert!(!f.on("demo"));
+        assert_eq!(f.get("host"), "0");
+    }
+}
