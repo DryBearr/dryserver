@@ -135,7 +135,11 @@ out=$(screen "$S/thief" "talk to the coordinator|Waiting to join" "" 2>&1)
 check "approve screen with a wrong signing key is refused" grep -q "refused" <<<"$out"
 check_not "it saw no machine names" grep -q "node-a" <<<"$out"
 
-echo "== the admin approves on the desktop"
+echo "== the admin signs the coordinator, then approves on the desktop"
+out=$(screen "$S/desk" "Press S to sign the coordinator" "S" "Its screen must show the code [0-9]{3} [0-9]{3}" "y" "Coordinator signed|Failed" "")
+check "first signature asks for the coordinator's code" grep -Eq "Its screen must show the code [0-9]{3} [0-9]{3}" <<<"$out"
+check "coordinator signed" grep -q "Coordinator signed" <<<"$out"
+check "nobody else became a member" test "$(jqr "len(d['members'])")" = 1
 out=$(screen "$S/desk" "node-a" "a" "approved and signed|Failed" "")
 check "screen showed the waiting machine" grep -q "node-a" <<<"$out"
 check "screen showed the same code the coordinator computed ($CODE)" grep -qF "$CODE" <<<"$out"

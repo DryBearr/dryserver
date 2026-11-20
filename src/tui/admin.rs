@@ -3,11 +3,10 @@
 
 use std::time::{Duration, Instant};
 
-use super::approve::ago;
 use super::{Doc, Emit, Event, Flow, Key, Model, dim, err, ok, sel, title};
 use crate::admin::{Admin, View};
 use crate::err::{Error, Result};
-use crate::gotime::Time;
+use crate::gotime::{Time, duration_string, round_ms};
 use crate::mesh;
 
 const REFRESH: Duration = Duration::from_secs(5);
@@ -15,6 +14,19 @@ const REFRESH: Duration = Duration::from_secs(5);
 const RETRY: Duration = Duration::from_secs(15);
 
 pub enum Msg {}
+
+/// "42s ago", "3m0s ago", "never".
+fn ago(t: Time, now: Time) -> String {
+    if t.is_zero() {
+        return "never".into();
+    }
+    let ms = now.since(t).num_milliseconds();
+    let secs = round_ms(ms, 1000) / 1000;
+    if secs < 60 {
+        return format!("{} ago", duration_string(secs));
+    }
+    format!("{} ago", duration_string(round_ms(secs * 1000, 60_000) / 1000))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum Action {
@@ -27,8 +39,8 @@ enum Action {
         name: String,
     },
     Remove(String),
-    /// Names to sign; empty means every unsigned member.
-    Sign(Vec<String>),
+    /// The first signature: the coordinator's own entry.
+    SignCoordinator,
     Resend,
 }
 
@@ -81,7 +93,7 @@ impl Screen {
             }
             Action::Reject { id, name } => self.admin.reject(id).map(|_| format!("{name} rejected.")),
             Action::Remove(name) => self.admin.remove(name).map(|_| format!("{name} removed; servers drop it within a minute.")),
-            Action::Sign(names) => self.admin.sign(names).map(|n| format!("{n} machine(s) signed.")),
+            Action::SignCoordinator => self.admin.sign_coordinator().map(|_| "Coordinator signed. New machines can join now.".to_string()),
             Action::Resend => self.admin.resend().map(|v| format!("Signed list sent again as version {v}.")),
         };
         self.notice = res.unwrap_or_else(|e| format!("Failed: {e}"));
@@ -140,19 +152,23 @@ impl Screen {
                 let q = format!("Remove {} from the swarm?", m.name);
                 self.decide(Action::Remove(m.name.clone()), Some(q), std::slice::from_ref(&m.name));
             }
-            Key::Char('s') => match member {
-                Some((m, false)) => self.decide(Action::Sign(vec![m.name.clone()]), None, std::slice::from_ref(&m.name)),
-                Some(_) => self.notice = "That machine is signed already.".into(),
-                None => self.notice = "Select a member marked NOT SIGNED first.".into(),
-            },
             Key::Char('S') => {
-                let names = self.view.unsigned();
-                if names.is_empty() {
-                    self.notice = "Every member is signed.".into();
+                if self.view.version != 0 {
+                    self.notice = if self.view.unsigned().is_empty() {
+                        "The coordinator is signed.".into()
+                    } else {
+                        "Only the coordinator is signed without a request. Machines marked NOT SIGNED were put on the coordinator \
+                         without you: press p to drop them."
+                            .into()
+                    };
+                } else if self.view.coordinator_code.is_empty() {
+                    self.notice = "The coordinator sent no entry for itself.".into();
                 } else {
-                    let q =
-                        format!("Sign all {} machine(s) marked NOT SIGNED ({})? Only if you know each one.", names.len(), names.join(", "));
-                    self.confirm = Some((format!("{q} y to confirm"), Action::Sign(Vec::new())));
+                    let q = format!(
+                        "Sign the coordinator? Its screen must show the code {} (shown after its install).",
+                        self.view.coordinator_code
+                    );
+                    self.decide(Action::SignCoordinator, Some(q), &[]);
                 }
             }
             Key::Char('p') => self.run(Action::Resend),
@@ -231,8 +247,10 @@ impl Model for Screen {
                 b.s(" ").add(err("NOT SIGNED")).nl();
             }
         }
-        if !self.view.unsigned().is_empty() {
-            b.add(dim("  NOT SIGNED: on the coordinator, but you never signed it here. Sign it (s) only if you know the machine.")).nl();
+        if self.view.version == 0 && !self.view.members.is_empty() {
+            b.add(dim("  Nothing is signed yet. Press S to sign the coordinator; then machines can join.")).nl();
+        } else if !self.view.unsigned().is_empty() {
+            b.add(err("  NOT SIGNED: put on the coordinator without you. Servers ignore it. Press p to drop it.")).nl();
         }
 
         if !self.view.unknown.is_empty() {
@@ -260,7 +278,8 @@ impl Model for Screen {
         } else if !self.notice.is_empty() {
             b.nl().s(&self.notice).nl();
         }
-        b.nl().add(dim("↑/↓ select · a approve · r reject · d remove · s sign · S sign all · p send list again · q quit")).nl();
+        let first = if self.view.version == 0 { "S sign coordinator · " } else { "" };
+        b.nl().add(dim(format!("↑/↓ select · a approve · r reject · d remove · {first}p send list again · q quit"))).nl();
         b
     }
 }
@@ -269,8 +288,16 @@ impl Model for Screen {
 mod tests {
     use super::*;
     use crate::admin::tests::{COORD_KEY, key32, request, setup};
-    use crate::registry::{Member, Status};
+    use crate::registry::Member;
     use crate::testutil::TempDir;
+
+    #[test]
+    fn ago_like_go() {
+        let t = Time::ymd_hms(2026, 1, 1, 12, 0, 0);
+        assert_eq!(ago(Time::zero(), t), "never");
+        assert_eq!(ago(t, t.add(chrono::TimeDelta::seconds(42))), "42s ago");
+        assert_eq!(ago(t, t.add(chrono::TimeDelta::seconds(150))), "3m0s ago");
+    }
 
     #[test]
     fn approve_reject_remove() {
@@ -315,59 +342,72 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_members_need_a_decision() {
+    fn unsigned_members_are_never_signed_here() {
         let dir = TempDir::new();
         let (admin, store) = setup(&dir);
         store
             .update(|s| {
-                for (host, name, seed) in [(2, "node-a", 2), (3, "rogue", 3)] {
-                    s.members.push(Member { host, name: name.into(), wg_key: key32(seed), ..Member::default() });
-                }
+                s.members.push(Member { host: 3, name: "rogue".into(), wg_key: key32(3), ..Member::default() });
                 s.add_request(request("node-n", 9), COORD_KEY, Time::now())?;
                 Ok(())
             })
             .unwrap();
         let mut s = Screen::new(admin);
         s.load();
+        assert!(s.view().plain().contains("Press S to sign the coordinator"), "{}", s.view().plain());
 
-        // Approving would drop the two unsigned machines: asked first.
-        s.key(Key::Char('a'));
-        let v = s.view().plain();
-        assert!(v.contains("This also drops node-a, rogue from the swarm") && v.contains("y to confirm"), "{v}");
-        s.key(Key::Esc);
-        assert_eq!(store.read().unwrap().members.len(), 3);
-        assert_eq!(store.read().unwrap().requests[0].status, Status::Pending);
-
-        // Sign node-a only (cursor: request, coord, node-a): rogue goes.
-        s.key(Key::Down);
-        s.key(Key::Down);
-        s.key(Key::Char('s'));
-        assert!(s.view().plain().contains("This also drops rogue from the swarm"), "{}", s.view().plain());
-        s.key(Key::Char('y'));
-        let names: Vec<String> = store.read().unwrap().members.iter().map(|m| m.name.clone()).collect();
-        assert_eq!(names, vec!["coord", "node-a"]);
-        s.key(Key::Char('s'));
-        assert!(s.notice.contains("signed already"), "{:?}", s.notice);
+        // The first signature asks for the coordinator's code and says
+        // that the machine nobody approved is dropped.
         s.key(Key::Char('S'));
-        assert!(s.notice.contains("Every member is signed"));
-    }
+        let v = s.view().plain();
+        let code = crate::registry::coordinator_code(&key32(1), COORD_KEY);
+        assert!(v.contains(&format!("Its screen must show the code {code}")) && v.contains("This also drops rogue from the swarm"), "{v}");
+        s.key(Key::Esc);
+        assert_eq!(store.read().unwrap().signed_version, 0, "anything but y must sign nothing");
+        s.key(Key::Char('S'));
+        s.key(Key::Char('y'));
+        assert!(s.notice.contains("Coordinator signed"), "{:?}", s.notice);
+        let names: Vec<String> = store.read().unwrap().members.iter().map(|m| m.name.clone()).collect();
+        assert_eq!(names, vec!["coord"]);
 
-    #[test]
-    fn sign_all_and_errors() {
-        let dir = TempDir::new();
-        let (admin, store) = setup(&dir);
+        // Later a machine appears on the coordinator without a request:
+        // there is no key that signs it.
         store
-            .update(|s| {
-                s.members.push(Member { host: 2, name: "node-a".into(), wg_key: key32(2), ..Member::default() });
+            .update(|st| {
+                st.members.push(Member { host: 7, name: "late".into(), wg_key: key32(7), ..Member::default() });
                 Ok(())
             })
             .unwrap();
+        s.load();
+        let v = s.view().plain();
+        assert!(v.contains("NOT SIGNED: put on the coordinator without you"), "{v}");
+        s.key(Key::Down);
+        s.key(Key::Down);
+        s.key(Key::Char('s'));
+        s.key(Key::Char('y'));
+        assert_eq!(store.read().unwrap().members.len(), 2, "s must do nothing");
+        s.key(Key::Char('S'));
+        assert!(s.notice.contains("press p to drop them"), "{:?}", s.notice);
+        assert!(!s.view().plain().contains("y to confirm"));
+        // Approving the real request drops it, after asking.
+        s.key(Key::Home);
+        s.key(Key::Char('k'));
+        s.key(Key::Char('k'));
+        s.key(Key::Char('a'));
+        assert!(s.view().plain().contains("This also drops late from the swarm"), "{}", s.view().plain());
+        s.key(Key::Char('y'));
+        let names: Vec<String> = store.read().unwrap().members.iter().map(|m| m.name.clone()).collect();
+        assert_eq!(names, vec!["coord", "node-n"]);
+    }
+
+    #[test]
+    fn resend_drops_what_nobody_signed() {
+        let dir = TempDir::new();
+        let (admin, store) = setup(&dir);
         let mut s = Screen::new(admin);
         s.load();
         s.key(Key::Char('S'));
-        assert!(s.view().plain().contains("Sign all 2 machine(s) marked NOT SIGNED (coord, node-a)?"), "{}", s.view().plain());
         s.key(Key::Char('y'));
-        assert!(s.notice.contains("signed"), "{:?}", s.notice);
         assert!(!s.view().plain().contains("NOT SIGNED"));
 
         // The coordinator's list was tampered with: shown in red.
@@ -385,6 +425,6 @@ mod tests {
         // "p" sends the signed list again; the machine nobody signed goes.
         s.key(Key::Char('p'));
         assert!(s.notice.contains("sent again"), "{:?}", s.notice);
-        assert_eq!(store.read().unwrap().members.len(), 2);
+        assert_eq!(store.read().unwrap().members.len(), 1);
     }
 }

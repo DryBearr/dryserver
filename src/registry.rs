@@ -1,7 +1,8 @@
 //! The list of mesh members on the coordinator: pending join requests,
-//! approved nodes and the scan report. Nothing joins without an admin
-//! approving a request whose pairing code matches the code shown on the new
-//! machine.
+//! approved nodes and the scan report. The coordinator cannot let anyone
+//! in: membership changes only through a list signed on the admin's
+//! desktop (publish), after the admin compared the pairing code with the
+//! one on the new machine's screen.
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -129,6 +130,15 @@ pub fn pairing_code(wg_key: &str, node_host_key: &str, coord_host_key: &str) -> 
     let h = Sha256::digest(input.as_bytes());
     let n = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 1_000_000;
     format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
+/// The coordinator's own code: shown on its screen after its install and
+/// on the admin's desktop before the coordinator is signed for the first
+/// time. It covers the coordinator's WireGuard key and SSH host key, so
+/// the admin knows the desktop talks to the machine that was installed and
+/// not to something else at its address.
+pub fn coordinator_code(wg_key: &str, host_key: &str) -> String {
+    pairing_code(wg_key, host_key, host_key)
 }
 
 /// Drops the comment of an OpenSSH public key line.
@@ -310,58 +320,6 @@ impl State {
         Ok(r.clone())
     }
 
-    /// Turns a pending request into a member with the next free host number
-    /// (1 is the coordinator). max_host is the last usable host number.
-    pub fn approve(&mut self, id: &str, max_host: u32, now: Time) -> Result<Member> {
-        let r = self.request(id)?.clone();
-        if r.status != Status::Pending {
-            return Err(errf!("request is {}", r.status));
-        }
-        let host = (2..=max_host).find(|n| !self.members.iter().any(|m| m.host == *n));
-        let Some(host) = host else {
-            return Err("mesh subnet is full".into());
-        };
-        let m = Member {
-            host,
-            name: r.name.clone(),
-            wg_key: r.wg_key.clone(),
-            ssh_host_key: r.ssh_host_key.clone(),
-            lan_ip: r.lan_ip.clone(),
-            switch: r.switch,
-            approved: now,
-            last_seen: now,
-        };
-        self.members.push(m.clone());
-        {
-            let q = self.request(id)?;
-            q.status = Status::Approved;
-            q.host = host;
-        }
-        // Settle other pending requests: the same machine's duplicates are
-        // approved with it; another machine asking under the same name is not.
-        for q in &mut self.requests {
-            if q.status != Status::Pending {
-                continue;
-            }
-            if q.wg_key == m.wg_key {
-                q.status = Status::Approved;
-                q.host = host;
-            } else if q.name == m.name {
-                q.status = Status::Rejected;
-            }
-        }
-        Ok(m)
-    }
-
-    pub fn reject(&mut self, id: &str) -> Result<()> {
-        let r = self.request(id)?;
-        if r.status != Status::Pending {
-            return Err(errf!("request is {}", r.status));
-        }
-        r.status = Status::Rejected;
-        Ok(())
-    }
-
     /// Makes a list signed by the admin the member list. The caller has
     /// checked the signature and the entries.
     ///
@@ -418,18 +376,6 @@ impl State {
         self.signed = env.clone();
         self.signed_version = list.version;
         Ok(())
-    }
-
-    /// Revokes a member. Its peers drop it at their next sync.
-    pub fn remove(&mut self, name: &str) -> Result<()> {
-        match self.members.iter().position(|m| m.name == name) {
-            None => Err(errf!("{name} is not a member")),
-            Some(i) if self.members[i].host == 1 => Err("the coordinator cannot be removed".into()),
-            Some(i) => {
-                self.members.remove(i);
-                Ok(())
-            }
-        }
     }
 
     /// Records a member's current LAN IP and switch link. host identifies
@@ -595,6 +541,10 @@ pub struct StatusReply {
     pub host: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coordinator: Option<Member>,
+    /// The signed member list that lets this machine in. The node trusts
+    /// only this; host and coordinator above are addresses to reach it.
+    #[serde(skip_serializing_if = "Envelope::is_empty")]
+    pub signed: Envelope,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -662,9 +612,10 @@ pub fn serve(
         ("status", 2) if valid_id(f[1]) => {
             let reply = st.update(|s| {
                 let r = s.request_status(f[1], now)?;
-                let mut reply = StatusReply { status: r.status, host: r.host, coordinator: None };
+                let mut reply = StatusReply { status: r.status, host: r.host, ..StatusReply::default() };
                 if r.status == Status::Approved {
                     reply.coordinator = s.members.iter().find(|m| m.host == 1).cloned();
+                    reply.signed = s.signed.clone();
                 }
                 Ok(reply)
             })?;
@@ -828,34 +779,19 @@ mod tests {
     }
 
     #[test]
-    fn approve_flow() {
+    fn request_and_expiry() {
         let mut s = State { members: vec![Member { wg_key: wg_key(), ..member(1, "coord") }], ..State::default() };
         let r = req("node-a");
         let id = s.add_request(r.clone(), COORD_KEY, t0()).unwrap();
         let p = s.pending();
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].code, pairing_code(&r.wg_key, &r.ssh_host_key, COORD_KEY));
-        let m = s.approve(&id, 254, t0()).unwrap();
-        assert_eq!(m.host, 2);
-        let st = s.request_status(&id, t0()).unwrap();
-        assert_eq!((st.status, st.host), (Status::Approved, 2));
-        assert!(s.approve(&id, 254, t0()).is_err(), "double approve");
-
-        // Same name again is refused; after removal the host number is reused.
-        assert!(s.add_request(req("node-a"), COORD_KEY, t0()).is_err(), "duplicate member name accepted");
-        s.remove("node-a").unwrap();
-        let id2 = s.add_request(req("node-b"), COORD_KEY, t0()).unwrap();
-        assert_eq!(s.approve(&id2, 254, t0()).unwrap().host, 2, "freed host number not reused");
-        assert!(s.remove("coord").is_err(), "coordinator removed");
-    }
-
-    #[test]
-    fn reject_and_expiry() {
-        let mut s = State::default();
-        let id = s.add_request(req("node-x"), COORD_KEY, t0()).unwrap();
-        s.reject(&id).unwrap();
-        assert_eq!(s.request_status(&id, t0()).unwrap().status, Status::Rejected);
+        assert_eq!(s.request_status(&id, t0()).unwrap().status, Status::Pending);
         assert!(s.request_status(&id, t0().add(TimeDelta::hours(2))).is_err(), "request did not expire");
+        // A member's name or key cannot ask again.
+        s.members.push(Member { wg_key: r.wg_key.clone(), ..member(2, "node-a") });
+        assert!(s.add_request(req("node-a"), COORD_KEY, t0()).is_err(), "duplicate member name accepted");
+        assert!(s.add_request(Request { name: "other".into(), ..r }, COORD_KEY, t0()).is_err(), "a member's key accepted");
     }
 
     #[test]
@@ -865,16 +801,6 @@ mod tests {
             s.add_request(req(&format!("n{}", "x".repeat(i + 1))), COORD_KEY, t0()).unwrap();
         }
         assert!(s.add_request(req("one-more"), COORD_KEY, t0()).is_err(), "pending limit not enforced");
-    }
-
-    #[test]
-    fn subnet_full() {
-        let mut s = State { members: vec![member(1, "coord")], ..State::default() };
-        // max_host 2: room for the coordinator and one node.
-        let id = s.add_request(req("a"), COORD_KEY, t0()).unwrap();
-        s.approve(&id, 2, t0()).unwrap();
-        let id = s.add_request(req("b"), COORD_KEY, t0()).unwrap();
-        assert!(s.approve(&id, 2, t0()).is_err(), "full subnet not detected");
     }
 
     #[test]
@@ -947,19 +873,6 @@ mod tests {
         assert_eq!(id1, id2);
         assert_eq!(s.requests.len(), 1, "retry made a new request");
         assert!(s.add_request(req("node-a"), COORD_KEY, t0()).is_err(), "same name from another machine accepted");
-    }
-
-    #[test]
-    fn approve_settles_duplicates() {
-        let r = req("node-a");
-        let dup = |id: &str, wg: String| Request { id: id.into(), wg_key: wg, status: Status::Pending, created: t0(), ..r.clone() };
-        let mut s =
-            State { requests: vec![dup("a1", r.wg_key.clone()), dup("a2", r.wg_key.clone()), dup("x", wg_key())], ..State::default() };
-        s.approve("a1", 254, t0()).unwrap();
-        let st = s.request_status("a2", t0()).unwrap();
-        assert_eq!((st.status, st.host), (Status::Approved, 2), "duplicate from the same machine");
-        assert_eq!(s.request_status("x", t0()).unwrap().status, Status::Rejected, "impostor");
-        assert!(s.pending().is_empty(), "requests left pending");
     }
 
     // ---- serve ----
@@ -1173,12 +1086,24 @@ mod tests {
 
         let out = call(&st, &format!("status {id}"), "192.168.1.23 5000 22", "").unwrap();
         assert!(out.contains(r#""status":"pending""#) && !out.contains("coordinator"), "pending status {out:?}");
-        st.update(|s| s.approve(&id, 254, t0())).unwrap();
+        // Nothing on the coordinator can approve: only a signed list does.
+        assert!(call(&st, &format!("approve {id}"), "192.168.1.23 5000 22", "").is_err());
+        let me = st.read().unwrap().members[0].clone();
+        let list = List {
+            version: 1,
+            members: vec![
+                signed::Entry::of(&me),
+                signed::Entry { host: 2, name: "node-a".into(), wg_key: r.wg_key.clone(), ssh_host_key: signed::key_body(&r.ssh_host_key) },
+            ],
+            rejected: vec![],
+        };
+        publish(&st, &ADMIN, &list).unwrap();
         let out = call(&st, &format!("status {id}"), "192.168.1.23 5000 22", "").unwrap();
         let sr: StatusReply = serde_json::from_str(&out).unwrap();
         assert_eq!(sr.status, Status::Approved);
         assert_eq!(sr.host, 2);
         assert_eq!(sr.coordinator.unwrap().lan_ip, "192.168.1.50");
+        assert_eq!(sr.signed.list(&ADMIN, |h| h < 255).unwrap(), list, "the approved node must get the signed list");
 
         // peers: only from the member's mesh address.
         assert!(call(&st, "peers", "192.168.1.23 5000 22", r#"{"lan_ip":"192.168.1.23"}"#).is_err(), "peers answered over the LAN");

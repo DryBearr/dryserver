@@ -132,6 +132,10 @@ impl Backend for Demo {
         }
     }
 
+    fn coordinator_code(&self) -> String {
+        "305 771".into()
+    }
+
     fn reboot(&self) -> Result<()> {
         Ok(())
     }

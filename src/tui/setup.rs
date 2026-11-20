@@ -185,6 +185,7 @@ impl Setup {
             }
             Msg::InstallDone(None) => {
                 if self.ch.role() == Role::Coordinator {
+                    self.code = self.be.coordinator_code();
                     self.state = State::Done;
                 } else {
                     self.start_join(emit);
@@ -607,8 +608,8 @@ impl Setup {
             b.s(format!("{} Sending join request to the coordinator at {}…\n", spinner(), self.cfg.coord_lan_ip));
             return;
         }
-        b.s("Installed. Now approve this machine on the coordinator:\n\n");
-        b.s("  ").add(sel("sudo dryserver approve")).s("\n\n");
+        b.s("Installed. Now approve this machine on your own computer:\n\n");
+        b.s("  ").add(sel("./dryserver approve")).s("\n\n");
         b.s("Approve only if it shows the same code:\n\n");
         let mut code = Doc::new();
         code.s(&self.code);
@@ -620,7 +621,15 @@ impl Setup {
     fn view_done(&self, b: &mut Doc) {
         if self.ch.role() == Role::Coordinator {
             b.add(ok("Coordinator installed.")).s("\n\n");
-            b.s("New machines ask to join here. Approve them with:\n  sudo dryserver approve\n");
+            b.s("No machine can join until you sign this coordinator. On your own computer run:\n\n");
+            b.s("  ").add(sel("./dryserver approve")).s("   and press S\n\n");
+            if !self.code.is_empty() {
+                b.s("Sign only if it shows the same code:\n\n");
+                let mut code = Doc::new();
+                code.s(&self.code);
+                b.append(code.boxed(Border::Double, Color::LightBlue, 4, 1, true)).s("\n\n");
+                b.add(dim("The code is also on this machine's screen after it restarts, until you signed.")).nl();
+            }
         } else if let Some(e) = &self.join_err {
             b.add(ok("Installed.")).s(format!(" Joining was skipped or failed: {e}\n"));
             b.s("After reboot the server asks again and shows the code on its screen.\n");
@@ -950,10 +959,13 @@ mod tests {
         let emit = t.emit.clone();
         t.s.start_install(&emit);
         t.drain(&[State::Install, State::Join]);
-        assert!(t.s.state == State::Done && t.s.code.is_empty());
+        assert!(t.s.state == State::Done && t.s.code == "305 771", "the coordinator's own code must be shown: {:?}", t.s.code);
         let v = t.view();
         assert!(!v.contains("passphrase once"), "passphrase mode has no first-boot TPM step");
-        assert!(v.contains("sudo dryserver approve"), "coordinator done screen must explain approving");
+        assert!(
+            v.contains("./dryserver approve") && v.contains("press S") && v.contains("305 771") && !v.contains("sudo dryserver approve"),
+            "coordinator done screen must explain approving:\n{v}"
+        );
     }
 
     #[test]

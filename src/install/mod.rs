@@ -151,6 +151,9 @@ pub trait Backend: Send + Sync {
     /// the coordinator approves (returns the mesh host number) or rejects.
     /// Cancelling ctx skips joining; the server retries at boot.
     fn join(&self, ctx: &Ctx, cfg: &Config, ch: &Choices, code: &(dyn Fn(String) + Send + Sync)) -> Result<u32>;
+    /// After a coordinator install: the code the admin compares on the
+    /// desktop before signing this coordinator. "" when not known.
+    fn coordinator_code(&self) -> String;
     fn reboot(&self) -> Result<()>;
 }
 

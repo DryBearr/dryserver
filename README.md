@@ -49,9 +49,12 @@ approval.
 1. **Desktop**: a menu to fill in the config, build the installer ISO and
    flash it to a USB stick.
 2. **First laptop**: install it as the **coordinator**. It keeps the list of
-   servers and approves new ones. It does not route traffic.
+   servers and hands it out. It cannot let anyone in by itself, and it does
+   not route traffic.
 3. **Other laptops**: install them as **servers**. Each one shows a 6-digit
-   pairing code; you approve it on the coordinator if the code matches.
+   pairing code; you approve it on your desktop (`./dryserver approve`) if
+   the code matches. Your desktop signs the list of machines; servers accept
+   only what you signed.
 4. All servers talk to each other directly over WireGuard, by name
    (`ssh node-a`, `ping node-b`), over a switch when cabled or else over WiFi.
 
@@ -97,10 +100,13 @@ sudo ./dryserver     # menu: 3 flash USB             (writing to a USB drive nee
    or Esc) and choose **coordinator**.
 5. In your router, **reserve the coordinator's IP** (the device named `coord`),
    then reboot the coordinator once.
-6. **Other laptops**: boot the same USB and choose **server**. When the code
-   appears, run `sudo dryserver approve` on the coordinator and approve the
-   machine if the code matches.
-7. **Desktop**: `./dryserver ssh-config`, then `ssh coord` or `ssh node-xxxx`.
+6. **Desktop**: run `./dryserver approve` once and press `S` to sign the
+   coordinator, if it shows the same code as the coordinator's screen. From
+   now on servers accept only the machines you approve here.
+7. **Other laptops**: boot the same USB and choose **server**. When the code
+   appears on the laptop, find the machine in `./dryserver approve` on your
+   desktop and press `a` if the code matches.
+8. **Desktop**: `./dryserver ssh-config`, then `ssh coord` or `ssh node-xxxx`.
 
 Try the laptop setup screen without touching anything: `./dryserver install --demo`.
 
@@ -244,13 +250,14 @@ Limits for now:
 - **Disk encryption**: LUKS2 with argon2id; TPM unlock bound to the signed
   kernel image, Secure Boot state and kernel command line; no disk swap
   (zram only).
-- **Joining**: needs your approval with a matching pairing code. The code
-  covers both machines' keys, so a fake coordinator or a swapped request shows
-  a different code. After approval, the member list is only served over the
-  mesh. Removing a machine (`d` in `dryserver approve`) drops it from all
-  servers within a minute.
+- **Joining**: needs your approval on your desktop with a matching pairing
+  code. The code covers both machines' keys, so a fake coordinator or a
+  swapped request shows a different code. A new machine joins only when it
+  finds itself, with its own keys, in a list you signed. After approval, the
+  member list is only served over the mesh. Removing a machine (`d` in
+  `./dryserver approve`) drops it from all servers within a minute.
 - **Unknown devices**: the coordinator scans its networks every 15 minutes and
-  lists unknown devices in `dryserver approve` (report only).
+  lists unknown devices in `./dryserver approve` (report only).
 - **Hardening**: kernel sysctl hardening, no LLMNR/mDNS, WireGuard peers
   locked to their own mesh address.
 - **Nothing from the coordinator is used unchecked.** Servers check every
@@ -261,10 +268,16 @@ Limits for now:
   `secrets/signing_ed25519` on your computer; its public half is installed
   on every server. `./dryserver approve` on your computer signs every
   decision (approve, reject, remove) with it. The coordinator stores and
-  hands out the signed list but cannot make or change one, and an older
-  list is refused, so a removed machine cannot be brought back. Servers
-  check the list and log when the coordinator's members differ from what
-  you signed.
+  hands out the signed list but cannot make or change one. Servers use only
+  the machines in the signed list: one the coordinator adds by itself is
+  ignored and logged, and an older list is refused, so a removed machine
+  cannot be brought back. Nobody can approve on a server, the coordinator
+  included, and a machine that shows up on the coordinator without a join
+  request cannot be signed at all. `./dryserver ssh-config` takes server
+  names and SSH host keys from the signed list too. Limit: a hacked
+  coordinator can hold back a newer list from servers that have not seen it
+  yet, so a removal may not arrive; cut the machine off with
+  `./dryserver quarantine-all -name NAME` then.
 - **The USB stick** holds the WiFi password and the key that lets machines ask
   to join. Keep it safe, or re-flash it after installing.
 
@@ -278,7 +291,7 @@ On your desktop:
 | `./dryserver build` | build the ISO, log to stdout |
 | `./dryserver disks` | list disks and which ones may be flashed |
 | `sudo ./dryserver flash --iso FILE` | flash any image to a USB drive |
-| `./dryserver approve` | approve, reject or remove machines; every decision is signed |
+| `./dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed |
 | `./dryserver ssh-config` | SSH config for all servers |
 | `./dryserver quarantine-all` | kill switch: cut the coordinator off on every server |
 | `./dryserver install --demo` | try the laptop setup screen; changes nothing |
@@ -287,7 +300,6 @@ On servers:
 
 | Command | What it does |
 |---|---|
-| `sudo dryserver approve` | coordinator: approve or reject machines, remove members, see unknown devices |
 | `sudo dryserver tpm-enroll` | let the TPM unlock the disk again (after a firmware change) |
 | `sudo dryserver quarantine` | kill switch on this server (`-name`, `-status`, `-lift`) |
 | `dryserver sync`, `join`, `scan`, `registry` | run automatically by systemd, cron and SSH |
@@ -295,9 +307,10 @@ On servers:
 ## FAQ
 
 ### What is the coordinator?
-The first laptop you install. New servers ask it to join, you approve them
-there, and every server fetches the member list from it once a minute. Traffic
-between servers does not go through it.
+The first laptop you install. New servers ask it to join, and every server
+fetches the member list from it once a minute. You approve machines on your
+desktop, which signs the list; the coordinator only stores and hands it out.
+Traffic between servers does not go through it.
 
 ### Which IP do I use for the coordinator?
 A free address on your home network. Run `ip -br addr` on your desktop: if it

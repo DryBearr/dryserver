@@ -409,8 +409,11 @@ impl Real {
         let dir = fsx::dir(registry::DEFAULT_PATH).display().to_string();
         self.chroot(ctx, &["chown", "-R", &format!("{REGISTRY_USER}:{REGISTRY_USER}"), &dir])?;
         let _ = fsx::chmod(self.target(&dir), 0o700);
-        let n =
-            Node { cfg: self.cfg.clone(), hostname: ch.hostname.clone(), root: self.target.clone(), run: self.run.clone(), tmp_dir: None };
+        let n = Node::new(self.cfg.clone(), &ch.hostname, &self.target, self.run.clone());
+        // On the console until the admin signed this coordinator: the code
+        // to compare on the desktop. sync removes it once a list is signed.
+        let code = registry::coordinator_code(&me.wg_key, &me.ssh_host_key);
+        n.write(node::ISSUE_FILE, 0o644, &node::coordinator_issue(&code))?;
         n.apply(SelfInfo { host: 1, switch: me.switch }, &[me])?;
         self.chroot(ctx, &["systemctl", "enable", "wg-quick@wg0.service", "dryserver-sync.timer"])
     }
@@ -423,7 +426,7 @@ impl Real {
         let bg = Ctx::new();
         // Until approved, the installed system retries at every boot.
         self.chroot(&bg, &["systemctl", "enable", "dryserver-join.service"])?;
-        let n = Node { cfg: cfg.clone(), hostname: ch.hostname.clone(), root: self.target.clone(), run: self.run.clone(), tmp_dir: None };
+        let n = Node::new(cfg.clone(), &ch.hostname, &self.target, self.run.clone());
         let lan = node::local_ip(ctx, self.run.as_ref(), &cfg.coord_lan_ip)?;
         let switch_mac = self.state.lock().unwrap().switch_mac.clone();
         let sw = node::port_link(&switch_mac);
@@ -463,6 +466,14 @@ impl Backend for Real {
 
     fn join(&self, ctx: &Ctx, cfg: &Config, ch: &Choices, code: &(dyn Fn(String) + Send + Sync)) -> Result<u32> {
         self.join_impl(ctx, cfg, ch, code)
+    }
+
+    fn coordinator_code(&self) -> String {
+        let st = self.state.lock().unwrap();
+        if st.wg_public.is_empty() || st.host_key.is_empty() {
+            return String::new();
+        }
+        registry::coordinator_code(&st.wg_public, &st.host_key)
     }
 
     fn reboot(&self) -> Result<()> {
@@ -719,6 +730,9 @@ mod tests {
         assert_eq!(mode(node::SIGNING_PUB), 0o644);
         assert_eq!(mode("/usr/local/share/dryserver") & 0o005, 0o005, "the registry user must be able to reach the key");
 
+        // Coordinator: its code on the console until the admin signs it.
+        let issue = get(&r.target, node::ISSUE_FILE);
+        assert!(issue.contains("not signed yet") && issue.contains(&r.coordinator_code()) && r.coordinator_code().len() == 7, "{issue}");
         // Coordinator: registry with itself as member 1, mesh config, services.
         let reg = get(&r.target, "/var/lib/dryserver/registry.json");
         assert!(reg.contains(r#""host": 1"#) && reg.contains(r#""wg_key": "PUBLICKEY=""#), "registry: {reg}");

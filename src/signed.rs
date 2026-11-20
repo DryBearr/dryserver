@@ -168,7 +168,7 @@ pub trait Signer {
     fn sign(&self, namespace: &str, doc: &str) -> Result<String>;
 }
 
-pub trait Verifier {
+pub trait Verifier: Send + Sync {
     fn verify(&self, namespace: &str, doc: &str, sig: &str) -> Result<()>;
 }
 
@@ -221,10 +221,6 @@ impl SshVerifier {
     /// For a server: the key the installer put there.
     pub fn installed(root: &Path, tmp_dir: PathBuf) -> SshVerifier {
         SshVerifier { pubkey: fsx::under(root, crate::node::SIGNING_PUB), tmp_dir }
-    }
-
-    pub fn has_key(&self) -> bool {
-        self.pubkey.exists()
     }
 }
 
@@ -408,7 +404,7 @@ mod tests {
 
         // No key on the machine, or a file that is not a key.
         let none = SshVerifier { pubkey: dir.join("missing.pub"), tmp_dir: dir.path().to_path_buf() };
-        assert!(!none.has_key() && env.list(&none, fits).unwrap_err().to_string().contains("no signing key"));
+        assert!(env.list(&none, fits).unwrap_err().to_string().contains("no signing key"));
         std::fs::write(dir.join("junk.pub"), "hello\n").unwrap();
         let junk = SshVerifier { pubkey: dir.join("junk.pub"), tmp_dir: dir.path().to_path_buf() };
         assert!(env.list(&junk, fits).is_err());

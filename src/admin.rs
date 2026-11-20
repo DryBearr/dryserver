@@ -79,7 +79,8 @@ impl Link for SshLink {
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
         }
-        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // The coordinator's words: never raw onto the admin's terminal.
+        let msg = clean(String::from_utf8_lossy(&out.stderr).trim(), 300);
         if msg.contains("Host key verification failed") || msg.contains("HOST IDENTIFICATION HAS CHANGED") {
             bail!(
                 "the machine at {} does not have the SSH key this computer saw before. Either the coordinator was \
@@ -107,6 +108,21 @@ impl Link for SshLink {
     }
 }
 
+/// Text from the coordinator made safe to print: no control characters
+/// (a terminal would obey them), and not longer than max.
+fn clean(s: &str, max: usize) -> String {
+    s.chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
+/// A scan-report entry is shown only with a real address; its other fields
+/// are cut down to plain text.
+fn clean_device(d: Device) -> Option<Device> {
+    let ip = crate::cidr::parse_ip4(&d.ip)?.to_string();
+    let mac: String = d.mac.chars().filter(|c| c.is_ascii_hexdigit() || *c == ':').take(17).collect();
+    let vendor: String = d.vendor.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(40).collect();
+    Some(Device { ip, mac, vendor, ..d })
+}
+
 /// What the approval screen shows.
 #[derive(Debug, Clone, Default)]
 pub struct View {
@@ -118,6 +134,9 @@ pub struct View {
     pub scanned: Time,
     /// Version of the newest valid signed list; 0 when nothing is signed.
     pub version: u64,
+    /// The coordinator's own pairing code, shown on its screen after its
+    /// install: compared before the first signature.
+    pub coordinator_code: String,
     pub warnings: Vec<String>,
 }
 
@@ -178,11 +197,14 @@ impl Admin {
         let ask = signed::seal_admin(self.signer.as_ref(), "state", (self.now)().0.timestamp())?;
         let out = self.link.call("admin", &serde_json::to_string(&ask)?)?;
         let st: AdminState = serde_json::from_str(&out).map_err(|e| Error::from(e).wrap("the coordinator's answer"))?;
-        let mut v = View { unknown: st.unknown, scanned: st.scanned, ..View::default() };
+        let mut v = View { unknown: st.unknown.into_iter().filter_map(clean_device).collect(), scanned: st.scanned, ..View::default() };
         let coord_key = self.link.host_key()?;
 
         let (members, problems) = registry::check_members(st.members, |h| self.fits(h));
         v.warnings.extend(problems.into_iter().map(|p| format!("The coordinator lists a bad entry, ignored: {p}")));
+        if let Some(c) = members.iter().find(|m| m.host == 1) {
+            v.coordinator_code = registry::coordinator_code(&c.wg_key, &coord_key);
+        }
         match members.iter().find(|m| m.host == 1) {
             None => v.warnings.push("The coordinator sent no entry for itself.".into()),
             Some(c) if key_body(&c.ssh_host_key) != coord_key => v.warnings.push(
@@ -357,30 +379,18 @@ impl Admin {
         .map(|_| ())
     }
 
-    /// Signs members that are on the coordinator but not in the signed
-    /// list: all of them when names is empty.
-    pub fn sign(&mut self, names: &[String]) -> Result<usize> {
-        let add: Vec<Member> = self
-            .members
-            .iter()
-            .filter(|m| !self.base.has(m) && m.host != 1 && (names.is_empty() || names.contains(&m.name)))
-            .cloned()
-            .collect();
-        if add.is_empty() && self.base.members.iter().any(|e| e.host == 1) {
-            bail!("nothing to sign");
+    /// The first signature: signs the coordinator's own entry, which
+    /// nothing vouches for but the code the admin compared. Later machines
+    /// come in only through approve.
+    ///
+    /// There is no way to sign another machine that is on the coordinator
+    /// without a request: nobody can put it there but the coordinator
+    /// itself, so it is either a mistake or an attack.
+    pub fn sign_coordinator(&mut self) -> Result<()> {
+        if self.base.members.iter().any(|e| e.host == 1) {
+            bail!("the coordinator is signed already");
         }
-        // The first signature also signs the coordinator's own entry.
-        let n = add.len() + usize::from(!self.base.members.iter().any(|e| e.host == 1));
-        self.publish(|list, _| {
-            for m in &add {
-                // A changed key under a signed name or number replaces the
-                // old entry: the admin is looking at the new one.
-                list.members.retain(|e| e.host != m.host && e.name != m.name && e.wg_key != m.wg_key);
-                list.members.push(Entry::of(m));
-            }
-            Ok(())
-        })?;
-        Ok(n)
+        self.publish(|_, _| Ok(())).map(|_| ())
     }
 
     /// Signs and sends the current list again under a new version, for
@@ -390,6 +400,21 @@ impl Admin {
             bail!("nothing is signed yet");
         }
         self.publish(|_, _| Ok(()))
+    }
+
+    /// The servers in the signed list, with the LAN addresses the
+    /// coordinator reported at the last load.
+    pub fn servers(&self) -> Vec<crate::mesh::Server> {
+        self.base
+            .members
+            .iter()
+            .map(|e| crate::mesh::Server {
+                name: e.name.clone(),
+                mesh_ip: crate::mesh::ip(&self.subnet, e.host),
+                lan_ip: self.members.iter().find(|m| e.matches(m)).map(|m| m.lan_ip.clone()).unwrap_or_default(),
+                host_key: e.ssh_host_key.clone(),
+            })
+            .collect()
     }
 
     /// Members on the coordinator that the next signature would drop
@@ -560,13 +585,14 @@ pub mod tests {
     }
 
     #[test]
-    fn existing_swarm_is_taken_over() {
+    fn only_the_coordinator_is_signed_without_a_request() {
         let dir = TempDir::new();
         let (mut a, store) = setup(&dir);
-        // Members approved the old way, on the coordinator.
+        // Machines that are on the coordinator without the admin: only the
+        // coordinator itself can have put them there.
         store
             .update(|s| {
-                for (host, name, seed) in [(2, "node-a", 2), (3, "node-b", 3), (4, "rogue", 4)] {
+                for (host, name, seed) in [(2, "node-a", 2), (3, "rogue", 3)] {
                     s.members.push(Member {
                         host,
                         name: name.into(),
@@ -579,17 +605,43 @@ pub mod tests {
             })
             .unwrap();
         let v = a.load().unwrap();
-        assert_eq!(v.unsigned().len(), 4);
-        // Signing one would drop the others: the screen asks first.
-        assert_eq!(a.would_drop(&["node-a".to_string()]), vec!["node-b".to_string(), "rogue".into()]);
+        assert_eq!(v.unsigned().len(), 3);
+        assert_eq!(v.coordinator_code, registry::coordinator_code(&key32(1), COORD_KEY));
+        assert_eq!(a.would_drop(&[]), vec!["node-a".to_string(), "rogue".into()]);
 
-        // Sign the two known ones; the rogue is left out and dropped.
-        assert_eq!(a.sign(&["node-a".to_string(), "node-b".to_string()]).unwrap(), 3, "two machines and the coordinator");
+        a.sign_coordinator().unwrap();
         let names: Vec<String> = store.read().unwrap().members.iter().map(|m| m.name.clone()).collect();
-        assert_eq!(names, vec!["coord", "node-a", "node-b"]);
+        assert_eq!(names, vec!["coord"], "the first signature covers the coordinator and nothing else");
         let v = a.load().unwrap();
         assert!(v.unsigned().is_empty() && a.would_drop(&[]).is_empty());
-        assert!(a.sign(&[]).unwrap_err().to_string().contains("nothing to sign"));
+        assert!(a.sign_coordinator().unwrap_err().to_string().contains("signed already"));
+    }
+
+    #[test]
+    fn coordinator_text_is_cleaned() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        store
+            .update(|s| {
+                s.unknown = vec![
+                    Device {
+                        ip: "192.168.1.77".into(),
+                        mac: "aa:bb:cc:dd:ee:ff\x1b[2J".into(),
+                        vendor: "Evil\x1b]0;pwned\x07 Corp\n".into(),
+                        ..Device::default()
+                    },
+                    Device { ip: "\x1b[31mnot-an-ip".into(), ..Device::default() },
+                ];
+                Ok(())
+            })
+            .unwrap();
+        let v = a.load().unwrap();
+        assert_eq!(v.unknown.len(), 1, "an entry without a real address is not shown");
+        let d = &v.unknown[0];
+        assert_eq!(d.mac, "aa:bb:cc:dd:ee:ff");
+        assert!(!d.vendor.contains('\x1b') && !d.vendor.contains('\x07') && !d.vendor.contains('\n'), "{:?}", d.vendor);
+        assert_eq!(clean("a\x1b[2Jb\r\n", 10), "a[2Jb");
+        assert_eq!(clean("abcdef", 3), "abc");
     }
 
     #[test]
@@ -733,20 +785,23 @@ pub mod tests {
         let s = store.read().unwrap();
         assert_eq!(s.members.len(), 2);
 
-        // A node checks what the coordinator hands out.
+        // A node uses what the coordinator hands out only as far as it is
+        // signed.
         let node = crate::node::Node {
-            cfg: crate::config::Config::default(),
+            cfg: crate::config::Config { wg_subnet: "10.66.0.0/24".into(), ..crate::config::Config::default() },
             hostname: "node-a".into(),
             root: dir.join("node"),
             run: Arc::new(crate::runner::ExecRunner::silent()),
             tmp_dir: None,
+            verifier: Arc::new(checker()),
         };
-        let v = checker();
-        let status = node.check_signed(&s.members, &s.signed, Some(&v));
-        assert!(status.starts_with("ok: member list matches"), "{status}");
+        let (members, status) = node.signed_members(2, &s.members, &s.signed).unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(status.starts_with("ok: signed version"), "{status}");
         let mut more = s.members.clone();
         more.push(Member { host: 9, name: "rogue".into(), wg_key: key32(9), ..Member::default() });
-        assert!(node.check_signed(&more, &s.signed, Some(&v)).contains("not signed by you: rogue"));
+        let (members, status) = node.signed_members(2, &more, &s.signed).unwrap();
+        assert!(members.len() == 2 && status.contains("IGNORED, not signed by the admin: rogue"), "{status}");
 
         // Someone with the registry key but another signing key gets nothing.
         a.signer = Box::new(SshSigner { key: thief });
@@ -756,7 +811,7 @@ pub mod tests {
                 .unwrap();
         assert!(a.link.call("publish", &serde_json::to_string(&forged).unwrap()).unwrap_err().to_string().contains("bad signature"));
         assert_eq!(store.read().unwrap().members.len(), 2);
-        assert!(node.check_signed(&s.members, &forged, Some(&v)).starts_with("NOT VALID"));
+        assert!(node.signed_members(2, &s.members, &forged).unwrap_err().to_string().contains("bad signature"));
     }
 
     #[test]

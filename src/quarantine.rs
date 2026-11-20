@@ -940,9 +940,19 @@ PersistentKeepalive = 25
             "2201",
             "~/.ssh/known_hosts.d/dryserver",
             &[
-                mesh::Server { name: "coord".into(), mesh_ip: "10.66.0.1".into(), lan_ip: "192.168.1.50".into() },
-                mesh::Server { name: "node-b".into(), mesh_ip: "10.66.0.2".into(), lan_ip: "192.168.1.20".into() },
-                mesh::Server { name: "node-c".into(), mesh_ip: "10.66.0.3".into(), lan_ip: String::new() },
+                mesh::Server {
+                    name: "coord".into(),
+                    mesh_ip: "10.66.0.1".into(),
+                    lan_ip: "192.168.1.50".into(),
+                    ..mesh::Server::default()
+                },
+                mesh::Server {
+                    name: "node-b".into(),
+                    mesh_ip: "10.66.0.2".into(),
+                    lan_ip: "192.168.1.20".into(),
+                    ..mesh::Server::default()
+                },
+                mesh::Server { name: "node-c".into(), mesh_ip: "10.66.0.3".into(), ..mesh::Server::default() },
             ],
         );
         let all = remotes(&conf);
@@ -999,7 +1009,14 @@ PersistentKeepalive = 25
         put(root, node::WG_KEY, "PRIV=\n");
         put(root, node::JOIN_STATE, r#"{"host":2}"#);
         put(root, "/etc/nftables.conf", format!("table inet dryserver {{}}\n{NFT_INCLUDE}\n"));
-        Node { cfg: cfg(), hostname: "node-b".into(), root: root.to_path_buf(), run: fake, tmp_dir: Some(root.join("run")) }
+        Node {
+            cfg: cfg(),
+            hostname: "node-b".into(),
+            root: root.to_path_buf(),
+            run: fake,
+            tmp_dir: Some(root.join("run")),
+            verifier: Arc::new(crate::signed::fake::Key("admin")),
+        }
     }
 
     #[test]

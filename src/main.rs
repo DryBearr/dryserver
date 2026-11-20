@@ -33,7 +33,6 @@ use std::process::{Command, ExitCode};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cidr::Cidr;
 use crate::config::Config;
 use crate::ctx::Ctx;
 use crate::err::{Context, Result};
@@ -64,7 +63,6 @@ commands:
                       decision is signed with secrets/signing_ed25519
 
 on servers:
-  approve             coordinator: the same without signing (older way)
   join                ask the coordinator to join (runs at boot until approved)
   sync                update the mesh from the member list (runs every minute)
   quarantine          cut the coordinator (or -name a,b) off this server;
@@ -337,56 +335,35 @@ fn run_sysconf(args: &[String]) -> Result<()> {
 }
 
 fn run_ssh_config(args: &[String]) -> Result<()> {
-    let f = Flags::parse(
-        "ssh-config",
-        args,
-        &[
-            ("config", "config.env", "config file"),
-            ("host", "", "coordinator address (default: COORD_LAN_IP)"),
-            ("port", "22", "coordinator SSH port"),
-        ],
-    );
-    if fsx::is_root() {
-        bail!("run ssh-config as your normal user, not with sudo");
-    }
-    let cfg = Config::load(f.get("config"))?;
-    let host = if f.get("host").is_empty() { cfg.coord_lan_ip.clone() } else { f.get("host").to_string() };
+    let f = Flags::parse("ssh-config", args, DESKTOP_FLAGS);
+    let (mut a, host) = desktop_admin(&f, "ssh-config")?;
     let port = f.get("port");
-    let out = Command::new("ssh")
-        .args([
-            "-p",
-            port,
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            &format!("{}@{host}", cfg.username),
-            "cat /etc/hosts /etc/ssh/ssh_known_hosts",
-        ])
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .map_err(|e| err::Error::from(e).wrap("ssh"))?;
-    if !out.status.success() {
-        bail!("cannot read the server list from the coordinator {host}: {}", runner::exit_text(out.status));
+    // Names and SSH host keys come from the list you signed, never from
+    // what the coordinator says; only LAN addresses are its word.
+    let view = a.load()?;
+    for w in &view.warnings {
+        eprintln!("warning: {w}");
     }
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let servers = mesh::parse_hosts_block(&text);
-    let coord_ip = mesh::ip(&cfg.wg_subnet, 1);
+    let servers = a.servers();
+    let coord_ip = mesh::ip(&a.subnet, 1);
     let Some(coord_name) = servers.iter().find(|s| s.mesh_ip == coord_ip).map(|s| s.name.clone()) else {
-        bail!("the coordinator has no mesh list yet (is dryserver-sync running?)");
+        bail!("nothing is signed yet. Approve your machines first: ./dryserver approve");
     };
+    let cfg = Config::load(f.get("config"))?;
     let home = PathBuf::from(std::env::var("HOME").map_err(|_| errf!("$HOME is not defined"))?);
     let conf_path = home.join(".ssh/config.d/dryserver");
     let kh_path = home.join(".ssh/known_hosts.d/dryserver");
     for p in [&conf_path, &kh_path] {
         fsx::mkdir_all(fsx::dir(p), 0o700)?;
     }
-    fsx::write_file(&kh_path, mesh::desktop_known_hosts(&text, &coord_name, &host, port), 0o644)?;
+    fsx::write_file(&kh_path, mesh::desktop_known_hosts(&servers, &coord_name, &host, port), 0o644)?;
     let conf = mesh::desktop_ssh_config(&cfg.username, &coord_name, &host, port, "~/.ssh/known_hosts.d/dryserver", &servers);
     fsx::write_file(&conf_path, conf, 0o600)?;
     println!("Wrote {} ({} servers) and {}.", conf_path.display(), servers.len(), kh_path.display());
     let no_lan: Vec<&str> = servers.iter().filter(|s| s.name != coord_name && s.lan_ip.is_empty()).map(|s| s.name.as_str()).collect();
     if !no_lan.is_empty() {
         println!(
-            "No LAN address yet for: {} (older dryserver on the coordinator, or not synced yet).\n\
+            "No LAN address yet for: {} (not reported to the coordinator yet).\n\
              The kill switch (dryserver quarantine-all) cannot reach them; run ssh-config again later.",
             no_lan.join(", ")
         );
@@ -400,6 +377,47 @@ fn run_ssh_config(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+const DESKTOP_FLAGS: &[(&str, &str, &str)] = &[
+    ("config", "config.env", "config file"),
+    ("host", "", "coordinator address (default: COORD_LAN_IP)"),
+    ("port", "22", "coordinator SSH port"),
+];
+
+/// The admin's link to the coordinator, with the keys from secrets/.
+/// Returns it with the coordinator's address.
+fn desktop_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
+    if fsx::is_root() {
+        bail!("run {cmd} as your normal user, not with sudo");
+    }
+    let cfg = Config::load(f.get("config"))?;
+    let secrets = paths().secrets;
+    let need = |name: &str, what: &str| -> Result<PathBuf> {
+        let p = secrets.join(name);
+        if !p.exists() {
+            bail!("{} is missing ({what}). It is created when you build the USB stick: ./dryserver build", p.display());
+        }
+        Ok(p)
+    };
+    let registry_key = need(iso::KEY_NAME, "the key machines use to reach the coordinator's registry")?;
+    let signing_key = need(iso::SIGNING_KEY_NAME, "the key that signs your decisions")?;
+    let signing_pub = need(iso::SIGNING_PUB, "the public half of the signing key")?;
+    let host = if f.get("host").is_empty() { cfg.coord_lan_ip.clone() } else { f.get("host").to_string() };
+    let link = admin::SshLink {
+        key: registry_key,
+        known_hosts: secrets.join(admin::KNOWN_HOSTS),
+        host: host.clone(),
+        port: f.get("port").to_string(),
+    };
+    let a = admin::Admin::new(
+        Box::new(link),
+        Box::new(signed::SshSigner { key: signing_key }),
+        Box::new(signed::SshVerifier { pubkey: signing_pub, tmp_dir: std::env::temp_dir() }),
+        &secrets,
+        &cfg.wg_subnet,
+    );
+    Ok((a, host))
+}
+
 // ---- server commands ----
 
 /// What the node commands need on an installed server.
@@ -409,7 +427,7 @@ fn server_node() -> Result<(Node, Config)> {
     }
     let cfg = Config::load(LIVE_CONFIG).map_err(|e| e.wrap("not a dryserver server"))?;
     let host = fsx::read_or_empty("/proc/sys/kernel/hostname").trim().to_string();
-    let n = Node { cfg: cfg.clone(), hostname: host, root: PathBuf::from("/"), run: Arc::new(ExecRunner::silent()), tmp_dir: None };
+    let n = Node::new(cfg.clone(), &host, Path::new("/"), Arc::new(ExecRunner::silent()));
     Ok((n, cfg))
 }
 
@@ -606,54 +624,13 @@ fn run_scan(args: &[String]) -> Result<()> {
 }
 
 fn run_approve(args: &[String]) -> Result<()> {
-    let f = Flags::parse(
-        "approve",
-        args,
-        &[
-            ("config", "config.env", "desktop: config file"),
-            ("host", "", "desktop: coordinator address (default: COORD_LAN_IP)"),
-            ("port", "22", "desktop: coordinator SSH port"),
-        ],
-    );
-    if !Path::new(LIVE_CONFIG).exists() {
-        return run_approve_desktop(&f);
+    let f = Flags::parse("approve", args, DESKTOP_FLAGS);
+    if Path::new(LIVE_CONFIG).exists() {
+        // A server cannot let anyone in, the coordinator included: only
+        // the computer that holds the signing key can.
+        bail!("approve runs on your own computer, where the signing key is:\n  ./dryserver approve");
     }
-    let (_, cfg) = server_node()?;
-    if !is_coordinator() {
-        bail!("approve runs on your desktop (./dryserver approve), or on the coordinator ({})", cfg.coord_lan_ip);
-    }
-    let subnet = Cidr::parse(&cfg.wg_subnet).ok_or_else(|| errf!("invalid CIDR address: {}", cfg.wg_subnet))?;
-    let max_host = (subnet.size() - 2) as u32;
-    tui::run(&mut tui::approve::Approve::new(registry::Store::default_path(), &cfg.wg_subnet, max_host))
-}
-
-/// Approval from the admin's desktop: every decision is signed with
-/// secrets/signing_ed25519 and sent to the coordinator's registry.
-fn run_approve_desktop(f: &Flags) -> Result<()> {
-    if fsx::is_root() {
-        bail!("run approve as your normal user, not with sudo");
-    }
-    let cfg = Config::load(f.get("config"))?;
-    let secrets = paths().secrets;
-    let need = |name: &str, what: &str| -> Result<PathBuf> {
-        let p = secrets.join(name);
-        if !p.exists() {
-            bail!("{} is missing ({what}). It is created when you build the USB stick: ./dryserver build", p.display());
-        }
-        Ok(p)
-    };
-    let registry_key = need(iso::KEY_NAME, "the key machines use to reach the coordinator's registry")?;
-    let signing_key = need(iso::SIGNING_KEY_NAME, "the key that signs your decisions")?;
-    let signing_pub = need(iso::SIGNING_PUB, "the public half of the signing key")?;
-    let host = if f.get("host").is_empty() { cfg.coord_lan_ip.clone() } else { f.get("host").to_string() };
-    let link = admin::SshLink { key: registry_key, known_hosts: secrets.join(admin::KNOWN_HOSTS), host, port: f.get("port").to_string() };
-    let a = admin::Admin::new(
-        Box::new(link),
-        Box::new(signed::SshSigner { key: signing_key }),
-        Box::new(signed::SshVerifier { pubkey: signing_pub, tmp_dir: std::env::temp_dir() }),
-        &secrets,
-        &cfg.wg_subnet,
-    );
+    let (a, _) = desktop_admin(&f, "approve")?;
     tui::run(&mut tui::admin::Screen::new(a))
 }
 

@@ -47,6 +47,15 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
+/// What a coordinator shows on its console until the admin signed it.
+pub fn coordinator_issue(code: &str) -> String {
+    format!(
+        "\ndryserver: this coordinator is not signed yet, no machine can join.\n\
+         On your own computer run: ./dryserver approve   and press S.\n\
+         Sign only if it shows this code:  {code}\n\n"
+    )
+}
+
 /// Kept in JOIN_STATE between steps and reboots.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -69,6 +78,8 @@ pub struct Node {
     pub run: Arc<dyn Runner>,
     /// RAM-backed dir for temporary key material; None = /run.
     pub tmp_dir: Option<PathBuf>,
+    /// Checks the admin's signature on member lists.
+    pub verifier: Arc<dyn Verifier>,
 }
 
 /// What a node reports on each sync.
@@ -79,8 +90,26 @@ pub struct Heartbeat {
 }
 
 impl Node {
+    /// A node rooted at root that checks signatures with the signing key
+    /// the installer put there.
+    pub fn new(cfg: Config, hostname: &str, root: &Path, run: Arc<dyn Runner>) -> Node {
+        let tmp = if root == Path::new("/") { PathBuf::from("/run") } else { std::env::temp_dir() };
+        Node {
+            cfg,
+            hostname: hostname.into(),
+            root: root.to_path_buf(),
+            run,
+            tmp_dir: None,
+            verifier: Arc::new(signed::SshVerifier::installed(root, tmp)),
+        }
+    }
+
     pub fn path(&self, p: &str) -> PathBuf {
         fsx::under(&self.root, p)
+    }
+
+    fn fits(&self, host: u32) -> bool {
+        !mesh::ip(&self.cfg.wg_subnet, host).is_empty()
     }
 
     fn read(&self, p: &str) -> Result<String> {
@@ -208,9 +237,10 @@ impl Node {
                                 // What it sends ends up in wg0.conf, /etc/hosts
                                 // and the SSH trust files: check all of it.
                                 let coord_ok = r.coordinator.as_ref().is_some_and(|c| c.host == 1 && registry::member_problem(c).is_none());
-                                if !coord_ok || r.host < 2 || mesh::ip(&self.cfg.wg_subnet, r.host).is_empty() {
+                                if !coord_ok || r.host < 2 || !self.fits(r.host) {
                                     return Err("coordinator sent an incomplete or invalid approval".into());
                                 }
+                                self.check_approval(&r)?;
                                 return Ok(r);
                             }
                             Status::Rejected => return Err(Error::with_kind(Kind::Rejected, "the coordinator rejected this machine")),
@@ -227,6 +257,38 @@ impl Node {
             }
             ctx.sleep(every)?;
         }
+    }
+
+    /// An approval counts only with a member list signed by the admin
+    /// that holds this machine under its own name and keys, and the
+    /// coordinator this machine has been talking to. The coordinator's word
+    /// alone lets nobody in.
+    fn check_approval(&self, r: &StatusReply) -> Result<()> {
+        let list = r
+            .signed
+            .list(self.verifier.as_ref(), |h| self.fits(h))
+            .map_err(|e| e.wrap("the approval has no valid member list signed by the admin"))?;
+        let me = Member {
+            host: r.host,
+            name: self.hostname.clone(),
+            wg_key: self.read(WG_PUB)?,
+            ssh_host_key: self.read(HOST_KEY_PUB)?,
+            ..Member::default()
+        };
+        if !list.has(&me) {
+            return Err("the signed member list does not hold this machine with its name and keys".into());
+        }
+        let coord = r.coordinator.as_ref().ok_or_else(|| Error::new("coordinator sent an incomplete or invalid approval"))?;
+        let Some(signed_coord) = list.members.iter().find(|e| e.host == 1) else {
+            return Err("the signed member list has no coordinator".into());
+        };
+        if !signed_coord.matches(coord) {
+            return Err("the coordinator's keys in the approval are not the ones the admin signed".into());
+        }
+        if signed::key_body(&signed_coord.ssh_host_key) != self.coordinator_key()? {
+            return Err("the coordinator this machine talks to is not the one the admin signed".into());
+        }
+        Ok(())
     }
 
     /// Writes the mesh config for an approved node: its switch address,
@@ -248,6 +310,8 @@ impl Node {
         let key = self.coordinator_key()?;
         let pin = format!("{},{} {key}\n", self.cfg.coord_lan_ip, mesh::ip(&self.cfg.wg_subnet, 1));
         self.write(KNOWN_HOSTS, 0o600, &pin)?;
+        // The list that let this machine in is the first one it has seen.
+        self.write(SIGNED_FILE, 0o600, &(serde_json::to_string(&r.signed)? + "\n"))?;
         let me = SelfInfo { host: r.host, ..me };
         let coord = r.coordinator.clone().ok_or_else(|| Error::new("coordinator sent an incomplete approval"))?;
         self.apply(me, &[coord, Member { host: r.host, name: self.hostname.clone(), ..Member::default() }])
@@ -288,31 +352,23 @@ impl Node {
         for p in &problems {
             eprintln!("dryserver: sync: ignoring {p}");
         }
-        // Without the coordinator's own entry this server would drop its
-        // peer and never reach it again: keep the current mesh instead.
-        if !members.iter().any(|m| m.host == 1) {
-            return Err("the coordinator's member list has no usable entry for the coordinator itself; keeping the current mesh".into());
-        }
         Ok((members, signed))
     }
 
-    /// Compares what the coordinator sent with the list the admin signed
-    /// and says the result in one line. Remembers the newest valid signed
-    /// list, so an older one later is noticed.
+    /// The members this server uses: exactly the list the admin signed.
+    /// What the coordinator says about them is taken only for addresses
+    /// (LAN address, switch link); machines it lists without a signature
+    /// are left out and named in the returned status line.
     ///
-    /// For now this only reports: the mesh still follows the coordinator.
-    pub fn check_signed(&self, members: &[Member], env: &Envelope, v: Option<&dyn Verifier>) -> String {
-        let Some(v) = v else {
-            return "not checked: this server has no signing key (installed by an older dryserver)".into();
-        };
+    /// Refused, leaving the mesh as it is: no list, a bad signature, a
+    /// version older than one this server has seen (an old list would
+    /// bring a removed machine back), another list under the same version,
+    /// or a list without this server.
+    pub fn signed_members(&self, me: u32, sent: &[Member], env: &Envelope) -> Result<(Vec<Member>, String)> {
         if env.is_empty() {
-            return "NOT SIGNED: the coordinator sent no signed member list (sign it from your desktop: ./dryserver approve)".into();
+            return Err("the coordinator sent no signed member list".into());
         }
-        let fits = |h: u32| !mesh::ip(&self.cfg.wg_subnet, h).is_empty();
-        let list = match env.list(v, fits) {
-            Ok(l) => l,
-            Err(e) => return format!("NOT VALID: the coordinator's signed member list was refused: {e}"),
-        };
+        let list = env.list(self.verifier.as_ref(), |h| self.fits(h))?;
         // The stored list was verified when it was saved; root owns it.
         let seen: Option<(u64, Envelope)> = std::fs::read(self.path(SIGNED_FILE)).ok().and_then(|b| {
             let e: Envelope = serde_json::from_slice(&b).ok()?;
@@ -321,35 +377,50 @@ impl Node {
         });
         match &seen {
             Some((ver, _)) if list.version < *ver => {
-                return format!(
-                    "ROLLBACK: the coordinator sent signed list version {}, this server has already seen version {ver}",
+                return Err(errf!(
+                    "the coordinator sent signed list version {}, older than version {ver} this server has seen",
                     list.version
-                );
+                ));
             }
             Some((ver, old)) if list.version == *ver && old.doc != env.doc => {
-                return format!("CONFLICT: the coordinator sent a different signed list with the same version {ver}");
+                return Err(errf!("the coordinator sent a different signed list under the same version {ver}"));
             }
-            Some((ver, _)) if list.version == *ver => {}
-            _ => {
-                let saved = serde_json::to_string(env).map_err(Error::from).and_then(|t| self.write(SIGNED_FILE, 0o600, &(t + "\n")));
-                if let Err(e) = saved {
-                    return format!("NOT SAVED: cannot remember signed list version {}: {e}", list.version);
-                }
-            }
+            _ => {}
         }
-        let extra: Vec<&str> = members.iter().filter(|m| !list.has(m)).map(|m| m.name.as_str()).collect();
-        let missing: Vec<&str> = list.members.iter().filter(|e| !members.iter().any(|m| e.matches(m))).map(|e| e.name.as_str()).collect();
-        if extra.is_empty() && missing.is_empty() {
-            return format!("ok: member list matches signed version {} ({} members)", list.version, list.members.len());
+        if !list.members.iter().any(|e| e.host == me) {
+            return Err("this server is not in the signed member list (was it removed?)".into());
         }
-        let mut parts = Vec::new();
-        if !extra.is_empty() {
-            parts.push(format!("not signed by you: {}", extra.join(", ")));
+        if !seen.as_ref().is_some_and(|(ver, _)| *ver == list.version) {
+            self.write(SIGNED_FILE, 0o600, &(serde_json::to_string(env)? + "\n"))?;
         }
-        if !missing.is_empty() {
-            parts.push(format!("signed but not sent: {}", missing.join(", ")));
-        }
-        format!("MISMATCH with signed version {}: {}", list.version, parts.join("; "))
+        let members: Vec<Member> = list
+            .members
+            .iter()
+            .map(|e| match sent.iter().find(|m| e.matches(m)) {
+                Some(m) => m.clone(),
+                // Signed but not sent (or sent with other keys): still a
+                // member, reached when it calls in.
+                None => Member {
+                    host: e.host,
+                    name: e.name.clone(),
+                    wg_key: e.wg_key.clone(),
+                    ssh_host_key: e.ssh_host_key.clone(),
+                    ..Member::default()
+                },
+            })
+            .collect();
+        let extra: Vec<&str> = sent.iter().filter(|m| !list.has(m)).map(|m| m.name.as_str()).collect();
+        let status = if extra.is_empty() {
+            format!("ok: signed version {}, {} members", list.version, members.len())
+        } else {
+            format!(
+                "ok: signed version {}, {} members; IGNORED, not signed by the admin: {}",
+                list.version,
+                members.len(),
+                extra.join(", ")
+            )
+        };
+        Ok((members, status))
     }
 
     /// Logs the status when it changed since the last sync, so the journal
@@ -459,7 +530,7 @@ pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> R
             }
         }
         show(&format!(
-            "dryserver: waiting for approval. On the coordinator run: sudo dryserver approve\n\
+            "dryserver: waiting for approval. On your own computer run: ./dryserver approve\n\
              Approve only if it shows this code:  {}",
             st.code
         ));
@@ -495,18 +566,11 @@ pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> R
 }
 
 /// Refreshes the mesh from the member list. Nodes ask the coordinator over
-/// the mesh; the coordinator reads its own registry. Members cut off by
-/// `dryserver quarantine` are left out, and with the coordinator cut a node
-/// does not sync at all: false means paused.
+/// the mesh and use only what the admin signed; the coordinator reads its
+/// own registry, which changes only through signed lists. Members cut off
+/// by `dryserver quarantine` are left out, and with the coordinator cut a
+/// node does not sync at all: false means paused.
 pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<bool> {
-    let tmp = n.tmp_dir.clone().unwrap_or_else(|| PathBuf::from("/run"));
-    let v = signed::SshVerifier::installed(&n.root, tmp);
-    sync_with(ctx, n, coordinator, store, v.has_key().then_some(&v as &dyn Verifier))
-}
-
-/// sync with the signature checker given (None: this server has no signing
-/// key).
-pub fn sync_with(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store, v: Option<&dyn Verifier>) -> Result<bool> {
     if !coordinator && quarantine::load(n)?.coordinator_cut() {
         return Ok(false);
     }
@@ -514,19 +578,33 @@ pub fn sync_with(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store, v: Optio
     let mut me = SelfInfo { host: 0, switch: sw };
     let members = if coordinator {
         me.host = 1;
-        store.update(|s| {
+        let (members, signed) = store.update(|s| {
             s.heartbeat(1, &n.cfg.coord_lan_ip, sw, Time::now())?;
-            Ok(s.members.clone())
-        })?
+            Ok((s.members.clone(), s.signed_version > 0))
+        })?;
+        // Signed by the admin: the code on the console has done its job.
+        if signed && n.path(ISSUE_FILE).exists() {
+            let _ = std::fs::remove_file(n.path(ISSUE_FILE));
+            let _ = n.cmd(ctx, "agetty", &["--reload"]);
+        }
+        members
     } else {
         me.host = n.load_state().host;
         if me.host == 0 {
             return Err("not joined yet".into());
         }
         let lan = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).unwrap_or_default();
-        let (members, env) = n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw })?;
-        n.note_signed(&n.check_signed(&members, &env, v));
-        members
+        let (sent, env) = n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw })?;
+        match n.signed_members(me.host, &sent, &env) {
+            Ok((members, status)) => {
+                n.note_signed(&status);
+                members
+            }
+            Err(e) => {
+                n.note_signed(&format!("REFUSED, mesh left as it is: {e}"));
+                return Err(e.wrap("member list refused, mesh left as it is"));
+            }
+        }
     };
     // The switch pings take up to a second each: before the lock, so a cut
     // never waits for them.
@@ -625,6 +703,8 @@ pub fn local_ip(ctx: &Ctx, run: &dyn Runner, dst: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::packages;
+    use crate::signed::fake::Key;
+    use crate::signed::{Entry, List, seal};
     use crate::testutil::{TempDir, get, put};
     use std::sync::Mutex;
 
@@ -632,6 +712,47 @@ mod tests {
     const NODE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInode root@node-a";
     const WG_PUBKEY: &str = "bm9kZS1hLXB1YmxpYy1rZXktMzItYnl0ZXMtbG9uZyE=";
     const COORD_WG: &str = "Y29vcmQtcHVibGljLWtleS0zMi1ieXRlcy1sb25nISE=";
+    const OTHER_WG: &str = "bm9kZS1jLXB1YmxpYy1rZXktMzItYnl0ZXMtbG9uZyE=";
+    const EVIL_WG: &str = "ZXZpbC0tcHVibGljLWtleS0zMi1ieXRlcy1sb25nISE=";
+    const ADMIN: Key = Key("admin");
+
+    fn coord_entry() -> Entry {
+        Entry { host: 1, name: "coord".into(), wg_key: COORD_WG.into(), ssh_host_key: COORD_KEY.into() }
+    }
+
+    /// This machine (node-a) as the admin signs it.
+    fn node_entry(host: u32) -> Entry {
+        Entry { host, name: "node-a".into(), wg_key: WG_PUBKEY.into(), ssh_host_key: signed::key_body(NODE_KEY) }
+    }
+
+    fn other_entry() -> Entry {
+        Entry { host: 3, name: "node-c".into(), wg_key: OTHER_WG.into(), ssh_host_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInodec".into() }
+    }
+
+    fn sign(key: &Key, version: u64, members: Vec<Entry>) -> Envelope {
+        seal(key, &List { version, members, rejected: vec![] }).unwrap()
+    }
+
+    fn coord_member() -> Member {
+        Member {
+            host: 1,
+            name: "coord".into(),
+            wg_key: COORD_WG.into(),
+            lan_ip: "192.168.1.50".into(),
+            switch: true,
+            ssh_host_key: COORD_KEY.into(),
+            ..Member::default()
+        }
+    }
+
+    fn node_member(host: u32) -> Member {
+        Member { host, name: "node-a".into(), wg_key: WG_PUBKEY.into(), ssh_host_key: NODE_KEY.into(), ..Member::default() }
+    }
+
+    /// A "peers" reply.
+    fn peers(members: &[Member], env: &Envelope) -> String {
+        serde_json::json!({ "members": members, "signed": env }).to_string()
+    }
 
     /// Answers registry commands like the coordinator would, and records the
     /// host key the way ssh accept-new does.
@@ -641,7 +762,8 @@ mod tests {
         calls: Mutex<Vec<String>>,
         last: Mutex<Option<Cmd>>,
         applied: Mutex<String>,
-        /// The "peers" reply to send instead of the normal two members.
+        /// The "peers" reply; by default the coordinator and this node as
+        /// host 2, signed as version 5.
         peers: Mutex<Option<String>>,
     }
 
@@ -694,12 +816,9 @@ mod tests {
             }
             if cmd == "peers" {
                 let fixed = self.peers.lock().unwrap().clone();
-                let list = fixed.unwrap_or_else(|| {
-                    format!(
-                        r#"{{"members":[{{"host":1,"name":"coord","wg_key":"{COORD_WG}","lan_ip":"192.168.1.50"}},{{"host":2,"name":"node-a","wg_key":"{WG_PUBKEY}"}}]}}"#
-                    )
-                });
-                return (list, Ok(()));
+                let reply =
+                    fixed.unwrap_or_else(|| peers(&[coord_member(), node_member(2)], &sign(&ADMIN, 5, vec![coord_entry(), node_entry(2)])));
+                return (reply, Ok(()));
             }
             (String::new(), Err("unknown".into()))
         }
@@ -715,25 +834,30 @@ mod tests {
         let cfg =
             Config { coord_lan_ip: "192.168.1.50".into(), admin_ssh_pubkey: "ssh-ed25519 AAAA me@desktop".into(), ..Config::default() };
         let fc = FakeCoord::new(root, statuses);
-        let n = Node { cfg, hostname: "node-a".into(), root: root.to_path_buf(), run: fc.clone(), tmp_dir: None };
+        let n =
+            Node { cfg, hostname: "node-a".into(), root: root.to_path_buf(), run: fc.clone(), tmp_dir: None, verifier: Arc::new(ADMIN) };
         (dir, n, fc)
+    }
+
+    /// A joined node (host 2) ready to sync, with the fake coordinator.
+    fn joined() -> (TempDir, TempDir, Node, Arc<FakeCoord>) {
+        let (dir, mut n, fc) = setup(vec![]);
+        n.save_state(&State { host: 2, ..State::default() }).unwrap();
+        put(&n.root, WG_KEY, "PRIVKEY=\n");
+        put(&n.root, KNOWN_HOSTS, format!("192.168.1.50,10.66.0.1 {COORD_KEY}\n"));
+        let tmp = TempDir::new();
+        n.tmp_dir = Some(tmp.path().to_path_buf());
+        (dir, tmp, n, fc)
+    }
+
+    fn approved(host: u32, signed: Envelope) -> StatusReply {
+        StatusReply { status: Status::Approved, host, coordinator: Some(coord_member()), signed }
     }
 
     #[test]
     fn join_flow() {
-        let coord = Member {
-            host: 1,
-            name: "coord".into(),
-            wg_key: COORD_WG.into(),
-            lan_ip: "192.168.1.50".into(),
-            switch: true,
-            ssh_host_key: COORD_KEY.into(),
-            ..Member::default()
-        };
-        let (_dir, n, fc) = setup(vec![
-            StatusReply { status: Status::Pending, ..StatusReply::default() },
-            StatusReply { status: Status::Approved, host: 4, coordinator: Some(coord) },
-        ]);
+        let env = sign(&ADMIN, 3, vec![coord_entry(), node_entry(4)]);
+        let (_dir, n, fc) = setup(vec![StatusReply { status: Status::Pending, ..StatusReply::default() }, approved(4, env.clone())]);
         let ctx = Ctx::new();
         let code = n.request(&ctx, "192.168.1.23", true).unwrap();
         assert_eq!(code, registry::pairing_code(WG_PUBKEY, NODE_KEY, COORD_KEY), "code must match the coordinator's");
@@ -756,11 +880,92 @@ mod tests {
         assert!(get(&n.root, "/etc/systemd/network/10-switch.network").contains("Address=172.16.66.4/24"));
         assert!(get(&n.root, KNOWN_HOSTS).contains("192.168.1.50,10.66.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIcoord"));
         assert!(get(&n.root, "/etc/hosts").contains("10.66.0.1 coord") && n.load_state().host == 4, "hosts/state not updated");
+        assert!(get(&n.root, SIGNED_FILE).contains(&env.sig), "the list that let this machine in must be remembered");
 
         let (members, signed) = n.fetch_members(&ctx, &Heartbeat { lan_ip: "192.168.1.23".into(), switch: false }).unwrap();
         assert_eq!(members.len(), 2);
-        assert!(signed.is_empty(), "an older coordinator sends no signed list");
+        assert!(!signed.is_empty());
         assert_eq!(fc.calls.lock().unwrap().last().unwrap(), "dryreg@10.66.0.1 peers", "sync must go over the mesh");
+    }
+
+    #[test]
+    fn approval_needs_the_admins_signature() {
+        let good = vec![coord_entry(), node_entry(4)];
+        let cases: Vec<(StatusReply, &str)> = vec![
+            // The coordinator alone says "approved".
+            (approved(4, Envelope::default()), "no valid member list signed by the admin"),
+            (approved(4, sign(&Key("thief"), 3, good.clone())), "no valid member list signed by the admin"),
+            // Signed, but not for this machine as it is.
+            (approved(4, sign(&ADMIN, 3, vec![coord_entry()])), "does not hold this machine"),
+            (approved(5, sign(&ADMIN, 3, good.clone())), "does not hold this machine"),
+            (
+                approved(4, sign(&ADMIN, 3, vec![coord_entry(), Entry { wg_key: EVIL_WG.into(), ..node_entry(4) }])),
+                "does not hold this machine",
+            ),
+            (
+                approved(4, sign(&ADMIN, 3, vec![coord_entry(), Entry { name: "node-b".into(), ..node_entry(4) }])),
+                "does not hold this machine",
+            ),
+            (
+                approved(4, sign(&ADMIN, 3, vec![coord_entry(), Entry { ssh_host_key: "ssh-ed25519 AAAAother".into(), ..node_entry(4) }])),
+                "does not hold this machine",
+            ),
+            // The coordinator in the reply is not the signed one.
+            (
+                StatusReply {
+                    coordinator: Some(Member { wg_key: EVIL_WG.into(), ..coord_member() }),
+                    ..approved(4, sign(&ADMIN, 3, good.clone()))
+                },
+                "not the ones the admin signed",
+            ),
+            // The signed coordinator is another machine than the one this
+            // node has been talking to.
+            (
+                StatusReply {
+                    coordinator: Some(Member { ssh_host_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIelse".into(), ..coord_member() }),
+                    ..approved(
+                        4,
+                        sign(
+                            &ADMIN,
+                            3,
+                            vec![
+                                Entry { ssh_host_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIelse".into(), ..coord_entry() },
+                                node_entry(4),
+                            ],
+                        ),
+                    )
+                },
+                "is not the one the admin signed",
+            ),
+            // Malformed replies.
+            (
+                StatusReply {
+                    coordinator: Some(Member { wg_key: "short".into(), ..coord_member() }),
+                    ..approved(4, sign(&ADMIN, 3, good.clone()))
+                },
+                "invalid approval",
+            ),
+            (
+                StatusReply {
+                    coordinator: Some(Member { name: "c d".into(), ..coord_member() }),
+                    ..approved(4, sign(&ADMIN, 3, good.clone()))
+                },
+                "invalid approval",
+            ),
+            (
+                StatusReply { coordinator: Some(Member { host: 3, ..coord_member() }), ..approved(4, sign(&ADMIN, 3, good.clone())) },
+                "invalid approval",
+            ),
+            (approved(9999, sign(&ADMIN, 3, good.clone())), "invalid approval"),
+            (StatusReply { coordinator: None, ..approved(4, sign(&ADMIN, 3, good.clone())) }, "invalid approval"),
+        ];
+        for (reply, want) in cases {
+            let (_dir, n, _) = setup(vec![reply.clone()]);
+            n.request(&Ctx::new(), "192.168.1.23", false).unwrap();
+            let e = n.wait(&Ctx::new(), Duration::from_millis(1)).unwrap_err().to_string();
+            assert!(e.contains(want), "want {want:?}, got {e:?} for {reply:?}");
+            assert!(get(&n.root, WG_CONF).is_empty(), "a refused approval must not write the mesh config");
+        }
     }
 
     #[test]
@@ -810,15 +1015,105 @@ mod tests {
     }
 
     #[test]
+    fn sync_uses_only_the_signed_list() {
+        let (_dir, _tmp, n, fc) = joined();
+        let store = Store::new("/nonexistent");
+        let ctx = Ctx::new();
+        let v5 = sign(&ADMIN, 5, vec![coord_entry(), node_entry(2)]);
+        let set = |text: String| *fc.peers.lock().unwrap() = Some(text);
+        let status = |n: &Node| get(&n.root, SIGNED_STATUS);
+
+        assert!(sync(&ctx, &n, false, &store).unwrap());
+        assert_eq!(status(&n), "ok: signed version 5, 2 members\n");
+        assert!(get(&n.root, SIGNED_FILE).contains(&v5.sig), "the verified list must be remembered");
+        let good = get(&n.root, WG_CONF);
+        assert!(good.contains(COORD_WG));
+
+        // The coordinator adds a machine the admin never signed: left out.
+        let rogue = Member { host: 9, name: "rogue".into(), wg_key: EVIL_WG.into(), lan_ip: "192.168.1.66".into(), ..Member::default() };
+        set(peers(&[coord_member(), node_member(2), rogue], &v5));
+        assert!(sync(&ctx, &n, false, &store).unwrap());
+        assert!(status(&n).contains("IGNORED, not signed by the admin: rogue"), "{}", status(&n));
+        for f in [WG_CONF, "/etc/hosts", "/etc/ssh/ssh_known_hosts"] {
+            let text = get(&n.root, f);
+            assert!(!text.contains(EVIL_WG) && !text.contains("rogue") && !text.contains("192.168.1.66"), "{f}:\n{text}");
+        }
+
+        // It swaps a signed member's key: the signed key stays in use.
+        set(peers(&[Member { wg_key: EVIL_WG.into(), ..coord_member() }, node_member(2)], &v5));
+        assert!(sync(&ctx, &n, false, &store).unwrap());
+        let wg = get(&n.root, WG_CONF);
+        assert!(wg.contains(COORD_WG) && !wg.contains(EVIL_WG), "{wg}");
+
+        // It leaves a signed member out: still a peer, reached when it calls.
+        let v6 = sign(&ADMIN, 6, vec![coord_entry(), node_entry(2), other_entry()]);
+        set(peers(&[coord_member(), node_member(2)], &v6));
+        assert!(sync(&ctx, &n, false, &store).unwrap());
+        let wg = get(&n.root, WG_CONF);
+        assert!(wg.contains(OTHER_WG) && get(&n.root, "/etc/hosts").contains("10.66.0.3 node-c"), "{wg}");
+        assert!(get(&n.root, SIGNED_FILE).contains(&v6.sig), "a newer list replaces the remembered one");
+        let kept = get(&n.root, WG_CONF);
+
+        // Everything below is refused and leaves the mesh as it is.
+        let refused: Vec<(String, &str)> = vec![
+            (peers(&[coord_member(), node_member(2)], &Envelope::default()), "no signed member list"),
+            (
+                r#"{"members":[{"host":1,"name":"coord","wg_key":"Y29vcmQtcHVibGljLWtleS0zMi1ieXRlcy1sb25nISE="}]}"#.into(),
+                "no signed member list",
+            ),
+            (peers(&[coord_member()], &Envelope { doc: v6.doc.replace("node-c", "node-x"), sig: v6.sig.clone() }), "bad signature"),
+            (peers(&[coord_member()], &sign(&Key("thief"), 9, vec![coord_entry(), node_entry(2)])), "bad signature"),
+            // An older list would bring a removed machine back.
+            (peers(&[coord_member()], &v5), "older than version 6"),
+            (
+                peers(&[coord_member()], &sign(&ADMIN, 6, vec![coord_entry(), node_entry(2)])),
+                "different signed list under the same version",
+            ),
+            // This server was removed.
+            (peers(&[coord_member()], &sign(&ADMIN, 7, vec![coord_entry(), other_entry()])), "not in the signed member list"),
+            (peers(&[coord_member()], &sign(&ADMIN, 7, vec![node_entry(2)])), "no coordinator"),
+        ];
+        for (reply, want) in refused {
+            set(reply);
+            let e = sync(&ctx, &n, false, &store).unwrap_err().to_string();
+            assert!(e.contains(want) && e.contains("mesh left as it is"), "want {want:?}: {e}");
+            assert_eq!(get(&n.root, WG_CONF), kept, "the mesh changed although the list was refused ({want})");
+            assert!(status(&n).starts_with("REFUSED"), "{}", status(&n));
+            assert!(get(&n.root, SIGNED_FILE).contains(&v6.sig), "a refused list replaced the remembered one ({want})");
+        }
+
+        // A server without the signing key trusts nothing.
+        let mut blind = n.clone();
+        blind.verifier = Arc::new(signed::SshVerifier::installed(&n.root, n.root.clone()));
+        set(peers(&[coord_member(), node_member(2)], &sign(&ADMIN, 8, vec![coord_entry(), node_entry(2)])));
+        assert!(sync(&ctx, &blind, false, &store).unwrap_err().to_string().contains("no signing key"));
+    }
+
+    #[test]
+    fn hostile_addresses_never_reach_files() {
+        let (_dir, _tmp, n, fc) = joined();
+        let env = sign(&ADMIN, 5, vec![coord_entry(), node_entry(2), other_entry()]);
+        // node-c is signed, but the coordinator sends junk for its address
+        // and key comment, and a second entry for the coordinator.
+        let reply = format!(
+            r#"{{"members":[{},{},{{"host":3,"name":"node-c","wg_key":"{OTHER_WG}","ssh_host_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInodec","lan_ip":"1.2.3.4 archlinux.org"}},{{"host":1,"name":"coord2","wg_key":"{EVIL_WG}"}},{{"host":7,"name":"a\n10.66.0.7 pkg.example.org","wg_key":"{EVIL_WG}"}}],"signed":{}}}"#,
+            serde_json::to_string(&coord_member()).unwrap(),
+            serde_json::to_string(&node_member(2)).unwrap(),
+            serde_json::to_string(&env).unwrap()
+        );
+        *fc.peers.lock().unwrap() = Some(reply);
+        assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
+        let (hosts, wg, kh) = (get(&n.root, "/etc/hosts"), get(&n.root, WG_CONF), get(&n.root, "/etc/ssh/ssh_known_hosts"));
+        for bad in ["archlinux.org", "pkg.example.org", "1.2.3.4", EVIL_WG, "coord2", "10.66.0.7"] {
+            assert!(!hosts.contains(bad) && !wg.contains(bad) && !kh.contains(bad), "{bad:?} reached a system file:\n{hosts}\n{wg}\n{kh}");
+        }
+        // node-c stays a member (it is signed), without the bad address.
+        assert!(hosts.contains("10.66.0.3 node-c\n") && wg.contains(OTHER_WG) && kh.contains("node-c,10.66.0.3 ssh-ed25519"));
+    }
+
+    #[test]
     fn sync_respects_quarantine() {
-        let (_dir, mut n, _) = setup(vec![]);
-        n.save_state(&State { host: 2, ..State::default() }).unwrap();
-        put(&n.root, WG_KEY, "PRIVKEY=\n");
-        put(&n.root, KNOWN_HOSTS, format!("192.168.1.50,10.66.0.1 {COORD_KEY}\n"));
-        let tmp = TempDir::new();
-        n.tmp_dir = Some(tmp.path().to_path_buf());
-        let fc = FakeCoord::new(&n.root, vec![]);
-        n.run = fc.clone();
+        let (_dir, _tmp, n, fc) = joined();
         let store = Store::new("/nonexistent");
 
         // Coordinator cut: no contact at all, nothing rewritten.
@@ -833,154 +1128,42 @@ mod tests {
         assert!(sync(&Ctx::new(), &n, false, &store).is_err());
         assert_eq!(get(&n.root, WG_CONF), "untouched\n");
 
-        // Only a worker cut: sync runs and leaves it out, by key.
-        put(&n.root, quarantine::STATE_FILE, format!(r#"{{"cuts":[{{"name":"node-x","hosts":[9],"wg_keys":["{COORD_WG}"]}}]}}"#));
+        // Only another member cut: sync runs and leaves it out, also when
+        // the admin's signed list still has it.
+        put(&n.root, quarantine::STATE_FILE, format!(r#"{{"cuts":[{{"name":"node-c","hosts":[3],"wg_keys":["{OTHER_WG}"]}}]}}"#));
+        let env = sign(&ADMIN, 5, vec![coord_entry(), node_entry(2), other_entry()]);
+        *fc.peers.lock().unwrap() = Some(peers(&[coord_member(), node_member(2)], &env));
         assert!(sync(&Ctx::new(), &n, false, &store).unwrap());
         let wg = get(&n.root, WG_CONF);
-        assert!(wg.contains("[Interface]") && !wg.contains(COORD_WG), "a cut key came back:\n{wg}");
+        assert!(wg.contains(COORD_WG) && !wg.contains(OTHER_WG), "a cut member came back:\n{wg}");
         // This server itself is never left out of its own files.
         assert!(get(&n.root, "/etc/hosts").contains("node-a"));
     }
 
     #[test]
-    fn sync_checks_what_the_coordinator_sends() {
-        let (_dir, mut n, _) = setup(vec![]);
-        n.save_state(&State { host: 2, ..State::default() }).unwrap();
-        put(&n.root, WG_KEY, "PRIVKEY=\n");
-        put(&n.root, KNOWN_HOSTS, format!("192.168.1.50,10.66.0.1 {COORD_KEY}\n"));
-        let tmp = TempDir::new();
+    fn coordinator_code_leaves_the_console_once_signed() {
+        let (_dir, tmp, mut n, _) = joined();
         n.tmp_dir = Some(tmp.path().to_path_buf());
-        let fc = FakeCoord::new(&n.root, vec![]);
-        n.run = fc.clone();
-        let store = Store::new("/nonexistent");
-        let coord = format!(r#"{{"host":1,"name":"coord","wg_key":"{COORD_WG}","lan_ip":"192.168.1.50"}}"#);
-        let me = format!(r#"{{"host":2,"name":"node-a","wg_key":"{WG_PUBKEY}"}}"#);
-        let evil_key = "ZXZpbC0tcHVibGljLWtleS0zMi1ieXRlcy1sb25nISE=";
-
-        // Hostile entries are left out; the good ones still apply.
-        let hostile = [
-            format!(r#"{{"host":5,"name":"x archlinux.org","wg_key":"{evil_key}"}}"#),
-            format!(r#"{{"host":6,"name":"a\n10.66.0.6 pkg.example.org","wg_key":"{evil_key}"}}"#),
-            r#"{"host":7,"name":"n7","wg_key":"AAAA\nEndpoint = 1.2.3.4:51820"}"#.to_string(),
-            format!(r#"{{"host":8,"name":"n8","wg_key":"{evil_key}","lan_ip":"1.2.3.4 archlinux.org"}}"#),
-            format!(r#"{{"host":9,"name":"n9","wg_key":"{evil_key}","ssh_host_key":"ssh-ed25519 AAAA x\n* ssh-ed25519 BBBB"}}"#),
-            format!(r#"{{"host":1,"name":"coord2","wg_key":"{evil_key}"}}"#),
-            format!(r#"{{"host":999,"name":"far","wg_key":"{evil_key}"}}"#),
-        ];
-        *fc.peers.lock().unwrap() = Some(format!(r#"{{"members":[{coord},{me},{}]}}"#, hostile.join(",")));
-        assert!(sync(&Ctx::new(), &n, false, &store).unwrap());
-        let (hosts, wg) = (get(&n.root, "/etc/hosts"), get(&n.root, WG_CONF));
-        let kh = get(&n.root, "/etc/ssh/ssh_known_hosts");
-        for bad in ["archlinux.org", "pkg.example.org", "1.2.3.4", evil_key, "coord2", "BBBB", "10.66.0.6"] {
-            assert!(!hosts.contains(bad) && !wg.contains(bad) && !kh.contains(bad), "{bad:?} reached a system file:\n{hosts}\n{wg}\n{kh}");
-        }
-        assert!(hosts.contains("10.66.0.1 coord\n") && wg.contains(COORD_WG));
-
-        // A list without a usable coordinator changes nothing: applying it
-        // would remove the peer this server needs to ever sync again.
-        *fc.peers.lock().unwrap() = Some(format!(r#"{{"members":[{{"host":1,"name":"bad name","wg_key":"{COORD_WG}"}},{me}]}}"#));
-        let e = sync(&Ctx::new(), &n, false, &store).unwrap_err().to_string();
-        assert!(e.contains("keeping the current mesh"), "{e}");
-        assert_eq!(get(&n.root, WG_CONF), wg, "wg0.conf changed although the list was refused");
-    }
-
-    #[test]
-    fn signed_list_is_checked_and_reported() {
-        use crate::signed::{Entry, List, fake::Key, seal};
-        let (_dir, mut n, _) = setup(vec![]);
-        n.save_state(&State { host: 2, ..State::default() }).unwrap();
-        put(&n.root, WG_KEY, "PRIVKEY=\n");
-        put(&n.root, KNOWN_HOSTS, format!("192.168.1.50,10.66.0.1 {COORD_KEY}\n"));
-        let tmp = TempDir::new();
-        n.tmp_dir = Some(tmp.path().to_path_buf());
-        let fc = FakeCoord::new(&n.root, vec![]);
-        n.run = fc.clone();
-        let store = Store::new("/nonexistent");
-        let admin = Key("admin");
-        let coord = Entry { host: 1, name: "coord".into(), wg_key: COORD_WG.into(), ssh_host_key: String::new() };
-        let me = Entry { host: 2, name: "node-a".into(), wg_key: WG_PUBKEY.into(), ssh_host_key: String::new() };
-        let members = format!(
-            r#"{{"host":1,"name":"coord","wg_key":"{COORD_WG}","lan_ip":"192.168.1.50"}},{{"host":2,"name":"node-a","wg_key":"{WG_PUBKEY}"}}"#
-        );
-        let reply =
-            |extra: &str, env: &Envelope| format!(r#"{{"members":[{members}{extra}],"signed":{}}}"#, serde_json::to_string(env).unwrap());
-        let status = |n: &Node| get(&n.root, SIGNED_STATUS);
-        let run = |n: &Node, text: String, v: Option<&dyn Verifier>| {
-            *fc.peers.lock().unwrap() = Some(text);
-            // Warn only: sync always succeeds and applies the list.
-            assert!(sync_with(&Ctx::new(), n, false, &store, v).unwrap());
-            status(n)
-        };
-
-        // No signing key on this server, then nothing signed yet.
-        assert!(run(&n, reply("", &Envelope::default()), None).starts_with("not checked"));
-        assert!(run(&n, reply("", &Envelope::default()), Some(&admin)).starts_with("NOT SIGNED"));
-
-        // A valid list that matches.
-        let v5 = seal(&admin, &List { version: 5, members: vec![coord.clone(), me.clone()], rejected: vec![] }).unwrap();
-        assert_eq!(run(&n, reply("", &v5), Some(&admin)), "ok: member list matches signed version 5 (2 members)\n");
-        assert!(get(&n.root, SIGNED_FILE).contains("version"), "the verified list must be remembered");
-
-        // The coordinator adds a machine the admin never signed.
-        let evil = "ZXZpbC0tcHVibGljLWtleS0zMi1ieXRlcy1sb25nISE=";
-        let s = run(&n, reply(&format!(r#",{{"host":3,"name":"rogue","wg_key":"{evil}"}}"#), &v5), Some(&admin));
-        assert!(s.starts_with("MISMATCH") && s.contains("not signed by you: rogue"), "{s}");
-        assert!(get(&n.root, WG_CONF).contains(evil), "this slice only warns; the mesh still follows the coordinator");
-
-        // A signed member whose key the coordinator swapped.
-        *fc.peers.lock().unwrap() = None;
-        let swapped = format!(
-            r#"{{"members":[{{"host":1,"name":"coord","wg_key":"{evil}"}},{{"host":2,"name":"node-a","wg_key":"{WG_PUBKEY}"}}],"signed":{}}}"#,
-            serde_json::to_string(&v5).unwrap()
-        );
-        let s = run(&n, swapped, Some(&admin));
-        assert!(s.contains("not signed by you: coord") && s.contains("signed but not sent: coord"), "{s}");
-
-        // Forged, or signed by another key.
-        let forged = Envelope { doc: v5.doc.replace("node-a", "node-x"), sig: v5.sig.clone() };
-        assert!(run(&n, reply("", &forged), Some(&admin)).starts_with("NOT VALID"));
-        let other = seal(&Key("thief"), &List { version: 9, members: vec![coord.clone(), me.clone()], rejected: vec![] }).unwrap();
-        assert!(run(&n, reply("", &other), Some(&admin)).starts_with("NOT VALID"));
-        assert!(get(&n.root, SIGNED_FILE).contains(&v5.sig), "an invalid list must not replace the remembered one");
-
-        // An older list (rollback), and a different list under the same version.
-        let v4 = seal(&admin, &List { version: 4, members: vec![coord.clone(), me.clone()], rejected: vec![] }).unwrap();
-        let s = run(&n, reply("", &v4), Some(&admin));
-        assert!(s.starts_with("ROLLBACK") && s.contains("version 4") && s.contains("seen version 5"), "{s}");
-        let v5b = seal(&admin, &List { version: 5, members: vec![coord.clone(), me.clone()], rejected: vec!["x".into()] }).unwrap();
-        assert!(run(&n, reply("", &v5b), Some(&admin)).starts_with("CONFLICT"));
-
-        // A newer list replaces the remembered one.
-        let v6 = seal(&admin, &List { version: 6, members: vec![coord, me], rejected: vec![] }).unwrap();
-        assert!(run(&n, reply("", &v6), Some(&admin)).starts_with("ok: member list matches signed version 6"));
-        assert!(get(&n.root, SIGNED_FILE).contains(&v6.sig));
-    }
-
-    #[test]
-    fn invalid_approval_is_refused() {
-        let coord = |wg: &str, name: &str| Member {
-            host: 1,
-            name: name.into(),
-            wg_key: wg.into(),
-            ssh_host_key: COORD_KEY.into(),
-            lan_ip: "192.168.1.50".into(),
-            ..Member::default()
-        };
-        for (reply, why) in [
-            (StatusReply { status: Status::Approved, host: 4, coordinator: Some(coord("short", "coord")) }, "bad key"),
-            (StatusReply { status: Status::Approved, host: 4, coordinator: Some(coord(COORD_WG, "c d")) }, "bad name"),
-            (
-                StatusReply { status: Status::Approved, host: 4, coordinator: Some(Member { host: 3, ..coord(COORD_WG, "coord") }) },
-                "not host 1",
-            ),
-            (StatusReply { status: Status::Approved, host: 9999, coordinator: Some(coord(COORD_WG, "coord")) }, "host outside the mesh"),
-            (StatusReply { status: Status::Approved, host: 4, coordinator: None }, "no coordinator"),
-        ] {
-            let (_dir, n, _) = setup(vec![reply]);
-            n.request(&Ctx::new(), "192.168.1.23", false).unwrap();
-            let e = n.wait(&Ctx::new(), Duration::from_millis(1)).unwrap_err().to_string();
-            assert!(e.contains("invalid approval"), "{why}: {e}");
-        }
+        let store_dir = TempDir::new();
+        let store = Store::new(store_dir.join("registry.json"));
+        store
+            .update(|s| {
+                s.members = vec![coord_member()];
+                Ok(())
+            })
+            .unwrap();
+        put(&n.root, ISSUE_FILE, coordinator_issue("123 456"));
+        assert!(get(&n.root, ISSUE_FILE).contains("Sign only if it shows this code:  123 456"));
+        sync(&Ctx::new(), &n, true, &store).unwrap();
+        assert!(!get(&n.root, ISSUE_FILE).is_empty(), "the code must stay until a list is signed");
+        store
+            .update(|s| {
+                s.signed_version = 9;
+                Ok(())
+            })
+            .unwrap();
+        sync(&Ctx::new(), &n, true, &store).unwrap();
+        assert!(get(&n.root, ISSUE_FILE).is_empty(), "the code must go once the admin signed");
     }
 
     #[test]
@@ -996,14 +1179,7 @@ mod tests {
 
     #[test]
     fn sync_keeps_private_key() {
-        let (_dir, mut n, _) = setup(vec![]);
-        n.save_state(&State { host: 2, ..State::default() }).unwrap();
-        put(&n.root, WG_KEY, "PRIVKEY=\n");
-        put(&n.root, KNOWN_HOSTS, format!("192.168.1.50,10.66.0.1 {COORD_KEY}\n"));
-        let tmp = TempDir::new();
-        n.tmp_dir = Some(tmp.path().to_path_buf());
-        let fc = FakeCoord::new(&n.root, vec![]);
-        n.run = fc.clone();
+        let (_dir, tmp, n, fc) = joined();
         assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
         let applied = fc.applied.lock().unwrap().clone();
         assert!(applied.contains("PrivateKey = PRIVKEY="), "syncconf input lost the private key:\n{applied}");
