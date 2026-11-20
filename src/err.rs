@@ -13,6 +13,9 @@ pub enum Kind {
     NotFound,
     Rejected,
     Expired,
+    /// The machine at the coordinator's address has another SSH host key
+    /// than the one pinned.
+    HostKey,
 }
 
 #[derive(Debug, Clone)]

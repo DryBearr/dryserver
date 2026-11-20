@@ -23,15 +23,58 @@ check_not() { local msg=$1; shift; if "$@" >/dev/null 2>&1; then bad "$msg"; els
 mkdir -p "$W/up" "$W/work"
 mount -t overlay overlay -o "lowerdir=/etc,upperdir=$W/up,workdir=$W/work" /etc
 mount -t tmpfs tmpfs /run
-[ -d /etc/wireguard ] && mount -t tmpfs tmpfs /etc/wireguard
+# Directories from the real system cannot be written to in here: empty
+# ones are mounted over those the server tools write.
+for d in /etc/wireguard /etc/ssh; do [ -d "$d" ] && mount -t tmpfs tmpfs "$d"; done
+# A private place for the signing public key (/usr/local may be a symlink).
+# A directory from the real system cannot be written to in here, so an
+# empty one is mounted over it.
+UL=$(realpath /usr/local)
+if [ -d "$UL/share" ]; then
+    mount -t tmpfs tmpfs "$UL/share"
+else
+    mkdir -p "$W/ul-up" "$W/ul-work"
+    mount -t overlay overlay -o "lowerdir=$UL,upperdir=$W/ul-up,workdir=$W/ul-work" "$UL"
+fi
 hostname node-b
 
 # Stand-ins for systemd and agetty (no init in here).
 mkdir -p "$W/bin"
 printf '#!/bin/sh\necho "systemctl $*" >> %s/systemctl.log\nexit 0\n' "$W" > "$W/bin/systemctl"
 printf '#!/bin/sh\nexit 0\n' > "$W/bin/agetty"
+# Stand-in for the coordinator's registry over SSH: "signed" answers with
+# $W/signed-reply, but only if the coordinator's LAN address is reachable
+# from the worker (so the firewall block must be gone before it is asked).
+cat > "$W/bin/ssh" <<EOF
+#!/bin/sh
+for a in "\$@"; do last=\$a; done
+[ "\$last" = signed ] || exit 255
+ping -c1 -W1 192.168.1.50 >/dev/null 2>&1 || { echo "ssh: connect to host 192.168.1.50: no route" >&2; exit 255; }
+[ -f "$W/signed-reply" ] || { echo "ssh: connection refused" >&2; exit 255; }
+cat "$W/signed-reply"
+EOF
 chmod +x "$W/bin/"*
 export PATH="$W/bin:$PATH"
+
+# The admin's signing key, and a way to make a signed member list:
+#   sign_list KEY VERSION COORD_WG COORD_SSH > reply
+ssh-keygen -q -t ed25519 -N '' -f "$W/signing"
+ssh-keygen -q -t ed25519 -N '' -f "$W/thief"
+mkdir -p /usr/local/share/dryserver
+cp "$W/signing.pub" /usr/local/share/dryserver/signing_ed25519.pub
+OLD_SSH="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIoldcoordinatoroldcoordinatoroldcoordinato"
+NEW_SSH="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInewcoordinatornewcoordinatornewcoordinato"
+sign_list() {
+    python3 -I -c '
+import json, sys
+ver, cwg, cssh, wwg, nwg = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+print(json.dumps({"version": ver, "members": [
+    {"host": 1, "name": "coord", "wg_key": cwg, "ssh_host_key": cssh},
+    {"host": 2, "name": "node-b", "wg_key": wwg, "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInodeb"},
+    {"host": 3, "name": "node-c", "wg_key": nwg, "ssh_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInodec"}], "rejected": []}), end="")' "$2" "$3" "$4" "$WP" "$CP" > "$W/doc"
+    ssh-keygen -Y sign -f "$1" -n dryserver-members < "$W/doc" > "$W/sig" 2>/dev/null
+    python3 -I -c 'import json,sys; print(json.dumps({"signed": {"doc": open(sys.argv[1]).read(), "sig": open(sys.argv[2]).read()}}))' "$W/doc" "$W/sig"
+}
 
 unshare -n sleep 600 & BR=$!
 unshare -n sleep 600 & WK=$!
@@ -69,6 +112,10 @@ USERNAME='admin'
 EOF
 echo '{"host":2}' > /etc/dryserver/join.json
 echo node > /etc/dryserver/role
+# This server pins the coordinator's SSH key and has seen signed version 5.
+echo "192.168.1.50,10.66.0.1 $OLD_SSH" > /etc/dryserver/known_hosts
+sign_list "$W/signing" 5 "$BP" "$OLD_SSH" > "$W/v5"
+python3 -I -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["signed"]))' "$W/v5" > /etc/dryserver/members.signed.json
 echo "$WKEY" > /etc/wireguard/wg0.key
 cat > /etc/wireguard/wg0.conf <<EOF
 # dryserver mesh, rewritten by "dryserver sync" from the coordinator's list.
@@ -180,10 +227,22 @@ check "unknown name is refused with the member list" grep -q "members here: node
 out=$(inw "$BIN" quarantine -lift -name node-c 2>&1)
 check "-lift with -name is refused" grep -q "take no -name" <<<"$out"
 
-echo "== lift"
+echo "== lift needs a member list signed by the admin"
+out=$(inw "$BIN" quarantine -lift 2>&1); rc=$?
+check "refused when the coordinator has no list ($rc)" bash -c "[ $rc != 0 ] && grep -q 'the quarantine stays' <<<'$out'"
+sign_list "$W/thief" 9 "$BP" "$OLD_SSH" > "$W/signed-reply"
+out=$(inw "$BIN" quarantine -lift 2>&1); rc=$?
+check "refused when the list is signed by someone else" bash -c "[ $rc != 0 ] && grep -q 'bad signature' <<<'$out'"
+check "the firewall block is back" inw nft list table inet dryserver_quarantine
+check_not "still cut off" inw ping -c1 -W1 10.66.0.1
+check_not "brain peer still out" bash -c "nsenter -t $WK -n wg show wg0 peers | grep -qF '$BP'"
+
+echo "== lift (false alarm: the same coordinator)"
+cp "$W/v5" "$W/signed-reply"
 inw "$BIN" quarantine -lift > "$W/lift.out" 2>&1; rc=$?
 sed 's/^/    | /' "$W/lift.out"
 check "lift exits 0" test "$rc" = 0
+check "says it is the same machine" grep -q "same machine as before" "$W/lift.out"
 check "brain peer back in the running wg0" bash -c "nsenter -t $WK -n wg show wg0 peers | grep -qF '$BP'"
 check "brain peer back in wg0.conf" grep -qF "$BP" /etc/wireguard/wg0.conf
 check_not "quarantine table gone" inw nft list table inet dryserver_quarantine
@@ -191,10 +250,35 @@ check_not "rules file gone" test -e /etc/dryserver/nft.d/quarantine.nft
 check "worker reaches brain again" inw ping -c1 -W1 10.66.0.1
 check "sync restarted" grep -q "start --no-block dryserver-sync.service" "$W/systemctl.log"
 
+echo "== the coordinator is reinstalled: new keys, signed by the admin"
+check "cut again" inw "$BIN" quarantine
+BK2=$(wg genkey); BP2=$(echo "$BK2" | wg pubkey)
+echo "$BK2" > "$W/bk2"
+inb wg set wg0 private-key "$W/bk2"
+sign_list "$W/signing" 9 "$BP2" "$NEW_SSH" > "$W/signed-reply"
+inw "$BIN" quarantine -lift > "$W/lift2.out" 2>&1; rc=$?
+sed 's/^/    | /' "$W/lift2.out"
+check "lift exits 0" test "$rc" = 0
+check "says it follows the new coordinator" grep -q "follows the new coordinator you signed" "$W/lift2.out"
+check "new coordinator key in the running wg0" bash -c "nsenter -t $WK -n wg show wg0 peers | grep -qF '$BP2'"
+check_not "old coordinator key stays out" bash -c "nsenter -t $WK -n wg show wg0 peers | grep -qF '$BP'"
+check_not "old coordinator key not in wg0.conf" grep -qF "$BP" /etc/wireguard/wg0.conf
+check "new SSH key pinned" grep -qF "192.168.1.50,10.66.0.1 $NEW_SSH" /etc/dryserver/known_hosts
+check_not "old SSH key gone" grep -qF "$OLD_SSH" /etc/dryserver/known_hosts
+check "worker reaches the new coordinator over the mesh" inw ping -c1 -W2 10.66.0.1
+check "version 9 remembered" grep -q 'version.*9' /etc/dryserver/members.signed.json
+# The old list cannot take it back.
+check "cut once more" inw "$BIN" quarantine
+cp "$W/v5" "$W/signed-reply"
+out=$(inw "$BIN" quarantine -lift 2>&1); rc=$?
+check "the old list is refused after the new one was seen" bash -c "[ $rc != 0 ] && grep -q 'older than version 9' <<<'$out'"
+sign_list "$W/signing" 9 "$BP2" "$NEW_SSH" > "$W/signed-reply"
+check "lift with the current list" inw "$BIN" quarantine -lift
+
 echo "== cut a worker by name"
 check "cut node-c" inw "$BIN" quarantine -name node-c
 check_not "node-c peer gone" bash -c "nsenter -t $WK -n wg show wg0 peers | grep -qF '$CP'"
-check "brain still reachable" inw ping -c1 -W1 10.66.0.1
+check "brain still reachable" inw ping -c1 -W2 10.66.0.1
 check "node-c's mesh address blocked" bash -c "nsenter -t $WK -n nft list table inet dryserver_quarantine | grep -q '10.66.0.3'"
 check_not "brain's address not blocked" bash -c "nsenter -t $WK -n nft list table inet dryserver_quarantine | grep -q '10.66.0.1[,} ]'"
 check "status shows sync running" bash -c "nsenter -t $WK -n $BIN quarantine -status | grep -q 'is running'"

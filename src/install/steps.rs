@@ -292,24 +292,23 @@ impl Real {
         let host_key = fsx::read_string(self.target("/etc/ssh/ssh_host_ed25519_key.pub"))?;
         self.state.lock().unwrap().host_key = host_key.trim().to_string();
         self.wireguard_key(ctx)?;
+        // Proof for the admin that this machine, with these keys, was
+        // installed from their stick. Only the proof is stored: the secret
+        // stays on the stick.
+        let secret_path = fsx::dir(&self.registry_key).join(iso::JOIN_SECRET);
+        let secret = fsx::read_string(&secret_path).map_err(|e| e.wrap("this installer has no join secret; build the USB stick again"))?;
+        if secret.trim().len() < 32 {
+            return Err(errf!("{} is damaged; build the USB stick again", secret_path.display()));
+        }
+        let (wg, host_key) = {
+            let st = self.state.lock().unwrap();
+            (st.wg_public.clone(), st.host_key.clone())
+        };
+        let proof = registry::join_proof(&secret, &ch.hostname, &wg, &host_key);
         if ch.role() == Role::Coordinator {
             self.setup_registry_user(ctx)?;
-            self.setup_coordinator_mesh(ctx, ch)?;
+            self.setup_coordinator_mesh(ctx, ch, &proof)?;
         } else {
-            // Proof for the admin that this machine, with these keys, was
-            // installed from their stick. Only the proof is stored: the
-            // secret stays on the stick.
-            let secret_path = fsx::dir(&self.registry_key).join(iso::JOIN_SECRET);
-            let secret =
-                fsx::read_string(&secret_path).map_err(|e| e.wrap("this installer has no join secret; build the USB stick again"))?;
-            if secret.trim().len() < 32 {
-                return Err(errf!("{} is damaged; build the USB stick again", secret_path.display()));
-            }
-            let (wg, host_key) = {
-                let st = self.state.lock().unwrap();
-                (st.wg_public.clone(), st.host_key.clone())
-            };
-            let proof = registry::join_proof(&secret, &ch.hostname, &wg, &host_key);
             self.write(node::JOIN_PROOF, 0o600, format!("{proof}\n"))?;
         }
 
@@ -400,7 +399,7 @@ impl Real {
 
     /// Creates the registry with the coordinator as member 1 and starts its
     /// WireGuard side of the mesh.
-    fn setup_coordinator_mesh(&self, ctx: &Ctx, ch: &Choices) -> Result<()> {
+    fn setup_coordinator_mesh(&self, ctx: &Ctx, ch: &Choices, proof: &str) -> Result<()> {
         let (wg_public, host_key, switch_mac) = {
             let st = self.state.lock().unwrap();
             (st.wg_public.clone(), st.host_key.clone(), st.switch_mac.clone())
@@ -418,8 +417,10 @@ impl Real {
         };
         let store = Store::new(self.target(registry::DEFAULT_PATH));
         let m = me.clone();
+        let proof = proof.to_string();
         store.update(move |s| {
             s.members = vec![m];
+            s.coordinator_proof = proof;
             Ok(())
         })?;
         let dir = fsx::dir(registry::DEFAULT_PATH).display().to_string();
@@ -771,6 +772,10 @@ mod tests {
         assert_eq!(mode("/usr/local/share/dryserver") & 0o005, 0o005, "the registry user must be able to reach the key");
 
         assert!(!r.target(node::JOIN_PROOF).exists(), "a coordinator asks nobody to join");
+        // Its proof goes into the registry, for the admin's first signature.
+        let proof = registry::join_proof(JOIN_SECRET, "coord", "PUBLICKEY=", "ssh-ed25519 AAAAhost root@new");
+        let reg = get(&r.target, "/var/lib/dryserver/registry.json");
+        assert!(reg.contains(&format!(r#""coordinator_proof": "{proof}""#)) && !reg.contains(JOIN_SECRET), "{reg}");
         // Coordinator: its code on the console until the admin signs it.
         let issue = get(&r.target, node::ISSUE_FILE);
         assert!(issue.contains("not signed yet") && issue.contains(&r.coordinator_code()) && r.coordinator_code().len() == 7, "{issue}");

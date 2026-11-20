@@ -545,8 +545,93 @@ pub fn cut(ctx: &Ctx, n: &Node, coordinator: bool, names: &[String], out: &mut d
     Ok(())
 }
 
-/// Undoes every cut: puts the saved peers back, removes the firewall
-/// table, and lets sync and join run again.
+/// What a server found when it asked the coordinator's address for the
+/// member list the admin signed.
+#[derive(Debug, PartialEq)]
+enum Coordinator {
+    /// The same machine this server pinned before.
+    Same,
+    /// A coordinator with other keys, signed by the admin: this server now
+    /// pins it and has its mesh files rewritten for it.
+    New,
+}
+
+/// Trusts the coordinator again only as far as the admin signed it.
+///
+/// The list is read from the coordinator's LAN address without checking who
+/// answers: the admin's signature on it is the check. It must not be older
+/// than what this server has seen, and it must hold this server. When its
+/// coordinator has other keys than the one pinned here (it was reinstalled),
+/// this server takes those keys from the signed list: the pinned SSH host
+/// key, the WireGuard peer and the trust files.
+fn adopt(ctx: &Ctx, n: &Node, me: u32) -> Result<Coordinator> {
+    let ip = &n.cfg.coord_lan_ip;
+    let env =
+        n.fetch_signed_unpinned(ctx).map_err(|e| e.wrap(format!("cannot read the signed member list from the coordinator at {ip}")))?;
+    if env.is_empty() {
+        bail!("the coordinator at {ip} has no member list signed by you (approve from your desktop first: ./dryserver approve)");
+    }
+    let list = env
+        .list(n.verifier.as_ref(), |h| !mesh::ip(&n.cfg.wg_subnet, h).is_empty())
+        .map_err(|e| e.wrap(format!("the member list from {ip}")))?;
+    let seen = n.seen_version();
+    if list.version < seen {
+        bail!("the coordinator at {ip} serves signed list version {}, older than version {seen} this server has seen", list.version);
+    }
+    if !list.members.iter().any(|e| e.host == me) {
+        bail!("the signed member list from {ip} does not hold this server");
+    }
+    let Some(coord) = list.members.iter().find(|e| e.host == 1) else {
+        bail!("the signed member list from {ip} has no coordinator");
+    };
+    let key = crate::signed::key_body(&coord.ssh_host_key);
+    if list.version == seen {
+        let known: Option<crate::signed::Envelope> =
+            std::fs::read(n.path(node::SIGNED_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        if known.is_some_and(|k| k.doc != env.doc) {
+            bail!("the coordinator at {ip} serves a different signed list under the same version {seen}");
+        }
+        if n.coordinator_key().ok().as_deref() == Some(key.as_str()) {
+            return Ok(Coordinator::Same);
+        }
+    }
+    let same_machine = n.coordinator_key().ok().as_deref() == Some(key.as_str());
+    let members: Vec<Member> = list
+        .members
+        .iter()
+        .map(|e| Member {
+            host: e.host,
+            name: e.name.clone(),
+            wg_key: e.wg_key.clone(),
+            ssh_host_key: e.ssh_host_key.clone(),
+            // The coordinator's address is in the config; the others are
+            // learned at the next sync.
+            lan_ip: if e.host == 1 { ip.clone() } else { String::new() },
+            ..Member::default()
+        })
+        .collect();
+    let sw = node::port_link(&n.switch_mac());
+    n.apply(mesh::SelfInfo { host: me, switch: sw }, &members)?;
+    // The pin and the remembered list come last: if anything above failed,
+    // this server still pins the old coordinator and the next try starts
+    // from the beginning instead of taking the job for done.
+    n.write(node::SIGNED_FILE, 0o600, &(serde_json::to_string(&env)? + "\n"))?;
+    n.write(node::KNOWN_HOSTS, 0o600, &format!("{ip},{} {key}\n", mesh::ip(&n.cfg.wg_subnet, 1)))?;
+    Ok(if same_machine { Coordinator::Same } else { Coordinator::New })
+}
+
+/// WireGuard keys of the members in the list this server has verified;
+/// None when it has none.
+fn signed_keys(n: &Node) -> Option<Vec<String>> {
+    let env: crate::signed::Envelope = serde_json::from_slice(&std::fs::read(n.path(node::SIGNED_FILE)).ok()?).ok()?;
+    let list: crate::signed::List = serde_json::from_str(&env.doc).ok()?;
+    Some(list.members.into_iter().map(|e| e.wg_key).collect())
+}
+
+/// Undoes every cut. A cut-off coordinator is trusted again only with a
+/// member list signed by the admin that holds this server (see adopt); if
+/// it has none, the quarantine stays. Then the firewall table goes and
+/// sync and join run again.
 pub fn lift(ctx: &Ctx, n: &Node, coordinator: bool, out: &mut dyn Write) -> Result<()> {
     let lock = fsx::lock(n.path(MESH_LOCK))?;
     let st = match load(n) {
@@ -556,16 +641,71 @@ pub fn lift(ctx: &Ctx, n: &Node, coordinator: bool, out: &mut dyn Write) -> Resu
             State::default()
         }
     };
+    let me = if coordinator { 1 } else { n.load_state().host };
     let any = !st.is_empty() || fsx::exists(n.path(STATE_FILE)) || fsx::exists(n.path(NFT_FILE));
     if !any {
+        // Not cut off, but maybe left behind: a server that was switched
+        // off while the coordinator was replaced still pins the old one.
+        if !coordinator
+            && me > 0
+            && let Ok(Coordinator::New) = adopt(ctx, n, me)
+        {
+            let _ = n.reload_wg(ctx);
+            drop(lock);
+            let _ = n.run.ok(ctx, &Cmd::new("systemctl", &["start", "--no-block", "dryserver-sync.service"]));
+            let _ = writeln!(out, "{} now follows the new coordinator you signed.", n.hostname);
+            return Ok(());
+        }
         let _ = writeln!(out, "{} is not quarantined.", n.hostname);
         return Ok(());
     }
+    let unload = |errs: &mut Vec<Error>| {
+        if let Err(e) = n.run.ok(ctx, &Cmd::new("nft", &["destroy", "table", "inet", TABLE])) {
+            errs.push(e.wrap("remove the firewall table"));
+        }
+    };
     let mut errs = Vec::new();
-    // Peers first, so sync can reach the coordinator again over the mesh.
     let conf = fsx::read_or_empty(n.path(node::WG_CONF));
-    if !conf.is_empty() {
-        let saved: Vec<String> = st.cuts.iter().flat_map(|c| c.peers.clone()).collect();
+    let mut found = None;
+    if st.coordinator_cut() && !coordinator {
+        // The block has to go before the coordinator can be asked; it comes
+        // straight back if the answer is not good enough.
+        unload(&mut errs);
+        if me == 0 {
+            // Not joined yet: forget the coordinator this machine saw. It
+            // asks again and shows a new code, made with whatever
+            // coordinator answers now, for the admin to compare.
+            let _ = std::fs::remove_file(n.path(node::KNOWN_HOSTS));
+            let _ = std::fs::remove_file(n.path(node::JOIN_STATE));
+        } else {
+            match adopt(ctx, n, me) {
+                Ok(c) => found = Some(c),
+                Err(e) => {
+                    let back = n.run.ok(ctx, &Cmd::new("nft", &["-f", &n.path(NFT_FILE).display().to_string()]));
+                    let note = if back.is_ok() {
+                        "the quarantine stays"
+                    } else {
+                        "THE FIREWALL BLOCK COULD NOT BE PUT BACK, run: sudo dryserver quarantine"
+                    };
+                    return Err(e.wrap(format!("not lifted, {note}")));
+                }
+            }
+        }
+    }
+    // Saved peers go back, so sync can reach the coordinator again over the
+    // mesh. Not after a new coordinator: adopt wrote the mesh files from the
+    // signed list, and the old coordinator's peer must stay out.
+    if !conf.is_empty() && found != Some(Coordinator::New) {
+        let conf = fsx::read_or_empty(n.path(node::WG_CONF));
+        let mut saved: Vec<String> = st.cuts.iter().flat_map(|c| c.peers.clone()).collect();
+        // On a server a saved peer returns only while the admin's signed
+        // list still has its key: never a member removed in the meantime,
+        // never the old coordinator after a new one was signed. (The
+        // coordinator's own mesh follows its registry at the next sync.)
+        if !coordinator {
+            let signed = signed_keys(n).unwrap_or_default();
+            saved.retain(|b| parse_peers(b).first().is_some_and(|p| signed.contains(&p.key)));
+        }
         let back = with_peers(&conf, &saved);
         if back != conf
             && let Err(e) = n.write(node::WG_CONF, 0o600, &back)
@@ -577,9 +717,7 @@ pub fn lift(ctx: &Ctx, n: &Node, coordinator: bool, out: &mut dyn Write) -> Resu
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => errs.push(Error::from(e).wrap(format!("remove {NFT_FILE}"))),
         _ => {}
     }
-    if let Err(e) = n.run.ok(ctx, &Cmd::new("nft", &["destroy", "table", "inet", TABLE])) {
-        errs.push(e.wrap("remove the firewall table"));
-    }
+    unload(&mut errs);
     if !conf.is_empty()
         && let Err(e) = n.reload_wg(ctx)
     {
@@ -598,13 +736,20 @@ pub fn lift(ctx: &Ctx, n: &Node, coordinator: bool, out: &mut dyn Write) -> Resu
     } else {
         let _ = n.run.ok(ctx, &Cmd::new("systemctl", &["restart", "--no-block", "dryserver-join.service"]));
     }
-    let _ = writeln!(out, "Lifted on {}. Sync runs again.", n.hostname);
-    if st.coordinator_cut() {
-        let _ = writeln!(
-            out,
-            "If the coordinator was reinstalled, its keys changed and sync will fail on the old pinned key: \
-             this server has to be paired with the new coordinator again (not automated yet)."
-        );
+    match found {
+        Some(Coordinator::New) => {
+            let _ = writeln!(out, "Lifted on {}. It now follows the new coordinator you signed; the old one stays out.", n.hostname);
+        }
+        Some(Coordinator::Same) => {
+            let _ = writeln!(
+                out,
+                "Lifted on {}. The coordinator is the same machine as before (not reinstalled): this server trusts it again.",
+                n.hostname
+            );
+        }
+        None => {
+            let _ = writeln!(out, "Lifted on {}. Sync runs again.", n.hostname);
+        }
     }
     Ok(())
 }
@@ -989,6 +1134,9 @@ PersistentKeepalive = 25
         calls: Mutex<Vec<String>>,
         nft_check_fails: bool,
         gateway: String,
+        /// What the coordinator's address answers to "signed"; None: ssh
+        /// fails.
+        signed: Mutex<Option<String>>,
     }
 
     impl Runner for Fake {
@@ -997,6 +1145,10 @@ PersistentKeepalive = 25
             self.calls.lock().unwrap().push(line.clone());
             match c.name.as_str() {
                 "nft" if self.nft_check_fails && c.args.first().map(String::as_str) == Some("-c") => (String::new(), Err("syntax".into())),
+                "ssh" => match self.signed.lock().unwrap().clone() {
+                    Some(reply) => (reply, Ok(())),
+                    None => (String::new(), Err("ssh: connect to host 192.168.1.50 port 22: No route to host".into())),
+                },
                 "ip" => (format!("default via {} dev wlan0\n", self.gateway), Ok(())),
                 "wg-quick" => ("[Interface]\nListenPort = 51820\n".into(), Ok(())),
                 _ => (String::new(), Ok(())),
@@ -1004,10 +1156,46 @@ PersistentKeepalive = 25
         }
     }
 
+    const COORD_SSH: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIcoordold";
+    const NEW_SSH: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIcoordnew";
+    const ADMIN: crate::signed::fake::Key = crate::signed::fake::Key("admin");
+
+    fn wg(seed: u8) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode([seed; 32])
+    }
+
+    fn entry(host: u32, name: &str, seed: u8, ssh: &str) -> crate::signed::Entry {
+        crate::signed::Entry { host, name: name.into(), wg_key: wg(seed), ssh_host_key: ssh.into() }
+    }
+
+    /// A "signed" reply with the list sealed by key.
+    fn signed_reply(key: &crate::signed::fake::Key, version: u64, members: Vec<crate::signed::Entry>) -> (String, crate::signed::Envelope) {
+        let env = crate::signed::seal(key, &crate::signed::List { version, members, rejected: vec![] }).unwrap();
+        (serde_json::json!({ "signed": env }).to_string(), env)
+    }
+
+    /// The swarm as signed before the trouble: coordinator, this server
+    /// (node-b, host 2) and node-c.
+    fn old_list() -> Vec<crate::signed::Entry> {
+        vec![entry(1, "coord", 1, COORD_SSH), entry(2, "node-b", 2, "ssh-ed25519 AAAAb"), entry(3, "node-c", 3, "ssh-ed25519 AAAAc")]
+    }
+
+    /// WG0 with the keys of the signed list (the coordinator and node-c).
+    fn wg0() -> String {
+        WG0.replace("COORDKEY=", &wg(1)).replace("NODECKEY=", &wg(3))
+    }
+
+    /// A joined server that pins the old coordinator and has seen version 5.
     fn server(root: &Path, fake: Arc<Fake>) -> Node {
-        put(root, node::WG_CONF, WG0);
+        put(root, node::WG_CONF, wg0());
         put(root, node::WG_KEY, "PRIV=\n");
         put(root, node::JOIN_STATE, r#"{"host":2}"#);
+        put(root, "/etc/hosts", "127.0.0.1 localhost\n");
+        put(root, node::KNOWN_HOSTS, format!("192.168.1.50,10.66.0.1 {COORD_SSH}\n"));
+        let (reply, env) = signed_reply(&ADMIN, 5, old_list());
+        put(root, node::SIGNED_FILE, serde_json::to_string(&env).unwrap());
+        *fake.signed.lock().unwrap() = Some(reply);
         put(root, "/etc/nftables.conf", format!("table inet dryserver {{}}\n{NFT_INCLUDE}\n"));
         Node {
             cfg: cfg(),
@@ -1015,7 +1203,7 @@ PersistentKeepalive = 25
             root: root.to_path_buf(),
             run: fake,
             tmp_dir: Some(root.join("run")),
-            verifier: Arc::new(crate::signed::fake::Key("admin")),
+            verifier: Arc::new(ADMIN),
         }
     }
 
@@ -1033,8 +1221,8 @@ PersistentKeepalive = 25
 
         let st = load(&n).unwrap();
         assert!(st.coordinator_cut());
-        let wg = get(dir.path(), node::WG_CONF);
-        assert!(!wg.contains("COORDKEY") && wg.contains("NODECKEY"), "{wg}");
+        let conf = get(dir.path(), node::WG_CONF);
+        assert!(!conf.contains(&wg(1)) && conf.contains(&wg(3)), "{conf}");
         assert!(get(dir.path(), NFT_FILE).contains("10.66.0.1"));
         assert!(!dir.path().join("etc/dryserver/nft.d/quarantine.nft.check").exists(), "check file left behind");
         assert!(get(dir.path(), ISSUE_FILE).contains("QUARANTINE"));
@@ -1045,20 +1233,156 @@ PersistentKeepalive = 25
         cut(&ctx, &n, false, &[], &mut Vec::new()).unwrap();
         assert_eq!(load(&n).unwrap(), st);
 
+        // False alarm: the same coordinator still serves the list this
+        // server knows. Its peer goes back.
         let mut out = Vec::new();
         lift(&ctx, &n, false, &mut out).unwrap();
         assert!(load(&n).unwrap().is_empty() && !dir.path().join(STATE_FILE.trim_start_matches('/')).exists());
-        assert!(get(dir.path(), node::WG_CONF).contains("COORDKEY="), "lift must put the coordinator's peer back");
+        let conf = get(dir.path(), node::WG_CONF);
+        assert_eq!(parse_peers(&conf).len(), 2, "lift must put the coordinator's peer back, and nothing else:\n{conf}");
+        assert!(conf.matches(&wg(1)).count() == 1 && conf.contains(&wg(3)), "{conf}");
         assert!(get(dir.path(), NFT_FILE).is_empty() && get(dir.path(), ISSUE_FILE).is_empty());
         let calls = fake.calls.lock().unwrap().join("\n");
         assert!(
             calls.contains("nft destroy table inet dryserver_quarantine") && calls.contains("systemctl start --no-block dryserver-sync")
         );
-        assert!(String::from_utf8_lossy(&out).contains("paired with the new coordinator"));
+        assert!(calls.contains("StrictHostKeyChecking=no") && calls.contains("dryreg@192.168.1.50 signed"), "{calls}");
+        assert!(String::from_utf8_lossy(&out).contains("same machine as before"), "{}", String::from_utf8_lossy(&out));
         // Lifting when nothing is cut is fine.
         let mut out = Vec::new();
         lift(&ctx, &n, false, &mut out).unwrap();
         assert!(String::from_utf8_lossy(&out).contains("not quarantined"));
+    }
+
+    #[test]
+    fn lift_follows_a_new_coordinator_only_if_signed() {
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        let ctx = Ctx::new();
+        cut(&ctx, &n, false, &[], &mut Vec::new()).unwrap();
+        let cut_conf = get(dir.path(), node::WG_CONF);
+        let calls_before = fake.calls.lock().unwrap().len();
+        let new_coord =
+            || vec![entry(1, "coord", 9, NEW_SSH), entry(2, "node-b", 2, "ssh-ed25519 AAAAb"), entry(3, "node-c", 3, "ssh-ed25519 AAAAc")];
+
+        // Whatever answers at the coordinator's address without a list the
+        // admin signed for this server: the quarantine stays.
+        let refused: Vec<(Option<String>, &str)> = vec![
+            (None, "cannot read the signed member list"),
+            (Some(r#"{"signed":{}}"#.into()), "no member list signed by you"),
+            (Some("garbage".into()), "cannot read the signed member list"),
+            (Some(signed_reply(&crate::signed::fake::Key("thief"), 9, new_coord()).0), "bad signature"),
+            (Some(signed_reply(&ADMIN, 4, new_coord()).0), "older than version 5"),
+            (Some(signed_reply(&ADMIN, 5, new_coord()).0), "different signed list under the same version"),
+            (
+                Some(signed_reply(&ADMIN, 9, vec![entry(1, "coord", 9, NEW_SSH), entry(3, "node-c", 3, "ssh-ed25519 AAAAc")]).0),
+                "does not hold this server",
+            ),
+        ];
+        for (reply, want) in refused {
+            *fake.signed.lock().unwrap() = reply;
+            let e = lift(&ctx, &n, false, &mut Vec::new()).unwrap_err().to_string();
+            assert!(e.contains(want) && e.contains("the quarantine stays"), "want {want:?}: {e}");
+            assert!(load(&n).unwrap().coordinator_cut(), "the cut was dropped ({want})");
+            assert_eq!(get(dir.path(), node::WG_CONF), cut_conf, "wg0.conf changed ({want})");
+            assert!(get(dir.path(), node::KNOWN_HOSTS).contains(COORD_SSH), "the pin changed ({want})");
+            assert!(!get(dir.path(), NFT_FILE).is_empty(), "the rules file was removed ({want})");
+        }
+        // Each refusal put the firewall table back.
+        let calls = fake.calls.lock().unwrap()[calls_before..].join("\n");
+        assert_eq!(calls.matches("nft destroy table").count(), calls.matches("nft -f ").count(), "{calls}");
+
+        // A switch that fails half way (here: the SSH trust file cannot be
+        // written) leaves the old pin, so the next try starts over.
+        let (reply, _) = signed_reply(&ADMIN, 9, new_coord());
+        *fake.signed.lock().unwrap() = Some(reply);
+        let kh = dir.path().join("etc/ssh/ssh_known_hosts.tmp");
+        std::fs::create_dir_all(&kh).unwrap();
+        let e = lift(&ctx, &n, false, &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("the quarantine stays"), "{e}");
+        assert!(get(dir.path(), node::KNOWN_HOSTS).contains(COORD_SSH), "the pin must change last");
+        assert!(load(&n).unwrap().coordinator_cut());
+        std::fs::remove_dir_all(&kh).unwrap();
+
+        // The admin reinstalled the coordinator and signed it: this server
+        // takes its keys from the signed list. The old coordinator's peer
+        // does not come back.
+        let (reply, env) = signed_reply(&ADMIN, 9, new_coord());
+        *fake.signed.lock().unwrap() = Some(reply);
+        let mut out = Vec::new();
+        lift(&ctx, &n, false, &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("follows the new coordinator you signed"), "{}", String::from_utf8_lossy(&out));
+        let wg0 = get(dir.path(), node::WG_CONF);
+        assert!(wg0.contains(&wg(9)) && wg0.contains(&wg(3)) && !wg0.contains(&wg(1)), "{wg0}");
+        assert!(wg0.contains("Endpoint = 192.168.1.50:51820"), "the new coordinator is reached at its configured address:\n{wg0}");
+        let pin = get(dir.path(), node::KNOWN_HOSTS);
+        assert!(pin.contains(NEW_SSH) && !pin.contains(COORD_SSH) && pin.starts_with("192.168.1.50,10.66.0.1 "), "{pin}");
+        assert!(get(dir.path(), node::SIGNED_FILE).contains(&env.sig));
+        assert!(get(dir.path(), "/etc/ssh/ssh_known_hosts").contains("coord,10.66.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIcoordnew"));
+        assert!(load(&n).unwrap().is_empty() && get(dir.path(), NFT_FILE).is_empty());
+
+        // Cut again and lift again: the peer saved from the new coordinator
+        // returns, never the one of the old coordinator.
+        cut(&ctx, &n, false, &[], &mut Vec::new()).unwrap();
+        lift(&ctx, &n, false, &mut Vec::new()).unwrap();
+        let wg0 = get(dir.path(), node::WG_CONF);
+        assert!(wg0.contains(&wg(9)) && !wg0.contains(&wg(1)), "{wg0}");
+    }
+
+    #[test]
+    fn a_removed_member_does_not_return_with_lift() {
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        let ctx = Ctx::new();
+        // node-c was cut by name; meanwhile the admin removed it for good.
+        cut(&ctx, &n, false, &["node-c".into()], &mut Vec::new()).unwrap();
+        let (_, env) = signed_reply(&ADMIN, 6, vec![entry(1, "coord", 1, COORD_SSH), entry(2, "node-b", 2, "ssh-ed25519 AAAAb")]);
+        put(dir.path(), node::SIGNED_FILE, serde_json::to_string(&env).unwrap());
+        lift(&ctx, &n, false, &mut Vec::new()).unwrap();
+        let wg0 = get(dir.path(), node::WG_CONF);
+        assert!(wg0.contains(&wg(1)) && !wg0.contains(&wg(3)), "a member the admin removed came back:\n{wg0}");
+    }
+
+    #[test]
+    fn a_server_left_behind_follows_the_new_coordinator() {
+        // Switched off while the coordinator was replaced: never cut, still
+        // pins the old one.
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        let (reply, _) = signed_reply(&ADMIN, 9, vec![entry(1, "coord", 9, NEW_SSH), entry(2, "node-b", 2, "ssh-ed25519 AAAAb")]);
+        *fake.signed.lock().unwrap() = Some(reply);
+        let mut out = Vec::new();
+        lift(&Ctx::new(), &n, false, &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("now follows the new coordinator you signed"));
+        assert!(get(dir.path(), node::KNOWN_HOSTS).contains(NEW_SSH));
+        assert!(get(dir.path(), node::WG_CONF).contains(&wg(9)));
+        // An unsigned answer changes nothing and just says "not quarantined".
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        *fake.signed.lock().unwrap() = Some(signed_reply(&crate::signed::fake::Key("thief"), 9, old_list()).0);
+        let mut out = Vec::new();
+        lift(&Ctx::new(), &n, false, &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("not quarantined"));
+        assert!(get(dir.path(), node::KNOWN_HOSTS).contains(COORD_SSH) && get(dir.path(), node::WG_CONF) == wg0());
+    }
+
+    #[test]
+    fn lift_before_joining_forgets_the_coordinator() {
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        put(dir.path(), node::JOIN_STATE, r#"{"request_id":"0123456789abcdef","code":"111 222"}"#);
+        std::fs::remove_file(dir.path().join("etc/wireguard/wg0.conf")).unwrap();
+        cut(&Ctx::new(), &n, false, &[], &mut Vec::new()).unwrap();
+        lift(&Ctx::new(), &n, false, &mut Vec::new()).unwrap();
+        assert!(get(dir.path(), node::KNOWN_HOSTS).is_empty(), "the old pin must go, so the next code is made with what answers now");
+        assert!(get(dir.path(), node::JOIN_STATE).is_empty());
+        let calls = fake.calls.lock().unwrap().join("\n");
+        assert!(calls.contains("systemctl restart --no-block dryserver-join.service"), "{calls}");
     }
 
     #[test]
@@ -1071,7 +1395,7 @@ PersistentKeepalive = 25
         assert!(!dir.path().join(NFT_FILE.trim_start_matches('/')).exists(), "a file that failed the check reached nft.d");
         // The cut is still saved and the peer still removed.
         assert!(load(&n).unwrap().coordinator_cut());
-        assert!(!get(dir.path(), node::WG_CONF).contains("COORDKEY"));
+        assert!(!get(dir.path(), node::WG_CONF).contains(&wg(1)));
     }
 
     #[test]

@@ -206,7 +206,22 @@ The servers keep running and keep talking to each other. Then:
 
 1. delete the tunnel in the Cloudflare dashboard, if you use one,
 2. power off the coordinator and keep its disk for investigation,
-3. reinstall it from the USB stick.
+3. reinstall it from the USB stick, as coordinator, at the same address,
+4. `./dryserver approve`: it says the machine there has another SSH key.
+   Press `N`, compare the code with the new coordinator's screen, confirm.
+   Your desktop signs a new list with the new coordinator in the old one's
+   place; every machine you signed before stays in it,
+5. `./dryserver quarantine-all -lift`: each server reads the signed list
+   from the coordinator's address, takes the new coordinator's keys from it
+   and follows it. The old coordinator stays out.
+
+A server lifts its quarantine only onto a coordinator that serves a list you
+signed, which holds that server and is not older than one it has seen.
+Whatever else answers at the coordinator's address, the quarantine stays.
+The new coordinator must also carry the proof from your USB stick, so a
+machine that was not installed from it cannot take the coordinator's place.
+A server that was switched off during all this runs
+`sudo dryserver quarantine -lift` once to follow the new coordinator.
 
 `quarantine` also prints the WireGuard peers each server keeps. A hacked
 coordinator may have added its own; cut any you do not know by name:
@@ -228,11 +243,8 @@ list. Give servers a fixed address in your router (DHCP reservation), so the
 
 Limits for now:
 
-- `-lift` is for a false alarm. After reinstalling the coordinator its keys
-  are new, and servers have to be paired with it again (not automated yet).
-- Servers installed by an older dryserver keep the cut over a reboot only for
-  WireGuard and sync; run `quarantine` again after a reboot to block the
-  addresses too, or reinstall them.
+- After a false alarm (the coordinator was not reinstalled), `-lift` trusts
+  the same machine again. Do that only when you are sure.
 - The coordinator's IPv6 addresses on the WiFi/router network are not
   blocked. WireGuard is cut, and SSH still needs your key.
 

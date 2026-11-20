@@ -124,6 +124,10 @@ pub struct State {
     pub signed: Envelope,
     #[serde(skip_serializing_if = "is_zero64")]
     pub signed_version: u64,
+    /// The installer's proof that this coordinator was installed from the
+    /// admin's USB stick (see join_proof). The coordinator cannot make one.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub coordinator_proof: String,
 }
 
 /// The 6-digit code both sides show. It covers the new node's keys and the
@@ -167,11 +171,16 @@ pub fn join_proof(secret: &str, name: &str, wg_key: &str, ssh_host_key: &str) ->
     fsx::hex(&hmac_sha256(secret.trim().as_bytes(), msg.as_bytes()))
 }
 
-/// Whether r carries the proof for its own fields. Compared in constant
-/// time.
+/// Whether r carries the proof for its own fields.
 pub fn proof_ok(secret: &str, r: &Request) -> bool {
-    let want = join_proof(secret, &r.name, &r.wg_key, &r.ssh_host_key);
-    let (a, b) = (want.as_bytes(), r.proof.as_bytes());
+    proof_matches(secret, &r.name, &r.wg_key, &r.ssh_host_key, &r.proof)
+}
+
+/// Whether proof is the one for this name and these keys. Compared in
+/// constant time.
+pub fn proof_matches(secret: &str, name: &str, wg_key: &str, ssh_host_key: &str, proof: &str) -> bool {
+    let want = join_proof(secret, name, wg_key, ssh_host_key);
+    let (a, b) = (want.as_bytes(), proof.as_bytes());
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
@@ -575,6 +584,8 @@ pub struct AdminState {
     pub unknown: Vec<Device>,
     pub scanned: Time,
     pub signed: Envelope,
+    /// See State::coordinator_proof.
+    pub coordinator_proof: String,
 }
 
 /// Answers "status". When approved it carries what the node needs to bring
@@ -627,6 +638,7 @@ fn valid_id(s: &str) -> bool {
 ///   request      stdin: Request JSON        -> {"id": ...}         (any source)
 ///   status ID                               -> StatusReply         (any source)
 ///   peers        stdin: {"lan_ip","switch"} -> {"members": [...], "signed": ...}  (mesh members only)
+///   signed                                  -> {"signed": ...}     (any source; it proves itself)
 ///   admin        stdin: signed admin request -> AdminState          (holder of the signing key)
 ///   publish      stdin: signed member list   -> {"version": N}      (holder of the signing key)
 ///
@@ -680,6 +692,13 @@ pub fn serve(
             })?;
             send(out, &serde_json::json!({ "members": members, "signed": signed }))
         }
+        ("signed", 1) => {
+            // Not secret, and nobody can change it without the admin's key.
+            // A server that cut the coordinator off reads it here, over the
+            // LAN, before it trusts the coordinator again.
+            let signed = st.read()?.signed;
+            send(out, &serde_json::json!({ "signed": signed }))
+        }
         ("admin", 1) => {
             let req: Envelope = decode_first(input).ok_or_else(|| Error::new("bad admin request"))?;
             signed::open_admin(verifier, &req, "state", now.0.timestamp())?;
@@ -691,6 +710,7 @@ pub fn serve(
                     unknown: s.unknown.clone(),
                     scanned: s.scanned,
                     signed: s.signed.clone(),
+                    coordinator_proof: s.coordinator_proof.clone(),
                 })
             })?;
             send(out, &reply)
@@ -1155,6 +1175,11 @@ mod tests {
         let out: serde_json::Value = serde_json::from_str(&call(&st, "peers", "10.66.0.2 5000 22", hb).unwrap()).unwrap();
         let env: Envelope = serde_json::from_value(out["signed"].clone()).unwrap();
         assert_eq!(env.list(&ADMIN, |h| h < 255).unwrap(), list, "nodes must get the list exactly as it was signed");
+        // The same list for anyone who asks from the LAN, and nothing else.
+        let out = call(&st, "signed", "192.168.1.77 5000 22", "").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(serde_json::from_value::<Envelope>(v["signed"].clone()).unwrap(), env);
+        assert!(v.as_object().unwrap().len() == 1 && !out.contains("lan_ip"), "signed must not leak addresses: {out}");
     }
 
     #[test]

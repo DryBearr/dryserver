@@ -179,8 +179,44 @@ impl Node {
         self.run.run(ctx, &Cmd::new("ssh", &args).stdin(stdin).stdout_only())
     }
 
+    /// Asks the coordinator at its LAN address for the signed member list
+    /// without checking its SSH host key. Safe only because the caller
+    /// verifies the admin's signature on what comes back: whoever answers
+    /// can send an old list or none, but not a forged one.
+    pub fn fetch_signed_unpinned(&self, ctx: &Ctx) -> Result<Envelope> {
+        let key = self.path(REGISTRY_KEY).display().to_string();
+        let target = format!("{}@{}", sysconf::REGISTRY_USER, self.cfg.coord_lan_ip);
+        let args = [
+            "-i",
+            &key,
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            &target,
+            "signed",
+        ];
+        let out = self.run.output(ctx, &Cmd::new("ssh", &args).stdout_only())?;
+        #[derive(Deserialize)]
+        struct Reply {
+            #[serde(default)]
+            signed: Envelope,
+        }
+        Ok(serde_json::from_str::<Reply>(&out).map_err(|e| Error::from(e).wrap("the coordinator's answer"))?.signed)
+    }
+
     /// The host key pinned for the coordinator.
-    fn coordinator_key(&self) -> Result<String> {
+    pub fn coordinator_key(&self) -> Result<String> {
         let text = fsx::read_string(self.path(KNOWN_HOSTS))?;
         for line in text.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
@@ -357,6 +393,17 @@ impl Node {
             eprintln!("dryserver: sync: ignoring {p}");
         }
         Ok((members, signed))
+    }
+
+    /// Version of the newest signed list this server has verified, 0 if
+    /// none.
+    pub fn seen_version(&self) -> u64 {
+        std::fs::read(self.path(SIGNED_FILE))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Envelope>(&b).ok())
+            .and_then(|e| serde_json::from_str::<signed::List>(&e.doc).ok())
+            .map(|l| l.version)
+            .unwrap_or(0)
     }
 
     /// The members this server uses: exactly the list the admin signed.

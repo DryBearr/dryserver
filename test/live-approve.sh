@@ -28,19 +28,27 @@ keygen "$S/desk/secrets/signing_ed25519" dryserver-signing
 # but not the private signing key.
 cp "$S/desk/secrets/registry_ed25519"* "$S/thief/secrets/"
 keygen "$S/thief/secrets/signing_ed25519" thief
+
 # The join secret from the stick: the desktop has it, and so does the thief.
 SECRET=$(openssl rand -hex 32)
 echo "$SECRET" > "$S/desk/secrets/join_secret"
 cp "$S/desk/secrets/join_secret" "$S/thief/secrets/"
-
 cp "$S/hostkey.pub" "$S/root/etc/ssh/ssh_host_ed25519_key.pub"
 cp "$S/desk/secrets/signing_ed25519.pub" "$S/root/usr/local/share/dryserver/"
 COORD_WG=$(wg genkey | wg pubkey)
 NODE_WG=$(wg genkey | wg pubkey)
 HOSTKEY=$(cut -d' ' -f1,2 "$S/hostkey.pub")
-cat > "$S/root/var/lib/dryserver/registry.json" <<EOF
-{"members":[{"host":1,"name":"coord","wg_key":"$COORD_WG","ssh_host_key":"$HOSTKEY root@coord","lan_ip":"127.0.0.1"}]}
+# What the installer of a coordinator leaves: itself as member 1 and its
+# proof, made with the join secret from the stick.
+proof() { printf 'dryserver-join-v1\n%s\n%s\n%s' "$1" "$2" "$3" | openssl dgst -sha256 -hmac "$SECRET" -r | cut -d' ' -f1; }
+registry() { # root, wg key, host key
+    mkdir -p "$1"/{etc/ssh,usr/local/share/dryserver,var/lib/dryserver}
+    cp "$S/desk/secrets/signing_ed25519.pub" "$1/usr/local/share/dryserver/"
+    cat > "$1/var/lib/dryserver/registry.json" <<EOF
+{"members":[{"host":1,"name":"coord","wg_key":"$2","ssh_host_key":"$3 root@coord","lan_ip":"127.0.0.1"}],"coordinator_proof":"$(proof coord "$2" "$3")"}
 EOF
+}
+registry "$S/root" "$COORD_WG" "$HOSTKEY"
 for d in desk thief; do
     printf "COORD_LAN_IP='127.0.0.1'\nWG_SUBNET='10.66.0.0/24'\nWG_PORT='51820'\nUSERNAME='admin'\n" > "$S/$d/config.env"
 done
@@ -129,7 +137,7 @@ screen() { local o; o=$(screen_raw "$@" 2>&1); local rc=$?; [ -n "${DEBUG_DIR:-}
 echo "== a machine asks to join"
 NODE_HK="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGVmCw4JXa0JQ1x0Z3ZJ3vY3lMSa7p4rG5Q6k8hO2c3d"
 # What the installer does on the new machine: HMAC over its name and keys.
-PROOF=$(printf 'dryserver-join-v1\nnode-a\n%s\n%s' "$NODE_WG" "$NODE_HK" | openssl dgst -sha256 -hmac "$SECRET" -r | cut -d' ' -f1)
+PROOF=$(proof node-a "$NODE_WG" "$NODE_HK")
 REQ=$(printf '{"name":"node-a","wg_key":"%s","ssh_host_key":"%s root@node-a","lan_ip":"192.168.1.23","switch":true,"proof":"%s"}' "$NODE_WG" "$NODE_HK" "$PROOF")
 out=$(echo "$REQ" | reg request)
 check "request accepted ($out)" grep -q '"id"' <<<"$out"
@@ -202,11 +210,41 @@ out=$(reg publish < "$S/old.json" 2>&1)
 check "the old signed list cannot bring node-a back ($out)" grep -q "not newer" <<<"$out"
 check "coordinator still has 1 member" test "$(jqr "len(d['members'])")" = 1
 
-echo "== the coordinator is replaced by another machine"
+echo "== something else answers at the coordinator's address"
 keygen "$S/hostkey2" other
 start_sshd "$S/hostkey2"
-out=$(screen "$S/desk" "talk to the coordinator|Waiting to join" "" 2>&1)
+out=$(screen "$S/desk" "press N to look at the new one" "N" "Not a coordinator of yours|y to confirm" "" 2>&1)
 check "approve refuses a machine with another SSH key" grep -q "does not have the SSH key this computer saw before" <<<"$out"
+check "N finds no coordinator of yours (it serves the old registry)" grep -q "Not a coordinator of yours" <<<"$out"
+check "the pin is still the old key" grep -qF "$HOSTKEY" "$S/desk/secrets/coordinator_known_hosts"
+
+echo "== the coordinator is reinstalled from the stick"
+# A member to carry over.
+start_sshd "$S/hostkey"
+NODE2_WG=$(wg genkey | wg pubkey)
+printf '{"name":"node-c","wg_key":"%s","ssh_host_key":"%s root@node-c","lan_ip":"192.168.1.25","proof":"%s"}' "$NODE2_WG" "$NODE_HK" "$(proof node-c "$NODE2_WG" "$NODE_HK")" | reg request >/dev/null
+out=$(screen "$S/desk" "node-c" "a" "approved and signed|Failed" "")
+check "node-c approved on the old coordinator" grep -q "node-c approved and signed" <<<"$out"
+VOLD=$(jqr "d['signed_version']")
+# Fresh install: new SSH key, new WireGuard key, empty registry, own proof.
+NEW_WG=$(wg genkey | wg pubkey)
+HOSTKEY2=$(cut -d' ' -f1,2 "$S/hostkey2.pub")
+registry "$S/root2" "$NEW_WG" "$HOSTKEY2"
+cp "$S/hostkey2.pub" "$S/root2/etc/ssh/ssh_host_ed25519_key.pub"
+echo "restrict,command=\"$BIN registry --subnet 10.66.0.0/24 --root $S/root2\" $(cat "$S/desk/secrets/registry_ed25519.pub")" > "$S/authorized_keys"
+start_sshd "$S/hostkey2"
+jq2() { python3 -I -c "import json,sys; d=json.load(open('$S/root2/var/lib/dryserver/registry.json')); print($1)"; }
+out=$(screen "$S/desk" "press N to look at the new one" "N" "Its screen must show the code [0-9]{3} [0-9]{3}" "y" "is your coordinator now|Failed" "")
+check "N shows the new coordinator's code" grep -Eq "Its screen must show the code [0-9]{3} [0-9]{3}" <<<"$out"
+check "the new coordinator is taken over" grep -q "coord is your coordinator now" <<<"$out"
+check "the new key is pinned" grep -qF "$HOSTKEY2" "$S/desk/secrets/coordinator_known_hosts"
+check "the new coordinator has node-c back" test "$(jq2 "sorted(m['name'] for m in d['members'])")" = "['coord', 'node-c']"
+check "its entry carries the new keys" test "$(jq2 "d['members'][0]['wg_key']")" = "$NEW_WG"
+check "version went up ($VOLD -> $(jq2 "d['signed_version']"))" test "$(jq2 "d['signed_version']")" -gt "$VOLD"
+out=$(echo | reg signed)
+check "servers can read the signed list from it" grep -q "BEGIN SSH SIGNATURE" <<<"$out"
+out=$(screen "$S/desk" "node-c" "" 2>&1)
+check_not "the screen is clean afterwards" grep -q "NOT SIGNED\|Cannot talk" <<<"$out"
 
 echo "== $pass passed, $fail failed"
 [ "$fail" = 0 ]

@@ -26,10 +26,17 @@ pub const KNOWN_HOSTS: &str = "coordinator_known_hosts";
 
 /// A way to run one registry command on the coordinator.
 pub trait Link {
+    /// Runs one registry command. Fails with Kind::HostKey when the machine
+    /// at the coordinator's address has another SSH key than the pinned one.
     fn call(&self, command: &str, stdin: &str) -> Result<String>;
     /// The coordinator's SSH host key ("type base64") that this desktop
     /// pinned on first contact.
     fn host_key(&self) -> Result<String>;
+    /// The SSH host key of whatever answers at the coordinator's address
+    /// now. Nothing vouches for it.
+    fn scan_host_key(&self) -> Result<String>;
+    /// Replaces the pinned host key ("" removes it).
+    fn repin(&self, key: &str) -> Result<()>;
 }
 
 /// The registry over SSH, with the key from secrets/ that every machine
@@ -82,11 +89,14 @@ impl Link for SshLink {
         // The coordinator's words: never raw onto the admin's terminal.
         let msg = clean(String::from_utf8_lossy(&out.stderr).trim(), 300);
         if msg.contains("Host key verification failed") || msg.contains("HOST IDENTIFICATION HAS CHANGED") {
-            bail!(
-                "the machine at {} does not have the SSH key this computer saw before. Either the coordinator was \
-                 reinstalled, or something else answers at its address. Nothing was sent.",
-                self.host
-            );
+            return Err(Error::with_kind(
+                crate::err::Kind::HostKey,
+                format!(
+                    "the machine at {} does not have the SSH key this computer saw before. Either the coordinator was \
+                     reinstalled, or something else answers at its address. Nothing was sent.",
+                    self.host
+                ),
+            ));
         }
         if out.status.code() == Some(255) {
             bail!("cannot reach the coordinator at {}: {}", self.host, msg.lines().last().unwrap_or("no answer"));
@@ -105,6 +115,37 @@ impl Link for SshLink {
             }
         }
         bail!("the coordinator's SSH key is not recorded in {}", self.known_hosts.display())
+    }
+
+    fn scan_host_key(&self) -> Result<String> {
+        let port = if self.port.is_empty() { "22" } else { &self.port };
+        let out = Command::new("ssh-keyscan")
+            .args(["-t", "ed25519", "-T", "5", "-p", port, &self.host])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| Error::from(e).wrap("ssh-keyscan"))?;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() >= 3 && f[1] == "ssh-ed25519" && f[2].chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')) {
+                return Ok(format!("{} {}", f[1], f[2]));
+            }
+        }
+        bail!("no SSH server answers at {}", self.host)
+    }
+
+    fn repin(&self, key: &str) -> Result<()> {
+        if key.is_empty() {
+            return match std::fs::remove_file(&self.known_hosts) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(Error::from(e).wrap(format!("remove {}", self.known_hosts.display())))
+                }
+                _ => Ok(()),
+            };
+        }
+        let tmp = PathBuf::from(format!("{}.tmp", self.known_hosts.display()));
+        fsx::write_file(&tmp, format!("{} {}\n", self.known_name(), key_body(key)), 0o600)?;
+        fsx::rename(&tmp, &self.known_hosts)
     }
 }
 
@@ -143,6 +184,18 @@ pub struct View {
     pub warnings: Vec<String>,
 }
 
+/// A machine at the coordinator's address with other keys than the ones
+/// this desktop knew: what it says it is. Nothing has been changed yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewCoordinator {
+    pub name: String,
+    /// The code its screen must show.
+    pub code: String,
+    entry: Entry,
+    /// The pin to put back when the admin says no.
+    old_pin: String,
+}
+
 impl View {
     pub fn unsigned(&self) -> Vec<String> {
         self.members.iter().filter(|(_, s)| !s).map(|(m, _)| m.name.clone()).collect()
@@ -163,6 +216,9 @@ pub struct Admin {
     members: Vec<Member>,
     pending: Vec<Request>,
     unproved: Vec<String>,
+    /// The coordinator showed the proof that it was installed from the
+    /// admin's stick, for the keys it has now.
+    coordinator_proved: bool,
 }
 
 impl Admin {
@@ -178,6 +234,7 @@ impl Admin {
             members: Vec::new(),
             pending: Vec::new(),
             unproved: Vec::new(),
+            coordinator_proved: false,
         }
     }
 
@@ -217,8 +274,11 @@ impl Admin {
 
         let (members, problems) = registry::check_members(st.members, |h| self.fits(h));
         v.warnings.extend(problems.into_iter().map(|p| format!("The coordinator lists a bad entry, ignored: {p}")));
+        self.coordinator_proved = false;
         if let Some(c) = members.iter().find(|m| m.host == 1) {
             v.coordinator_code = registry::coordinator_code(&c.wg_key, &coord_key);
+            self.coordinator_proved =
+                registry::proof_matches(&self.join_secret()?, &c.name, &c.wg_key, &c.ssh_host_key, &st.coordinator_proof);
         }
         match members.iter().find(|m| m.host == 1) {
             None => v.warnings.push("The coordinator sent no entry for itself.".into()),
@@ -329,6 +389,12 @@ impl Admin {
             if key_body(&c.ssh_host_key) != self.link.host_key()? {
                 bail!("the coordinator's own entry has another SSH key than the machine you are connected to; nothing signed");
             }
+            if !self.coordinator_proved {
+                bail!(
+                    "the machine at the coordinator's address has no valid proof from your USB stick: it was not installed \
+                     from it, or it is not the coordinator. Nothing signed."
+                );
+            }
             list.members.insert(0, Entry::of(c));
         }
         change(&mut list, self)?;
@@ -419,7 +485,87 @@ impl Admin {
         if self.base.members.iter().any(|e| e.host == 1) {
             bail!("the coordinator is signed already");
         }
+        if !self.coordinator_proved {
+            bail!(
+                "the machine at the coordinator's address has no valid proof from your USB stick: it was not installed \
+                 from it, or it is not the coordinator. Not signed."
+            );
+        }
         self.publish(|_, _| Ok(())).map(|_| ())
+    }
+
+    /// After Kind::HostKey: looks at the machine that answers at the
+    /// coordinator's address now. It must show the proof from the admin's
+    /// USB stick for the keys it has; the code is for the admin to compare
+    /// with its screen. Changes nothing: the old pin is back when this
+    /// returns.
+    pub fn probe_new_coordinator(&mut self) -> Result<NewCoordinator> {
+        let old_pin = self.link.host_key().unwrap_or_default();
+        let key = self.link.scan_host_key()?;
+        if key == old_pin {
+            bail!("the coordinator has the SSH key this computer knows; there is nothing to replace");
+        }
+        self.link.repin(&key)?;
+        let looked = (|| -> Result<NewCoordinator> {
+            let ask = signed::seal_admin(self.signer.as_ref(), "state", (self.now)().0.timestamp())?;
+            let out = self.link.call("admin", &serde_json::to_string(&ask)?)?;
+            let st: AdminState = serde_json::from_str(&out).map_err(|e| Error::from(e).wrap("the new coordinator's answer"))?;
+            let (members, _) = registry::check_members(st.members, |h| self.fits(h));
+            let Some(c) = members.iter().find(|m| m.host == 1) else {
+                bail!("the machine at the coordinator's address sent no valid entry for itself");
+            };
+            if key_body(&c.ssh_host_key) != key {
+                bail!("the machine at the coordinator's address claims another SSH key than the one it uses");
+            }
+            if !registry::proof_matches(&self.join_secret()?, &c.name, &c.wg_key, &c.ssh_host_key, &st.coordinator_proof) {
+                bail!(
+                    "the machine at the coordinator's address has no valid proof from your USB stick: it was not installed \
+                     from it as a coordinator"
+                );
+            }
+            Ok(NewCoordinator {
+                name: c.name.clone(),
+                code: registry::coordinator_code(&c.wg_key, &key),
+                entry: Entry::of(c),
+                old_pin: old_pin.clone(),
+            })
+        })();
+        // Back to the old pin either way: only accept changes it.
+        self.link.repin(&old_pin)?;
+        looked
+    }
+
+    /// Makes the probed machine the coordinator: pins its SSH key and signs
+    /// a new list in which it replaces the old coordinator. Every other
+    /// member stays, from this desktop's copy of the last signed list. The
+    /// servers take the new keys from that list when their quarantine is
+    /// lifted.
+    pub fn accept_new_coordinator(&mut self, c: &NewCoordinator) -> Result<u64> {
+        // The base is this desktop's copy: the old coordinator is gone and
+        // the new one has no list yet.
+        let fits = |h: u32| !crate::mesh::ip(&self.subnet, h).is_empty();
+        self.base = match std::fs::read(self.copy_path()) {
+            Err(_) => List::default(),
+            Ok(b) => serde_json::from_slice::<Envelope>(&b)
+                .map_err(Error::from)
+                .and_then(|e| e.list(self.verifier.as_ref(), fits))
+                .map_err(|e| e.wrap(format!("this computer's copy of the signed list ({}) was refused", self.copy_path().display())))?,
+        };
+        if self.base.members.iter().any(|e| e.host != 1 && (e.name == c.entry.name || e.wg_key == c.entry.wg_key)) {
+            bail!("a signed member already has the new coordinator's name or key ({}); remove it first", c.entry.name);
+        }
+        self.link.repin(&c.entry.ssh_host_key)?;
+        let entry = c.entry.clone();
+        let res = self.publish(|list, _| {
+            list.members.retain(|e| e.host != 1);
+            list.members.insert(0, entry);
+            Ok(())
+        });
+        if res.is_err() && self.base.members.first().is_some_and(|e| e.host == 1 && *e != c.entry) {
+            // Nothing was signed: keep pinning the coordinator in the list.
+            let _ = self.link.repin(&c.old_pin);
+        }
+        res
     }
 
     /// Signs and sends the current list again under a new version, for
@@ -488,10 +634,15 @@ pub mod tests {
         pub publish_fails: Arc<Mutex<bool>>,
         /// The coordinator's signature checker; None: the fake admin key.
         pub verifier: Option<Box<dyn Verifier>>,
+        /// What this desktop pinned; host_key is what the machine has.
+        pub pinned: Arc<Mutex<String>>,
     }
 
     impl Link for Direct {
         fn call(&self, command: &str, stdin: &str) -> Result<String> {
+            if *self.pinned.lock().unwrap() != self.host_key {
+                return Err(Error::with_kind(crate::err::Kind::HostKey, "does not have the SSH key this computer saw before"));
+            }
             if command == "publish" && *self.publish_fails.lock().unwrap() {
                 return Err("cannot reach the coordinator".into());
             }
@@ -512,7 +663,15 @@ pub mod tests {
             Ok(String::from_utf8(out).unwrap())
         }
         fn host_key(&self) -> Result<String> {
+            let k = self.pinned.lock().unwrap().clone();
+            if k.is_empty() { Err("not recorded".into()) } else { Ok(k) }
+        }
+        fn scan_host_key(&self) -> Result<String> {
             Ok(self.host_key.clone())
+        }
+        fn repin(&self, key: &str) -> Result<()> {
+            *self.pinned.lock().unwrap() = key_body(key);
+            Ok(())
         }
     }
 
@@ -548,6 +707,7 @@ pub mod tests {
                     lan_ip: "192.168.1.50".into(),
                     ..Member::default()
                 }];
+                s.coordinator_proof = registry::join_proof(SECRET, "coord", &key32(1), COORD_KEY);
                 Ok(())
             })
             .unwrap();
@@ -555,9 +715,29 @@ pub mod tests {
         std::fs::create_dir_all(&secrets).unwrap();
         std::fs::write(secrets.join(crate::iso::JOIN_SECRET), format!("{SECRET}\n")).unwrap();
         let fails: Arc<Mutex<bool>> = Arc::default();
-        let link = Direct { store: Store::new(&store.path), host_key: COORD_KEY.into(), publish_fails: fails.clone(), verifier: None };
+        let link = Direct {
+            store: Store::new(&store.path),
+            host_key: COORD_KEY.into(),
+            publish_fails: fails.clone(),
+            verifier: None,
+            pinned: Arc::new(Mutex::new(COORD_KEY.into())),
+        };
         let a = Admin::new(Box::new(link), Box::new(Key("admin")), Box::new(Key("admin")), &secrets, "10.66.0.0/24");
         (a, store, fails)
+    }
+
+    /// Points a at another coordinator machine while it still pins the
+    /// first one's SSH key.
+    pub fn move_to(a: &mut Admin, store: &Store, host_key: &str) -> Arc<Mutex<String>> {
+        let pinned = Arc::new(Mutex::new(COORD_KEY.to_string()));
+        a.link = Box::new(Direct {
+            store: Store::new(&store.path),
+            host_key: host_key.into(),
+            publish_fails: Arc::default(),
+            verifier: None,
+            pinned: pinned.clone(),
+        });
+        pinned
     }
 
     fn ask(store: &Store, name: &str, seed: u8) -> String {
@@ -649,6 +829,147 @@ pub mod tests {
         let v = a.load().unwrap();
         assert!(v.unsigned().is_empty() && a.would_drop(&[]).is_empty());
         assert!(a.sign_coordinator().unwrap_err().to_string().contains("signed already"));
+    }
+
+    #[test]
+    fn coordinator_needs_the_proof_from_the_stick() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        // Something answers at the coordinator's address with keys of its
+        // own, tried until the 6-digit code matched: it has no proof.
+        for bad in ["", "0000000000000000000000000000000000000000000000000000000000000000"] {
+            store
+                .update(|s| {
+                    s.coordinator_proof = bad.into();
+                    Ok(())
+                })
+                .unwrap();
+            let id = ask(&store, "node-a", 2);
+            a.load().unwrap();
+            assert!(a.sign_coordinator().unwrap_err().to_string().contains("no valid proof from your USB stick"));
+            // The first approval would sign the coordinator too: refused.
+            assert!(a.approve(&id).unwrap_err().to_string().contains("no valid proof from your USB stick"));
+            assert_eq!(store.read().unwrap().signed_version, 0);
+            assert!(!dir.join("secrets").join(SIGNED_COPY).exists());
+        }
+        // A proof for other keys (taken from another install) does not fit.
+        store
+            .update(|s| {
+                s.coordinator_proof = registry::join_proof(SECRET, "coord", &key32(99), COORD_KEY);
+                Ok(())
+            })
+            .unwrap();
+        a.load().unwrap();
+        assert!(a.sign_coordinator().is_err());
+    }
+
+    /// A reinstalled coordinator: fresh registry, new keys, new proof.
+    pub fn reinstalled(dir: &TempDir, name: &str, proof_secret: &str) -> (Store, String) {
+        let new_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInewcoordinator";
+        let store = Store::new(dir.join("registry-new.json"));
+        store
+            .update(|s| {
+                s.members = vec![Member {
+                    host: 1,
+                    name: name.into(),
+                    wg_key: key32(41),
+                    ssh_host_key: format!("{new_key} root@coord"),
+                    lan_ip: "192.168.1.50".into(),
+                    ..Member::default()
+                }];
+                s.coordinator_proof = registry::join_proof(proof_secret, name, &key32(41), new_key);
+                Ok(())
+            })
+            .unwrap();
+        (store, new_key.to_string())
+    }
+
+    #[test]
+    fn a_reinstalled_coordinator_is_taken_over() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        let id = ask(&store, "node-a", 2);
+        a.load().unwrap();
+        a.approve(&id).unwrap();
+        let v1 = store.read().unwrap().signed_version;
+
+        // The coordinator was hacked, cut off and reinstalled.
+        let (new_store, new_key) = reinstalled(&dir, "coord", SECRET);
+        let pinned = Arc::new(Mutex::new(COORD_KEY.to_string()));
+        a.link = Box::new(Direct {
+            store: Store::new(&new_store.path),
+            host_key: new_key.clone(),
+            publish_fails: Arc::default(),
+            verifier: None,
+            pinned: pinned.clone(),
+        });
+        let e = a.load().unwrap_err();
+        assert!(e.is(crate::err::Kind::HostKey), "{e}");
+
+        // Looking changes nothing.
+        let c = a.probe_new_coordinator().unwrap();
+        assert_eq!(c.name, "coord");
+        assert_eq!(c.code, registry::coordinator_code(&key32(41), &new_key));
+        assert_eq!(*pinned.lock().unwrap(), COORD_KEY, "probing must leave the old pin");
+        assert_eq!(new_store.read().unwrap().signed_version, 0);
+
+        // Accepting pins it and signs a list with it in the old one's place.
+        let v2 = a.accept_new_coordinator(&c).unwrap();
+        assert!(v2 > v1);
+        assert_eq!(*pinned.lock().unwrap(), new_key);
+        let s = new_store.read().unwrap();
+        let list = s.signed.list(&Key("admin"), |h| h < 255).unwrap();
+        assert_eq!(list.members.len(), 2, "every other member stays");
+        assert_eq!(
+            (list.members[0].host, list.members[0].wg_key.clone(), list.members[0].ssh_host_key.clone()),
+            (1, key32(41), new_key.clone())
+        );
+        assert_eq!(list.members[1].name, "node-a");
+        assert_eq!(s.members.len(), 2, "the new coordinator has the members back");
+        let v = a.load().unwrap();
+        assert!(v.unsigned().is_empty() && v.warnings.is_empty(), "{:?}", v.warnings);
+        assert!(a.probe_new_coordinator().unwrap_err().to_string().contains("nothing to replace"));
+    }
+
+    #[test]
+    fn a_fake_coordinator_is_not_taken_over() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        let id = ask(&store, "node-a", 2);
+        a.load().unwrap();
+        a.approve(&id).unwrap();
+        let copy = std::fs::read(dir.join("secrets").join(SIGNED_COPY)).unwrap();
+        let attach = |a: &mut Admin, store: &Store, key: &str| {
+            let pinned = Arc::new(Mutex::new(COORD_KEY.to_string()));
+            a.link = Box::new(Direct {
+                store: Store::new(&store.path),
+                host_key: key.into(),
+                publish_fails: Arc::default(),
+                verifier: None,
+                pinned: pinned.clone(),
+            });
+            pinned
+        };
+
+        // No proof from the stick (another secret, or none).
+        let (fake, key) = reinstalled(&dir, "coord", "not-the-secret-not-the-secret-not-the-secret");
+        let pinned = attach(&mut a, &fake, &key);
+        assert!(a.probe_new_coordinator().unwrap_err().to_string().contains("no valid proof from your USB stick"));
+        assert_eq!(*pinned.lock().unwrap(), COORD_KEY);
+
+        // It claims another SSH key than the one it answers with.
+        let (liar, _) = reinstalled(&dir, "coord", SECRET);
+        let pinned = attach(&mut a, &liar, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIsomethingelse");
+        assert!(a.probe_new_coordinator().unwrap_err().to_string().contains("claims another SSH key"));
+        assert_eq!(*pinned.lock().unwrap(), COORD_KEY);
+        assert_eq!(std::fs::read(dir.join("secrets").join(SIGNED_COPY)).unwrap(), copy, "nothing may be signed");
+
+        // A real reinstall whose name is already a member's.
+        let (clash, key) = reinstalled(&dir, "node-a", SECRET);
+        let pinned = attach(&mut a, &clash, &key);
+        let c = a.probe_new_coordinator().unwrap();
+        assert!(a.accept_new_coordinator(&c).unwrap_err().to_string().contains("already has the new coordinator's name"));
+        assert_eq!(*pinned.lock().unwrap(), COORD_KEY, "a refused takeover must leave the old pin");
     }
 
     #[test]
@@ -860,6 +1181,7 @@ pub mod tests {
             host_key: COORD_KEY.into(),
             publish_fails: Arc::default(),
             verifier: Some(Box::new(checker())),
+            pinned: Arc::new(Mutex::new(COORD_KEY.into())),
         });
 
         let id = ask(&store, "node-a", 2);

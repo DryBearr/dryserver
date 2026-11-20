@@ -4,8 +4,8 @@
 use std::time::{Duration, Instant};
 
 use super::{Doc, Emit, Event, Flow, Key, Model, dim, err, ok, sel, title};
-use crate::admin::{Admin, View};
-use crate::err::{Error, Result};
+use crate::admin::{Admin, NewCoordinator, View};
+use crate::err::{Error, Kind, Result};
 use crate::gotime::{Time, duration_string, round_ms};
 use crate::mesh;
 
@@ -41,6 +41,8 @@ enum Action {
     Remove(String),
     /// The first signature: the coordinator's own entry.
     SignCoordinator,
+    /// A reinstalled coordinator takes the old one's place.
+    NewCoordinator(NewCoordinator),
     Resend,
 }
 
@@ -94,6 +96,9 @@ impl Screen {
             Action::Reject { id, name } => self.admin.reject(id).map(|_| format!("{name} rejected.")),
             Action::Remove(name) => self.admin.remove(name).map(|_| format!("{name} removed; servers drop it within a minute.")),
             Action::SignCoordinator => self.admin.sign_coordinator().map(|_| "Coordinator signed. New machines can join now.".to_string()),
+            Action::NewCoordinator(c) => self.admin.accept_new_coordinator(c).map(|_| {
+                format!("{} is your coordinator now, with every machine you signed before. Let the servers follow it: ./dryserver quarantine-all -lift", c.name)
+            }),
             Action::Resend => self.admin.resend().map(|v| format!("Signed list sent again as version {v}.")),
         };
         self.notice = res.unwrap_or_else(|e| format!("Failed: {e}"));
@@ -171,6 +176,23 @@ impl Screen {
                     self.decide(Action::SignCoordinator, Some(q), &[]);
                 }
             }
+            Key::Char('N') => {
+                if !self.err.as_ref().is_some_and(|e| e.is(Kind::HostKey)) {
+                    self.notice = "N is for a reinstalled coordinator. The one this computer knows answers fine.".into();
+                    return Flow::Continue;
+                }
+                match self.admin.probe_new_coordinator() {
+                    Ok(c) => {
+                        let q = format!(
+                            "The machine at the coordinator's address was installed from your USB stick as coordinator {}. \
+                             Its screen must show the code {}. Make it your coordinator?",
+                            c.name, c.code
+                        );
+                        self.confirm = Some((format!("{q} y to confirm"), Action::NewCoordinator(c)));
+                    }
+                    Err(e) => self.notice = format!("Not a coordinator of yours: {e}"),
+                }
+            }
             Key::Char('p') => self.run(Action::Resend),
             _ => {}
         }
@@ -205,6 +227,10 @@ impl Model for Screen {
         b.add(title("dryserver · machines")).s("  ").add(dim("decisions here are signed with this computer's key")).s("\n\n");
         if let Some(e) = &self.err {
             b.add(err(format!("Cannot talk to the coordinator: {e}"))).s("\n\n");
+            if e.is(Kind::HostKey) {
+                b.s("If you reinstalled the coordinator from your USB stick, press N to look at the new one.\n");
+                b.add(dim("If you did not, something else answers at its address: change nothing.")).s("\n\n");
+            }
         }
         let line = |b: &mut Doc, i: usize, text: String| {
             if i == self.cursor {
@@ -301,7 +327,7 @@ impl Model for Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::tests::{COORD_KEY, key32, request, setup};
+    use crate::admin::tests::{COORD_KEY, SECRET, key32, move_to, reinstalled, request, setup};
     use crate::registry::Member;
     use crate::testutil::TempDir;
 
@@ -435,6 +461,54 @@ mod tests {
         assert_eq!(store.read().unwrap().members.len(), 1);
         s.key(Key::Char('r'));
         assert!(s.notice.contains("node-x rejected"), "{:?}", s.notice);
+    }
+
+    #[test]
+    fn a_reinstalled_coordinator_is_offered_and_taken() {
+        let dir = TempDir::new();
+        let (mut admin, store) = setup(&dir);
+        store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
+        admin.load().unwrap();
+        let id = store.read().unwrap().requests[0].id.clone();
+        admin.approve(&id).unwrap();
+
+        // Something without the stick's proof answers at the address.
+        let (fake, key) = reinstalled(&dir, "coord", "another-secret-another-secret-another-secret");
+        move_to(&mut admin, &fake, &key);
+        let mut s = Screen::new(admin);
+        s.load();
+        let v = s.view().plain();
+        assert!(v.contains("does not have the SSH key this computer saw before") && v.contains("press N to look at the new one"), "{v}");
+        s.key(Key::Char('N'));
+        assert!(s.notice.contains("Not a coordinator of yours") && s.notice.contains("no valid proof"), "{:?}", s.notice);
+        assert!(!s.view().plain().contains("y to confirm"));
+
+        // The real reinstall.
+        let dir2 = TempDir::new();
+        let (mut admin, store) = setup(&dir2);
+        store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
+        admin.load().unwrap();
+        let id = store.read().unwrap().requests[0].id.clone();
+        admin.approve(&id).unwrap();
+        let (new_store, key) = reinstalled(&dir2, "coord", SECRET);
+        let pinned = move_to(&mut admin, &new_store, &key);
+        let mut s = Screen::new(admin);
+        s.load();
+        s.key(Key::Char('N'));
+        let v = s.view().plain();
+        let code = crate::registry::coordinator_code(&key32(41), &key);
+        assert!(v.contains(&format!("Its screen must show the code {code}")) && v.contains("y to confirm"), "{v}");
+        s.key(Key::Char('n'));
+        assert_eq!(*pinned.lock().unwrap(), COORD_KEY, "saying no must change nothing");
+        s.key(Key::Char('N'));
+        s.key(Key::Char('y'));
+        assert!(s.notice.contains("coord is your coordinator now") && s.notice.contains("quarantine-all -lift"), "{:?}", s.notice);
+        assert_eq!(new_store.read().unwrap().members.len(), 2);
+        let v = s.view().plain();
+        assert!(!v.contains("Cannot talk") && v.contains("node-a") && !v.contains("NOT SIGNED"), "{v}");
+        // With a coordinator that answers, N does nothing.
+        s.key(Key::Char('N'));
+        assert!(s.notice.contains("answers fine"), "{:?}", s.notice);
     }
 
     #[test]
