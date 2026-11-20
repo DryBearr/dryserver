@@ -160,17 +160,18 @@ into a server with your terminal's paste key.
 
 ## SSH between machines
 
-No private keys are stored on servers. Your desktop key is forwarded when you
-connect, so a hacked server cannot log into the others on its own.
+No private keys are stored on servers, and your desktop key is never forwarded
+to them. A hacked server, the coordinator included, cannot use your key to log
+into the others. Connect to each server from the desktop:
 
 ```sh
 ./dryserver ssh-config     # writes ~/.ssh/config.d/dryserver
 ssh node-a                 # jumps through the coordinator
-ssh -A node-a              # then on node-a: ssh node-b
+scp -3 node-a:file node-b: # copy between servers through the desktop
 ```
 
 Add `Include config.d/*` at the top of `~/.ssh/config` if it is not there.
-Tip: `ssh-add -c` asks you before each use of the forwarded key.
+Servers refuse agent forwarding even if you ask for it with `ssh -A`.
 
 ## Security
 

@@ -235,9 +235,10 @@ MaxAuthTries 3
 LoginGraceTime 30
 X11Forwarding no
 PermitTunnel no
-# Agent forwarding lets you hop between servers with your desktop key;
-# TCP forwarding is needed for ProxyJump through a server.
-AllowAgentForwarding yes
+# No agent forwarding: your desktop key never reaches a server, so a hacked
+# server cannot use it. TCP forwarding is needed for ProxyJump through the
+# coordinator.
+AllowAgentForwarding no
 AllowTcpForwarding yes
 ClientAliveInterval 300
 ClientAliveCountMax 2
@@ -520,7 +521,7 @@ mod tests {
         assert!(!find(&coord, "/etc/nftables.conf").content.contains("ip saddr 172.16"), "lan transport must not add a switch rule");
 
         let sshd = &find(&node, "/etc/ssh/sshd_config.d/10-dryserver.conf").content;
-        for want in ["PasswordAuthentication no", "PermitRootLogin no", "AllowUsers admin\n"] {
+        for want in ["PasswordAuthentication no", "PermitRootLogin no", "AllowUsers admin\n", "AllowAgentForwarding no"] {
             assert!(sshd.contains(want), "sshd missing {want:?}");
         }
         assert!(find(&coord, "/etc/ssh/sshd_config.d/10-dryserver.conf").content.contains("AllowUsers admin dryreg"));

@@ -69,9 +69,10 @@ MaxAuthTries 3
 LoginGraceTime 30
 X11Forwarding no
 PermitTunnel no
-# Agent forwarding lets you hop between servers with your desktop key;
-# TCP forwarding is needed for ProxyJump through a server.
-AllowAgentForwarding yes
+# No agent forwarding: your desktop key never reaches a server, so a hacked
+# server cannot use it. TCP forwarding is needed for ProxyJump through the
+# coordinator.
+AllowAgentForwarding no
 AllowTcpForwarding yes
 ClientAliveInterval 300
 ClientAliveCountMax 2
