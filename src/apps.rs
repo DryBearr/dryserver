@@ -22,6 +22,18 @@ use crate::registry;
 use crate::{bail, errf};
 
 pub const NAMESPACE: &str = "apps";
+/// Where the way in from outside lives.
+pub const TUNNEL_NAMESPACE: &str = "edge";
+/// One pinned cloudflared release: the tag for people, the digest for the
+/// machine (the image index, so it fits every CPU type). A changed image
+/// under the same tag is refused.
+pub const TUNNEL_IMAGE: &str =
+    "docker.io/cloudflare/cloudflared:2026.11.1@sha256:e613aadbc2d9511785d2e67a86b0c8ac18dd63a3f9af0d06faf04cbfdcb35f2d";
+/// The admin puts the tunnel's token here, in secrets/.
+pub const TUNNEL_TOKEN_FILE: &str = "cloudflare_tunnel_token";
+/// What the tunnel's public host names point at, in the Cloudflare
+/// dashboard: the cluster's ingress.
+pub const TUNNEL_TARGET: &str = "http://traefik.kube-system.svc.cluster.local:80";
 
 /// One app as the admin describes it.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -140,6 +152,13 @@ spec:
       securityContext:
         seccompProfile:
           type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: {name}
       containers:
         - name: {name}
           image: "{image}"
@@ -194,6 +213,144 @@ spec:
         }
         Ok(y)
     }
+}
+
+/// The token from what the admin saved. The dashboard shows it inside a
+/// command ("cloudflared service install eyJ..."); pasting that whole
+/// line works too.
+pub fn tunnel_token(text: &str) -> Result<String> {
+    let token = text.split_whitespace().last().unwrap_or("");
+    valid_tunnel_token(token)?;
+    Ok(token.to_string())
+}
+
+/// A Cloudflare Tunnel token: base64, nothing else.
+pub fn valid_tunnel_token(t: &str) -> Result<()> {
+    let ok =
+        (40..=4096).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
+    if ok { Ok(()) } else { Err("not a tunnel token (copy the long token from the tunnel's page in the Cloudflare dashboard)".into()) }
+}
+
+/// cloudflared as pods: the only way in from outside. It dials out to
+/// Cloudflare, so no machine opens a port; Cloudflare sends what arrives
+/// for your host names through it to the ingress.
+///
+/// - Namespace "edge" with the strictest pod security level; nothing may
+///   connect to these pods.
+/// - The token is a Secret (encrypted in the cluster's database).
+/// - Runs as a plain user, read-only, with no privileges and no cluster
+///   credentials. Two copies on different servers, so one can die.
+/// - A copy counts as running only while it holds a connection to
+///   Cloudflare (cloudflared's own /ready answer).
+pub fn tunnel_manifest(token: &str) -> Result<String> {
+    let token = token.trim();
+    valid_tunnel_token(token)?;
+    Ok(format!(
+        r#"apiVersion: v1
+kind: Namespace
+metadata:
+  name: {TUNNEL_NAMESPACE}
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {TUNNEL_NAMESPACE}
+spec:
+  podSelector: {{}}
+  policyTypes: [Ingress]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tunnel
+  namespace: {TUNNEL_NAMESPACE}
+stringData:
+  token: "{token}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: {TUNNEL_NAMESPACE}
+  labels:
+    app: cloudflared
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cloudflared
+  template:
+    metadata:
+      labels:
+        app: cloudflared
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: cloudflared
+      containers:
+        - name: cloudflared
+          image: "{TUNNEL_IMAGE}"
+          args: ["tunnel", "--no-autoupdate", "--metrics", "0.0.0.0:2000", "run"]
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 2000
+            periodSeconds: 10
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: tunnel
+                  key: token
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+"#
+    ))
+}
+
+/// Starts the tunnel, or gives it another token.
+pub fn connect_tunnel(c: &dyn Cluster, token: &str) -> Result<()> {
+    let manifest = tunnel_manifest(token)?;
+    let out = c.kubectl(&["apply", "-f", "-"], &manifest)?;
+    // A changed token only reaches pods that start after it. (A new
+    // tunnel starts its pods with the token it was made with.)
+    if out.lines().any(|l| l.trim() == "secret/tunnel configured") {
+        c.kubectl(&["-n", TUNNEL_NAMESPACE, "rollout", "restart", "deployment/cloudflared"], "")?;
+    }
+    Ok(())
+}
+
+/// Closes the way in from outside. The apps keep running.
+pub fn remove_tunnel(c: &dyn Cluster) -> Result<()> {
+    c.kubectl(&["-n", TUNNEL_NAMESPACE, "delete", "deployment/cloudflared", "secret/tunnel", "--ignore-not-found"], "").map(|_| ())
+}
+
+/// The cluster as the apps screen shows it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Overview {
+    pub apps: Vec<Running>,
+    /// Tunnel pods ready and wanted; None when no tunnel is set up.
+    pub tunnel: Option<(u32, u32)>,
 }
 
 /// An app as the cluster has it.
@@ -265,6 +422,7 @@ impl Cluster for SshCluster {
 #[serde(default)]
 struct Meta {
     name: String,
+    namespace: String,
     labels: std::collections::HashMap<String, String>,
 }
 
@@ -283,31 +441,35 @@ struct List {
     items: Vec<Item>,
 }
 
-/// The apps in the cluster. Names and hosts come from the cluster; they
-/// are checked before they are shown.
-pub fn list(c: &dyn Cluster) -> Result<Vec<Running>> {
-    let out = match c.kubectl(&["-n", NAMESPACE, "get", "deployments,ingresses,pods", "-o", "json"], "") {
-        Ok(o) => o,
-        Err(e) if e.to_string().contains("NotFound") => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
+/// The apps and the tunnel, in one question to the cluster (each one is
+/// an SSH login). Names and hosts come from the cluster; they are checked
+/// before they are shown.
+pub fn overview(c: &dyn Cluster) -> Result<Overview> {
+    let out = c.kubectl(&["get", "deployments,ingresses,pods", "-A", "-l", "app", "-o", "json"], "")?;
     if out.trim().is_empty() {
-        return Ok(Vec::new());
+        return Ok(Overview::default());
     }
     let l: List = serde_json::from_str(&out).map_err(|e| Error::from(e).wrap("kubectl output"))?;
-    let mut apps: Vec<Running> = Vec::new();
-    for it in l.items.iter().filter(|i| i.kind == "Deployment" && registry::valid_name(&i.metadata.name)) {
+    let mut o = Overview::default();
+    for it in l.items.iter().filter(|i| i.kind == "Deployment") {
+        let (ready, copies) = (it.status["readyReplicas"].as_u64().unwrap_or(0) as u32, it.spec["replicas"].as_u64().unwrap_or(0) as u32);
+        if it.metadata.namespace == TUNNEL_NAMESPACE && it.metadata.name == "cloudflared" {
+            o.tunnel = Some((ready, copies));
+        }
+        if it.metadata.namespace != NAMESPACE || !registry::valid_name(&it.metadata.name) {
+            continue;
+        }
         let image = it.spec["template"]["spec"]["containers"][0]["image"].as_str().unwrap_or("").to_string();
-        apps.push(Running {
+        o.apps.push(Running {
             name: it.metadata.name.clone(),
             image: if valid_image(&image).is_ok() { image } else { "?".into() },
-            ready: it.status["readyReplicas"].as_u64().unwrap_or(0) as u32,
-            copies: it.spec["replicas"].as_u64().unwrap_or(0) as u32,
+            ready,
+            copies,
             ..Running::default()
         });
     }
-    for it in &l.items {
-        let Some(app) = it.metadata.labels.get("app").and_then(|n| apps.iter_mut().find(|a| a.name == *n)) else { continue };
+    for it in l.items.iter().filter(|i| i.metadata.namespace == NAMESPACE) {
+        let Some(app) = it.metadata.labels.get("app").and_then(|n| o.apps.iter_mut().find(|a| a.name == *n)) else { continue };
         match it.kind.as_str() {
             "Ingress" => {
                 let host = it.spec["rules"][0]["host"].as_str().unwrap_or("");
@@ -324,8 +486,8 @@ pub fn list(c: &dyn Cluster) -> Result<Vec<Running>> {
             _ => {}
         }
     }
-    apps.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(apps)
+    o.apps.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(o)
 }
 
 pub fn deploy(c: &dyn Cluster, app: &App) -> Result<()> {
@@ -361,6 +523,7 @@ pub mod tests {
             "name: default-deny\n  namespace: apps\nspec:\n  podSelector: {}\n  policyTypes: [Ingress]",
             "app.kubernetes.io/name: traefik",
             "replicas: 2",
+            "topologyKey: kubernetes.io/hostname",
             "image: \"ghcr.io/me/blog:v2\"",
             "containerPort: 8080",
             "automountServiceAccountToken: false",
@@ -408,6 +571,8 @@ pub mod tests {
     pub struct Fake {
         pub calls: Mutex<Vec<(String, String)>>,
         pub listing: Mutex<String>,
+        /// What "apply" prints.
+        pub applied: Mutex<String>,
         pub fail: Mutex<Option<String>>,
     }
 
@@ -417,28 +582,38 @@ pub mod tests {
             if let Some(e) = self.fail.lock().unwrap().clone() {
                 return Err(e.into());
             }
-            Ok(if args.contains(&"get") { self.listing.lock().unwrap().clone() } else { String::new() })
+            Ok(if args.contains(&"get") {
+                self.listing.lock().unwrap().clone()
+            } else if args.contains(&"apply") {
+                self.applied.lock().unwrap().clone()
+            } else {
+                String::new()
+            })
         }
     }
 
     pub const LISTING: &str = r#"{"items":[
-      {"kind":"Deployment","metadata":{"name":"blog","labels":{"app":"blog"}},"spec":{"replicas":2,"template":{"spec":{"containers":[{"image":"ghcr.io/me/blog:v2"}]}}},"status":{"readyReplicas":1}},
-      {"kind":"Deployment","metadata":{"name":"api","labels":{"app":"api"}},"spec":{"replicas":1,"template":{"spec":{"containers":[{"image":"evil\u001b[2Jimage"}]}}},"status":{}},
-      {"kind":"Deployment","metadata":{"name":"Bad Name","labels":{}},"spec":{},"status":{}},
-      {"kind":"Ingress","metadata":{"name":"blog","labels":{"app":"blog"}},"spec":{"rules":[{"host":"blog.example.com"}]}},
-      {"kind":"Ingress","metadata":{"name":"api","labels":{"app":"api"}},"spec":{"rules":[{"host":"not a host"}]}},
-      {"kind":"Pod","metadata":{"name":"blog-1","labels":{"app":"blog"}},"spec":{"nodeName":"node-a"}},
-      {"kind":"Pod","metadata":{"name":"blog-2","labels":{"app":"blog"}},"spec":{"nodeName":"node-b"}},
-      {"kind":"Pod","metadata":{"name":"blog-3","labels":{"app":"blog"}},"spec":{"nodeName":"node-a"}}
+      {"kind":"Deployment","metadata":{"name":"blog","namespace":"apps","labels":{"app":"blog"}},"spec":{"replicas":2,"template":{"spec":{"containers":[{"image":"ghcr.io/me/blog:v2"}]}}},"status":{"readyReplicas":1}},
+      {"kind":"Deployment","metadata":{"name":"api","namespace":"apps","labels":{"app":"api"}},"spec":{"replicas":1,"template":{"spec":{"containers":[{"image":"evil\u001b[2Jimage"}]}}},"status":{}},
+      {"kind":"Deployment","metadata":{"name":"Bad Name","namespace":"apps","labels":{}},"spec":{},"status":{}},
+      {"kind":"Deployment","metadata":{"name":"local-path-provisioner","namespace":"kube-system","labels":{"app":"local-path-provisioner"}},"spec":{"replicas":1},"status":{"readyReplicas":1}},
+      {"kind":"Deployment","metadata":{"name":"cloudflared","namespace":"edge","labels":{"app":"cloudflared"}},"spec":{"replicas":2},"status":{"readyReplicas":1}},
+      {"kind":"Ingress","metadata":{"name":"blog","namespace":"apps","labels":{"app":"blog"}},"spec":{"rules":[{"host":"blog.example.com"}]}},
+      {"kind":"Ingress","metadata":{"name":"api","namespace":"apps","labels":{"app":"api"}},"spec":{"rules":[{"host":"not a host"}]}},
+      {"kind":"Ingress","metadata":{"name":"blog","namespace":"other","labels":{"app":"blog"}},"spec":{"rules":[{"host":"stolen.example.com"}]}},
+      {"kind":"Pod","metadata":{"name":"blog-1","namespace":"apps","labels":{"app":"blog"}},"spec":{"nodeName":"node-a"}},
+      {"kind":"Pod","metadata":{"name":"blog-2","namespace":"apps","labels":{"app":"blog"}},"spec":{"nodeName":"node-b"}},
+      {"kind":"Pod","metadata":{"name":"blog-3","namespace":"apps","labels":{"app":"blog"}},"spec":{"nodeName":"node-a"}}
     ]}"#;
 
     #[test]
     fn list_deploy_remove() {
         let c = Fake::default();
         *c.listing.lock().unwrap() = LISTING.into();
-        let apps = list(&c).unwrap();
+        let o = overview(&c).unwrap();
+        assert_eq!(o.tunnel, Some((1, 2)));
         assert_eq!(
-            apps,
+            o.apps,
             vec![
                 Running { name: "api".into(), image: "?".into(), ready: 0, copies: 1, host: String::new(), nodes: vec![] },
                 Running {
@@ -450,8 +625,9 @@ pub mod tests {
                     nodes: vec!["node-a".into(), "node-b".into()]
                 },
             ],
-            "what the cluster says is checked before it is shown"
+            "what the cluster says is checked before it is shown, and only the apps namespace counts"
         );
+        assert_eq!(c.calls.lock().unwrap().len(), 1, "one question to the cluster per refresh");
 
         deploy(&c, &app()).unwrap();
         let (args, stdin) = c.calls.lock().unwrap().last().unwrap().clone();
@@ -466,10 +642,65 @@ pub mod tests {
         );
         assert!(remove(&c, "blog -A").is_err(), "a name must not carry kubectl arguments");
 
-        // An empty cluster (no namespace yet) is an empty list.
-        *c.fail.lock().unwrap() = Some("Error from server (NotFound): namespaces \"apps\" not found".into());
-        assert!(list(&c).unwrap().is_empty());
+        // An empty cluster is an empty list; an unreachable one an error.
+        *c.listing.lock().unwrap() = r#"{"items":[]}"#.into();
+        assert_eq!(overview(&c).unwrap(), Overview::default());
         *c.fail.lock().unwrap() = Some("connection refused".into());
-        assert!(list(&c).is_err());
+        assert!(overview(&c).is_err());
+    }
+
+    #[test]
+    fn tunnel() {
+        let token = "eyJhIjoiMTIzNDU2Nzg5MGFiY2RlZiIsInQiOiJhYmNkZWYiLCJzIjoiWldGemVTQjBieUJ6WldVPSJ9";
+        let y = tunnel_manifest(&format!("{token}\n")).unwrap();
+        for want in [
+            "name: edge\n  labels:\n    pod-security.kubernetes.io/enforce: restricted",
+            "policyTypes: [Ingress]",
+            &format!("token: \"{token}\""),
+            "image: \"docker.io/cloudflare/cloudflared:2026.11.1@sha256:",
+            "args: [\"tunnel\", \"--no-autoupdate\", \"--metrics\", \"0.0.0.0:2000\", \"run\"]",
+            "path: /ready",
+            "topologyKey: kubernetes.io/hostname",
+            "runAsNonRoot: true",
+            "readOnlyRootFilesystem: true",
+            "drop: [\"ALL\"]",
+            "automountServiceAccountToken: false",
+            "replicas: 2",
+        ] {
+            assert!(y.contains(want), "tunnel manifest missing {want:?}:\n{y}");
+        }
+        for bad in [
+            "",
+            "short",
+            "has space in it aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "quote\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "line\nbreakaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: x",
+        ] {
+            assert!(tunnel_manifest(bad).is_err(), "{bad:?}");
+        }
+        // The dashboard's whole command line works as well as the bare token.
+        assert_eq!(tunnel_token(&format!("sudo cloudflared service install {token}\n")).unwrap(), token);
+        assert_eq!(tunnel_token(&format!("  {token}  ")).unwrap(), token);
+        assert!(tunnel_token("").is_err() && tunnel_token("cloudflared service install").is_err());
+        valid_image(TUNNEL_IMAGE).unwrap();
+        let c = Fake::default();
+        // A new tunnel: its pods start with the token.
+        *c.applied.lock().unwrap() = "namespace/edge created\nsecret/tunnel created\ndeployment.apps/cloudflared created\n".into();
+        connect_tunnel(&c, token).unwrap();
+        assert_eq!(c.calls.lock().unwrap().iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(), vec!["apply -f -"]);
+        // The same token again changes nothing.
+        *c.applied.lock().unwrap() = "namespace/edge unchanged\nsecret/tunnel unchanged\ndeployment.apps/cloudflared unchanged\n".into();
+        connect_tunnel(&c, token).unwrap();
+        assert_eq!(c.calls.lock().unwrap().len(), 2);
+        // Another token reaches only pods that start after it.
+        *c.applied.lock().unwrap() = "namespace/edge unchanged\nsecret/tunnel configured\ndeployment.apps/cloudflared unchanged\n".into();
+        connect_tunnel(&c, token).unwrap();
+        assert_eq!(
+            c.calls.lock().unwrap().last().unwrap().0,
+            "-n edge rollout restart deployment/cloudflared",
+            "a new token needs new pods"
+        );
+        remove_tunnel(&c).unwrap();
+        assert_eq!(c.calls.lock().unwrap().last().unwrap().0, "-n edge delete deployment/cloudflared secret/tunnel --ignore-not-found");
     }
 }

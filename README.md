@@ -284,6 +284,38 @@ What dryserver sets up around every app (namespace `apps`):
 k3s is one pinned release, downloaded from its GitHub releases when the USB
 stick is built and checked against the checksum dryserver was built with.
 
+### Reaching apps from outside
+
+No machine opens a port to the internet. The way in is a Cloudflare Tunnel
+that runs as two pods in the cluster and dials out to Cloudflare:
+
+1. In the Cloudflare dashboard (Zero Trust, Networks, Tunnels) create a
+   tunnel and copy its token. Save it on your computer as
+   `secrets/cloudflare_tunnel_token` (the whole
+   `cloudflared service install ...` line works too).
+2. In `./dryserver apps` press `t`. The line "From outside" shows how many
+   copies hold a connection to Cloudflare.
+3. In the dashboard, add a public host name per app and point each at
+   `http://traefik.kube-system.svc.cluster.local:80`. The ingress then
+   routes by the host name you gave the app.
+
+`T` closes the tunnel; the apps keep running, reachable only inside the
+cluster. `t` again after you changed the file gives the tunnel the new
+token. The token is stored in the cluster as an encrypted secret. The tunnel
+pods run as a plain user with a read-only file system, no privileges and no
+cluster credentials, from one cloudflared image pinned by its digest, and
+nothing in the cluster may connect to them.
+
+### When a machine leaves
+
+Remove a server in `./dryserver approve` and the cluster follows: the
+coordinator deletes it from the cluster, and its apps start on the servers
+that are left. The removed server stops k3s and every container as soon as
+it sees the signed list without itself (it asks the coordinator on the home
+network when the mesh no longer answers). A server that only lost contact
+keeps its apps running. To bring a removed server back, run
+`sudo dryserver join` on it and approve it like a new machine.
+
 ## Security
 
 - **Firewall first.** The live USB accepts no incoming connections and runs no
@@ -341,7 +373,9 @@ stick is built and checked against the checksum dryserver was built with.
   hands out the signed list but cannot make or change one. Servers use only
   the machines in the signed list: one the coordinator adds by itself is
   ignored and logged, and an older list is refused, so a removed machine
-  cannot be brought back. Nobody can approve on a server, the coordinator
+  cannot be brought back. A server that finds itself gone from a newer
+  signed list stops k3s and its containers and no longer counts itself a
+  member. Nobody can approve on a server, the coordinator
   included, and a machine that shows up on the coordinator without a join
   request cannot be signed at all. `./dryserver ssh-config` takes server
   names and SSH host keys from the signed list too. Limit: a hacked

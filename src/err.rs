@@ -16,6 +16,8 @@ pub enum Kind {
     /// The machine at the coordinator's address has another SSH host key
     /// than the one pinned.
     HostKey,
+    /// The admin's newest signed list no longer has this machine.
+    Removed,
 }
 
 #[derive(Debug, Clone)]

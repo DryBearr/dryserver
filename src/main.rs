@@ -215,7 +215,8 @@ fn run_app() -> Result<()> {
         let res = if app.open_machines {
             desktop_admin(&f, "approve").and_then(|(a, _)| tui::run(&mut tui::admin::Screen::new(a)))
         } else if app.open_apps {
-            desktop_cluster(&f, "apps").and_then(|c| tui::run(&mut tui::apps::Screen::new(Box::new(c))))
+            desktop_cluster(&f, "apps")
+                .and_then(|c| tui::run(&mut tui::apps::Screen::new(Box::new(c), paths().secrets.join(apps::TUNNEL_TOKEN_FILE))))
         } else {
             return Ok(());
         };
@@ -666,7 +667,7 @@ fn run_apps(args: &[String]) -> Result<()> {
     if Path::new(LIVE_CONFIG).exists() {
         bail!("apps runs on your own computer:\n  ./dryserver apps\nOn the coordinator itself, use: k3s kubectl");
     }
-    tui::run(&mut tui::apps::Screen::new(Box::new(desktop_cluster(&f, "apps")?)))
+    tui::run(&mut tui::apps::Screen::new(Box::new(desktop_cluster(&f, "apps")?), paths().secrets.join(apps::TUNNEL_TOKEN_FILE)))
 }
 
 fn run_approve(args: &[String]) -> Result<()> {

@@ -91,6 +91,11 @@ pub struct Node {
 
 /// Where k3s on the coordinator keeps the token agents join with.
 pub const K3S_AGENT_TOKEN: &str = "/var/lib/rancher/k3s/server/agent-token";
+/// The cgroups of what k3s runs: its own helpers (containerd and the
+/// container shims) and every pod.
+pub const K3S_CGROUPS: [&str; 2] = ["/sys/fs/cgroup/system.slice/k3s.service", "/sys/fs/cgroup/kubepods.slice"];
+/// Where pods have things mounted, their secrets among them.
+const POD_MOUNTS: [&str; 3] = ["/var/lib/kubelet/pods/", "/run/k3s/", "/run/netns/cni-"];
 
 /// What the coordinator answers to "peers".
 #[derive(Debug, Clone, Default)]
@@ -522,8 +527,15 @@ impl Node {
             }
             _ => {}
         }
-        if !list.members.iter().any(|e| e.host == me) {
-            return Err("this server is not in the signed member list (was it removed?)".into());
+        if !list.members.iter().any(|e| self.is_me(me, e)) {
+            // Newer than a list this server was in: the admin took it out.
+            if seen.as_ref().is_some_and(|(ver, _)| list.version > *ver) {
+                return Err(Error::with_kind(
+                    Kind::Removed,
+                    format!("the admin removed this server from the swarm (signed list version {})", list.version),
+                ));
+            }
+            return Err("this server is not in the signed member list".into());
         }
         if !seen.as_ref().is_some_and(|(ver, _)| *ver == list.version) {
             self.write(SIGNED_FILE, 0o600, &(serde_json::to_string(env)? + "\n"))?;
@@ -556,6 +568,55 @@ impl Node {
             )
         };
         Ok((members, status))
+    }
+
+    /// Whether a signed entry is this machine: its number and its
+    /// WireGuard key. The number alone is not enough; after a removal the
+    /// admin's next approval hands it to another machine.
+    fn is_me(&self, me: u32, e: &signed::Entry) -> bool {
+        e.host == me && self.read(WG_PUB).map_or(true, |k| k == e.wg_key)
+    }
+
+    /// The admin took this machine out of the swarm. It stops running the
+    /// swarm's apps, forgets its way into the cluster and no longer counts
+    /// itself a member. To come back it asks again (sudo dryserver join)
+    /// and waits for approval like a new machine.
+    fn leave(&self, ctx: &Ctx, env: &Envelope, why: &Error) {
+        self.k3s_leave(ctx);
+        if let Ok(text) = serde_json::to_string(env) {
+            let _ = self.write(SIGNED_FILE, 0o600, &(text + "\n"));
+        }
+        let _ = self.save_state(&State::default());
+        self.note_signed(&format!("REMOVED: {why}. k3s and its containers are stopped. To bring this machine back: sudo dryserver join"));
+    }
+
+    /// Stops k3s and every container it started, and deletes this
+    /// machine's way into the cluster.
+    ///
+    /// systemd stops only the k3s process (KillMode=process keeps apps up
+    /// while k3s restarts), so the rest goes through the kernel: one write
+    /// to cgroup.kill ends everything in a cgroup. What the pods had
+    /// mounted goes last, their secrets (kept in memory) with it.
+    pub fn k3s_leave(&self, ctx: &Ctx) {
+        for f in [sysconf::K3S_TOKEN, sysconf::K3S_CONFIG] {
+            let _ = std::fs::remove_file(self.path(f));
+        }
+        let _ = self.cmd(ctx, "systemctl", &["stop", "k3s.service"]);
+        for cgroup in K3S_CGROUPS {
+            let kill = self.path(&format!("{cgroup}/cgroup.kill"));
+            if kill.exists() {
+                let _ = std::fs::OpenOptions::new().write(true).open(&kill).and_then(|mut f| f.write_all(b"1"));
+            }
+        }
+        let mounts = fsx::read_or_empty(self.path("/proc/self/mounts"));
+        let mut points: Vec<&str> =
+            mounts.lines().filter_map(|l| l.split(' ').nth(1)).filter(|p| POD_MOUNTS.iter().any(|pre| p.starts_with(pre))).collect();
+        // A mount inside another sorts after it: backwards is inside first.
+        points.sort_unstable();
+        for point in points.into_iter().rev() {
+            // Lazy: the killed processes may need a moment to let go.
+            let _ = self.run.output(ctx, &Cmd::new("umount", &["-l", point]).quiet());
+        }
     }
 
     /// Logs the status when it changed since the last sync, so the journal
@@ -734,15 +795,36 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     } else {
         me.host = n.load_state().host;
         if me.host == 0 {
-            return Err("not joined yet".into());
+            return Err("not a member of the swarm: not joined yet, or removed by the admin (sudo dryserver join asks to join)".into());
         }
         let lan = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).unwrap_or_default();
-        let Fetched { members: sent, signed: env, k3s_token } = n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw, cuts })?;
+        let fetched = match n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw, cuts }) {
+            Ok(f) => f,
+            Err(e) => {
+                // A removed machine is cut from the mesh before it hears
+                // why. The coordinator hands the signed list to anyone on
+                // the home network; only the admin's signature on it
+                // counts, so it does not matter who answers.
+                if let Ok(env) = n.fetch_signed_unpinned(ctx)
+                    && let Err(gone) = n.signed_members(me.host, &[], &env)
+                    && gone.is(Kind::Removed)
+                {
+                    n.leave(ctx, &env, &gone);
+                    return Err(gone);
+                }
+                return Err(e);
+            }
+        };
+        let Fetched { members: sent, signed: env, k3s_token } = fetched;
         token = k3s_token;
         match n.signed_members(me.host, &sent, &env) {
             Ok((members, status)) => {
                 n.note_signed(&status);
                 members
+            }
+            Err(e) if e.is(Kind::Removed) => {
+                n.leave(ctx, &env, &e);
+                return Err(e);
             }
             Err(e) => {
                 n.note_signed(&format!("REFUSED, mesh left as it is: {e}"));
@@ -920,6 +1002,12 @@ mod tests {
         peers: Mutex<Option<String>>,
         /// k3s command lines.
         k3s: Mutex<Vec<String>>,
+        /// systemctl and umount command lines.
+        ran: Mutex<Vec<String>>,
+        /// The coordinator does not answer over the mesh.
+        mesh_down: Mutex<bool>,
+        /// The "signed" reply on the home network; None: nobody answers.
+        signed: Mutex<Option<Envelope>>,
     }
 
     impl FakeCoord {
@@ -932,6 +1020,9 @@ mod tests {
                 applied: Mutex::new(String::new()),
                 peers: Mutex::new(None),
                 k3s: Mutex::new(Vec::new()),
+                ran: Mutex::new(Vec::new()),
+                mesh_down: Mutex::new(false),
+                signed: Mutex::new(None),
             })
         }
     }
@@ -941,7 +1032,11 @@ mod tests {
             *self.last.lock().unwrap() = Some(c.clone());
             // Sync helpers: systemctl, ping, ip, wg-quick and wg.
             match c.name.as_str() {
-                "systemctl" | "ping" | "ip" | "agetty" | "networkctl" => return (String::new(), Ok(())),
+                "systemctl" | "umount" => {
+                    self.ran.lock().unwrap().push(format!("{} {}", c.name, c.args.join(" ")));
+                    return (String::new(), Ok(()));
+                }
+                "ping" | "ip" | "agetty" | "networkctl" => return (String::new(), Ok(())),
                 // No blocked members in the firewall's set.
                 "nft" => return (String::new(), Err("no such set".into())),
                 // The cluster knows the coordinator, this node and one
@@ -978,6 +1073,15 @@ mod tests {
                     st.remove(0);
                 }
                 return (serde_json::to_string(&r).unwrap(), Ok(()));
+            }
+            if cmd == "signed" {
+                return match self.signed.lock().unwrap().clone() {
+                    Some(env) => (serde_json::json!({ "signed": env }).to_string(), Ok(())),
+                    None => (String::new(), Err("ssh: connect to host 192.168.1.50 port 22: Connection timed out".into())),
+                };
+            }
+            if cmd == "peers" && *self.mesh_down.lock().unwrap() {
+                return (String::new(), Err("ssh: connect to host 10.66.0.1 port 22: Connection timed out".into()));
             }
             if cmd == "peers" {
                 let fixed = self.peers.lock().unwrap().clone();
@@ -1234,8 +1338,6 @@ mod tests {
                 peers(&[coord_member()], &sign(&ADMIN, 6, vec![coord_entry(), node_entry(2)])),
                 "different signed list under the same version",
             ),
-            // This server was removed.
-            (peers(&[coord_member()], &sign(&ADMIN, 7, vec![coord_entry(), other_entry()])), "not in the signed member list"),
             (peers(&[coord_member()], &sign(&ADMIN, 7, vec![node_entry(2)])), "no coordinator"),
         ];
         for (reply, want) in refused {
@@ -1303,6 +1405,111 @@ mod tests {
         assert!(wg.contains(COORD_WG) && !wg.contains(OTHER_WG), "a cut member came back:\n{wg}");
         // This server itself is never left out of its own files.
         assert!(get(&n.root, "/etc/hosts").contains("node-a"));
+    }
+
+    /// A joined server that runs apps: token, config, cgroups, pod mounts.
+    fn running_apps() -> (TempDir, TempDir, Node, Arc<FakeCoord>, String) {
+        let (dir, tmp, n, fc) = joined();
+        assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
+        put(&n.root, sysconf::K3S_TOKEN, "K10abc::node:secret\n");
+        put(&n.root, sysconf::K3S_CONFIG, "server: https://10.66.0.1:6443\n");
+        for cgroup in K3S_CGROUPS {
+            put(&n.root, &format!("{cgroup}/cgroup.kill"), "");
+        }
+        put(
+            &n.root,
+            "/proc/self/mounts",
+            "proc /proc proc rw 0 0\n\
+             tmpfs /var/lib/kubelet/pods/a/volumes/kubernetes.io~secret/s tmpfs rw 0 0\n\
+             overlay /run/k3s/containerd/x/rootfs overlay rw 0 0\n\
+             shm /run/k3s/containerd/x/rootfs/dev/shm tmpfs rw 0 0\n\
+             nsfs /run/netns/cni-1 nsfs rw 0 0\n\
+             /dev/vda2 /var/lib/rancher ext4 rw 0 0\n",
+        );
+        fc.ran.lock().unwrap().clear();
+        let wg = get(&n.root, WG_CONF);
+        (dir, tmp, n, fc, wg)
+    }
+
+    /// Everything a removed server must have done.
+    fn assert_left(n: &Node, fc: &FakeCoord, list: &Envelope, wg: &str) {
+        assert!(
+            get(&n.root, sysconf::K3S_TOKEN).is_empty() && get(&n.root, sysconf::K3S_CONFIG).is_empty(),
+            "the way into the cluster stays"
+        );
+        for cgroup in K3S_CGROUPS {
+            assert_eq!(get(&n.root, &format!("{cgroup}/cgroup.kill")), "1", "{cgroup} not killed");
+        }
+        assert_eq!(
+            *fc.ran.lock().unwrap(),
+            vec![
+                "systemctl stop k3s.service",
+                "umount -l /var/lib/kubelet/pods/a/volumes/kubernetes.io~secret/s",
+                "umount -l /run/netns/cni-1",
+                "umount -l /run/k3s/containerd/x/rootfs/dev/shm",
+                "umount -l /run/k3s/containerd/x/rootfs",
+            ],
+            "k3s first, then the pods' mounts from the inside out, and nothing else"
+        );
+        assert_eq!(n.load_state().host, 0, "it still counts itself a member");
+        let status = get(&n.root, SIGNED_STATUS);
+        assert!(status.starts_with("REMOVED") && status.contains("sudo dryserver join"), "{status}");
+        assert!(get(&n.root, SIGNED_FILE).contains(&list.sig), "the list that removed it is the newest it has seen");
+        assert_eq!(get(&n.root, WG_CONF), wg);
+        // From here on it is like a machine that never joined.
+        let e = sync(&Ctx::new(), n, false, &Store::new("/nonexistent")).unwrap_err().to_string();
+        assert!(e.contains("not a member of the swarm"), "{e}");
+    }
+
+    #[test]
+    fn removed_server_hears_it_over_the_mesh() {
+        let (_dir, _tmp, n, fc, wg) = running_apps();
+        // The coordinator has not dropped this server's peer yet.
+        let gone = sign(&ADMIN, 7, vec![coord_entry(), other_entry()]);
+        *fc.peers.lock().unwrap() = Some(peers(&[coord_member()], &gone));
+        let e = sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap_err();
+        assert!(e.is(Kind::Removed) && e.to_string().contains("signed list version 7"), "{e}");
+        assert_left(&n, &fc, &gone, &wg);
+    }
+
+    #[test]
+    fn removed_server_hears_it_on_the_home_network() {
+        let (_dir, _tmp, n, fc, wg) = running_apps();
+        let store = Store::new("/nonexistent");
+        let ctx = Ctx::new();
+        let untouched = |why: &str| {
+            let e = sync(&ctx, &n, false, &store).unwrap_err();
+            assert!(!e.is(Kind::Removed), "{why}: {e}");
+            assert!(!get(&n.root, sysconf::K3S_TOKEN).is_empty() && n.load_state().host == 2, "{why}: left the cluster");
+            assert!(fc.ran.lock().unwrap().is_empty(), "{why}: {:?}", fc.ran.lock().unwrap());
+        };
+        // The coordinator is silent everywhere: maybe it is only switched
+        // off. The apps keep running.
+        *fc.mesh_down.lock().unwrap() = true;
+        untouched("coordinator off");
+        // Whoever answers on the home network needs the admin's signature
+        // on a newer list.
+        for (env, why) in [
+            (sign(&ADMIN, 4, vec![coord_entry()]), "an older list without this server"),
+            (sign(&Key("thief"), 9, vec![coord_entry()]), "a list signed by someone else"),
+            (sign(&ADMIN, 5, vec![coord_entry()]), "another list under the version it has"),
+            (Envelope::default(), "no list"),
+            (sign(&ADMIN, 9, vec![node_entry(2)]), "a list without a coordinator"),
+        ] {
+            *fc.signed.lock().unwrap() = Some(env);
+            untouched(why);
+        }
+        // A newer list with this server in it: nothing to do but remember it.
+        let newer = sign(&ADMIN, 8, vec![coord_entry(), node_entry(2), other_entry()]);
+        *fc.signed.lock().unwrap() = Some(newer.clone());
+        untouched("still a member");
+        assert!(get(&n.root, SIGNED_FILE).contains(&newer.sig));
+        // Removed, and its number already went to another machine.
+        let gone = sign(&ADMIN, 9, vec![coord_entry(), Entry { host: 2, ..other_entry() }]);
+        *fc.signed.lock().unwrap() = Some(gone.clone());
+        let e = sync(&ctx, &n, false, &store).unwrap_err();
+        assert!(e.is(Kind::Removed), "{e}");
+        assert_left(&n, &fc, &gone, &wg);
     }
 
     #[test]
