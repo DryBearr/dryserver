@@ -326,6 +326,20 @@ check "the quarantine table is loaded with it" inw nft list table inet dryserver
 check_not "still cut off" inw ping -c1 -W1 10.66.0.1
 out=$(inw "$BIN" sync 2>&1)
 check_not "a second sync does not cut again" grep -q "by itself" <<<"$out"
+# Lifting forgives: the firewall's entry goes too, or the next sync would
+# cut the same member again (seen on a real install).
+for port in 9200 9201 9202; do inb python3 -I -c "
+import socket
+s = socket.socket(); s.setblocking(False)
+try: s.connect(('10.66.0.2', $port))
+except OSError: pass"; done
+inw nft add element inet dryserver offenders4 '{ 10.66.0.1 }'
+check "lift" inw "$BIN" quarantine -lift
+check_not "the firewall's entry is gone after the lift" bash -c "nsenter -t $WK -n nft list set inet dryserver offenders4 | grep -q 10.66.0.1"
+out=$(inw "$BIN" sync 2>&1)
+check_not "the next sync does not cut the lifted member again" grep -q "by itself" <<<"$out"
+check_not "no quarantine after it" test -e /etc/dryserver/quarantine.json
+check "the coordinator is reachable again" inw ping -c1 -W2 10.66.0.1
 
 kill $BR $WK 2>/dev/null
 echo "== $pass passed, $fail failed"

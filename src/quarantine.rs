@@ -806,6 +806,10 @@ pub fn lift(ctx: &Ctx, n: &Node, coordinator: bool, out: &mut dyn Write) -> Resu
         // The saved cut stays, so sync keeps away until a re-run finishes.
         return Err(e.wrap("the quarantine is only partly lifted; run the command again"));
     }
+    // Lifting forgives: the firewall's own one-hour block of members that
+    // tried closed ports goes too. With it left in place the next sync
+    // would cut the same member off again within a minute.
+    let _ = n.run.ok(ctx, &Cmd::new("nft", &["flush", "set", "inet", "dryserver", crate::sysconf::OFFENDERS_SET]).quiet());
     let _ = std::fs::remove_file(n.path(ISSUE_FILE));
     let _ = n.run.ok(ctx, &Cmd::new("agetty", &["--reload"]));
     let _ = std::fs::remove_file(n.path(STATE_FILE));
@@ -1471,6 +1475,19 @@ PersistentKeepalive = 25
         let st = load(&n).unwrap();
         assert!(st.coordinator_cut() && st.cuts.iter().all(|c| c.auto));
         assert!(get(dir.path(), AUTO_LOG).contains("cut off the coordinator (10.66.0.1)"));
+
+        // Lifting clears the firewall's entry too; otherwise the next sync
+        // would cut the same member again.
+        let before = fake.calls.lock().unwrap().len();
+        let (reply, env) = signed_reply(&ADMIN, 5, old_list());
+        put(dir.path(), node::SIGNED_FILE, serde_json::to_string(&env).unwrap());
+        *fake.signed.lock().unwrap() = Some(reply);
+        lift(&ctx, &n, false, &mut Vec::new()).unwrap();
+        let calls = fake.calls.lock().unwrap()[before..].join("\n");
+        assert!(calls.contains("nft flush set inet dryserver offenders4"), "{calls}");
+        *fake.offenders.lock().unwrap() = Some(listing(""));
+        auto_cut(&ctx, &n, false).unwrap();
+        assert!(load(&n).unwrap().is_empty(), "a lifted member was cut again");
 
         // On the coordinator its own address in the set means nothing.
         let dir = TempDir::new();
