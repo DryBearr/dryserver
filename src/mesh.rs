@@ -127,14 +127,14 @@ pub fn known_hosts(cfg: &Config, members: &[Member]) -> String {
     b
 }
 
-/// Lets `ssh <name>` reach any member over the mesh and forwards the agent
-/// (the desktop key) for the next hop. No private keys live on servers.
+/// Lets `ssh <name>` reach any member over the mesh by name, with pinned host
+/// keys. The desktop key is never forwarded, so no key reaches servers.
 pub fn ssh_config(cfg: &Config, members: &[Member]) -> String {
     let names: Vec<String> = sorted(members).into_iter().map(|m| m.name).collect();
     format!(
-        "# dryserver mesh hosts: ssh <name> works between servers using the key\n\
-         # forwarded from your desktop (connect with ssh -A).\n\
-         Host {}\n    User {}\n    ForwardAgent yes\n    StrictHostKeyChecking yes\n",
+        "# dryserver mesh hosts: names and pinned host keys. Your desktop key is\n\
+         # never forwarded to servers; connect to each server from the desktop.\n\
+         Host {}\n    User {}\n    ForwardAgent no\n    StrictHostKeyChecking yes\n",
         names.join(" "),
         cfg.username
     )
@@ -180,22 +180,24 @@ pub fn parse_hosts_block(hosts: &str) -> Vec<Server> {
 }
 
 /// ~/.ssh/config.d/dryserver: the coordinator by its LAN IP, every other
-/// server through it (ProxyJump) by mesh IP. The agent (your desktop key) is
-/// forwarded so you can hop between servers.
+/// server through it (ProxyJump) by mesh IP. ProxyJump only tunnels the
+/// connection through the coordinator; the key never leaves the desktop.
+/// ForwardAgent no is explicit so a "Host *" default in ~/.ssh/config cannot
+/// turn forwarding back on.
 pub fn desktop_ssh_config(user: &str, coord_name: &str, coord_lan_ip: &str, port: &str, known_hosts: &str, servers: &[Server]) -> String {
     let port_line = if !port.is_empty() && port != "22" { format!("    Port {port}\n") } else { String::new() };
     let mut b = format!(
         "# dryserver servers, written by \"dryserver ssh-config\". Regenerate after\n\
-         # adding machines. Your key stays on this desktop; it is forwarded (-A).\n\
+         # adding machines. Your key stays on this desktop and is never forwarded.\n\
          \n\
-         Host {coord_name}\n    HostName {coord_lan_ip}\n{port_line}    User {user}\n    ForwardAgent yes\n    UserKnownHostsFile ~/.ssh/known_hosts {known_hosts}\n"
+         Host {coord_name}\n    HostName {coord_lan_ip}\n{port_line}    User {user}\n    ForwardAgent no\n    UserKnownHostsFile ~/.ssh/known_hosts {known_hosts}\n"
     );
     for s in servers {
         if s.name == coord_name {
             continue;
         }
         b += &format!(
-            "\nHost {}\n    HostName {}\n    User {user}\n    ProxyJump {coord_name}\n    ForwardAgent yes\n    UserKnownHostsFile ~/.ssh/known_hosts {known_hosts}\n",
+            "\nHost {}\n    HostName {}\n    User {user}\n    ProxyJump {coord_name}\n    ForwardAgent no\n    UserKnownHostsFile ~/.ssh/known_hosts {known_hosts}\n",
             s.name, s.mesh_ip
         );
     }
@@ -289,7 +291,8 @@ mod tests {
         let kh = known_hosts(&c, &members());
         assert!(kh.contains("coord,10.66.0.1 ssh-ed25519 AAAAa\n") && !kh.contains("root@"), "known_hosts:\n{kh}");
         let sc = ssh_config(&c, &members());
-        assert!(sc.contains("Host coord node-b node-c") && sc.contains("ForwardAgent yes"), "ssh_config:\n{sc}");
+        assert!(sc.contains("Host coord node-b node-c") && sc.contains("ForwardAgent no"), "ssh_config:\n{sc}");
+        assert!(!sc.contains("ForwardAgent yes"), "servers must not forward the agent:\n{sc}");
     }
 
     #[test]
@@ -311,10 +314,11 @@ mod tests {
         let conf = desktop_ssh_config("admin", "coord", "192.168.1.50", "22", "~/.ssh/known_hosts.d/dryserver", &servers);
         for want in [
             "Host coord\n    HostName 192.168.1.50\n",
-            "Host node-b\n    HostName 10.66.0.2\n    User admin\n    ProxyJump coord\n    ForwardAgent yes",
+            "Host node-b\n    HostName 10.66.0.2\n    User admin\n    ProxyJump coord\n    ForwardAgent no",
         ] {
             assert!(conf.contains(want), "config missing {want:?}:\n{conf}");
         }
+        assert!(!conf.contains("ForwardAgent yes"), "the desktop key must never be forwarded:\n{conf}");
         let kh = desktop_known_hosts(&known_hosts(&c, &members()), "coord", "192.168.1.50", "22");
         assert!(kh.contains("coord,10.66.0.1,192.168.1.50 ssh-ed25519 AAAAa\n"), "{kh}");
         assert!(kh.contains("node-c,10.66.0.3 ssh-ed25519 AAAAc\n"), "{kh}");
