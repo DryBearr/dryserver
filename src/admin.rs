@@ -128,6 +128,9 @@ fn clean_device(d: Device) -> Option<Device> {
 pub struct View {
     /// Waiting requests, with pairing codes computed on this desktop.
     pub pending: Vec<Request>,
+    /// IDs of waiting requests without a valid proof from the USB stick's
+    /// join secret. They cannot be approved.
+    pub unproved: Vec<String>,
     /// Members on the coordinator, and whether this desktop signed them.
     pub members: Vec<(Member, bool)>,
     pub unknown: Vec<Device>,
@@ -159,6 +162,7 @@ pub struct Admin {
     /// The coordinator's members and requests, as last loaded and checked.
     members: Vec<Member>,
     pending: Vec<Request>,
+    unproved: Vec<String>,
 }
 
 impl Admin {
@@ -173,7 +177,18 @@ impl Admin {
             base: List::default(),
             members: Vec::new(),
             pending: Vec::new(),
+            unproved: Vec::new(),
         }
+    }
+
+    /// The join secret installers used, from secrets/.
+    fn join_secret(&self) -> Result<String> {
+        let path = self.secrets.join(crate::iso::JOIN_SECRET);
+        let s = fsx::read_string(&path).map_err(|e| e.wrap("no join secret; it is created when you build the USB stick"))?;
+        if s.trim().len() < 32 {
+            bail!("{} is damaged", path.display());
+        }
+        Ok(s)
     }
 
     fn fits(&self, host: u32) -> bool {
@@ -279,16 +294,23 @@ impl Admin {
 
         // Requests are untrusted too; the code is computed here from the
         // keys in the request and the coordinator key this desktop pinned.
+        let secret = self.join_secret()?;
         for mut r in st.requests {
             if let Err(e) = registry::validate_request(&r) {
                 v.warnings.push(format!("The coordinator sent a bad join request, ignored: {e}"));
                 continue;
             }
             r.code = registry::pairing_code(&r.wg_key, &r.ssh_host_key, &coord_key);
+            // Without the proof the request does not come from a machine
+            // installed from this stick, or the coordinator changed it.
+            if !registry::proof_ok(&secret, &r) {
+                v.unproved.push(r.id.clone());
+            }
             v.pending.push(r);
         }
         self.members = members;
         self.pending = v.pending.clone();
+        self.unproved = v.unproved.clone();
         Ok(v)
     }
 
@@ -338,6 +360,13 @@ impl Admin {
         let Some(r) = self.pending.iter().find(|r| r.id == id).cloned() else {
             bail!("that request is gone");
         };
+        if self.unproved.contains(&r.id) {
+            bail!(
+                "{} has no valid proof from your USB stick: it was not installed from it, or the coordinator changed the request. \
+                 Not approved. Reject it (r); if the machine is yours, reinstall it from your stick.",
+                r.name
+            );
+        }
         let mut host = 0;
         self.publish(|list, a| {
             if list.members.iter().any(|e| e.name == r.name) {
@@ -435,6 +464,7 @@ pub mod tests {
     use std::sync::{Arc, Mutex};
 
     pub const COORD_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIcoordinatorkey";
+    pub const SECRET: &str = "7e577e577e577e577e577e577e577e577e577e577e577e577e577e577e577e57";
 
     pub fn key32(seed: u8) -> String {
         base64::engine::general_purpose::STANDARD.encode([seed; 32])
@@ -486,14 +516,17 @@ pub mod tests {
         }
     }
 
+    /// A join request as a machine installed from the admin's stick sends it.
     pub fn request(name: &str, seed: u8) -> Request {
-        Request {
+        let mut r = Request {
             name: name.into(),
             wg_key: key32(seed),
             ssh_host_key: format!("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI{} root@{name}", name.replace('-', "")),
             lan_ip: "192.168.1.23".into(),
             ..Request::default()
-        }
+        };
+        r.proof = registry::join_proof(SECRET, &r.name, &r.wg_key, &r.ssh_host_key);
+        r
     }
 
     /// A coordinator with itself as member 1, and an Admin talking to it.
@@ -520,6 +553,7 @@ pub mod tests {
             .unwrap();
         let secrets = dir.join("secrets");
         std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::write(secrets.join(crate::iso::JOIN_SECRET), format!("{SECRET}\n")).unwrap();
         let fails: Arc<Mutex<bool>> = Arc::default();
         let link = Direct { store: Store::new(&store.path), host_key: COORD_KEY.into(), publish_fails: fails.clone(), verifier: None };
         let a = Admin::new(Box::new(link), Box::new(Key("admin")), Box::new(Key("admin")), &secrets, "10.66.0.0/24");
@@ -615,6 +649,55 @@ pub mod tests {
         let v = a.load().unwrap();
         assert!(v.unsigned().is_empty() && a.would_drop(&[]).is_empty());
         assert!(a.sign_coordinator().unwrap_err().to_string().contains("signed already"));
+    }
+
+    #[test]
+    fn requests_need_the_proof_from_the_stick() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        // The real machine asks. Then a hacked coordinator swaps in its own
+        // WireGuard key, and adds a request of its own, with a made-up
+        // proof and with none.
+        let real = ask(&store, "node-a", 2);
+        store
+            .update(|s| {
+                let mut swapped = s.requests[0].clone();
+                swapped.id = "00000000000000aa".into();
+                swapped.name = "node-b".into();
+                swapped.wg_key = key32(66);
+                s.requests.push(swapped);
+                let mut made_up = request("node-c", 4);
+                made_up.id = "00000000000000bb".into();
+                made_up.proof = "0".repeat(64);
+                made_up.status = registry::Status::Pending;
+                made_up.created = Time::now();
+                s.requests.push(made_up);
+                let mut none = request("node-d", 5);
+                none.id = "00000000000000cc".into();
+                none.proof.clear();
+                none.status = registry::Status::Pending;
+                none.created = Time::now();
+                s.requests.push(none);
+                Ok(())
+            })
+            .unwrap();
+        let v = a.load().unwrap();
+        assert_eq!(v.pending.len(), 4);
+        assert_eq!(v.unproved, vec!["00000000000000aa".to_string(), "00000000000000bb".into(), "00000000000000cc".into()]);
+        for id in &v.unproved {
+            let e = a.approve(id).unwrap_err().to_string();
+            assert!(e.contains("no valid proof from your USB stick"), "{e}");
+        }
+        assert_eq!(store.read().unwrap().members.len(), 1, "an unproved request became a member");
+        // The untouched request of the real machine goes through.
+        a.approve(&real).unwrap();
+        // They can still be rejected.
+        a.load().unwrap();
+        a.reject("00000000000000aa").unwrap();
+
+        // Without the secret nothing can be judged: refused outright.
+        std::fs::remove_file(dir.join("secrets").join(crate::iso::JOIN_SECRET)).unwrap();
+        assert!(a.load().unwrap_err().to_string().contains("no join secret"));
     }
 
     #[test]

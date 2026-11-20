@@ -253,7 +253,11 @@ Limits for now:
 - **Joining**: needs your approval on your desktop with a matching pairing
   code. The code covers both machines' keys, so a fake coordinator or a
   swapped request shows a different code. A new machine joins only when it
-  finds itself, with its own keys, in a list you signed. After approval, the
+  finds itself, with its own keys, in a list you signed. Each request also
+  carries a proof made by the installer with a secret from your USB stick
+  (`secrets/join_secret`); no installed machine keeps that secret. Without
+  the proof a request cannot be approved, so a hacked coordinator cannot
+  swap its own keys into a waiting request. After approval, the
   member list is only served over the mesh. Removing a machine (`d` in
   `./dryserver approve`) drops it from all servers within a minute.
 - **Unknown devices**: the coordinator scans its networks every 15 minutes and
@@ -278,8 +282,10 @@ Limits for now:
   coordinator can hold back a newer list from servers that have not seen it
   yet, so a removal may not arrive; cut the machine off with
   `./dryserver quarantine-all -name NAME` then.
-- **The USB stick** holds the WiFi password and the key that lets machines ask
-  to join. Keep it safe, or re-flash it after installing.
+- **The USB stick** holds the WiFi password, the key that lets machines ask
+  to join and the join secret. Whoever has it can make a join request that
+  looks installed from your stick; it still needs your approval and a
+  matching code. Keep it safe, or re-flash it after installing.
 
 ## Commands
 
@@ -377,6 +383,8 @@ Golden files for the generated system files are in `testdata/sysconf`;
 |---|---|
 | `config.env` | your settings, contains the WiFi password; not committed |
 | `secrets/registry_ed25519` | key machines use to ask to join; not committed |
+| `secrets/join_secret` | proves a join request comes from a machine installed from your stick; on the stick and here, never on an installed machine; not committed. **Back it up** |
+| `secrets/members.signed.json` | this computer's copy of the last machine list you signed: the backup of who is in your swarm |
 | `secrets/signing_ed25519` | key that signs the list of machines in your swarm; created by the first build, never leaves this computer, not committed. **Back it up.** Only `signing_ed25519.pub` goes onto the USB stick and the servers |
 | `out/dryserver.iso`, `out/build.log` | built installer image and its log |
 

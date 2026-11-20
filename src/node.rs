@@ -35,6 +35,9 @@ pub const SWITCH_MAC_FILE: &str = "/etc/dryserver/switch.mac";
 /// /etc/dryserver (root only) because the coordinator's registry user reads
 /// it too; root owns it, everyone may read it.
 pub const SIGNING_PUB: &str = "/usr/local/share/dryserver/signing_ed25519.pub";
+/// Proof from the installer that this machine was installed from the
+/// admin's USB stick; sent with every join request.
+pub const JOIN_PROOF: &str = "/etc/dryserver/join.proof";
 /// The newest signed member list this server has verified. A lower version
 /// from the coordinator later is a rollback.
 pub const SIGNED_FILE: &str = "/etc/dryserver/members.signed.json";
@@ -198,6 +201,7 @@ impl Node {
             ssh_host_key: host_key.clone(),
             lan_ip: lan_ip.into(),
             switch: sw,
+            proof: self.read(JOIN_PROOF).unwrap_or_default(),
             ..registry::Request::default()
         };
         let body = serde_json::to_string(&req)?;

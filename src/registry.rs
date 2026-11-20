@@ -91,6 +91,10 @@ pub struct Request {
     pub status: Status,
     #[serde(skip_serializing_if = "is_zero")]
     pub host: u32,
+    /// Made by the installer with the join secret from the USB stick; see
+    /// join_proof. The coordinator only carries it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub proof: String,
 }
 
 /// A scan-report entry: something on the network that is not a member.
@@ -130,6 +134,45 @@ pub fn pairing_code(wg_key: &str, node_host_key: &str, coord_host_key: &str) -> 
     let h = Sha256::digest(input.as_bytes());
     let n = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 1_000_000;
     format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
+/// HMAC-SHA256 (RFC 2104).
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    inner.update(msg);
+    let mut outer = Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+/// Proof that a join request was made by a machine installed from the
+/// admin's USB stick, for exactly this name and these keys.
+///
+/// The join secret is on the stick and on the admin's desktop. The
+/// installer uses it once and stores only the proof; no installed machine
+/// keeps the secret, the coordinator included. So a hacked coordinator
+/// cannot show the admin a request with its own keys in place of the real
+/// machine's: without the secret it has no proof for them, however many
+/// keys it tries until the 6-digit pairing code matches.
+pub fn join_proof(secret: &str, name: &str, wg_key: &str, ssh_host_key: &str) -> String {
+    let msg = ["dryserver-join-v1", name, wg_key.trim(), &key_body(ssh_host_key)].join("\n");
+    fsx::hex(&hmac_sha256(secret.trim().as_bytes(), msg.as_bytes()))
+}
+
+/// Whether r carries the proof for its own fields. Compared in constant
+/// time.
+pub fn proof_ok(secret: &str, r: &Request) -> bool {
+    let want = join_proof(secret, &r.name, &r.wg_key, &r.ssh_host_key);
+    let (a, b) = (want.as_bytes(), r.proof.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// The coordinator's own code: shown on its screen after its install and
@@ -249,6 +292,9 @@ pub fn validate_request(r: &Request) -> Result<()> {
     }
     if parse_ip4(&r.lan_ip).is_none() {
         return Err("bad LAN IP".into());
+    }
+    if !r.proof.is_empty() && !(r.proof.len() == 64 && r.proof.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+        return Err("bad join proof".into());
     }
     Ok(())
 }
@@ -776,6 +822,49 @@ mod tests {
         let (ok, _) = check_members(vec![good(1, "coord", 1), good(1, "fake", 9)], fits);
         assert_eq!(ok.len(), 1);
         assert_eq!(ok[0].name, "coord");
+    }
+
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        let hex = |b: [u8; 32]| fsx::hex(&b);
+        assert_eq!(hex(hmac_sha256(&[0x0b; 20], b"Hi There")), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+        assert_eq!(
+            hex(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // A key longer than the block size is hashed first (test case 6).
+        assert_eq!(
+            hex(hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn join_proof_covers_name_and_keys() {
+        let r = req("node-a");
+        let proof = join_proof("secret-1", &r.name, &r.wg_key, &r.ssh_host_key);
+        assert_eq!(proof.len(), 64);
+        let with = |f: &dyn Fn(&mut Request)| {
+            let mut x = Request { proof: proof.clone(), ..r.clone() };
+            f(&mut x);
+            x
+        };
+        assert!(proof_ok("secret-1", &with(&|_| {})));
+        assert!(proof_ok("secret-1\n", &with(&|_| {})), "a trailing newline in the secret file must not matter");
+        // The key comment and addresses are not part of the identity.
+        assert!(proof_ok("secret-1", &with(&|x| x.ssh_host_key += " root@other")));
+        assert!(proof_ok("secret-1", &with(&|x| x.lan_ip = "10.0.0.9".into())));
+        // Anything a hacked coordinator would swap breaks it.
+        assert!(!proof_ok("secret-1", &with(&|x| x.wg_key = wg_key())));
+        assert!(!proof_ok("secret-1", &with(&|x| x.name = "node-b".into())));
+        assert!(!proof_ok("secret-1", &with(&|x| x.ssh_host_key = "ssh-ed25519 AAAAother".into())));
+        assert!(!proof_ok("secret-2", &with(&|_| {})), "another stick's secret");
+        assert!(!proof_ok("secret-1", &with(&|x| x.proof.clear())));
+        assert!(!proof_ok("secret-1", &with(&|x| x.proof.push('0'))));
+        // The registry carries a proof but refuses junk in its place.
+        assert!(validate_request(&with(&|_| {})).is_ok());
+        assert!(validate_request(&with(&|x| x.proof = "zz".into())).is_err());
+        assert!(validate_request(&with(&|x| x.proof = "A".repeat(64))).is_err());
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub const KEY_NAME: &str = "registry_ed25519";
 /// secrets/ on the desktop; only SIGNING_PUB goes into the ISO.
 pub const SIGNING_KEY_NAME: &str = "signing_ed25519";
 pub const SIGNING_PUB: &str = "signing_ed25519.pub";
+/// The secret installers use to prove a join request comes from this
+/// stick. On the stick and in secrets/; never on an installed machine.
+pub const JOIN_SECRET: &str = "join_secret";
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -85,13 +88,14 @@ pub fn run(ctx: &Ctx, o: &Options, log: &mut (dyn Write + Send)) -> Result<()> {
 
     let key = ensure_registry_key(ctx, &o.secrets_dir, &mut tee)?;
     let signing_pub = ensure_signing_key(ctx, &o.secrets_dir, &mut tee)?;
+    let join_secret = ensure_join_secret(&o.secrets_dir, &mut tee)?;
 
     let stage = out_dir.join("stage");
     let stage_c = stage.clone();
     let _rm = Defer(|| {
         let _ = std::fs::remove_dir_all(&stage_c);
     });
-    write_stage(&stage, &me, &o.config, &key, &signing_pub).map_err(|e| e.wrap("prepare build files"))?;
+    write_stage(&stage, &me, &o.config, &key, &signing_pub, &join_secret).map_err(|e| e.wrap("prepare build files"))?;
 
     let _ = writeln!(tee, "==> Starting {IMAGE} (first run downloads ~1 GB)");
     let start = Instant::now();
@@ -296,10 +300,35 @@ fn ensure_signing_key(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<Path
     Ok(pubkey)
 }
 
+/// Makes sure secrets/ holds the join secret and returns its path. Created
+/// once: machines installed from an older stick carry proofs made with it.
+fn ensure_join_secret(dir: &Path, log: &mut dyn Write) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(JOIN_SECRET);
+    if !path.exists() {
+        fsx::mkdir_all(dir, 0o700)?;
+        let _ = writeln!(log, "==> Generating join secret {}", path.display());
+        fsx::write_file(&path, format!("{}\n", fsx::hex(&fsx::random_bytes(32))), 0o600)?;
+    }
+    let text = fsx::read_string(&path)?;
+    let t = text.trim();
+    if t.len() < 32 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(errf!(
+            "{} is damaged (not a hex secret). Restore it from your backup, or remove it to make a new one.",
+            path.display()
+        ));
+    }
+    let mode = std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
+    if mode & 0o077 != 0 {
+        fsx::chmod(&path, 0o600)?;
+    }
+    Ok(path)
+}
+
 /// Lays out the directory mounted at /stage in the container: the embedded
 /// assets plus this binary, the config, the registry key and the public
 /// half of the signing key. The signing private key is never staged.
-fn write_stage(stage: &Path, me: &Path, cfg: &Config, key: &Path, signing_pub: &Path) -> Result<()> {
+fn write_stage(stage: &Path, me: &Path, cfg: &Config, key: &Path, signing_pub: &Path, join_secret: &Path) -> Result<()> {
     match std::fs::remove_dir_all(stage) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
@@ -318,7 +347,8 @@ fn write_stage(stage: &Path, me: &Path, cfg: &Config, key: &Path, signing_pub: &
     cfg.save(etc.join("config.env"))?;
     copy_file(key, &etc.join(KEY_NAME), 0o600)?;
     copy_file(&PathBuf::from(format!("{}.pub", key.display())), &etc.join(format!("{KEY_NAME}.pub")), 0o644)?;
-    copy_file(signing_pub, &etc.join(SIGNING_PUB), 0o644)
+    copy_file(signing_pub, &etc.join(SIGNING_PUB), 0o644)?;
+    copy_file(join_secret, &etc.join(JOIN_SECRET), 0o600)
 }
 
 fn copy_file(src: &Path, dst: &Path, mode: u32) -> Result<()> {
@@ -343,12 +373,15 @@ mod tests {
         let stage = dir.join("stage");
         std::fs::write(dir.join(SIGNING_KEY_NAME), "signing private").unwrap();
         std::fs::write(dir.join(SIGNING_PUB), "ssh-ed25519 AAAAsign dryserver-signing\n").unwrap();
-        write_stage(&stage, &me, &cfg, &key, &dir.join(SIGNING_PUB)).unwrap();
+        std::fs::write(dir.join(JOIN_SECRET), "0123456789abcdef0123456789abcdef\n").unwrap();
+        write_stage(&stage, &me, &cfg, &key, &dir.join(SIGNING_PUB), &dir.join(JOIN_SECRET)).unwrap();
 
         let key_pub = format!("overlay/airootfs/etc/dryserver/{KEY_NAME}.pub");
         let key_priv = format!("overlay/airootfs/etc/dryserver/{KEY_NAME}");
         let signing_pub = format!("overlay/airootfs/etc/dryserver/{SIGNING_PUB}");
-        let want: [(&str, u32); 8] = [
+        let join_secret = format!("overlay/airootfs/etc/dryserver/{JOIN_SECRET}");
+        let want: [(&str, u32); 9] = [
+            (&join_secret, 0o600),
             (&signing_pub, 0o644),
             ("build.sh", 0),
             ("packages.extra", 0),
@@ -382,6 +415,27 @@ mod tests {
             );
             assert_ne!(f.file_name().unwrap(), SIGNING_KEY_NAME, "{}", f.display());
         }
+    }
+
+    #[test]
+    fn join_secret_lifecycle() {
+        let dir = TempDir::new();
+        let secrets = dir.join("secrets");
+        let mut log = Vec::new();
+        let p = ensure_join_secret(&secrets, &mut log).unwrap();
+        let first = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(first.trim().len(), 64, "32 random bytes in hex");
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        // Kept across builds.
+        ensure_join_secret(&secrets, &mut Vec::new()).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), first);
+        // Loose permissions are tightened; junk is refused, not replaced.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_join_secret(&secrets, &mut Vec::new()).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::write(&p, "not hex!\n").unwrap();
+        assert!(ensure_join_secret(&secrets, &mut Vec::new()).unwrap_err().to_string().contains("damaged"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "not hex!\n");
     }
 
     #[test]

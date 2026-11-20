@@ -28,6 +28,10 @@ keygen "$S/desk/secrets/signing_ed25519" dryserver-signing
 # but not the private signing key.
 cp "$S/desk/secrets/registry_ed25519"* "$S/thief/secrets/"
 keygen "$S/thief/secrets/signing_ed25519" thief
+# The join secret from the stick: the desktop has it, and so does the thief.
+SECRET=$(openssl rand -hex 32)
+echo "$SECRET" > "$S/desk/secrets/join_secret"
+cp "$S/desk/secrets/join_secret" "$S/thief/secrets/"
 
 cp "$S/hostkey.pub" "$S/root/etc/ssh/ssh_host_ed25519_key.pub"
 cp "$S/desk/secrets/signing_ed25519.pub" "$S/root/usr/local/share/dryserver/"
@@ -123,7 +127,10 @@ PY
 screen() { local o; o=$(screen_raw "$@" 2>&1); local rc=$?; [ -n "${DEBUG_DIR:-}" ] && printf '%s\n' "$o" > "$DEBUG_DIR/screen-$(date +%s%N).txt"; printf '%s\n' "$o"; return $rc; }
 
 echo "== a machine asks to join"
-REQ=$(printf '{"name":"node-a","wg_key":"%s","ssh_host_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGVmCw4JXa0JQ1x0Z3ZJ3vY3lMSa7p4rG5Q6k8hO2c3d root@node-a","lan_ip":"192.168.1.23","switch":true}' "$NODE_WG")
+NODE_HK="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGVmCw4JXa0JQ1x0Z3ZJ3vY3lMSa7p4rG5Q6k8hO2c3d"
+# What the installer does on the new machine: HMAC over its name and keys.
+PROOF=$(printf 'dryserver-join-v1\nnode-a\n%s\n%s' "$NODE_WG" "$NODE_HK" | openssl dgst -sha256 -hmac "$SECRET" -r | cut -d' ' -f1)
+REQ=$(printf '{"name":"node-a","wg_key":"%s","ssh_host_key":"%s root@node-a","lan_ip":"192.168.1.23","switch":true,"proof":"%s"}' "$NODE_WG" "$NODE_HK" "$PROOF")
 out=$(echo "$REQ" | reg request)
 check "request accepted ($out)" grep -q '"id"' <<<"$out"
 CODE=$(jqr "d['requests'][0]['code']")
@@ -152,6 +159,17 @@ check "coordinator stores a signed list (version $V1)" test "$V1" -gt 1600000000
 check "desktop kept its own copy" test -s "$S/desk/secrets/members.signed.json"
 check "desktop pinned the coordinator's SSH key" grep -q "^\[127.0.0.1\]:$PORT ssh-ed25519" "$S/desk/secrets/coordinator_known_hosts"
 check "the node gets approved status" bash -c "echo | /usr/bin/ssh -i $S/desk/secrets/registry_ed25519 -p $PORT -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR $USER@127.0.0.1 'status $(jqr "d['requests'][0]['id']")' | grep -q approved"
+
+echo "== a request without the stick's proof (a swapped key, or a machine not installed from the stick)"
+EVIL_WG=$(wg genkey | wg pubkey)
+out=$(printf '{"name":"node-b","wg_key":"%s","ssh_host_key":"%s root@node-b","lan_ip":"192.168.1.24","proof":"%s"}' "$EVIL_WG" "$NODE_HK" "$PROOF" | reg request)
+check "the coordinator takes it (it cannot tell)" grep -q '"id"' <<<"$out"
+out=$(screen "$S/desk" "NO PROOF" "a" "no valid proof|approved and signed" "")
+check "screen marks it NO PROOF" grep -q "NO PROOF: not installed from your USB stick" <<<"$out"
+check "approving it is refused" grep -q "no valid proof from your USB stick" <<<"$out"
+check "still 2 members" test "$(jqr "len(d['members'])")" = 2
+out=$(screen "$S/desk" "NO PROOF" "r" "node-b rejected|Failed" "")
+check "it can be rejected" grep -q "node-b rejected" <<<"$out"
 
 # The stored signature verifies with plain OpenSSH, outside dryserver.
 python3 -I -c "

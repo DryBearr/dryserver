@@ -401,6 +401,7 @@ fn desktop_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
     let registry_key = need(iso::KEY_NAME, "the key machines use to reach the coordinator's registry")?;
     let signing_key = need(iso::SIGNING_KEY_NAME, "the key that signs your decisions")?;
     let signing_pub = need(iso::SIGNING_PUB, "the public half of the signing key")?;
+    need(iso::JOIN_SECRET, "the secret that proves a machine was installed from your stick")?;
     let host = if f.get("host").is_empty() { cfg.coord_lan_ip.clone() } else { f.get("host").to_string() };
     let link = admin::SshLink {
         key: registry_key,

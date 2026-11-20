@@ -219,7 +219,21 @@ impl Model for Screen {
             b.add(dim("  none. New machines show up here after their setup finishes.")).nl();
         }
         for (i, r) in pending.iter().enumerate() {
-            line(&mut b, i, format!("{:<14} {:<15} code {}   {}", r.name, r.lan_ip, r.code, ago(r.created, now)));
+            let text = format!("{:<14} {:<15} code {}   {}", r.name, r.lan_ip, r.code, ago(r.created, now));
+            if !self.view.unproved.contains(&r.id) {
+                line(&mut b, i, text);
+                continue;
+            }
+            if i == self.cursor {
+                b.add(sel(format!("> {text}")));
+            } else {
+                b.s(format!("  {text}"));
+            }
+            b.s("  ").add(err("NO PROOF")).nl();
+        }
+        if !self.view.unproved.is_empty() {
+            b.add(err("  NO PROOF: not installed from your USB stick, or changed by the coordinator. Cannot be approved; reject it (r)."))
+                .nl();
         }
         if !pending.is_empty() {
             b.add(dim("  Approve only if the code matches the one on the new machine's screen.")).nl();
@@ -398,6 +412,29 @@ mod tests {
         s.key(Key::Char('y'));
         let names: Vec<String> = store.read().unwrap().members.iter().map(|m| m.name.clone()).collect();
         assert_eq!(names, vec!["coord", "node-n"]);
+    }
+
+    #[test]
+    fn unproved_requests_are_marked_and_refused() {
+        let dir = TempDir::new();
+        let (admin, store) = setup(&dir);
+        store
+            .update(|s| {
+                let mut r = request("node-x", 5);
+                r.wg_key = key32(55);
+                s.add_request(r, COORD_KEY, Time::now())?;
+                Ok(())
+            })
+            .unwrap();
+        let mut s = Screen::new(admin);
+        s.load();
+        let v = s.view().plain();
+        assert!(v.contains("node-x") && v.contains("NO PROOF: not installed from your USB stick"), "{v}");
+        s.key(Key::Char('a'));
+        assert!(s.notice.contains("Failed") && s.notice.contains("no valid proof"), "{:?}", s.notice);
+        assert_eq!(store.read().unwrap().members.len(), 1);
+        s.key(Key::Char('r'));
+        assert!(s.notice.contains("node-x rejected"), "{:?}", s.notice);
     }
 
     #[test]

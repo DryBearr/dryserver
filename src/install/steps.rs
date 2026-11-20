@@ -295,6 +295,22 @@ impl Real {
         if ch.role() == Role::Coordinator {
             self.setup_registry_user(ctx)?;
             self.setup_coordinator_mesh(ctx, ch)?;
+        } else {
+            // Proof for the admin that this machine, with these keys, was
+            // installed from their stick. Only the proof is stored: the
+            // secret stays on the stick.
+            let secret_path = fsx::dir(&self.registry_key).join(iso::JOIN_SECRET);
+            let secret =
+                fsx::read_string(&secret_path).map_err(|e| e.wrap("this installer has no join secret; build the USB stick again"))?;
+            if secret.trim().len() < 32 {
+                return Err(errf!("{} is damaged; build the USB stick again", secret_path.display()));
+            }
+            let (wg, host_key) = {
+                let st = self.state.lock().unwrap();
+                (st.wg_public.clone(), st.host_key.clone())
+            };
+            let proof = registry::join_proof(&secret, &ch.hostname, &wg, &host_key);
+            self.write(node::JOIN_PROOF, 0o600, format!("{proof}\n"))?;
         }
 
         // Services from the bundles.
@@ -567,6 +583,7 @@ mod tests {
         }
     }
 
+    const JOIN_SECRET: &str = "5ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2";
     const DISK_PASS: &str = "disk passphrase 123";
     const USER_PASS: &str = "user password 456";
 
@@ -582,6 +599,7 @@ mod tests {
         std::fs::write(&key, "private").unwrap();
         std::fs::write(dir.join("registry_ed25519.pub"), "ssh-ed25519 AAAAreg dryserver-registry\n").unwrap();
         std::fs::write(dir.join(iso::SIGNING_PUB), "ssh-ed25519 AAAAsign dryserver-signing\n").unwrap();
+        std::fs::write(dir.join(iso::JOIN_SECRET), format!("{JOIN_SECRET}\n")).unwrap();
 
         let cfg = Config {
             coord_lan_ip: "192.168.1.50".into(),
@@ -686,6 +704,28 @@ mod tests {
         assert!(read("/etc/crypttab").contains("data0 UUID=1111-uuid /etc/cryptsetup-keys.d/data0.key"), "{}", read("/etc/crypttab"));
         assert_eq!(read("/etc/wireguard/wg0.key"), "PRIVATEKEY=\n");
         assert_eq!(r.state.lock().unwrap().wg_public, "PUBLICKEY=");
+        // The join proof for this machine's name and keys; the secret
+        // itself must not be anywhere in the new system.
+        assert_eq!(
+            read(node::JOIN_PROOF).trim(),
+            registry::join_proof(JOIN_SECRET, "node-3a2f", "PUBLICKEY=", "ssh-ed25519 AAAAhost root@new")
+        );
+        assert_eq!(mode(r.target(node::JOIN_PROOF)).0, 0o600);
+        fn files(d: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_symlink() {
+                    continue;
+                }
+                if p.is_dir() { files(&p, out) } else { out.push(p) }
+            }
+        }
+        let mut all = Vec::new();
+        files(&r.target, &mut all);
+        for f in all {
+            let b = std::fs::read(&f).unwrap_or_default();
+            assert!(!b.windows(JOIN_SECRET.len()).any(|w| w == JOIN_SECRET.as_bytes()), "the join secret was copied to {}", f.display());
+        }
         assert_eq!(std::fs::read_link(r.target("/etc/resolv.conf")).unwrap(), PathBuf::from("/run/systemd/resolve/stub-resolv.conf"));
         assert!(!read("/etc/skel/.tmux.conf").is_empty(), "bundle files not installed");
         assert!(
@@ -730,6 +770,7 @@ mod tests {
         assert_eq!(mode(node::SIGNING_PUB), 0o644);
         assert_eq!(mode("/usr/local/share/dryserver") & 0o005, 0o005, "the registry user must be able to reach the key");
 
+        assert!(!r.target(node::JOIN_PROOF).exists(), "a coordinator asks nobody to join");
         // Coordinator: its code on the console until the admin signs it.
         let issue = get(&r.target, node::ISSUE_FILE);
         assert!(issue.contains("not signed yet") && issue.contains(&r.coordinator_code()) && r.coordinator_code().len() == 7, "{issue}");

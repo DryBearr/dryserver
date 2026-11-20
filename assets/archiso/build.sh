@@ -61,6 +61,7 @@ file_permissions+=(
   ["/etc/dryserver"]="0:0:700"
   ["/etc/dryserver/config.env"]="0:0:600"
   ["/etc/dryserver/registry_ed25519"]="0:0:600"
+  ["/etc/dryserver/join_secret"]="0:0:600"
 )
 PERMS
 
