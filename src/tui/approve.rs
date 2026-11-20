@@ -120,7 +120,7 @@ impl Approve {
     }
 }
 
-fn ago(t: Time, now: Time) -> String {
+pub(super) fn ago(t: Time, now: Time) -> String {
     if t.is_zero() {
         return "never".into();
     }

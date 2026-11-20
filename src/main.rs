@@ -1,6 +1,7 @@
 //! dryserver builds and flashes the Arch + WireGuard installer USB, and runs
 //! the setup screen and mesh tools on the servers it installs.
 
+mod admin;
 mod assets;
 mod cidr;
 mod config;
@@ -19,6 +20,7 @@ mod packages;
 mod quarantine;
 mod registry;
 mod runner;
+mod signed;
 mod sysconf;
 #[cfg(test)]
 mod testutil;
@@ -58,8 +60,11 @@ commands:
                       -name a,b cuts those members instead, -lift undoes,
                       -status shows
 
+  approve             approve or reject machines, remove members; every
+                      decision is signed with secrets/signing_ed25519
+
 on servers:
-  approve             coordinator: approve or reject machines, remove members
+  approve             coordinator: the same without signing (older way)
   join                ask the coordinator to join (runs at boot until approved)
   sync                update the mesh from the member list (runs every minute)
   quarantine          cut the coordinator (or -name a,b) off this server;
@@ -413,12 +418,16 @@ fn is_coordinator() -> bool {
 }
 
 fn run_registry(args: &[String]) -> Result<()> {
-    let f = Flags::parse("registry", args, &[("subnet", "", "mesh subnet")]);
-    let host_key = fsx::read_string("/etc/ssh/ssh_host_ed25519_key.pub")?;
+    // The flags come from the forced command in authorized_keys, never
+    // from the caller: what the caller asks for is SSH_ORIGINAL_COMMAND.
+    let f = Flags::parse("registry", args, &[("subnet", "", "mesh subnet"), ("root", "/", "directory holding this server's files")]);
+    let root = Path::new(f.get("root"));
+    let host_key = fsx::read_string(fsx::under(root, "/etc/ssh/ssh_host_ed25519_key.pub"))?;
     let env = |k: &str| std::env::var(k).unwrap_or_default();
     registry::serve(
-        &registry::Store::default_path(),
+        &registry::Store::new(fsx::under(root, registry::DEFAULT_PATH)),
         &mesh::Subnet(f.get("subnet").to_string()),
+        &signed::SshVerifier::installed(root, std::env::temp_dir()),
         &host_key,
         &env("SSH_ORIGINAL_COMMAND"),
         &env("SSH_CLIENT"),
@@ -597,14 +606,55 @@ fn run_scan(args: &[String]) -> Result<()> {
 }
 
 fn run_approve(args: &[String]) -> Result<()> {
-    Flags::parse("approve", args, &[]);
+    let f = Flags::parse(
+        "approve",
+        args,
+        &[
+            ("config", "config.env", "desktop: config file"),
+            ("host", "", "desktop: coordinator address (default: COORD_LAN_IP)"),
+            ("port", "22", "desktop: coordinator SSH port"),
+        ],
+    );
+    if !Path::new(LIVE_CONFIG).exists() {
+        return run_approve_desktop(&f);
+    }
     let (_, cfg) = server_node()?;
     if !is_coordinator() {
-        bail!("approve runs on the coordinator ({})", cfg.coord_lan_ip);
+        bail!("approve runs on your desktop (./dryserver approve), or on the coordinator ({})", cfg.coord_lan_ip);
     }
     let subnet = Cidr::parse(&cfg.wg_subnet).ok_or_else(|| errf!("invalid CIDR address: {}", cfg.wg_subnet))?;
     let max_host = (subnet.size() - 2) as u32;
     tui::run(&mut tui::approve::Approve::new(registry::Store::default_path(), &cfg.wg_subnet, max_host))
+}
+
+/// Approval from the admin's desktop: every decision is signed with
+/// secrets/signing_ed25519 and sent to the coordinator's registry.
+fn run_approve_desktop(f: &Flags) -> Result<()> {
+    if fsx::is_root() {
+        bail!("run approve as your normal user, not with sudo");
+    }
+    let cfg = Config::load(f.get("config"))?;
+    let secrets = paths().secrets;
+    let need = |name: &str, what: &str| -> Result<PathBuf> {
+        let p = secrets.join(name);
+        if !p.exists() {
+            bail!("{} is missing ({what}). It is created when you build the USB stick: ./dryserver build", p.display());
+        }
+        Ok(p)
+    };
+    let registry_key = need(iso::KEY_NAME, "the key machines use to reach the coordinator's registry")?;
+    let signing_key = need(iso::SIGNING_KEY_NAME, "the key that signs your decisions")?;
+    let signing_pub = need(iso::SIGNING_PUB, "the public half of the signing key")?;
+    let host = if f.get("host").is_empty() { cfg.coord_lan_ip.clone() } else { f.get("host").to_string() };
+    let link = admin::SshLink { key: registry_key, known_hosts: secrets.join(admin::KNOWN_HOSTS), host, port: f.get("port").to_string() };
+    let a = admin::Admin::new(
+        Box::new(link),
+        Box::new(signed::SshSigner { key: signing_key }),
+        Box::new(signed::SshVerifier { pubkey: signing_pub, tmp_dir: std::env::temp_dir() }),
+        &secrets,
+        &cfg.wg_subnet,
+    );
+    tui::run(&mut tui::admin::Screen::new(a))
 }
 
 /// The LUKS container of the root filesystem, from /etc/crypttab.

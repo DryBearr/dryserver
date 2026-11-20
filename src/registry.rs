@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::cidr::parse_ip4;
 use crate::err::{Error, Result};
 use crate::gotime::{Time, null_default};
+use crate::signed::{self, Envelope, List, Verifier};
 use crate::{errf, fsx};
 
 pub const MAX_PENDING: usize = 20;
@@ -27,6 +28,10 @@ pub fn request_ttl() -> TimeDelta {
 }
 
 fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -108,6 +113,12 @@ pub struct State {
     #[serde(deserialize_with = "null_default")]
     pub unknown: Vec<Device>,
     pub scanned: Time,
+    /// The member list the admin signed last, exactly as it arrived. The
+    /// coordinator hands it to every node; it cannot make one itself.
+    #[serde(skip_serializing_if = "Envelope::is_empty")]
+    pub signed: Envelope,
+    #[serde(skip_serializing_if = "is_zero64")]
+    pub signed_version: u64,
 }
 
 /// The 6-digit code both sides show. It covers the new node's keys and the
@@ -351,6 +362,64 @@ impl State {
         Ok(())
     }
 
+    /// Makes a list signed by the admin the member list. The caller has
+    /// checked the signature and the entries.
+    ///
+    /// - An older or equal version is refused: signed lists are not secret,
+    ///   so anyone could send an old one back to undo a removal.
+    /// - The coordinator's own name and keys must be the ones it has. A list
+    ///   made for another coordinator would cut every node off from it.
+    /// - Addresses and "last seen" of members that stay are kept; a new
+    ///   member gets them from its join request.
+    /// - Waiting requests are settled: signed in means approved; turned
+    ///   down, or another machine under a signed member's name, rejected.
+    pub fn publish(&mut self, list: &List, env: &Envelope, now: Time) -> Result<()> {
+        if list.version <= self.signed_version {
+            return Err(errf!("this list (version {}) is not newer than the current one (version {})", list.version, self.signed_version));
+        }
+        let Some(me) = self.members.iter().find(|m| m.host == 1) else {
+            return Err("the coordinator has no entry for itself".into());
+        };
+        if !list.members.iter().any(|e| e.host == 1 && e.matches(me)) {
+            return Err("the signed list does not carry this coordinator's own name and keys (was the coordinator reinstalled?)".into());
+        }
+        let mut members = Vec::new();
+        for e in &list.members {
+            let m = match self.members.iter().find(|m| m.host == e.host && m.wg_key == e.wg_key) {
+                Some(old) => Member { name: e.name.clone(), ssh_host_key: e.ssh_host_key.clone(), ..old.clone() },
+                None => {
+                    let req = self.requests.iter().rev().find(|r| r.wg_key == e.wg_key);
+                    Member {
+                        host: e.host,
+                        name: e.name.clone(),
+                        wg_key: e.wg_key.clone(),
+                        ssh_host_key: e.ssh_host_key.clone(),
+                        lan_ip: req.map(|r| r.lan_ip.clone()).unwrap_or_default(),
+                        switch: req.is_some_and(|r| r.switch),
+                        approved: now,
+                        last_seen: now,
+                    }
+                }
+            };
+            members.push(m);
+        }
+        for q in &mut self.requests {
+            if q.status != Status::Pending {
+                continue;
+            }
+            if let Some(e) = list.members.iter().find(|e| e.wg_key == q.wg_key) {
+                q.status = Status::Approved;
+                q.host = e.host;
+            } else if list.rejected.contains(&q.wg_key) || list.members.iter().any(|e| e.name == q.name) {
+                q.status = Status::Rejected;
+            }
+        }
+        self.members = members;
+        self.signed = env.clone();
+        self.signed_version = list.version;
+        Ok(())
+    }
+
     /// Revokes a member. Its peers drop it at their next sync.
     pub fn remove(&mut self, name: &str) -> Result<()> {
         match self.members.iter().position(|m| m.name == name) {
@@ -490,11 +559,30 @@ pub fn unknown(found: &[Device], known: &[String], now: Time) -> Vec<Device> {
 // ---- the SSH forced command ----
 
 const MAX_INPUT: u64 = 16 << 10;
+/// A signed list of a full /24 mesh is about 100 KiB.
+const MAX_SIGNED_INPUT: u64 = 1 << 20;
 
 /// Describes the mesh subnet so serve can tell members by address.
 pub trait Mesh {
     /// The member host number for a mesh IP, or 0.
     fn host_of(&self, ip: Ipv4Addr) -> u32;
+    /// Whether a host number has an address in the mesh.
+    fn fits(&self, host: u32) -> bool;
+}
+
+/// What the admin's desktop gets for its approval screen.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdminState {
+    #[serde(deserialize_with = "null_default")]
+    pub members: Vec<Member>,
+    /// Waiting requests only.
+    #[serde(deserialize_with = "null_default")]
+    pub requests: Vec<Request>,
+    #[serde(deserialize_with = "null_default")]
+    pub unknown: Vec<Device>,
+    pub scanned: Time,
+    pub signed: Envelope,
 }
 
 /// Answers "status". When approved it carries what the node needs to bring
@@ -517,8 +605,12 @@ struct HeartbeatIn {
 }
 
 fn decode_first<T: serde::de::DeserializeOwned>(input: &mut dyn Read) -> Option<T> {
+    decode_limited(input, MAX_INPUT)
+}
+
+fn decode_limited<T: serde::de::DeserializeOwned>(input: &mut dyn Read, max: u64) -> Option<T> {
     let mut buf = Vec::new();
-    input.take(MAX_INPUT).read_to_end(&mut buf).ok()?;
+    input.take(max).read_to_end(&mut buf).ok()?;
     serde_json::Deserializer::from_slice(&buf).into_iter::<T>().next()?.ok()
 }
 
@@ -538,11 +630,18 @@ fn valid_id(s: &str) -> bool {
 ///
 ///   request      stdin: Request JSON        -> {"id": ...}         (any source)
 ///   status ID                               -> StatusReply         (any source)
-///   peers        stdin: {"lan_ip","switch"} -> {"members": [...]}  (mesh members only)
+///   peers        stdin: {"lan_ip","switch"} -> {"members": [...], "signed": ...}  (mesh members only)
+///   admin        stdin: signed admin request -> AdminState          (holder of the signing key)
+///   publish      stdin: signed member list   -> {"version": N}      (holder of the signing key)
+///
+/// The key that reaches this command is on every server and on the USB
+/// stick, so it proves nothing. admin and publish are allowed by the
+/// signature on their input alone.
 #[allow(clippy::too_many_arguments)]
 pub fn serve(
     st: &Store,
     mesh: &dyn Mesh,
+    verifier: &dyn Verifier,
     coord_host_key: &str,
     cmdline: &str,
     client: &str,
@@ -578,11 +677,32 @@ pub fn serve(
                 return Err("peers is only answered over the mesh".into());
             }
             let hb: HeartbeatIn = decode_first(input).ok_or_else(|| Error::new("bad heartbeat JSON"))?;
-            let members = st.update(|s| {
+            let (members, signed) = st.update(|s| {
                 s.heartbeat(host, &hb.lan_ip, hb.switch, now)?;
-                Ok(s.members.clone())
+                Ok((s.members.clone(), s.signed.clone()))
             })?;
-            send(out, &serde_json::json!({ "members": members }))
+            send(out, &serde_json::json!({ "members": members, "signed": signed }))
+        }
+        ("admin", 1) => {
+            let req: Envelope = decode_first(input).ok_or_else(|| Error::new("bad admin request"))?;
+            signed::open_admin(verifier, &req, "state", now.0.timestamp())?;
+            let reply = st.update(|s| {
+                s.prune(now);
+                Ok(AdminState {
+                    members: s.members.clone(),
+                    requests: s.pending(),
+                    unknown: s.unknown.clone(),
+                    scanned: s.scanned,
+                    signed: s.signed.clone(),
+                })
+            })?;
+            send(out, &reply)
+        }
+        ("publish", 1) => {
+            let env: Envelope = decode_limited(input, MAX_SIGNED_INPUT).ok_or_else(|| Error::new("bad signed list"))?;
+            let list = env.list(verifier, |h| mesh.fits(h))?;
+            st.update(|s| s.publish(&list, &env, now))?;
+            send(out, &serde_json::json!({ "version": list.version }))
         }
         _ => Err(errf!("unknown command {:?}", f[0])),
     }
@@ -850,13 +970,189 @@ mod tests {
         fn host_of(&self, ip: Ipv4Addr) -> u32 {
             self.0.get(&ip.to_string()).copied().unwrap_or(0)
         }
+        fn fits(&self, host: u32) -> bool {
+            (1..=254).contains(&host)
+        }
     }
+
+    const ADMIN: signed::fake::Key = signed::fake::Key("admin");
 
     fn call(st: &Store, cmd: &str, client: &str, stdin: &str) -> Result<String> {
         let mesh = FakeMesh(HashMap::from([("10.66.0.2".to_string(), 2)]));
         let mut out = Vec::new();
-        serve(st, &mesh, COORD_KEY, cmd, client, &mut stdin.as_bytes(), &mut out, t0())?;
+        serve(st, &mesh, &ADMIN, COORD_KEY, cmd, client, &mut stdin.as_bytes(), &mut out, t0())?;
         Ok(String::from_utf8(out).unwrap())
+    }
+
+    fn key32(seed: u8) -> String {
+        base64::engine::general_purpose::STANDARD.encode([seed; 32])
+    }
+
+    /// A coordinator with itself as member 1 and node-a waiting.
+    fn coordinator(dir: &TempDir) -> Store {
+        let st = Store::new(dir.join("registry.json"));
+        st.update(|s| {
+            s.members = vec![Member {
+                host: 1,
+                name: "coord".into(),
+                wg_key: key32(1),
+                ssh_host_key: format!("{COORD_KEY} root@coord"),
+                lan_ip: "192.168.1.50".into(),
+                switch: true,
+                ..Member::default()
+            }];
+            let r = Request {
+                name: "node-a".into(),
+                wg_key: key32(2),
+                ssh_host_key: "ssh-ed25519 AAAAnodea root@a".into(),
+                lan_ip: "192.168.1.23".into(),
+                switch: true,
+                ..Request::default()
+            };
+            s.add_request(r, COORD_KEY, t0())?;
+            Ok(())
+        })
+        .unwrap();
+        st
+    }
+
+    fn entry(host: u32, name: &str, seed: u8, host_key: &str) -> signed::Entry {
+        signed::Entry { host, name: name.into(), wg_key: key32(seed), ssh_host_key: host_key.into() }
+    }
+
+    fn publish(st: &Store, key: &signed::fake::Key, list: &List) -> Result<String> {
+        call(st, "publish", "192.168.1.9 5000 22", &serde_json::to_string(&signed::seal(key, list).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn publish_signed_list() {
+        let dir = TempDir::new();
+        let st = coordinator(&dir);
+        let coord = entry(1, "coord", 1, COORD_KEY);
+        let node_a = entry(2, "node-a", 2, "ssh-ed25519 AAAAnodea");
+        let v5 = List { version: 5, members: vec![coord.clone(), node_a.clone()], rejected: vec![] };
+
+        // Not signed with the admin's key: refused, nothing changes.
+        assert!(publish(&st, &signed::fake::Key("thief"), &v5).is_err());
+        assert_eq!(st.read().unwrap().members.len(), 1);
+
+        assert!(publish(&st, &ADMIN, &v5).unwrap().contains(r#""version":5"#));
+        let s = st.read().unwrap();
+        assert_eq!(s.signed_version, 5);
+        let a = s.members.iter().find(|m| m.name == "node-a").unwrap();
+        assert_eq!((a.host, a.lan_ip.as_str(), a.switch), (2, "192.168.1.23", true), "address must come from the join request");
+        assert_eq!(s.members[0].lan_ip, "192.168.1.50", "a member that stays keeps its address");
+        assert_eq!(s.requests[0].status, Status::Approved);
+        assert_eq!(s.requests[0].host, 2);
+        assert!(s.pending().is_empty());
+
+        // The same or an older list is refused: no way back to an old list.
+        for old in [5, 4] {
+            let e = publish(&st, &ADMIN, &List { version: old, members: vec![coord.clone()], rejected: vec![] }).unwrap_err().to_string();
+            assert!(e.contains("not newer"), "{e}");
+        }
+        assert_eq!(st.read().unwrap().members.len(), 2);
+
+        // A newer list without node-a removes it.
+        publish(&st, &ADMIN, &List { version: 6, members: vec![coord.clone()], rejected: vec![] }).unwrap();
+        assert_eq!(st.read().unwrap().members.len(), 1);
+
+        // A list for another coordinator (other keys or name) is refused.
+        for other in [entry(1, "coord", 9, COORD_KEY), entry(1, "coord", 1, "ssh-ed25519 AAAAother"), entry(1, "brain", 1, COORD_KEY)] {
+            let e = publish(&st, &ADMIN, &List { version: 7, members: vec![other], rejected: vec![] }).unwrap_err().to_string();
+            assert!(e.contains("own name and keys"), "{e}");
+        }
+        // Bad entries are refused even with a good signature.
+        let bad = List { version: 7, members: vec![coord.clone(), entry(300, "far", 3, "ssh-ed25519 AAAAx")], rejected: vec![] };
+        assert!(publish(&st, &ADMIN, &bad).unwrap_err().to_string().contains("outside the mesh"));
+        assert_eq!(st.read().unwrap().signed_version, 6);
+    }
+
+    #[test]
+    fn publish_settles_requests() {
+        let dir = TempDir::new();
+        let st = coordinator(&dir);
+        st.update(|s| {
+            let r = Request {
+                name: "node-z".into(),
+                wg_key: key32(8),
+                ssh_host_key: "ssh-ed25519 AAAAq".into(),
+                lan_ip: "192.168.1.30".into(),
+                ..Request::default()
+            };
+            s.add_request(r, COORD_KEY, t0())?;
+            // A waiting request under node-a's name with another key (it
+            // cannot arrive through add_request, which refuses it).
+            let mut imp = s.requests[0].clone();
+            imp.id = "00000000000000ff".into();
+            imp.wg_key = key32(7);
+            s.requests.push(imp);
+            Ok(())
+        })
+        .unwrap();
+        let list = List {
+            version: 1,
+            members: vec![entry(1, "coord", 1, COORD_KEY), entry(2, "node-a", 2, "ssh-ed25519 AAAAnodea")],
+            rejected: vec![],
+        };
+        publish(&st, &ADMIN, &list).unwrap();
+        let s = st.read().unwrap();
+        let status = |seed: u8| s.requests.iter().find(|r| r.wg_key == key32(seed)).unwrap().status;
+        assert_eq!(status(2), Status::Approved);
+        assert_eq!(status(7), Status::Rejected, "an impostor under a signed name must be rejected");
+        assert_eq!(status(8), Status::Pending);
+        // Turning node-z down.
+        let list = List { version: 2, rejected: vec![key32(8)], ..list };
+        publish(&st, &ADMIN, &list).unwrap();
+        assert!(st.read().unwrap().pending().is_empty());
+    }
+
+    #[test]
+    fn admin_needs_the_signing_key() {
+        let dir = TempDir::new();
+        let st = coordinator(&dir);
+        let now = t0().0.timestamp();
+        let ask = |key: &signed::fake::Key, op: &str, time: i64| {
+            call(&st, "admin", "192.168.1.9 5000 22", &serde_json::to_string(&signed::seal_admin(key, op, time).unwrap()).unwrap())
+        };
+        let reply: AdminState = serde_json::from_str(&ask(&ADMIN, "state", now).unwrap()).unwrap();
+        assert_eq!(reply.members.len(), 1);
+        assert_eq!(reply.requests.len(), 1);
+        assert!(reply.signed.is_empty());
+        assert!(ask(&signed::fake::Key("thief"), "state", now).is_err(), "the registry key alone must not open the registry");
+        assert!(ask(&ADMIN, "state", now - 3600).unwrap_err().to_string().contains("old"), "a replayed request must expire");
+        assert!(ask(&ADMIN, "other", now).is_err());
+        assert!(call(&st, "admin", "192.168.1.9 5000 22", "{}").is_err());
+        // A signed list is not an admin request and the other way round.
+        let list = List { version: 1, members: vec![entry(1, "coord", 1, COORD_KEY)], rejected: vec![] };
+        let env = serde_json::to_string(&signed::seal(&ADMIN, &list).unwrap()).unwrap();
+        assert!(call(&st, "admin", "192.168.1.9 5000 22", &env).is_err());
+        let adm = serde_json::to_string(&signed::seal_admin(&ADMIN, "state", now).unwrap()).unwrap();
+        assert!(call(&st, "publish", "192.168.1.9 5000 22", &adm).is_err());
+    }
+
+    #[test]
+    fn peers_carry_the_signed_list() {
+        let dir = TempDir::new();
+        let st = coordinator(&dir);
+        let list = List {
+            version: 3,
+            members: vec![entry(1, "coord", 1, COORD_KEY), entry(2, "node-a", 2, "ssh-ed25519 AAAAnodea")],
+            rejected: vec![],
+        };
+        // Before anything is signed the field is there but empty.
+        st.update(|s| {
+            s.members.push(Member { host: 2, name: "node-a".into(), wg_key: key32(2), ..Member::default() });
+            Ok(())
+        })
+        .unwrap();
+        let hb = r#"{"lan_ip":"192.168.1.23","switch":false}"#;
+        let out: serde_json::Value = serde_json::from_str(&call(&st, "peers", "10.66.0.2 5000 22", hb).unwrap()).unwrap();
+        assert_eq!(out["signed"]["doc"], "");
+        publish(&st, &ADMIN, &list).unwrap();
+        let out: serde_json::Value = serde_json::from_str(&call(&st, "peers", "10.66.0.2 5000 22", hb).unwrap()).unwrap();
+        let env: Envelope = serde_json::from_value(out["signed"].clone()).unwrap();
+        assert_eq!(env.list(&ADMIN, |h| h < 255).unwrap(), list, "nodes must get the list exactly as it was signed");
     }
 
     #[test]

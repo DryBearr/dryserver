@@ -16,6 +16,7 @@ use crate::gotime::Time;
 use crate::mesh::{self, SelfInfo};
 use crate::registry::{self, Member, Status, StatusReply, Store};
 use crate::runner::{Cmd, Runner};
+use crate::signed::{self, Envelope, Verifier};
 use crate::sysconf::{self, Params};
 use crate::{errf, fsx, quarantine};
 
@@ -34,6 +35,11 @@ pub const SWITCH_MAC_FILE: &str = "/etc/dryserver/switch.mac";
 /// /etc/dryserver (root only) because the coordinator's registry user reads
 /// it too; root owns it, everyone may read it.
 pub const SIGNING_PUB: &str = "/usr/local/share/dryserver/signing_ed25519.pub";
+/// The newest signed member list this server has verified. A lower version
+/// from the coordinator later is a rollback.
+pub const SIGNED_FILE: &str = "/etc/dryserver/members.signed.json";
+/// What the last sync thought of the coordinator's list; a change is logged.
+pub const SIGNED_STATUS: &str = "/run/dryserver-signed.status";
 /// Shows join status on the console login screen.
 pub const ISSUE_FILE: &str = "/etc/issue.d/50-dryserver.issue";
 
@@ -257,8 +263,9 @@ impl Node {
     }
 
     /// Asks the coordinator for the member list over the mesh, reporting
-    /// this node's current LAN IP and cable link.
-    pub fn fetch_members(&self, ctx: &Ctx, hb: &Heartbeat) -> Result<Vec<Member>> {
+    /// this node's current LAN IP and cable link. Also returns the signed
+    /// list as the coordinator sent it (empty when it has none).
+    pub fn fetch_members(&self, ctx: &Ctx, hb: &Heartbeat) -> Result<(Vec<Member>, Envelope)> {
         let body = serde_json::to_string(hb)?;
         let out = {
             let (out, res) = self.ssh(ctx, &mesh::ip(&self.cfg.wg_subnet, 1), "peers", &body);
@@ -269,9 +276,11 @@ impl Node {
         struct Reply {
             #[serde(default, deserialize_with = "crate::gotime::null_default")]
             members: Vec<Member>,
+            #[serde(default, deserialize_with = "crate::gotime::null_default")]
+            signed: Envelope,
         }
-        let members = match serde_json::from_str::<Reply>(&out) {
-            Ok(r) if !r.members.is_empty() => r.members,
+        let (members, signed) = match serde_json::from_str::<Reply>(&out) {
+            Ok(r) if !r.members.is_empty() => (r.members, r.signed),
             _ => return Err("bad member list from coordinator".into()),
         };
         // Nothing from the coordinator is used unchecked.
@@ -284,7 +293,75 @@ impl Node {
         if !members.iter().any(|m| m.host == 1) {
             return Err("the coordinator's member list has no usable entry for the coordinator itself; keeping the current mesh".into());
         }
-        Ok(members)
+        Ok((members, signed))
+    }
+
+    /// Compares what the coordinator sent with the list the admin signed
+    /// and says the result in one line. Remembers the newest valid signed
+    /// list, so an older one later is noticed.
+    ///
+    /// For now this only reports: the mesh still follows the coordinator.
+    pub fn check_signed(&self, members: &[Member], env: &Envelope, v: Option<&dyn Verifier>) -> String {
+        let Some(v) = v else {
+            return "not checked: this server has no signing key (installed by an older dryserver)".into();
+        };
+        if env.is_empty() {
+            return "NOT SIGNED: the coordinator sent no signed member list (sign it from your desktop: ./dryserver approve)".into();
+        }
+        let fits = |h: u32| !mesh::ip(&self.cfg.wg_subnet, h).is_empty();
+        let list = match env.list(v, fits) {
+            Ok(l) => l,
+            Err(e) => return format!("NOT VALID: the coordinator's signed member list was refused: {e}"),
+        };
+        // The stored list was verified when it was saved; root owns it.
+        let seen: Option<(u64, Envelope)> = std::fs::read(self.path(SIGNED_FILE)).ok().and_then(|b| {
+            let e: Envelope = serde_json::from_slice(&b).ok()?;
+            let l: signed::List = serde_json::from_str(&e.doc).ok()?;
+            Some((l.version, e))
+        });
+        match &seen {
+            Some((ver, _)) if list.version < *ver => {
+                return format!(
+                    "ROLLBACK: the coordinator sent signed list version {}, this server has already seen version {ver}",
+                    list.version
+                );
+            }
+            Some((ver, old)) if list.version == *ver && old.doc != env.doc => {
+                return format!("CONFLICT: the coordinator sent a different signed list with the same version {ver}");
+            }
+            Some((ver, _)) if list.version == *ver => {}
+            _ => {
+                let saved = serde_json::to_string(env).map_err(Error::from).and_then(|t| self.write(SIGNED_FILE, 0o600, &(t + "\n")));
+                if let Err(e) = saved {
+                    return format!("NOT SAVED: cannot remember signed list version {}: {e}", list.version);
+                }
+            }
+        }
+        let extra: Vec<&str> = members.iter().filter(|m| !list.has(m)).map(|m| m.name.as_str()).collect();
+        let missing: Vec<&str> = list.members.iter().filter(|e| !members.iter().any(|m| e.matches(m))).map(|e| e.name.as_str()).collect();
+        if extra.is_empty() && missing.is_empty() {
+            return format!("ok: member list matches signed version {} ({} members)", list.version, list.members.len());
+        }
+        let mut parts = Vec::new();
+        if !extra.is_empty() {
+            parts.push(format!("not signed by you: {}", extra.join(", ")));
+        }
+        if !missing.is_empty() {
+            parts.push(format!("signed but not sent: {}", missing.join(", ")));
+        }
+        format!("MISMATCH with signed version {}: {}", list.version, parts.join("; "))
+    }
+
+    /// Logs the status when it changed since the last sync, so the journal
+    /// gets one line per change and not one per minute.
+    fn note_signed(&self, status: &str) {
+        let path = self.path(SIGNED_STATUS);
+        if fsx::read_or_empty(&path).trim() == status {
+            return;
+        }
+        eprintln!("dryserver: member list: {status}");
+        let _ = fsx::mkdir_all(fsx::dir(&path), 0o755);
+        let _ = fsx::write_file(&path, format!("{status}\n"), 0o644);
     }
 
     // ---- commands run at boot and by the timer ----
@@ -422,6 +499,14 @@ pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> R
 /// `dryserver quarantine` are left out, and with the coordinator cut a node
 /// does not sync at all: false means paused.
 pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<bool> {
+    let tmp = n.tmp_dir.clone().unwrap_or_else(|| PathBuf::from("/run"));
+    let v = signed::SshVerifier::installed(&n.root, tmp);
+    sync_with(ctx, n, coordinator, store, v.has_key().then_some(&v as &dyn Verifier))
+}
+
+/// sync with the signature checker given (None: this server has no signing
+/// key).
+pub fn sync_with(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store, v: Option<&dyn Verifier>) -> Result<bool> {
     if !coordinator && quarantine::load(n)?.coordinator_cut() {
         return Ok(false);
     }
@@ -439,7 +524,9 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
             return Err("not joined yet".into());
         }
         let lan = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).unwrap_or_default();
-        n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw })?
+        let (members, env) = n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw })?;
+        n.note_signed(&n.check_signed(&members, &env, v));
+        members
     };
     // The switch pings take up to a second each: before the lock, so a cut
     // never waits for them.
@@ -670,8 +757,9 @@ mod tests {
         assert!(get(&n.root, KNOWN_HOSTS).contains("192.168.1.50,10.66.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIcoord"));
         assert!(get(&n.root, "/etc/hosts").contains("10.66.0.1 coord") && n.load_state().host == 4, "hosts/state not updated");
 
-        let members = n.fetch_members(&ctx, &Heartbeat { lan_ip: "192.168.1.23".into(), switch: false }).unwrap();
+        let (members, signed) = n.fetch_members(&ctx, &Heartbeat { lan_ip: "192.168.1.23".into(), switch: false }).unwrap();
         assert_eq!(members.len(), 2);
+        assert!(signed.is_empty(), "an older coordinator sends no signed list");
         assert_eq!(fc.calls.lock().unwrap().last().unwrap(), "dryreg@10.66.0.1 peers", "sync must go over the mesh");
     }
 
@@ -794,6 +882,78 @@ mod tests {
         let e = sync(&Ctx::new(), &n, false, &store).unwrap_err().to_string();
         assert!(e.contains("keeping the current mesh"), "{e}");
         assert_eq!(get(&n.root, WG_CONF), wg, "wg0.conf changed although the list was refused");
+    }
+
+    #[test]
+    fn signed_list_is_checked_and_reported() {
+        use crate::signed::{Entry, List, fake::Key, seal};
+        let (_dir, mut n, _) = setup(vec![]);
+        n.save_state(&State { host: 2, ..State::default() }).unwrap();
+        put(&n.root, WG_KEY, "PRIVKEY=\n");
+        put(&n.root, KNOWN_HOSTS, format!("192.168.1.50,10.66.0.1 {COORD_KEY}\n"));
+        let tmp = TempDir::new();
+        n.tmp_dir = Some(tmp.path().to_path_buf());
+        let fc = FakeCoord::new(&n.root, vec![]);
+        n.run = fc.clone();
+        let store = Store::new("/nonexistent");
+        let admin = Key("admin");
+        let coord = Entry { host: 1, name: "coord".into(), wg_key: COORD_WG.into(), ssh_host_key: String::new() };
+        let me = Entry { host: 2, name: "node-a".into(), wg_key: WG_PUBKEY.into(), ssh_host_key: String::new() };
+        let members = format!(
+            r#"{{"host":1,"name":"coord","wg_key":"{COORD_WG}","lan_ip":"192.168.1.50"}},{{"host":2,"name":"node-a","wg_key":"{WG_PUBKEY}"}}"#
+        );
+        let reply =
+            |extra: &str, env: &Envelope| format!(r#"{{"members":[{members}{extra}],"signed":{}}}"#, serde_json::to_string(env).unwrap());
+        let status = |n: &Node| get(&n.root, SIGNED_STATUS);
+        let run = |n: &Node, text: String, v: Option<&dyn Verifier>| {
+            *fc.peers.lock().unwrap() = Some(text);
+            // Warn only: sync always succeeds and applies the list.
+            assert!(sync_with(&Ctx::new(), n, false, &store, v).unwrap());
+            status(n)
+        };
+
+        // No signing key on this server, then nothing signed yet.
+        assert!(run(&n, reply("", &Envelope::default()), None).starts_with("not checked"));
+        assert!(run(&n, reply("", &Envelope::default()), Some(&admin)).starts_with("NOT SIGNED"));
+
+        // A valid list that matches.
+        let v5 = seal(&admin, &List { version: 5, members: vec![coord.clone(), me.clone()], rejected: vec![] }).unwrap();
+        assert_eq!(run(&n, reply("", &v5), Some(&admin)), "ok: member list matches signed version 5 (2 members)\n");
+        assert!(get(&n.root, SIGNED_FILE).contains("version"), "the verified list must be remembered");
+
+        // The coordinator adds a machine the admin never signed.
+        let evil = "ZXZpbC0tcHVibGljLWtleS0zMi1ieXRlcy1sb25nISE=";
+        let s = run(&n, reply(&format!(r#",{{"host":3,"name":"rogue","wg_key":"{evil}"}}"#), &v5), Some(&admin));
+        assert!(s.starts_with("MISMATCH") && s.contains("not signed by you: rogue"), "{s}");
+        assert!(get(&n.root, WG_CONF).contains(evil), "this slice only warns; the mesh still follows the coordinator");
+
+        // A signed member whose key the coordinator swapped.
+        *fc.peers.lock().unwrap() = None;
+        let swapped = format!(
+            r#"{{"members":[{{"host":1,"name":"coord","wg_key":"{evil}"}},{{"host":2,"name":"node-a","wg_key":"{WG_PUBKEY}"}}],"signed":{}}}"#,
+            serde_json::to_string(&v5).unwrap()
+        );
+        let s = run(&n, swapped, Some(&admin));
+        assert!(s.contains("not signed by you: coord") && s.contains("signed but not sent: coord"), "{s}");
+
+        // Forged, or signed by another key.
+        let forged = Envelope { doc: v5.doc.replace("node-a", "node-x"), sig: v5.sig.clone() };
+        assert!(run(&n, reply("", &forged), Some(&admin)).starts_with("NOT VALID"));
+        let other = seal(&Key("thief"), &List { version: 9, members: vec![coord.clone(), me.clone()], rejected: vec![] }).unwrap();
+        assert!(run(&n, reply("", &other), Some(&admin)).starts_with("NOT VALID"));
+        assert!(get(&n.root, SIGNED_FILE).contains(&v5.sig), "an invalid list must not replace the remembered one");
+
+        // An older list (rollback), and a different list under the same version.
+        let v4 = seal(&admin, &List { version: 4, members: vec![coord.clone(), me.clone()], rejected: vec![] }).unwrap();
+        let s = run(&n, reply("", &v4), Some(&admin));
+        assert!(s.starts_with("ROLLBACK") && s.contains("version 4") && s.contains("seen version 5"), "{s}");
+        let v5b = seal(&admin, &List { version: 5, members: vec![coord.clone(), me.clone()], rejected: vec!["x".into()] }).unwrap();
+        assert!(run(&n, reply("", &v5b), Some(&admin)).starts_with("CONFLICT"));
+
+        // A newer list replaces the remembered one.
+        let v6 = seal(&admin, &List { version: 6, members: vec![coord, me], rejected: vec![] }).unwrap();
+        assert!(run(&n, reply("", &v6), Some(&admin)).starts_with("ok: member list matches signed version 6"));
+        assert!(get(&n.root, SIGNED_FILE).contains(&v6.sig));
     }
 
     #[test]

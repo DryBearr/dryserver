@@ -257,10 +257,14 @@ Limits for now:
   name, key and address in the member list before it reaches `/etc/hosts`,
   WireGuard or the SSH trust files, and drop entries that are malformed or
   appear twice.
-- **Signing key**: building the USB stick creates `secrets/signing_ed25519`
-  on your computer. Its public half is installed on every server. (Servers
-  will accept only member lists signed with it; that check is not switched
-  on yet.)
+- **Signed member list**: building the USB stick creates
+  `secrets/signing_ed25519` on your computer; its public half is installed
+  on every server. `./dryserver approve` on your computer signs every
+  decision (approve, reject, remove) with it. The coordinator stores and
+  hands out the signed list but cannot make or change one, and an older
+  list is refused, so a removed machine cannot be brought back. Servers
+  check the list and log when the coordinator's members differ from what
+  you signed.
 - **The USB stick** holds the WiFi password and the key that lets machines ask
   to join. Keep it safe, or re-flash it after installing.
 
@@ -274,6 +278,7 @@ On your desktop:
 | `./dryserver build` | build the ISO, log to stdout |
 | `./dryserver disks` | list disks and which ones may be flashed |
 | `sudo ./dryserver flash --iso FILE` | flash any image to a USB drive |
+| `./dryserver approve` | approve, reject or remove machines; every decision is signed |
 | `./dryserver ssh-config` | SSH config for all servers |
 | `./dryserver quarantine-all` | kill switch: cut the coordinator off on every server |
 | `./dryserver install --demo` | try the laptop setup screen; changes nothing |
@@ -339,6 +344,8 @@ TPM refuses (firmware update, changed boot settings).
 ```sh
 make test                           # unit tests (cargo test)
 test/validate-sysconf.sh            # check generated firewall/SSH/sudo files with real nft and sshd
+test/live-quarantine.sh             # kill switch with real WireGuard and nftables, in private namespaces
+test/live-approve.sh                # signed approval: the real screen against a real sshd and registry
 test/qemu.sh coord                  # boot out/dryserver.iso in a UEFI VM with a blank disk
 BIOS=1 test/qemu.sh node            # legacy BIOS
 TPM=1 OVMF_CODE=... test/qemu.sh    # TPM tests need firmware that measures boot (Arch's edk2-ovmf)
@@ -348,7 +355,8 @@ SWITCH=1 SSH_PORT=2201 ...          # shared switch NIC between VMs, SSH on loca
 Layout: `src/main.rs` (CLI), `src/tui` (screens), `src/install`
 (installer), `src/sysconf.rs` (generated system files), `src/registry.rs`
 and `src/node.rs` (joining and sync), `src/mesh.rs` (WireGuard and SSH
-config), `src/quarantine.rs` (kill switch), `assets/` (files embedded into the ISO and servers by `build.rs`).
+config), `src/quarantine.rs` (kill switch), `src/signed.rs` and
+`src/admin.rs` (signed member list and approval from the desktop), `assets/` (files embedded into the ISO and servers by `build.rs`).
 Golden files for the generated system files are in `testdata/sysconf`;
 `UPDATE_GOLDEN=1 cargo test` rewrites them.
 

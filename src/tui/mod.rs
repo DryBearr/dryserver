@@ -2,6 +2,7 @@
 //! messages from background work, and renders a Doc (styled lines). The
 //! event loop draws it with ratatui.
 
+pub mod admin;
 pub mod app;
 pub mod approve;
 pub mod build;

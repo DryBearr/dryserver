@@ -48,6 +48,10 @@ impl registry::Mesh for Subnet {
     fn host_of(&self, ip: Ipv4Addr) -> u32 {
         host_of(&self.0, ip)
     }
+
+    fn fits(&self, host: u32) -> bool {
+        !ip(&self.0, host).is_empty()
+    }
 }
 
 /// Where to send WireGuard packets for peer: its switch address when both
