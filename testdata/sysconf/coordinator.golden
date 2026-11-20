@@ -124,6 +124,12 @@ table inet dryserver {
 		# Pods are reached by other pods, by this machine, and through
 		# the ingress.
 		oifname "cni0" iifname != { "cni0", "flannel.1" } drop
+		# Routing is for this machine's own containers and pods. What
+		# arrives from the home network, the switch, the mesh or another
+		# machine's pods is never passed on to another network: no
+		# machine here is a router into the cluster.
+		iifname "flannel.1" oifname != "cni0" drop
+		iifname != { "cni0", "flannel.1", "docker0", "br-*" } oifname != { "docker0", "br-*" } drop
 	}
 
 	# What a k3s pod may start. Which pod may talk to which is for
@@ -137,7 +143,7 @@ table inet dryserver {
 		oifname "wg0" drop
 		udp dport { 53, 123 } accept
 		tcp dport 53 accept
-		ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } drop
+		ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop
 		ip6 daddr { fc00::/7, fe80::/10 } drop
 		tcp dport { 80, 443 } accept
 		# Cloudflare Tunnel (cloudflared runs as a pod).
@@ -157,7 +163,7 @@ table inet dryserver {
 		# DNS and time first: the resolver is often the home router.
 		udp dport { 53, 123 } accept
 		tcp dport 53 accept
-		ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } drop
+		ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop
 		ip6 daddr { fc00::/7, fe80::/10 } drop
 		tcp dport { 80, 443 } accept
 		meta l4proto { icmp, ipv6-icmp } accept
@@ -380,6 +386,7 @@ flannel-iface: wg0
 cluster-cidr: 10.42.0.0/16
 service-cidr: 10.43.0.0/16
 secrets-encryption: true
+agent-token-file: /etc/rancher/k3s/agent-token
 write-kubeconfig-mode: "0640"
 write-kubeconfig-group: wheel
 disable:

@@ -94,6 +94,10 @@ pub const K3S_AGENT_TOKEN: &str = "/var/lib/rancher/k3s/server/agent-token";
 /// The cgroups of what k3s runs: its own helpers (containerd and the
 /// container shims) and every pod.
 pub const K3S_CGROUPS: [&str; 2] = ["/sys/fs/cgroup/system.slice/k3s.service", "/sys/fs/cgroup/kubepods.slice"];
+/// On the coordinator: which machine (by WireGuard key) holds each name in
+/// the cluster. A machine installed again under an old name is another
+/// machine; the cluster has to forget the old one first.
+pub const K3S_NODES: &str = "/etc/dryserver/k3s-nodes.json";
 /// Where pods have things mounted, their secrets among them.
 const POD_MOUNTS: [&str; 3] = ["/var/lib/kubelet/pods/", "/run/k3s/", "/run/netns/cni-"];
 
@@ -437,6 +441,12 @@ impl Node {
         if token.len() > 512 || !token.starts_with("K10") || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == ':') {
             return Err("the coordinator sent a cluster token that is not one; k3s left as it is".into());
         }
+        if !token.contains("::node:") {
+            // The control plane's own token opens more than a server needs.
+            return Err("the coordinator sent a token that is not for agents; k3s left as it is".into());
+        }
+        // Sync runs, so the coordinator is not cut off (any more).
+        let _ = std::fs::remove_file(self.path(sysconf::K3S_HOLD));
         let config = sysconf::k3s_agent_config(&mesh::ip(&self.cfg.wg_subnet, 1), &mesh::ip(&self.cfg.wg_subnet, me));
         let mut changed = false;
         // The token is the secret; the config only says where things are.
@@ -458,29 +468,55 @@ impl Node {
     }
 
     /// On the coordinator: puts the cluster's agent token where members
-    /// get it, and takes machines that are no longer members out of the
-    /// cluster.
+    /// get it, and takes out of the cluster what is no longer there: a
+    /// machine that left the swarm, and the old machine behind a name that
+    /// was installed again (the cluster would turn the new one away).
     pub fn k3s_share(&self, ctx: &Ctx, store: &Store, members: &[Member]) {
         let token = fsx::read_or_empty(self.path(K3S_AGENT_TOKEN)).trim().to_string();
         if token.is_empty() {
             // k3s is not up yet; the next sync tries again.
             return;
         }
-        let _ = store.update(|s| {
-            if s.k3s_token != token {
-                s.k3s_token = token.clone();
-            }
-            Ok(())
-        });
+        if token.contains("::node:") {
+            let _ = store.update(|s| {
+                if s.k3s_token != token {
+                    s.k3s_token = token.clone();
+                }
+                Ok(())
+            });
+        } else {
+            // Without a secret of its own for agents, k3s gives them the
+            // server's token. That one is never handed out.
+            eprintln!("dryserver: k3s has no token of its own for agents ({} missing?); servers get none", sysconf::K3S_AGENT_SECRET);
+        }
         let Ok(out) = self.run.output(ctx, &Cmd::new("k3s", &["kubectl", "get", "nodes", "-o", "name"]).quiet().stdout_only()) else {
             return;
         };
-        for name in out.lines().filter_map(|l| l.trim().strip_prefix("node/")) {
-            if name == self.hostname || !registry::valid_name(name) || members.iter().any(|m| m.name == name) {
-                continue;
+        let names: Vec<&str> =
+            out.lines().filter_map(|l| l.trim().strip_prefix("node/")).filter(|n| *n != self.hostname && registry::valid_name(n)).collect();
+        let was: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&fsx::read_or_empty(self.path(K3S_NODES))).unwrap_or_default();
+        let mut known = was.clone();
+        known.retain(|name, _| names.contains(&name.as_str()));
+        for name in names {
+            let why = match (members.iter().find(|m| m.name == name), known.get(name)) {
+                (None, _) => "is no longer a member",
+                (Some(m), Some(key)) if *key != m.wg_key => "was installed again",
+                (Some(m), None) => {
+                    known.insert(name.to_string(), m.wg_key.clone());
+                    continue;
+                }
+                _ => continue,
+            };
+            eprintln!("dryserver: {name} {why}: removing the old machine from the cluster");
+            if self.cmd(ctx, "k3s", &["kubectl", "delete", "node", name, "--timeout=20s"]).is_ok() {
+                known.remove(name);
             }
-            eprintln!("dryserver: {name} is no longer a member: removing it from the cluster");
-            let _ = self.cmd(ctx, "k3s", &["kubectl", "delete", "node", name, "--timeout=20s"]);
+        }
+        if known != was
+            && let Ok(text) = serde_json::to_string(&known)
+        {
+            let _ = self.write(K3S_NODES, 0o600, &(text + "\n"));
         }
     }
 
@@ -573,7 +609,7 @@ impl Node {
     /// Whether a signed entry is this machine: its number and its
     /// WireGuard key. The number alone is not enough; after a removal the
     /// admin's next approval hands it to another machine.
-    fn is_me(&self, me: u32, e: &signed::Entry) -> bool {
+    pub(crate) fn is_me(&self, me: u32, e: &signed::Entry) -> bool {
         e.host == me && self.read(WG_PUB).map_or(true, |k| k == e.wg_key)
     }
 
@@ -581,7 +617,7 @@ impl Node {
     /// swarm's apps, forgets its way into the cluster and no longer counts
     /// itself a member. To come back it asks again (sudo dryserver join)
     /// and waits for approval like a new machine.
-    fn leave(&self, ctx: &Ctx, env: &Envelope, why: &Error) {
+    pub(crate) fn leave(&self, ctx: &Ctx, env: &Envelope, why: &Error) {
         self.k3s_leave(ctx);
         if let Ok(text) = serde_json::to_string(env) {
             let _ = self.write(SIGNED_FILE, 0o600, &(text + "\n"));
@@ -590,17 +626,34 @@ impl Node {
         self.note_signed(&format!("REMOVED: {why}. k3s and its containers are stopped. To bring this machine back: sudo dryserver join"));
     }
 
-    /// Stops k3s and every container it started, and deletes this
-    /// machine's way into the cluster.
+    /// Deletes this machine's way into the cluster and stops k3s with
+    /// every container it started.
+    pub fn k3s_leave(&self, ctx: &Ctx) {
+        for f in [sysconf::K3S_TOKEN, sysconf::K3S_CONFIG] {
+            let _ = std::fs::remove_file(self.path(f));
+        }
+        self.k3s_stop(ctx);
+    }
+
+    /// On a server that cuts the coordinator off: k3s stops, with every
+    /// container, and stays down until the cut is lifted. The coordinator
+    /// runs the cluster's control plane; if it is not trusted, neither is
+    /// anything it started here. The way into the cluster is kept for the
+    /// day the cut is lifted.
+    pub fn k3s_hold(&self, ctx: &Ctx) {
+        if self.write(sysconf::K3S_HOLD, 0o600, "the coordinator is cut off (dryserver quarantine)\n").is_err() {
+            eprintln!("dryserver: cannot write {}; k3s may start again at boot", sysconf::K3S_HOLD);
+        }
+        self.k3s_stop(ctx);
+    }
+
+    /// Stops k3s and every container it started.
     ///
     /// systemd stops only the k3s process (KillMode=process keeps apps up
     /// while k3s restarts), so the rest goes through the kernel: one write
     /// to cgroup.kill ends everything in a cgroup. What the pods had
     /// mounted goes last, their secrets (kept in memory) with it.
-    pub fn k3s_leave(&self, ctx: &Ctx) {
-        for f in [sysconf::K3S_TOKEN, sysconf::K3S_CONFIG] {
-            let _ = std::fs::remove_file(self.path(f));
-        }
+    fn k3s_stop(&self, ctx: &Ctx) {
         let _ = self.cmd(ctx, "systemctl", &["stop", "k3s.service"]);
         for cgroup in K3S_CGROUPS {
             let kill = self.path(&format!("{cgroup}/cgroup.kill"));
@@ -1518,7 +1571,9 @@ mod tests {
         let store = Store::new("/nonexistent");
         let ctx = Ctx::new();
         // No token yet (k3s on the coordinator is still starting).
+        put(&n.root, sysconf::K3S_HOLD, "x\n");
         assert!(sync(&ctx, &n, false, &store).unwrap());
+        assert!(n.path(sysconf::K3S_HOLD).exists(), "nothing to start yet");
         assert!(get(&n.root, sysconf::K3S_TOKEN).is_empty() && get(&n.root, sysconf::K3S_CONFIG).is_empty());
 
         let token = "K10abcdef0123::node:5ecre7";
@@ -1529,6 +1584,7 @@ mod tests {
         *fc.peers.lock().unwrap() = Some(reply(token));
         assert!(sync(&ctx, &n, false, &store).unwrap());
         assert_eq!(get(&n.root, sysconf::K3S_TOKEN), format!("{token}\n"));
+        assert!(!n.path(sysconf::K3S_HOLD).exists(), "sync runs again: a hold left from a cut is over");
         let conf = get(&n.root, sysconf::K3S_CONFIG);
         assert!(
             conf.contains("server: https://10.66.0.1:6443") && conf.contains("node-ip: 10.66.0.2") && conf.contains("flannel-iface: wg0"),
@@ -1538,8 +1594,16 @@ mod tests {
         for (f, mode) in [(sysconf::K3S_TOKEN, 0o600), (sysconf::K3S_CONFIG, 0o644)] {
             assert_eq!(std::fs::metadata(n.path(f)).unwrap().permissions().mode() & 0o777, mode, "{f}");
         }
-        // Junk in place of a token changes nothing.
-        for bad in ["not a token", "K10abc\nserver: https://evil", "K10;rm -rf", &"K10".repeat(400)] {
+        // Junk in place of a token changes nothing, and neither does the
+        // control plane's own token.
+        for bad in [
+            "not a token",
+            "K10abc\nserver: https://evil",
+            "K10;rm -rf",
+            &"K10".repeat(400),
+            "K10abcdef0123::server:5ecre7",
+            "K10abcdef0123",
+        ] {
             assert!(n.k3s_join(&ctx, 2, bad).is_err(), "{bad:?}");
             assert_eq!(get(&n.root, sysconf::K3S_TOKEN), format!("{token}\n"));
         }
@@ -1568,6 +1632,21 @@ mod tests {
             vec!["kubectl get nodes -o name".to_string(), "kubectl delete node ghost --timeout=20s".into()],
             "only the machine that left goes"
         );
+        assert_eq!(get(&coord.root, K3S_NODES).trim(), format!(r#"{{"node-a":"{WG_PUBKEY}"}}"#), "which machine holds the name node-a");
+        // node-a was installed again: same name, another machine. The
+        // cluster forgets the old one, or it would turn the new one away.
+        fc.k3s.lock().unwrap().clear();
+        let again = vec![coord_member(), Member { wg_key: OTHER_WG.into(), ..node_member(2) }];
+        coord.k3s_share(&Ctx::new(), &store, &again);
+        assert!(fc.k3s.lock().unwrap().contains(&"kubectl delete node node-a --timeout=20s".to_string()), "{:?}", fc.k3s.lock().unwrap());
+        assert_eq!(get(&coord.root, K3S_NODES).trim(), "{}", "the name is free for the new machine");
+        // k3s without a token of its own for agents: the server's token
+        // is never handed out.
+        let dir2 = TempDir::new();
+        let store2 = Store::new(dir2.join("registry.json"));
+        put(&coord.root, K3S_AGENT_TOKEN, "K10abc::server:topsecret\n");
+        coord.k3s_share(&Ctx::new(), &store2, &members);
+        assert_eq!(store2.read().map(|s| s.k3s_token).unwrap_or_default(), "");
     }
 
     #[test]

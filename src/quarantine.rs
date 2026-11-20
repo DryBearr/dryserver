@@ -26,7 +26,7 @@ use crate::mesh;
 use crate::node::{self, Node};
 use crate::registry::{self, Member};
 use crate::runner::Cmd;
-use crate::{bail, fsx};
+use crate::{bail, errf, fsx};
 
 pub const STATE_FILE: &str = "/etc/dryserver/quarantine.json";
 pub const NFT_DIR: &str = "/etc/dryserver/nft.d";
@@ -609,6 +609,12 @@ fn cut_as(ctx: &Ctx, n: &Node, coordinator: bool, names: &[String], auto: bool, 
     {
         errs.push(e.wrap("apply wg0.conf"));
     }
+    // The coordinator runs the cluster's control plane. Cut off, it is not
+    // trusted, and neither is anything its cluster started on this server.
+    if !coordinator && st.coordinator_cut() {
+        n.k3s_hold(ctx);
+        let _ = writeln!(out, "k3s and its containers are stopped on {} until the cut is lifted.", n.hostname);
+    }
     if !fsx::read_or_empty(n.path("/etc/nftables.conf")).contains(NFT_INCLUDE) {
         let _ = writeln!(
             out,
@@ -657,7 +663,17 @@ fn adopt(ctx: &Ctx, n: &Node, me: u32) -> Result<Coordinator> {
     if list.version < seen {
         bail!("the coordinator at {ip} serves signed list version {}, older than version {seen} this server has seen", list.version);
     }
-    if !list.members.iter().any(|e| e.host == me) {
+    if !list.members.iter().any(|e| n.is_me(me, e)) {
+        // Newer than a list this server was in: the admin took it out
+        // while it was cut off. It leaves like any removed server.
+        if seen > 0 && list.version > seen {
+            let gone = Error::with_kind(
+                crate::err::Kind::Removed,
+                format!("the admin removed this server from the swarm (signed list version {})", list.version),
+            );
+            n.leave(ctx, &env, &gone);
+            return Err(gone);
+        }
         bail!("the signed member list from {ip} does not hold this server");
     }
     let Some(coord) = list.members.iter().find(|e| e.host == 1) else {
@@ -766,6 +782,12 @@ pub fn lift(ctx: &Ctx, n: &Node, coordinator: bool, out: &mut dyn Write) -> Resu
                     } else {
                         "THE FIREWALL BLOCK COULD NOT BE PUT BACK, run: sudo dryserver quarantine"
                     };
+                    if e.is(crate::err::Kind::Removed) {
+                        return Err(errf!(
+                            "{e}. It no longer counts itself a member and its k3s stays stopped; {note}. To bring it back: \
+                             sudo dryserver quarantine -lift once more, then sudo dryserver join"
+                        ));
+                    }
                     return Err(e.wrap(format!("not lifted, {note}")));
                 }
             }
@@ -813,6 +835,8 @@ pub fn lift(ctx: &Ctx, n: &Node, coordinator: bool, out: &mut dyn Write) -> Resu
     let _ = std::fs::remove_file(n.path(ISSUE_FILE));
     let _ = n.run.ok(ctx, &Cmd::new("agetty", &["--reload"]));
     let _ = std::fs::remove_file(n.path(STATE_FILE));
+    // k3s may run again; the next sync starts it.
+    let _ = std::fs::remove_file(n.path(crate::sysconf::K3S_HOLD));
     drop(lock);
     if joined(n, coordinator) {
         let _ = n.run.ok(ctx, &Cmd::new("systemctl", &["start", "--no-block", "dryserver-sync.service"]));
@@ -1320,6 +1344,11 @@ PersistentKeepalive = 25
         assert!(get(dir.path(), ISSUE_FILE).contains("QUARANTINE"));
         let calls = fake.calls.lock().unwrap().join("\n");
         assert!(calls.contains("nft -c -f") && calls.contains("nft -f") && calls.contains("wg syncconf wg0"), "{calls}");
+        // The coordinator's cluster is not trusted either: k3s stops here
+        // and stays down over a reboot.
+        assert!(calls.contains("systemctl stop k3s.service"), "{calls}");
+        assert!(calls.find("nft -f").unwrap() < calls.find("systemctl stop k3s.service").unwrap(), "the cut comes first: {calls}");
+        assert!(n.path(crate::sysconf::K3S_HOLD).exists() && text.contains("k3s and its containers are stopped on node-b"), "{text}");
 
         // Running it again changes nothing and keeps the saved peer.
         cut(&ctx, &n, false, &[], &mut Vec::new()).unwrap();
@@ -1347,6 +1376,37 @@ PersistentKeepalive = 25
     }
 
     #[test]
+    fn cut_off_server_learns_on_lift_that_it_was_removed() {
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        let ctx = Ctx::new();
+        // Another member cut off: this server's k3s keeps running.
+        cut(&ctx, &n, false, &["node-c".into()], &mut Vec::new()).unwrap();
+        assert!(!n.path(crate::sysconf::K3S_HOLD).exists() && !fake.calls.lock().unwrap().join("\n").contains("k3s.service"));
+        cut(&ctx, &n, false, &[], &mut Vec::new()).unwrap();
+        put(dir.path(), crate::sysconf::K3S_TOKEN, "K10abc::node:secret\n");
+        // While it was cut off the admin removed it.
+        let gone = signed_reply(&ADMIN, 9, vec![entry(1, "coord", 1, COORD_SSH), entry(3, "node-c", 3, "ssh-ed25519 AAAAc")]);
+        *fake.signed.lock().unwrap() = Some(gone.0);
+        let e = lift(&ctx, &n, false, &mut Vec::new()).unwrap_err();
+        let text = e.to_string();
+        assert!(
+            text.contains("removed this server from the swarm (signed list version 9)") && text.contains("the quarantine stays"),
+            "{text}"
+        );
+        assert!(text.contains("sudo dryserver quarantine -lift once more, then sudo dryserver join"), "{text}");
+        assert_eq!(n.load_state().host, 0, "it still counts itself a member");
+        assert!(get(dir.path(), crate::sysconf::K3S_TOKEN).is_empty(), "it kept its way into the cluster");
+        assert!(get(dir.path(), node::SIGNED_FILE).contains(&gone.1.sig));
+        assert!(load(&n).unwrap().coordinator_cut(), "the cut was dropped");
+        // Lifting again clears the cut: the machine is like a new one that
+        // has not joined, and asks again with sudo dryserver join.
+        lift(&ctx, &n, false, &mut Vec::new()).unwrap();
+        assert!(load(&n).unwrap().is_empty() && !n.path(crate::sysconf::K3S_HOLD).exists());
+    }
+
+    #[test]
     fn lift_follows_a_new_coordinator_only_if_signed() {
         let dir = TempDir::new();
         let fake = Arc::new(Fake::default());
@@ -1367,10 +1427,6 @@ PersistentKeepalive = 25
             (Some(signed_reply(&crate::signed::fake::Key("thief"), 9, new_coord()).0), "bad signature"),
             (Some(signed_reply(&ADMIN, 4, new_coord()).0), "older than version 5"),
             (Some(signed_reply(&ADMIN, 5, new_coord()).0), "different signed list under the same version"),
-            (
-                Some(signed_reply(&ADMIN, 9, vec![entry(1, "coord", 9, NEW_SSH), entry(3, "node-c", 3, "ssh-ed25519 AAAAc")]).0),
-                "does not hold this server",
-            ),
         ];
         for (reply, want) in refused {
             *fake.signed.lock().unwrap() = reply;

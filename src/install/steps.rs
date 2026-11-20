@@ -314,6 +314,8 @@ impl Real {
         };
         let proof = registry::join_proof(&secret, &ch.hostname, &wg, &host_key);
         if ch.role() == Role::Coordinator {
+            // The cluster's secret for agents, made here and never shown.
+            self.write(sysconf::K3S_AGENT_SECRET, 0o600, fsx::hex(&fsx::random_bytes(32)))?;
             self.setup_registry_user(ctx)?;
             self.setup_coordinator_mesh(ctx, ch, &proof)?;
         } else {
@@ -790,6 +792,13 @@ mod tests {
         fr.index(&format!("arch-chroot {t} grub-install --target=i386-pc /dev/sda"));
         fr.index("mkfs.ext4 -F -q -L boot /dev/sda1");
         fr.index(&format!("arch-chroot {t} useradd --system -m -d /var/lib/dryreg -s /bin/sh dryreg"));
+        let secret = get(&r.target, sysconf::K3S_AGENT_SECRET);
+        assert!(secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit()), "agent secret: {secret:?}");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(fsx::under(&r.target, sysconf::K3S_AGENT_SECRET)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         let slice = get(&r.target, "/etc/systemd/system/user-967.slice.d/50-dryserver.conf");
         assert!(slice.contains("[Slice]\nTasksMax=200\nMemoryMax=384M\n"), "the registry account has no ceiling: {slice}");
 

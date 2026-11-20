@@ -203,9 +203,12 @@ never through the coordinator, and runs `sudo dryserver quarantine` there
 - drops all traffic from and to its mesh, switch and WiFi/router addresses,
   also connections that are already open,
 - pauses sync and join, so the coordinator cannot push anything,
+- stops k3s and every container on that server: the coordinator runs the
+  cluster's control plane, and what it started there is not trusted,
 - stays in place after a reboot.
 
-The servers keep running and keep talking to each other. Then:
+The servers keep running and keep talking to each other. Your apps are down
+until you lift the cut. Then:
 
 1. delete the tunnel in the Cloudflare dashboard, if you use one,
 2. power off the coordinator and keep its disk for investigation,
@@ -246,6 +249,14 @@ list. Give servers a fixed address in your router (DHCP reservation), so the
 
 Limits for now:
 
+- The coordinator runs the control plane of your cluster. Whoever takes it
+  over can start containers with full rights on every server, until you cut
+  it off. The cut stops them, but they may have changed the servers before.
+  After a real break-in (not a false alarm), reinstall the servers too.
+- A server that ran a copy of the Cloudflare Tunnel knows the tunnel's
+  token. After you cut off or removed a server you do not trust, make a new
+  token in the Cloudflare dashboard, save it and press `t` in
+  `./dryserver apps`.
 - After a false alarm (the coordinator was not reinstalled), `-lift` trusts
   the same machine again. Do that only when you are sure.
 - The coordinator's IPv6 addresses on the WiFi/router network are not
@@ -263,8 +274,8 @@ server dies. Apps never run on the coordinator.
 ./dryserver apps           # or "Apps" in the menu
 ```
 
-`n` starts an app from a container image: a name, the image, the port it
-listens on, and, if it should be reachable from outside, a public host name.
+`n` starts an app from a container image: a name (it starts with a letter),
+the image, the port it listens on, and, if it should be reachable from outside, a public host name.
 The screen shows what runs on which server; `d` removes an app. Under it is
 plain Kubernetes: on the coordinator, `k3s kubectl` works for you without
 sudo.
@@ -275,13 +286,19 @@ What dryserver sets up around every app (namespace `apps`):
   port from the ingress and from your other apps,
 - an app reaches your other apps, DNS and the internet, and nothing else:
   not the cluster's own services, not the machines,
+- an app cannot send raw packets, so it cannot pose as another address on
+  the pod network,
 - a public host name makes the built-in ingress (Traefik) route that name to
   the app. The ingress has no port on any machine: what comes in from
   outside reaches it through a tunnel that runs inside the cluster,
 - containers cannot gain privileges and get no cluster credentials,
 - the firewall on every machine is a wall around all pods: web out, never
   your home network, never SSH on the machines; a NodePort or hostPort is
-  not a door from the mesh or the home network.
+  not a door from the mesh or the home network,
+- no machine is a router into the cluster: what arrives from the home
+  network, the switch or the mesh is never passed on to pods elsewhere,
+- servers join the cluster with a token that is for agents only. It does
+  not open the control plane.
 
 k3s is one pinned release, downloaded from its GitHub releases when the USB
 stick is built and checked against the checksum dryserver was built with.
@@ -317,7 +334,9 @@ that are left. The removed server stops k3s and every container as soon as
 it sees the signed list without itself (it asks the coordinator on the home
 network when the mesh no longer answers). A server that only lost contact
 keeps its apps running. To bring a removed server back, run
-`sudo dryserver join` on it and approve it like a new machine.
+`sudo dryserver join` on it and approve it like a new machine. A machine
+installed again under a name the cluster knows takes that name over: the
+coordinator forgets the old machine first.
 
 ## Security
 

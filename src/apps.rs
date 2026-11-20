@@ -26,6 +26,9 @@ use crate::{bail, errf};
 pub const NAMESPACE: &str = "apps";
 /// Where the way in from outside lives.
 pub const TUNNEL_NAMESPACE: &str = "edge";
+/// Where the ingress pods take plain HTTP (Traefik's "web" entry; the
+/// service's port 80 leads there). Its other ports are its own business.
+const INGRESS_PORT: u16 = 8000;
 /// One pinned cloudflared release: the tag for people, the digest for the
 /// machine (the image index, so it fits every CPU type). A changed image
 /// under the same tag is refused.
@@ -101,13 +104,21 @@ pub fn valid_host(s: &str) -> Result<()> {
     if ok { Ok(()) } else { Err("a host name like app.example.com, or empty".into()) }
 }
 
+/// An app's name is a DNS name inside the cluster (http://NAME) and the
+/// name of its Kubernetes objects: it starts with a letter.
+pub fn valid_app_name(s: &str) -> Result<()> {
+    if registry::valid_name(s) && s.len() <= 40 && s.as_bytes()[0].is_ascii_lowercase() {
+        Ok(())
+    } else {
+        Err("starts with a letter, then lowercase letters, digits and -, at most 40".into())
+    }
+}
+
 impl App {
     /// Everything here ends up in YAML and in command lines: only plain
     /// names pass.
     pub fn validate(&self) -> Result<()> {
-        if !registry::valid_name(&self.name) || self.name.len() > 40 {
-            bail!("name: lowercase letters, digits and -, at most 40");
-        }
+        valid_app_name(&self.name).map_err(|e| e.wrap("name"))?;
         valid_image(&self.image).map_err(|e| e.wrap("image"))?;
         if self.port == 0 {
             bail!("port: 1 to 65535");
@@ -166,14 +177,14 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {name}
+  name: "app-{name}"
   namespace: {NAMESPACE}
   labels:
-    app: {name}
+    app: "{name}"
 spec:
   podSelector:
     matchLabels:
-      app: {name}
+      app: "{name}"
   policyTypes: [Ingress]
   ingress:
     - from:
@@ -190,19 +201,19 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {name}
+  name: "{name}"
   namespace: {NAMESPACE}
   labels:
-    app: {name}
+    app: "{name}"
 spec:
   replicas: {copies}
   selector:
     matchLabels:
-      app: {name}
+      app: "{name}"
   template:
     metadata:
       labels:
-        app: {name}
+        app: "{name}"
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -214,14 +225,18 @@ spec:
           whenUnsatisfiable: ScheduleAnyway
           labelSelector:
             matchLabels:
-              app: {name}
+              app: "{name}"
 {tolerations}      containers:
-        - name: {name}
+        - name: "{name}"
           image: "{image}"
           ports:
             - containerPort: {port}
           securityContext:
             allowPrivilegeEscalation: false
+            # No raw packets: a taken-over app cannot pose as another
+            # address on the pod network.
+            capabilities:
+              drop: ["NET_RAW"]
           resources:
             requests:
               cpu: 50m
@@ -230,13 +245,13 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {name}
+  name: "{name}"
   namespace: {NAMESPACE}
   labels:
-    app: {name}
+    app: "{name}"
 spec:
   selector:
-    app: {name}
+    app: "{name}"
   ports:
     - port: 80
       targetPort: {port}
@@ -248,10 +263,10 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {name}
+  name: "{name}"
   namespace: {NAMESPACE}
   labels:
-    app: {name}
+    app: "{name}"
 spec:
   rules:
     - host: "{host}"
@@ -261,7 +276,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {name}
+                name: "{name}"
                 port:
                   number: 80
 "#
@@ -302,6 +317,9 @@ pub fn tunnel_manifest(token: &str) -> Result<String> {
     let token = token.trim();
     valid_tunnel_token(token)?;
     let tolerations = tolerations();
+    // Changes with the token and says nothing about it: Kubernetes starts
+    // new pods when the pod template changes, and only then.
+    let mark = crate::fsx::hex(&registry::hmac_sha256(b"dryserver-tunnel-token", token.as_bytes())[..8]);
     Ok(format!(
         r#"apiVersion: v1
 kind: Namespace
@@ -338,6 +356,8 @@ spec:
           podSelector:
             matchLabels:
               app.kubernetes.io/name: traefik
+      ports:
+        - port: {INGRESS_PORT}
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -372,6 +392,8 @@ spec:
     metadata:
       labels:
         app: cloudflared
+      annotations:
+        dryserver/token-mark: "{mark}"
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -414,16 +436,11 @@ spec:
     ))
 }
 
-/// Starts the tunnel, or gives it another token.
+/// Starts the tunnel, or gives it another token. The pods carry a mark
+/// made from the token, so another token starts new pods by itself.
 pub fn connect_tunnel(c: &dyn Cluster, token: &str) -> Result<()> {
     let manifest = tunnel_manifest(token)?;
-    let out = c.kubectl(&["apply", "-f", "-"], &manifest)?;
-    // A changed token only reaches pods that start after it. (A new
-    // tunnel starts its pods with the token it was made with.)
-    if out.lines().any(|l| l.trim() == "secret/tunnel configured") {
-        c.kubectl(&["-n", TUNNEL_NAMESPACE, "rollout", "restart", "deployment/cloudflared"], "")?;
-    }
-    Ok(())
+    c.kubectl(&["apply", "-f", "-"], &manifest).map(|_| ())
 }
 
 /// Closes the way in from outside. The apps keep running.
@@ -455,6 +472,10 @@ pub struct Running {
 pub trait Cluster {
     fn kubectl(&self, args: &[&str], stdin: &str) -> Result<String>;
 }
+
+/// The most kubectl may answer: a full listing of a busy cluster is a
+/// few MiB.
+const MAX_ANSWER: usize = 32 << 20;
 
 /// kubectl over the admin's own SSH login to the coordinator. The host key
 /// must be the one this desktop pinned for the coordinator.
@@ -491,13 +512,49 @@ impl Cluster for SshCluster {
         let writer = std::thread::spawn(move || {
             let _ = pipe.write_all(text.as_bytes());
         });
-        let out = child.wait_with_output().map_err(|e| Error::from(e).wrap("ssh"))?;
+        // The coordinator's answer is kept up to a limit; one that goes on
+        // and on ends the call.
+        let over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = |mut pipe: Box<dyn std::io::Read + Send>, limit: usize| {
+            let over = over.clone();
+            std::thread::spawn(move || {
+                let mut kept = Vec::new();
+                let mut buf = [0u8; 65536];
+                loop {
+                    match pipe.read(&mut buf) {
+                        Ok(0) | Err(_) => return kept,
+                        Ok(n) if kept.len() + n > limit => {
+                            over.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return kept;
+                        }
+                        Ok(n) => kept.extend_from_slice(&buf[..n]),
+                    }
+                }
+            })
+        };
+        let stdout = reader(Box::new(child.stdout.take().ok_or_else(|| Error::new("ssh: no stdout"))?), MAX_ANSWER);
+        let stderr = reader(Box::new(child.stderr.take().ok_or_else(|| Error::new("ssh: no stderr"))?), 65536);
+        let status = loop {
+            if let Some(st) = child.try_wait().map_err(|e| Error::from(e).wrap("ssh"))? {
+                break st;
+            }
+            if over.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("the coordinator's answer is longer than {} MiB; stopped reading", MAX_ANSWER >> 20);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        };
         let _ = writer.join();
-        if out.status.success() {
-            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        let (out, err) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
+        if over.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("the coordinator's answer is longer than {} MiB; stopped reading", MAX_ANSWER >> 20);
         }
-        let msg: String = String::from_utf8_lossy(&out.stderr).chars().filter(|c| !c.is_control() || *c == '\n').take(400).collect();
-        if out.status.code() == Some(255) {
+        if status.success() {
+            return Ok(String::from_utf8_lossy(&out).into_owned());
+        }
+        let msg: String = String::from_utf8_lossy(&err).chars().filter(|c| !c.is_control() || *c == '\n').take(400).collect();
+        if status.code() == Some(255) {
             bail!("cannot log in to the coordinator at {} with your SSH key: {}", self.host, msg.trim());
         }
         Err(errf!("kubectl: {}", msg.trim()))
@@ -578,7 +635,12 @@ pub fn overview(c: &dyn Cluster) -> Result<Overview> {
 
 pub fn deploy(c: &dyn Cluster, app: &App) -> Result<()> {
     let manifest = app.manifest()?;
-    c.kubectl(&["apply", "-f", "-"], &manifest).map(|_| ())
+    c.kubectl(&["apply", "-f", "-"], &manifest)?;
+    if app.host.is_empty() {
+        // Started again without a public name: the old way in goes.
+        c.kubectl(&["-n", NAMESPACE, "delete", "ingress", &app.name, "--ignore-not-found"], "")?;
+    }
+    Ok(())
 }
 
 /// Removes an app's objects. The namespace and its default-deny policy
@@ -613,6 +675,9 @@ pub mod tests {
             "- key: node.kubernetes.io/unreachable\n          operator: Exists\n          effect: NoExecute\n          tolerationSeconds: 30\n",
             "- key: node.kubernetes.io/not-ready\n",
             "image: \"ghcr.io/me/blog:v2\"",
+            "name: \"app-blog\"\n  namespace: apps\n  labels:\n    app: \"blog\"\nspec:\n  podSelector:",
+            "kind: Deployment\nmetadata:\n  name: \"blog\"",
+            "capabilities:\n              drop: [\"NET_RAW\"]",
             "containerPort: 8080",
             "automountServiceAccountToken: false",
             "allowPrivilegeEscalation: false",
@@ -644,6 +709,9 @@ pub mod tests {
             (App { name: "Blog".into(), ..app() }, "name"),
             (App { name: "a\nkind: Secret".into(), ..app() }, "name"),
             (App { name: "x".repeat(41), ..app() }, "name"),
+            // A name is a DNS name in the cluster: a letter first.
+            (App { name: "123".into(), ..app() }, "name"),
+            (App { name: "9lives".into(), ..app() }, "name"),
             (App { image: "nginx; rm -rf /".into(), ..app() }, "image"),
             (App { image: "nginx\"\n  privileged: true".into(), ..app() }, "image"),
             (App { image: String::new(), ..app() }, "image"),
@@ -661,6 +729,19 @@ pub mod tests {
         }
         for image in ["nginx", "nginx:1.27", "docker.io/library/nginx@sha256:abc123", "ghcr.io/a_b/c-d:v1.2"] {
             valid_image(image).unwrap();
+        }
+        // Names that mean something else to YAML or to the namespace
+        // stay what they are: quoted, and never the name of a wall.
+        for name in ["true", "null", "no", "outgoing", "default-deny"] {
+            let y = App { name: name.into(), ..app() }.manifest().unwrap();
+            assert!(y.contains(&format!("kind: Deployment\nmetadata:\n  name: \"{name}\"")), "{name}:\n{y}");
+            assert!(y.contains(&format!("name: \"app-{name}\"")), "{name}");
+            assert_eq!(y.matches("\n  name: default-deny\n").count(), 1, "{name} took the place of a wall");
+            assert_eq!(y.matches("\n  name: outgoing\n").count(), 1, "{name} took the place of a wall");
+            assert!(
+                !y.contains(&format!("name: {name}\n")) || name == "outgoing" || name == "default-deny",
+                "{name} is unquoted somewhere"
+            );
         }
     }
 
@@ -732,6 +813,9 @@ pub mod tests {
         assert_eq!(args, "apply -f -");
         assert_eq!(stdin, app().manifest().unwrap());
         assert!(deploy(&c, &App { name: "no good".into(), ..app() }).is_err());
+        // Started again without a public name: the old way in is taken away.
+        deploy(&c, &App { host: String::new(), ..app() }).unwrap();
+        assert_eq!(c.calls.lock().unwrap().last().unwrap().0, "-n apps delete ingress blog --ignore-not-found");
 
         remove(&c, "blog").unwrap();
         assert_eq!(
@@ -757,6 +841,7 @@ pub mod tests {
             "policyTypes: [Egress]",
             "app.kubernetes.io/name: traefik",
             "- port: 7844\n          protocol: UDP",
+            "app.kubernetes.io/name: traefik\n      ports:\n        - port: 8000\n",
             &format!("token: \"{token}\""),
             "image: \"docker.io/cloudflare/cloudflared:2026.11.1@sha256:",
             "args: [\"tunnel\", \"--no-autoupdate\", \"--metrics\", \"0.0.0.0:2000\", \"run\"]",
@@ -785,23 +870,17 @@ pub mod tests {
         assert_eq!(tunnel_token(&format!("  {token}  ")).unwrap(), token);
         assert!(tunnel_token("").is_err() && tunnel_token("cloudflared service install").is_err());
         valid_image(TUNNEL_IMAGE).unwrap();
+        // The pods carry a mark of the token: another token is another
+        // pod template, so Kubernetes starts new pods by itself. The mark
+        // gives the token away to nobody.
+        let mark = |y: &str| y.lines().find(|l| l.contains("dryserver/token-mark")).unwrap().to_string();
+        let other = tunnel_manifest(&token.replace("eyJh", "eyJi")).unwrap();
+        assert_eq!(mark(&y), mark(&tunnel_manifest(token).unwrap()));
+        assert_ne!(mark(&y), mark(&other));
+        assert!(mark(&y).len() < 60 && !mark(&y).contains(&token[..12]), "{}", mark(&y));
         let c = Fake::default();
-        // A new tunnel: its pods start with the token.
-        *c.applied.lock().unwrap() = "namespace/edge created\nsecret/tunnel created\ndeployment.apps/cloudflared created\n".into();
         connect_tunnel(&c, token).unwrap();
         assert_eq!(c.calls.lock().unwrap().iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(), vec!["apply -f -"]);
-        // The same token again changes nothing.
-        *c.applied.lock().unwrap() = "namespace/edge unchanged\nsecret/tunnel unchanged\ndeployment.apps/cloudflared unchanged\n".into();
-        connect_tunnel(&c, token).unwrap();
-        assert_eq!(c.calls.lock().unwrap().len(), 2);
-        // Another token reaches only pods that start after it.
-        *c.applied.lock().unwrap() = "namespace/edge unchanged\nsecret/tunnel configured\ndeployment.apps/cloudflared unchanged\n".into();
-        connect_tunnel(&c, token).unwrap();
-        assert_eq!(
-            c.calls.lock().unwrap().last().unwrap().0,
-            "-n edge rollout restart deployment/cloudflared",
-            "a new token needs new pods"
-        );
         remove_tunnel(&c).unwrap();
         assert_eq!(c.calls.lock().unwrap().last().unwrap().0, "-n edge delete deployment/cloudflared secret/tunnel --ignore-not-found");
     }

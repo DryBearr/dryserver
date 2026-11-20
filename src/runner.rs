@@ -221,6 +221,10 @@ fn last_line(s: &str, quiet: bool) -> String {
 
 /// Collects output and emits it line by line; carriage returns (progress
 /// bars) also end a line.
+/// The most output kept from one command (the rest is still logged line
+/// by line).
+pub const MAX_KEPT: usize = 32 << 20;
+
 pub struct Lines {
     emit: LogFn,
     pub all: Vec<u8>,
@@ -233,7 +237,10 @@ impl Lines {
     }
 
     pub fn write(&mut self, p: &[u8]) {
-        self.all.extend_from_slice(p);
+        // Kept up to a limit: what a command prints may come from another
+        // machine (ssh), and nobody gets to fill this one's memory.
+        let room = MAX_KEPT.saturating_sub(self.all.len());
+        self.all.extend_from_slice(&p[..p.len().min(room)]);
         self.pending.extend_from_slice(p);
         while let Some(i) = self.pending.iter().position(|&b| b == b'\r' || b == b'\n') {
             let line = String::from_utf8_lossy(&self.pending[..i]).trim().to_string();
@@ -282,6 +289,17 @@ impl Write for LineWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kept_output_has_a_ceiling() {
+        let mut l = Lines::new(Arc::new(|_| {}));
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..40 {
+            l.write(&chunk);
+            l.write(b"\n");
+        }
+        assert_eq!(l.all.len(), MAX_KEPT, "a command that prints for ever must not fill the memory");
+    }
 
     fn collect() -> (LogFn, Arc<Mutex<Vec<String>>>) {
         let got = Arc::new(Mutex::new(Vec::new()));

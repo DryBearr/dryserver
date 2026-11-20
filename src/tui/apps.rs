@@ -8,7 +8,6 @@ use super::form::{Field, Form, Group, Status};
 use super::{Doc, Emit, Event, Flow, Key, Model, dim, err, ok, sel, theme};
 use crate::apps::{self, App, Cluster, Overview};
 use crate::err::Error;
-use crate::registry;
 
 /// Each refresh is an SSH login, and the coordinator lets one address
 /// open 10 a minute.
@@ -46,8 +45,8 @@ fn new_app_form() -> Form<Draft> {
             Group::new(vec![
                 Field::input("Name", |d: &D| d.name.clone(), |d, v| d.name = v)
                     .placeholder("blog")
-                    .desc("Lowercase letters, digits and -. Other apps reach it as http://NAME.")
-                    .validate(|v, _| if registry::valid_name(v.trim()) && v.trim().len() <= 40 { Ok(()) } else { Err("lowercase letters, digits and -, at most 40".into()) }),
+                    .desc("Starts with a letter; lowercase letters, digits and -. Other apps reach it as http://NAME.")
+                    .validate(|v, _| apps::valid_app_name(v.trim())),
                 Field::input("Image", |d: &D| d.image.clone(), |d, v| d.image = v)
                     .placeholder("nginx:1.27")
                     .desc("The container image to run, with its tag.")

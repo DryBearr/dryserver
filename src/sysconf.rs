@@ -177,6 +177,14 @@ pub const K3S_CONFIG: &str = "/etc/rancher/k3s/config.yaml";
 /// A server's token for joining the cluster, handed out by the coordinator
 /// to members over the mesh.
 pub const K3S_TOKEN: &str = "/etc/rancher/k3s/token";
+/// On the coordinator: the secret agents join with, made at install. With
+/// none of its own, k3s hands agents the server's token, and that one
+/// opens the control plane's own doors (its certificate authority).
+pub const K3S_AGENT_SECRET: &str = "/etc/rancher/k3s/agent-token";
+/// While this file exists a server does not run k3s. It cut the
+/// coordinator off: what the coordinator's cluster started here is not
+/// trusted until the admin lifts the cut.
+pub const K3S_HOLD: &str = "/etc/dryserver/k3s.hold";
 
 /// k3s runs your apps as one cluster over the mesh: the server (control
 /// plane) on the coordinator, an agent on every other machine. It starts
@@ -184,8 +192,8 @@ pub const K3S_TOKEN: &str = "/etc/rancher/k3s/token";
 /// install, a server gets config and token once it is approved.
 fn k3s_unit(role: Role) -> String {
     let (what, mode, needs) = match role {
-        Role::Coordinator => ("control plane of your cluster", "server", K3S_CONFIG),
-        Role::Node => ("runs your apps as part of the cluster", "agent", K3S_TOKEN),
+        Role::Coordinator => ("control plane of your cluster", "server", K3S_CONFIG.to_string()),
+        Role::Node => ("runs your apps as part of the cluster", "agent", format!("{K3S_TOKEN}\nConditionPathExists=!{K3S_HOLD}")),
     };
     format!(
         "[Unit]
@@ -218,6 +226,7 @@ WantedBy=multi-user.target
 /// - Everything on the mesh address: the API server is not reachable from
 ///   the home network.
 /// - Secrets are encrypted in the cluster's database.
+/// - Agents join with their own token, which opens nothing else.
 /// - No ServiceLB: it would open ports 80 and 443 on every machine. The
 ///   way in from outside is the tunnel, which runs as a pod.
 /// - Apps never run on the coordinator (taint); k3s's own parts may.
@@ -231,6 +240,7 @@ flannel-iface: wg0
 cluster-cidr: {K3S_POD_CIDR}
 service-cidr: {K3S_SERVICE_CIDR}
 secrets-encryption: true
+agent-token-file: {K3S_AGENT_SECRET}
 write-kubeconfig-mode: \"0640\"
 write-kubeconfig-group: wheel
 disable:
@@ -458,6 +468,12 @@ table inet dryserver {{
 		# Pods are reached by other pods, by this machine, and through
 		# the ingress.
 		oifname "cni0" iifname != {{ "cni0", "flannel.1" }} drop
+		# Routing is for this machine's own containers and pods. What
+		# arrives from the home network, the switch, the mesh or another
+		# machine's pods is never passed on to another network: no
+		# machine here is a router into the cluster.
+		iifname "flannel.1" oifname != "cni0" drop
+		iifname != {{ "cni0", "flannel.1", "docker0", "br-*" }} oifname != {{ "docker0", "br-*" }} drop
 	}}
 
 	# What a k3s pod may start. Which pod may talk to which is for
@@ -471,7 +487,7 @@ table inet dryserver {{
 		oifname "wg0" drop
 		udp dport {{ 53, 123 }} accept
 		tcp dport 53 accept
-		ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }} drop
+		ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 }} drop
 		ip6 daddr {{ fc00::/7, fe80::/10 }} drop
 		tcp dport {web_tcp} accept{extra_udp}
 		# Cloudflare Tunnel (cloudflared runs as a pod).
@@ -491,7 +507,7 @@ table inet dryserver {{
 		# DNS and time first: the resolver is often the home router.
 		udp dport {{ 53, 123 }} accept
 		tcp dport 53 accept
-		ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }} drop
+		ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 }} drop
 		ip6 daddr {{ fc00::/7, fe80::/10 }} drop
 		tcp dport {web_tcp} accept{extra_udp}
 		meta l4proto {{ icmp, ipv6-icmp }} accept
@@ -844,7 +860,7 @@ mod tests {
             "type filter hook output priority filter; policy drop;",
             "ip daddr 192.168.1.50 tcp dport 22 accept",
             "reject with icmpx admin-prohibited",
-            "ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } drop",
+            "ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop",
         ] {
             assert!(nft.contains(want), "node nftables missing {want:?}:\n{nft}");
         }
@@ -890,6 +906,19 @@ mod tests {
             assert!(conf.content.contains(want), "coordinator k3s config missing {want:?}:\n{}", conf.content);
         }
         assert!(k3s_agent_config("10.66.0.1", "10.66.0.7").contains("node-ip: 10.66.0.7"));
+        assert!(conf.content.contains("agent-token-file: /etc/rancher/k3s/agent-token\n"), "servers would get the control plane's token");
+        // A server that cut the coordinator off does not start k3s.
+        let unit = &find(&node, "/etc/systemd/system/k3s.service").content;
+        assert!(unit.contains("ConditionPathExists=!/etc/dryserver/k3s.hold\n"), "{unit}");
+        assert!(!find(&coord, "/etc/systemd/system/k3s.service").content.contains("k3s.hold"));
+        // No machine routes anyone into the cluster.
+        for nft in [nft, &find(&coord, "/etc/nftables.conf").content] {
+            assert!(nft.contains("iifname \"flannel.1\" oifname != \"cni0\" drop"), "{nft}");
+            assert!(
+                nft.contains("iifname != { \"cni0\", \"flannel.1\", \"docker0\", \"br-*\" } oifname != { \"docker0\", \"br-*\" } drop"),
+                "{nft}"
+            );
+        }
         let coord_nft = &find(&coord, "/etc/nftables.conf").content;
         assert!(
             coord_nft.contains("chain mesh {\n\t\ttcp dport 22 accept"),
