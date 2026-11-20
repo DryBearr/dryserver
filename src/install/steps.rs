@@ -9,6 +9,7 @@ use super::real::InstallState;
 use super::*;
 use crate::err::{Error, Kind};
 use crate::gotime::Time;
+use crate::iso;
 use crate::mesh::SelfInfo;
 use crate::node::{self, Node};
 use crate::packages::{self, Plan};
@@ -277,6 +278,15 @@ impl Real {
             let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             self.write(&format!("/etc/dryserver/{name}"), mode, fsx::read(src)?)?;
         }
+        // The public half of the admin's signing key: what this server
+        // checks member lists against. Required, so a stick without it
+        // cannot install a server that would accept unsigned lists later.
+        let signing = fsx::dir(&self.registry_key).join(iso::SIGNING_PUB);
+        let line = fsx::read_string(&signing).map_err(|e| e.wrap("this installer has no signing key; build the USB stick again"))?;
+        if !line.trim_start().starts_with("ssh-ed25519 ") {
+            return Err(errf!("{} is not an ed25519 public key; build the USB stick again", signing.display()));
+        }
+        self.write(node::SIGNING_PUB, 0o644, line)?;
         let _ = fsx::chmod(self.target("/etc/dryserver"), 0o700);
         self.chroot(ctx, &["ssh-keygen", "-A"])?;
         let host_key = fsx::read_string(self.target("/etc/ssh/ssh_host_ed25519_key.pub"))?;
@@ -560,6 +570,7 @@ mod tests {
         let key = dir.join("registry_ed25519");
         std::fs::write(&key, "private").unwrap();
         std::fs::write(dir.join("registry_ed25519.pub"), "ssh-ed25519 AAAAreg dryserver-registry\n").unwrap();
+        std::fs::write(dir.join(iso::SIGNING_PUB), "ssh-ed25519 AAAAsign dryserver-signing\n").unwrap();
 
         let cfg = Config {
             coord_lan_ip: "192.168.1.50".into(),
@@ -702,6 +713,11 @@ mod tests {
         );
         assert!(get(&r.target, "/etc/ssh/sshd_config.d/10-dryserver.conf").contains("AllowUsers admin dryreg"));
         assert!(!r.target("/etc/crypttab").exists(), "unencrypted install must not write crypttab");
+        // The signing public key, readable by root and the registry user.
+        assert_eq!(get(&r.target, node::SIGNING_PUB), "ssh-ed25519 AAAAsign dryserver-signing\n");
+        let mode = |p: &str| std::fs::metadata(r.target(p)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(node::SIGNING_PUB), 0o644);
+        assert_eq!(mode("/usr/local/share/dryserver") & 0o005, 0o005, "the registry user must be able to reach the key");
 
         // Coordinator: registry with itself as member 1, mesh config, services.
         let reg = get(&r.target, "/var/lib/dryserver/registry.json");

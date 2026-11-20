@@ -30,6 +30,10 @@ pub const WG_CONF: &str = "/etc/wireguard/wg0.conf";
 pub const HOST_KEY_PUB: &str = "/etc/ssh/ssh_host_ed25519_key.pub";
 /// Records which Ethernet port is the switch port.
 pub const SWITCH_MAC_FILE: &str = "/etc/dryserver/switch.mac";
+/// The public half of the admin's signing key, from the installer. Outside
+/// /etc/dryserver (root only) because the coordinator's registry user reads
+/// it too; root owns it, everyone may read it.
+pub const SIGNING_PUB: &str = "/usr/local/share/dryserver/signing_ed25519.pub";
 /// Shows join status on the console login screen.
 pub const ISSUE_FILE: &str = "/etc/issue.d/50-dryserver.issue";
 
@@ -195,8 +199,11 @@ impl Node {
                     if let Ok(r) = serde_json::from_str::<StatusReply>(&out) {
                         match r.status {
                             Status::Approved => {
-                                if r.coordinator.is_none() || r.host < 2 {
-                                    return Err("coordinator sent an incomplete approval".into());
+                                // What it sends ends up in wg0.conf, /etc/hosts
+                                // and the SSH trust files: check all of it.
+                                let coord_ok = r.coordinator.as_ref().is_some_and(|c| c.host == 1 && registry::member_problem(c).is_none());
+                                if !coord_ok || r.host < 2 || mesh::ip(&self.cfg.wg_subnet, r.host).is_empty() {
+                                    return Err("coordinator sent an incomplete or invalid approval".into());
                                 }
                                 return Ok(r);
                             }
@@ -263,10 +270,21 @@ impl Node {
             #[serde(default, deserialize_with = "crate::gotime::null_default")]
             members: Vec<Member>,
         }
-        match serde_json::from_str::<Reply>(&out) {
-            Ok(r) if !r.members.is_empty() => Ok(r.members),
-            _ => Err("bad member list from coordinator".into()),
+        let members = match serde_json::from_str::<Reply>(&out) {
+            Ok(r) if !r.members.is_empty() => r.members,
+            _ => return Err("bad member list from coordinator".into()),
+        };
+        // Nothing from the coordinator is used unchecked.
+        let (members, problems) = registry::check_members(members, |h| !mesh::ip(&self.cfg.wg_subnet, h).is_empty());
+        for p in &problems {
+            eprintln!("dryserver: sync: ignoring {p}");
         }
+        // Without the coordinator's own entry this server would drop its
+        // peer and never reach it again: keep the current mesh instead.
+        if !members.iter().any(|m| m.host == 1) {
+            return Err("the coordinator's member list has no usable entry for the coordinator itself; keeping the current mesh".into());
+        }
+        Ok(members)
     }
 
     // ---- commands run at boot and by the timer ----
@@ -526,6 +544,7 @@ mod tests {
     const COORD_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIcoord";
     const NODE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInode root@node-a";
     const WG_PUBKEY: &str = "bm9kZS1hLXB1YmxpYy1rZXktMzItYnl0ZXMtbG9uZyE=";
+    const COORD_WG: &str = "Y29vcmQtcHVibGljLWtleS0zMi1ieXRlcy1sb25nISE=";
 
     /// Answers registry commands like the coordinator would, and records the
     /// host key the way ssh accept-new does.
@@ -535,6 +554,8 @@ mod tests {
         calls: Mutex<Vec<String>>,
         last: Mutex<Option<Cmd>>,
         applied: Mutex<String>,
+        /// The "peers" reply to send instead of the normal two members.
+        peers: Mutex<Option<String>>,
     }
 
     impl FakeCoord {
@@ -545,6 +566,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 last: Mutex::new(None),
                 applied: Mutex::new(String::new()),
+                peers: Mutex::new(None),
             })
         }
     }
@@ -584,10 +606,13 @@ mod tests {
                 return (serde_json::to_string(&r).unwrap(), Ok(()));
             }
             if cmd == "peers" {
-                return (
-                    r#"{"members":[{"host":1,"name":"coord","wg_key":"C","lan_ip":"192.168.1.50"},{"host":2,"name":"node-a","wg_key":"A"}]}"#.into(),
-                    Ok(()),
-                );
+                let fixed = self.peers.lock().unwrap().clone();
+                let list = fixed.unwrap_or_else(|| {
+                    format!(
+                        r#"{{"members":[{{"host":1,"name":"coord","wg_key":"{COORD_WG}","lan_ip":"192.168.1.50"}},{{"host":2,"name":"node-a","wg_key":"{WG_PUBKEY}"}}]}}"#
+                    )
+                });
+                return (list, Ok(()));
             }
             (String::new(), Err("unknown".into()))
         }
@@ -612,7 +637,7 @@ mod tests {
         let coord = Member {
             host: 1,
             name: "coord".into(),
-            wg_key: "COORDWG".into(),
+            wg_key: COORD_WG.into(),
             lan_ip: "192.168.1.50".into(),
             switch: true,
             ssh_host_key: COORD_KEY.into(),
@@ -709,7 +734,7 @@ mod tests {
         let store = Store::new("/nonexistent");
 
         // Coordinator cut: no contact at all, nothing rewritten.
-        put(&n.root, quarantine::STATE_FILE, r#"{"cuts":[{"name":"coord","hosts":[1],"wg_keys":["C"]}]}"#);
+        put(&n.root, quarantine::STATE_FILE, format!(r#"{{"cuts":[{{"name":"coord","hosts":[1],"wg_keys":["{COORD_WG}"]}}]}}"#));
         put(&n.root, WG_CONF, "untouched\n");
         assert!(!sync(&Ctx::new(), &n, false, &store).unwrap(), "sync must report paused");
         assert!(fc.calls.lock().unwrap().is_empty(), "sync talked to a cut coordinator");
@@ -721,12 +746,81 @@ mod tests {
         assert_eq!(get(&n.root, WG_CONF), "untouched\n");
 
         // Only a worker cut: sync runs and leaves it out, by key.
-        put(&n.root, quarantine::STATE_FILE, r#"{"cuts":[{"name":"node-x","hosts":[9],"wg_keys":["C"]}]}"#);
+        put(&n.root, quarantine::STATE_FILE, format!(r#"{{"cuts":[{{"name":"node-x","hosts":[9],"wg_keys":["{COORD_WG}"]}}]}}"#));
         assert!(sync(&Ctx::new(), &n, false, &store).unwrap());
         let wg = get(&n.root, WG_CONF);
-        assert!(!wg.contains("PublicKey = C\n"), "a cut key came back:\n{wg}");
+        assert!(wg.contains("[Interface]") && !wg.contains(COORD_WG), "a cut key came back:\n{wg}");
         // This server itself is never left out of its own files.
         assert!(get(&n.root, "/etc/hosts").contains("node-a"));
+    }
+
+    #[test]
+    fn sync_checks_what_the_coordinator_sends() {
+        let (_dir, mut n, _) = setup(vec![]);
+        n.save_state(&State { host: 2, ..State::default() }).unwrap();
+        put(&n.root, WG_KEY, "PRIVKEY=\n");
+        put(&n.root, KNOWN_HOSTS, format!("192.168.1.50,10.66.0.1 {COORD_KEY}\n"));
+        let tmp = TempDir::new();
+        n.tmp_dir = Some(tmp.path().to_path_buf());
+        let fc = FakeCoord::new(&n.root, vec![]);
+        n.run = fc.clone();
+        let store = Store::new("/nonexistent");
+        let coord = format!(r#"{{"host":1,"name":"coord","wg_key":"{COORD_WG}","lan_ip":"192.168.1.50"}}"#);
+        let me = format!(r#"{{"host":2,"name":"node-a","wg_key":"{WG_PUBKEY}"}}"#);
+        let evil_key = "ZXZpbC0tcHVibGljLWtleS0zMi1ieXRlcy1sb25nISE=";
+
+        // Hostile entries are left out; the good ones still apply.
+        let hostile = [
+            format!(r#"{{"host":5,"name":"x archlinux.org","wg_key":"{evil_key}"}}"#),
+            format!(r#"{{"host":6,"name":"a\n10.66.0.6 pkg.example.org","wg_key":"{evil_key}"}}"#),
+            r#"{"host":7,"name":"n7","wg_key":"AAAA\nEndpoint = 1.2.3.4:51820"}"#.to_string(),
+            format!(r#"{{"host":8,"name":"n8","wg_key":"{evil_key}","lan_ip":"1.2.3.4 archlinux.org"}}"#),
+            format!(r#"{{"host":9,"name":"n9","wg_key":"{evil_key}","ssh_host_key":"ssh-ed25519 AAAA x\n* ssh-ed25519 BBBB"}}"#),
+            format!(r#"{{"host":1,"name":"coord2","wg_key":"{evil_key}"}}"#),
+            format!(r#"{{"host":999,"name":"far","wg_key":"{evil_key}"}}"#),
+        ];
+        *fc.peers.lock().unwrap() = Some(format!(r#"{{"members":[{coord},{me},{}]}}"#, hostile.join(",")));
+        assert!(sync(&Ctx::new(), &n, false, &store).unwrap());
+        let (hosts, wg) = (get(&n.root, "/etc/hosts"), get(&n.root, WG_CONF));
+        let kh = get(&n.root, "/etc/ssh/ssh_known_hosts");
+        for bad in ["archlinux.org", "pkg.example.org", "1.2.3.4", evil_key, "coord2", "BBBB", "10.66.0.6"] {
+            assert!(!hosts.contains(bad) && !wg.contains(bad) && !kh.contains(bad), "{bad:?} reached a system file:\n{hosts}\n{wg}\n{kh}");
+        }
+        assert!(hosts.contains("10.66.0.1 coord\n") && wg.contains(COORD_WG));
+
+        // A list without a usable coordinator changes nothing: applying it
+        // would remove the peer this server needs to ever sync again.
+        *fc.peers.lock().unwrap() = Some(format!(r#"{{"members":[{{"host":1,"name":"bad name","wg_key":"{COORD_WG}"}},{me}]}}"#));
+        let e = sync(&Ctx::new(), &n, false, &store).unwrap_err().to_string();
+        assert!(e.contains("keeping the current mesh"), "{e}");
+        assert_eq!(get(&n.root, WG_CONF), wg, "wg0.conf changed although the list was refused");
+    }
+
+    #[test]
+    fn invalid_approval_is_refused() {
+        let coord = |wg: &str, name: &str| Member {
+            host: 1,
+            name: name.into(),
+            wg_key: wg.into(),
+            ssh_host_key: COORD_KEY.into(),
+            lan_ip: "192.168.1.50".into(),
+            ..Member::default()
+        };
+        for (reply, why) in [
+            (StatusReply { status: Status::Approved, host: 4, coordinator: Some(coord("short", "coord")) }, "bad key"),
+            (StatusReply { status: Status::Approved, host: 4, coordinator: Some(coord(COORD_WG, "c d")) }, "bad name"),
+            (
+                StatusReply { status: Status::Approved, host: 4, coordinator: Some(Member { host: 3, ..coord(COORD_WG, "coord") }) },
+                "not host 1",
+            ),
+            (StatusReply { status: Status::Approved, host: 9999, coordinator: Some(coord(COORD_WG, "coord")) }, "host outside the mesh"),
+            (StatusReply { status: Status::Approved, host: 4, coordinator: None }, "no coordinator"),
+        ] {
+            let (_dir, n, _) = setup(vec![reply]);
+            n.request(&Ctx::new(), "192.168.1.23", false).unwrap();
+            let e = n.wait(&Ctx::new(), Duration::from_millis(1)).unwrap_err().to_string();
+            assert!(e.contains("invalid approval"), "{why}: {e}");
+        }
     }
 
     #[test]

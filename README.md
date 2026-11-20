@@ -253,6 +253,14 @@ Limits for now:
   lists unknown devices in `dryserver approve` (report only).
 - **Hardening**: kernel sysctl hardening, no LLMNR/mDNS, WireGuard peers
   locked to their own mesh address.
+- **Nothing from the coordinator is used unchecked.** Servers check every
+  name, key and address in the member list before it reaches `/etc/hosts`,
+  WireGuard or the SSH trust files, and drop entries that are malformed or
+  appear twice.
+- **Signing key**: building the USB stick creates `secrets/signing_ed25519`
+  on your computer. Its public half is installed on every server. (Servers
+  will accept only member lists signed with it; that check is not switched
+  on yet.)
 - **The USB stick** holds the WiFi password and the key that lets machines ask
   to join. Keep it safe, or re-flash it after installing.
 
@@ -340,7 +348,7 @@ SWITCH=1 SSH_PORT=2201 ...          # shared switch NIC between VMs, SSH on loca
 Layout: `src/main.rs` (CLI), `src/tui` (screens), `src/install`
 (installer), `src/sysconf.rs` (generated system files), `src/registry.rs`
 and `src/node.rs` (joining and sync), `src/mesh.rs` (WireGuard and SSH
-config), `assets/` (files embedded into the ISO and servers by `build.rs`).
+config), `src/quarantine.rs` (kill switch), `assets/` (files embedded into the ISO and servers by `build.rs`).
 Golden files for the generated system files are in `testdata/sysconf`;
 `UPDATE_GOLDEN=1 cargo test` rewrites them.
 
@@ -348,6 +356,7 @@ Golden files for the generated system files are in `testdata/sysconf`;
 |---|---|
 | `config.env` | your settings, contains the WiFi password; not committed |
 | `secrets/registry_ed25519` | key machines use to ask to join; not committed |
+| `secrets/signing_ed25519` | key that signs the list of machines in your swarm; created by the first build, never leaves this computer, not committed. **Back it up.** Only `signing_ed25519.pub` goes onto the USB stick and the servers |
 | `out/dryserver.iso`, `out/build.log` | built installer image and its log |
 
 ## License

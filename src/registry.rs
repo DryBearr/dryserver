@@ -159,14 +159,69 @@ fn valid_ssh_key(s: &str) -> bool {
         && comment.is_none_or(|c| !c.contains(ws))
 }
 
+/// A WireGuard public key: 32 bytes in standard base64.
+pub fn valid_wg_key(s: &str) -> bool {
+    matches!(base64::engine::general_purpose::STANDARD.decode(s), Ok(b) if b.len() == 32)
+}
+
+/// What is wrong with a member's fields, if anything. Nodes check every
+/// member the coordinator sends with this before a name or key reaches
+/// /etc/hosts, wg0.conf or the SSH trust files: a hacked coordinator could
+/// otherwise write lines of its choosing into them.
+pub fn member_problem(m: &Member) -> Option<&'static str> {
+    if !valid_name(&m.name) {
+        return Some("bad name");
+    }
+    if !valid_wg_key(&m.wg_key) {
+        return Some("bad WireGuard key");
+    }
+    if !m.ssh_host_key.is_empty() && !valid_ssh_key(m.ssh_host_key.trim()) {
+        return Some("bad SSH host key");
+    }
+    if !m.lan_ip.is_empty() && parse_ip4(&m.lan_ip).is_none() {
+        return Some("bad LAN address");
+    }
+    None
+}
+
+/// Keeps the members that are safe to use and says why the others were
+/// dropped. fits tells whether a host number has an address in the mesh.
+/// A host number, name or key may appear once; the first one wins.
+pub fn check_members(members: Vec<Member>, fits: impl Fn(u32) -> bool) -> (Vec<Member>, Vec<String>) {
+    let mut ok: Vec<Member> = Vec::new();
+    let mut problems = Vec::new();
+    for m in members {
+        // Debug form: control characters in a hostile name are escaped.
+        let shown: String = m.name.chars().take(40).collect();
+        let who = format!("member {shown:?} (host {})", m.host);
+        let problem = if !fits(m.host) {
+            Some("host number outside the mesh")
+        } else if let Some(p) = member_problem(&m) {
+            Some(p)
+        } else if ok.iter().any(|o| o.host == m.host) {
+            Some("host number used twice")
+        } else if ok.iter().any(|o| o.name == m.name) {
+            Some("name used twice")
+        } else if ok.iter().any(|o| o.wg_key == m.wg_key) {
+            Some("WireGuard key used twice")
+        } else {
+            None
+        };
+        match problem {
+            Some(p) => problems.push(format!("{who}: {p}")),
+            None => ok.push(m),
+        }
+    }
+    (ok, problems)
+}
+
 /// Checks untrusted join-request fields strictly.
 pub fn validate_request(r: &Request) -> Result<()> {
     if !valid_name(&r.name) {
         return Err("bad hostname".into());
     }
-    match base64::engine::general_purpose::STANDARD.decode(&r.wg_key) {
-        Ok(b) if b.len() == 32 => {}
-        _ => return Err("bad WireGuard key".into()),
+    if !valid_wg_key(&r.wg_key) {
+        return Err("bad WireGuard key".into());
     }
     if !valid_ssh_key(r.ssh_host_key.trim()) {
         return Err("bad SSH host key".into());
@@ -604,6 +659,52 @@ mod tests {
             change(&mut r);
             assert!(validate_request(&r).is_err(), "{name} accepted");
         }
+    }
+
+    #[test]
+    fn members_from_the_coordinator_are_checked() {
+        let good = |host: u32, name: &str, seed: u8| Member {
+            host,
+            name: name.into(),
+            wg_key: base64::engine::general_purpose::STANDARD.encode([seed; 32]),
+            ssh_host_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIhost root@x".into(),
+            lan_ip: "192.168.1.20".into(),
+            ..Member::default()
+        };
+        let fits = |h: u32| (1..=254).contains(&h);
+        let all = vec![good(1, "coord", 1), good(2, "node-b", 2)];
+        let (ok, problems) = check_members(all.clone(), fits);
+        assert_eq!(ok, all);
+        assert!(problems.is_empty(), "{problems:?}");
+        // A self entry without a host key (as written at activation) is fine.
+        assert!(member_problem(&Member { ssh_host_key: String::new(), lan_ip: String::new(), ..good(2, "node-b", 2) }).is_none());
+
+        let bad = vec![
+            (Member { name: "x archlinux.org".into(), ..good(3, "", 3) }, "bad name"),
+            (Member { name: "a\n10.0.0.1 evil".into(), ..good(3, "", 3) }, "bad name"),
+            (Member { name: String::new(), ..good(3, "", 3) }, "bad name"),
+            (Member { wg_key: "C".into(), ..good(3, "n3", 3) }, "bad WireGuard key"),
+            (Member { wg_key: "AAAA\n[Peer]".into(), ..good(3, "n3", 3) }, "bad WireGuard key"),
+            (Member { ssh_host_key: "ssh-ed25519 AAAA x\nother,* ssh-ed25519 BBBB".into(), ..good(3, "n3", 3) }, "bad SSH host key"),
+            (Member { lan_ip: "10.0.0.1 gateway".into(), ..good(3, "n3", 3) }, "bad LAN address"),
+            (good(0, "n0", 4), "outside the mesh"),
+            (good(255, "n255", 5), "outside the mesh"),
+            (good(2, "other", 6), "host number used twice"),
+            (good(4, "node-b", 7), "name used twice"),
+            (good(5, "n5", 1), "WireGuard key used twice"),
+        ];
+        for (m, want) in bad {
+            let mut list = all.clone();
+            list.push(m.clone());
+            let (ok, problems) = check_members(list, fits);
+            assert_eq!(ok, all, "{m:?} was not dropped");
+            assert!(problems.len() == 1 && problems[0].contains(want), "{m:?}: {problems:?}");
+            assert!(!problems[0].contains('\n'), "a hostile name must not break the log line: {:?}", problems[0]);
+        }
+        // The first of two entries wins, also for the coordinator's address.
+        let (ok, _) = check_members(vec![good(1, "coord", 1), good(1, "fake", 9)], fits);
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].name, "coord");
     }
 
     #[test]

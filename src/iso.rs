@@ -17,13 +17,17 @@ pub const IMAGE: &str = "docker.io/library/archlinux:latest";
 pub const ISO_NAME: &str = "dryserver.iso";
 pub const LOG_NAME: &str = "build.log";
 pub const KEY_NAME: &str = "registry_ed25519";
+/// The keypair that signs the member list. The private half never leaves
+/// secrets/ on the desktop; only SIGNING_PUB goes into the ISO.
+pub const SIGNING_KEY_NAME: &str = "signing_ed25519";
+pub const SIGNING_PUB: &str = "signing_ed25519.pub";
 
 #[derive(Debug, Clone)]
 pub struct Options {
     pub config: Config,
     /// Receives dryserver.iso, build.log and the pacman cache.
     pub out_dir: PathBuf,
-    /// Holds the registry SSH keypair, created on first build.
+    /// Holds the registry and signing SSH keypairs, created on first build.
     pub secrets_dir: PathBuf,
 }
 
@@ -80,13 +84,14 @@ pub fn run(ctx: &Ctx, o: &Options, log: &mut (dyn Write + Send)) -> Result<()> {
     let mut tee = Tee { file, log };
 
     let key = ensure_registry_key(ctx, &o.secrets_dir, &mut tee)?;
+    let signing_pub = ensure_signing_key(ctx, &o.secrets_dir, &mut tee)?;
 
     let stage = out_dir.join("stage");
     let stage_c = stage.clone();
     let _rm = Defer(|| {
         let _ = std::fs::remove_dir_all(&stage_c);
     });
-    write_stage(&stage, &me, &o.config, &key).map_err(|e| e.wrap("prepare build files"))?;
+    write_stage(&stage, &me, &o.config, &key, &signing_pub).map_err(|e| e.wrap("prepare build files"))?;
 
     let _ = writeln!(tee, "==> Starting {IMAGE} (first run downloads ~1 GB)");
     let start = Instant::now();
@@ -209,21 +214,92 @@ fn ensure_registry_key(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<Pat
     fsx::mkdir_all(dir, 0o700)?;
     let _ = writeln!(log, "==> Generating registry key {}", key.display());
     ctx.check()?;
-    let out = Command::new("ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-N", "", "-C", "dryserver-registry", "-f"])
-        .arg(&key)
-        .output()
-        .map_err(|e| Error::from(e).wrap("ssh-keygen"))?;
-    if !out.status.success() {
-        let msg = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-        return Err(errf!("ssh-keygen: {}: {msg}", crate::runner::exit_text(out.status)));
-    }
+    ssh_keygen(|c| c.args(["-q", "-t", "ed25519", "-N", "", "-C", "dryserver-registry", "-f"]).arg(&key))?;
     Ok(key)
 }
 
+/// Runs ssh-keygen and returns its standard output.
+fn ssh_keygen(args: impl FnOnce(&mut Command) -> &mut Command) -> Result<String> {
+    let mut c = Command::new("ssh-keygen");
+    args(&mut c);
+    let out = c.stdin(Stdio::null()).output().map_err(|e| Error::from(e).wrap("ssh-keygen (is OpenSSH installed?)"))?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+        return Err(errf!("ssh-keygen: {}: {}", crate::runner::exit_text(out.status), msg.trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// "type base64" of an SSH public key line, without its comment.
+fn key_body(line: &str) -> String {
+    line.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+}
+
+/// Makes sure secrets/ holds the keypair that signs the member list, and
+/// returns the path of its public half. Servers installed from the ISO
+/// accept only member lists signed with this key, so:
+///
+/// - it is created once and never replaced;
+/// - a public half without its private half is an error, not a reason to
+///   make a new pair (servers already trust the old one);
+/// - the two halves must belong together.
+fn ensure_signing_key(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let key = dir.join(SIGNING_KEY_NAME);
+    let pubkey = dir.join(SIGNING_PUB);
+    ctx.check()?;
+    if !key.exists() {
+        if pubkey.exists() {
+            return Err(errf!(
+                "{} is missing but {} is there. Restore the private key from your backup: servers installed with this \
+                 key accept only lists signed by it. To start over with a new key instead, remove the .pub file \
+                 (servers installed before will not trust the new key).",
+                key.display(),
+                pubkey.display()
+            ));
+        }
+        fsx::mkdir_all(dir, 0o700)?;
+        let _ = writeln!(
+            log,
+            "==> Generating signing key {} (signs the list of machines in your swarm).\n    \
+             It stays on this computer; back up {} and keep it private.",
+            key.display(),
+            dir.display()
+        );
+        ssh_keygen(|c| c.args(["-q", "-t", "ed25519", "-N", "", "-C", "dryserver-signing", "-f"]).arg(&key))?;
+    }
+    // The private half is for this user only, whatever it was restored as.
+    let mode = std::fs::metadata(&key).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
+    if mode & 0o077 != 0 {
+        fsx::chmod(&key, 0o600)?;
+    }
+    let derived = ssh_keygen(|c| c.arg("-y").arg("-f").arg(&key)).map_err(|e| e.wrap(format!("read {}", key.display())))?;
+    let derived = key_body(&derived);
+    if !derived.starts_with("ssh-ed25519 ") {
+        return Err(errf!("{} is not an ed25519 key", key.display()));
+    }
+    match std::fs::read_to_string(&pubkey) {
+        Ok(have) if key_body(&have) == derived => {}
+        Ok(_) => {
+            return Err(errf!(
+                "{} does not belong to {}. Restore the matching pair from your backup, or remove the .pub file to \
+                 rewrite it from the private key.",
+                pubkey.display(),
+                key.display()
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fsx::write_file(&pubkey, format!("{derived} dryserver-signing\n"), 0o644)?;
+        }
+        Err(e) => return Err(Error::from(e).wrap(format!("open {}", pubkey.display()))),
+    }
+    Ok(pubkey)
+}
+
 /// Lays out the directory mounted at /stage in the container: the embedded
-/// assets plus this binary, the config and the registry key.
-fn write_stage(stage: &Path, me: &Path, cfg: &Config, key: &Path) -> Result<()> {
+/// assets plus this binary, the config, the registry key and the public
+/// half of the signing key. The signing private key is never staged.
+fn write_stage(stage: &Path, me: &Path, cfg: &Config, key: &Path, signing_pub: &Path) -> Result<()> {
     match std::fs::remove_dir_all(stage) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
@@ -241,7 +317,8 @@ fn write_stage(stage: &Path, me: &Path, cfg: &Config, key: &Path) -> Result<()> 
     copy_file(me, &bin.join("dryserver"), 0o755)?;
     cfg.save(etc.join("config.env"))?;
     copy_file(key, &etc.join(KEY_NAME), 0o600)?;
-    copy_file(&PathBuf::from(format!("{}.pub", key.display())), &etc.join(format!("{KEY_NAME}.pub")), 0o644)
+    copy_file(&PathBuf::from(format!("{}.pub", key.display())), &etc.join(format!("{KEY_NAME}.pub")), 0o644)?;
+    copy_file(signing_pub, &etc.join(SIGNING_PUB), 0o644)
 }
 
 fn copy_file(src: &Path, dst: &Path, mode: u32) -> Result<()> {
@@ -264,11 +341,15 @@ mod tests {
         std::fs::write(&me, "binary").unwrap();
         let cfg = Config { wifi_ssid: "home".into(), ..Config::default() };
         let stage = dir.join("stage");
-        write_stage(&stage, &me, &cfg, &key).unwrap();
+        std::fs::write(dir.join(SIGNING_KEY_NAME), "signing private").unwrap();
+        std::fs::write(dir.join(SIGNING_PUB), "ssh-ed25519 AAAAsign dryserver-signing\n").unwrap();
+        write_stage(&stage, &me, &cfg, &key, &dir.join(SIGNING_PUB)).unwrap();
 
         let key_pub = format!("overlay/airootfs/etc/dryserver/{KEY_NAME}.pub");
         let key_priv = format!("overlay/airootfs/etc/dryserver/{KEY_NAME}");
-        let want: [(&str, u32); 7] = [
+        let signing_pub = format!("overlay/airootfs/etc/dryserver/{SIGNING_PUB}");
+        let want: [(&str, u32); 8] = [
+            (&signing_pub, 0o644),
             ("build.sh", 0),
             ("packages.extra", 0),
             ("overlay/airootfs/etc/motd", 0),
@@ -285,6 +366,72 @@ mod tests {
         }
         let got = Config::load(stage.join("overlay/airootfs/etc/dryserver/config.env")).unwrap();
         assert_eq!(got.wifi_ssid, "home");
+        // The signing private key must never reach the stick, under any name.
+        fn files(d: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                if e.path().is_dir() { files(&e.path(), out) } else { out.push(e.path()) }
+            }
+        }
+        let mut all = Vec::new();
+        files(&stage, &mut all);
+        for f in all {
+            assert!(
+                !std::fs::read(&f).unwrap().windows(15).any(|w| w == b"signing private"),
+                "signing private key staged in {}",
+                f.display()
+            );
+            assert_ne!(f.file_name().unwrap(), SIGNING_KEY_NAME, "{}", f.display());
+        }
+    }
+
+    #[test]
+    fn signing_key_lifecycle() {
+        if !in_path("ssh-keygen") {
+            return;
+        }
+        let dir = TempDir::new();
+        let secrets = dir.join("secrets");
+        let ctx = Ctx::new();
+        let mut log = Vec::new();
+        let p = ensure_signing_key(&ctx, &secrets, &mut log).unwrap();
+        assert!(String::from_utf8_lossy(&log).contains("back up"), "first build must tell the admin to back the key up");
+        let first = std::fs::read_to_string(&p).unwrap();
+        assert!(first.starts_with("ssh-ed25519 "), "{first}");
+        let key = secrets.join(SIGNING_KEY_NAME);
+        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&secrets).unwrap().permissions().mode() & 0o777, 0o700);
+
+        // Kept across builds, silently.
+        let mut log = Vec::new();
+        ensure_signing_key(&ctx, &secrets, &mut log).unwrap();
+        assert!(log.is_empty());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), first);
+
+        // A lost public half is rewritten from the private half.
+        std::fs::remove_file(&p).unwrap();
+        ensure_signing_key(&ctx, &secrets, &mut Vec::new()).unwrap();
+        assert_eq!(key_body(&std::fs::read_to_string(&p).unwrap()), key_body(&first));
+
+        // Loose permissions on a restored key are tightened.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_signing_key(&ctx, &secrets, &mut Vec::new()).unwrap();
+        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+
+        // A public half from another pair is refused.
+        std::fs::write(&p, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherOtherOtherOtherOtherOtherOtherOtherOtherO x\n").unwrap();
+        let e = ensure_signing_key(&ctx, &secrets, &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("does not belong"), "{e}");
+        std::fs::write(&p, &first).unwrap();
+
+        // A lost private half never leads to a new pair.
+        std::fs::remove_file(&key).unwrap();
+        let e = ensure_signing_key(&ctx, &secrets, &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("Restore the private key"), "{e}");
+        assert!(!key.exists() && std::fs::read_to_string(&p).unwrap() == first);
+
+        // A file that is not a key is refused.
+        std::fs::write(&key, "garbage").unwrap();
+        assert!(ensure_signing_key(&ctx, &secrets, &mut Vec::new()).is_err());
     }
 
     #[test]
