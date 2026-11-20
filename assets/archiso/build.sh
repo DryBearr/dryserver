@@ -32,6 +32,23 @@ cp -r /usr/share/archiso/configs/releng "$profile"
 cp -rT /stage/overlay "$profile"
 grep -v '^#' /stage/packages.extra >> "$profile/packages.x86_64"
 
+# k3s: one pinned release from its own GitHub releases, checked against the
+# checksum dryserver was built with. Kept in the package cache between
+# builds.
+. /stage/k3s.env
+k3s=/var/cache/pacman/pkg/k3s-$K3S_VERSION
+if ! echo "$K3S_SHA256  $k3s" | sha256sum -c --status 2>/dev/null; then
+    echo "==> Downloading k3s $K3S_VERSION"
+    curl -fsSL -o "$k3s.part" "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION//+/%2B}/k3s"
+    if ! echo "$K3S_SHA256  $k3s.part" | sha256sum -c --status; then
+        rm -f "$k3s.part"
+        echo "k3s $K3S_VERSION: the download does not have the expected checksum" >&2
+        exit 1
+    fi
+    mv "$k3s.part" "$k3s"
+fi
+install -Dm755 "$k3s" "$profile/airootfs/usr/local/bin/k3s"
+
 # Lock down the live system: no listening services, no cloud-init, no VM
 # agents. Only outgoing connections are needed by the installer.
 wants=$profile/airootfs/etc/systemd/system
@@ -58,6 +75,7 @@ sed -i \
 cat >> "$profile/profiledef.sh" <<'PERMS'
 file_permissions+=(
   ["/usr/local/bin/dryserver"]="0:0:755"
+  ["/usr/local/bin/k3s"]="0:0:755"
   ["/etc/dryserver"]="0:0:700"
   ["/etc/dryserver/config.env"]="0:0:600"
   ["/etc/dryserver/registry_ed25519"]="0:0:600"

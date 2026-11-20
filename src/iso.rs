@@ -24,6 +24,11 @@ pub const SIGNING_PUB: &str = "signing_ed25519.pub";
 /// The secret installers use to prove a join request comes from this
 /// stick. On the stick and in secrets/; never on an installed machine.
 pub const JOIN_SECRET: &str = "join_secret";
+/// The k3s release every machine gets, and the SHA-256 of its amd64
+/// binary as published with the release (sha256sum-amd64.txt). The ISO
+/// build downloads it and refuses anything else.
+pub const K3S_VERSION: &str = "v1.37.2+k3s1";
+pub const K3S_SHA256: &str = "265b3ee6a3198ef14033c63ef46cbb32370d83795199fb6d1b01f21575eddbda";
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -348,7 +353,8 @@ fn write_stage(stage: &Path, me: &Path, cfg: &Config, key: &Path, signing_pub: &
     copy_file(key, &etc.join(KEY_NAME), 0o600)?;
     copy_file(&PathBuf::from(format!("{}.pub", key.display())), &etc.join(format!("{KEY_NAME}.pub")), 0o644)?;
     copy_file(signing_pub, &etc.join(SIGNING_PUB), 0o644)?;
-    copy_file(join_secret, &etc.join(JOIN_SECRET), 0o600)
+    copy_file(join_secret, &etc.join(JOIN_SECRET), 0o600)?;
+    fsx::write_file(stage.join("k3s.env"), format!("K3S_VERSION='{K3S_VERSION}'\nK3S_SHA256='{K3S_SHA256}'\n"), 0o644)
 }
 
 fn copy_file(src: &Path, dst: &Path, mode: u32) -> Result<()> {
@@ -399,6 +405,10 @@ mod tests {
         }
         let got = Config::load(stage.join("overlay/airootfs/etc/dryserver/config.env")).unwrap();
         assert_eq!(got.wifi_ssid, "home");
+        // The k3s pin the container downloads and checks.
+        let pin = std::fs::read_to_string(stage.join("k3s.env")).unwrap();
+        assert_eq!(pin, format!("K3S_VERSION='{K3S_VERSION}'\nK3S_SHA256='{K3S_SHA256}'\n"));
+        assert!(K3S_SHA256.len() == 64 && K3S_SHA256.bytes().all(|b| b.is_ascii_hexdigit()) && K3S_VERSION.starts_with('v'));
         // The signing private key must never reach the stick, under any name.
         fn files(d: &Path, out: &mut Vec<PathBuf>) {
             for e in std::fs::read_dir(d).unwrap().flatten() {

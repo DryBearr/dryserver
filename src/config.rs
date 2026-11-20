@@ -195,6 +195,7 @@ impl Config {
         if self.wg_transport == TRANSPORT_AUTO {
             check("switch subnet", valid_switch_subnet(&self.switch_subnet, &self.wg_subnet, &self.coord_lan_ip));
         }
+        check("networks", free_of_cluster_ranges(self));
         check("mesh ports", valid_mesh_ports(&self.mesh_ports));
         check("outgoing ports", valid_mesh_ports(&self.egress_ports));
         check("tools", packages::valid_tools(&self.tool_list()));
@@ -322,6 +323,33 @@ fn go_atoi(s: &str) -> Option<i64> {
 
 pub fn valid_mesh_ports(s: &str) -> Result<()> {
     parse_ports(s).map(|_| ())
+}
+
+/// k3s uses 10.42.0.0/16 for pods and 10.43.0.0/16 for services on every
+/// machine. A mesh, switch or home network inside them would be shadowed.
+fn free_of_cluster_ranges(c: &Config) -> Result<()> {
+    let cluster = Cidr { addr: u32::from(std::net::Ipv4Addr::new(10, 42, 0, 0)), prefix: 15 };
+    let inside = |ip: std::net::Ipv4Addr| cluster.contains(ip);
+    let mut nets = vec![("mesh subnet", c.wg_subnet.as_str())];
+    if c.wg_transport == TRANSPORT_AUTO {
+        nets.push(("switch subnet", c.switch_subnet.as_str()));
+    }
+    for (what, text) in nets {
+        if let Some(n) = Cidr::parse(text)
+            && (inside(n.network_ip()) || n.contains(cluster.network_ip()))
+        {
+            return Err(errf!("the {what} {text} overlaps 10.42.0.0/15, which the cluster uses inside every machine; pick another"));
+        }
+    }
+    if let Some(ip) = parse_ip4(&c.coord_lan_ip)
+        && inside(ip)
+    {
+        return Err(errf!(
+            "the coordinator IP {} is inside 10.42.0.0/15, which the cluster uses inside every machine; your home network needs other addresses",
+            c.coord_lan_ip
+        ));
+    }
+    Ok(())
 }
 
 pub fn valid_transport(s: &str) -> Result<()> {
@@ -482,6 +510,28 @@ mod tests {
         let (c, err) = Config::load_partial(dir.join("nope.env"));
         assert!(err.unwrap().is_not_found());
         assert_eq!(c, Config::default(), "missing file must give defaults");
+    }
+
+    #[test]
+    fn cluster_ranges_must_stay_free() {
+        for (set, want) in [
+            ((|c: &mut Config| c.wg_subnet = "10.42.7.0/24".into()) as fn(&mut Config), "mesh subnet 10.42.7.0/24 overlaps"),
+            (|c| c.wg_subnet = "10.43.0.0/16".into(), "mesh subnet"),
+            (|c| c.wg_subnet = "10.0.0.0/8".into(), "mesh subnet"),
+            (|c| c.switch_subnet = "10.43.9.0/24".into(), "switch subnet"),
+            (|c| c.coord_lan_ip = "10.42.0.50".into(), "coordinator IP 10.42.0.50 is inside"),
+        ] {
+            let mut c = valid();
+            set(&mut c);
+            let e = c.validate().unwrap_err().to_string();
+            assert!(e.contains(want), "{want}: {e}");
+        }
+        // Next to the ranges is fine.
+        let mut c = valid();
+        c.wg_subnet = "10.44.0.0/24".into();
+        c.coord_lan_ip = "10.41.255.9".into();
+        c.switch_subnet = "172.16.66.0/24".into();
+        assert!(!c.validate().map_err(|e| e.to_string()).err().unwrap_or_default().contains("10.42.0.0/15"));
     }
 
     #[test]

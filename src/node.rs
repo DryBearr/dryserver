@@ -89,6 +89,20 @@ pub struct Node {
     pub verifier: Arc<dyn Verifier>,
 }
 
+/// Where k3s on the coordinator keeps the token agents join with.
+pub const K3S_AGENT_TOKEN: &str = "/var/lib/rancher/k3s/server/agent-token";
+
+/// What the coordinator answers to "peers".
+#[derive(Debug, Clone, Default)]
+pub struct Fetched {
+    /// Checked entries; what the coordinator says, not what is signed.
+    pub members: Vec<Member>,
+    /// The signed list as sent (empty when the coordinator has none).
+    pub signed: Envelope,
+    /// The token for joining the k3s cluster; "" before k3s is up.
+    pub k3s_token: String,
+}
+
 /// What a node reports on each sync.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Heartbeat {
@@ -375,7 +389,7 @@ impl Node {
     /// Asks the coordinator for the member list over the mesh, reporting
     /// this node's current LAN IP and cable link. Also returns the signed
     /// list as the coordinator sent it (empty when it has none).
-    pub fn fetch_members(&self, ctx: &Ctx, hb: &Heartbeat) -> Result<(Vec<Member>, Envelope)> {
+    pub fn fetch_members(&self, ctx: &Ctx, hb: &Heartbeat) -> Result<Fetched> {
         let body = serde_json::to_string(hb)?;
         let out = {
             let (out, res) = self.ssh(ctx, &mesh::ip(&self.cfg.wg_subnet, 1), "peers", &body);
@@ -388,9 +402,11 @@ impl Node {
             members: Vec<Member>,
             #[serde(default, deserialize_with = "crate::gotime::null_default")]
             signed: Envelope,
+            #[serde(default, deserialize_with = "crate::gotime::null_default")]
+            k3s_token: String,
         }
-        let (members, signed) = match serde_json::from_str::<Reply>(&out) {
-            Ok(r) if !r.members.is_empty() => (r.members, r.signed),
+        let (members, signed, k3s_token) = match serde_json::from_str::<Reply>(&out) {
+            Ok(r) if !r.members.is_empty() => (r.members, r.signed, r.k3s_token),
             _ => return Err("bad member list from coordinator".into()),
         };
         // Nothing from the coordinator is used unchecked.
@@ -398,7 +414,69 @@ impl Node {
         for p in &problems {
             eprintln!("dryserver: sync: ignoring {p}");
         }
-        Ok((members, signed))
+        Ok(Fetched { members, signed, k3s_token })
+    }
+
+    /// On a server: joins the k3s cluster once the coordinator handed out
+    /// the token. Writes the token and the config for this machine's mesh
+    /// address, and starts k3s (again, if either changed).
+    ///
+    /// The token comes from the coordinator unsigned. It can only make
+    /// this machine's k3s agent talk to the coordinator's address over the
+    /// mesh, which is where it talks anyway.
+    pub fn k3s_join(&self, ctx: &Ctx, me: u32, token: &str) -> Result<()> {
+        let token = token.trim();
+        if token.is_empty() || me < 2 {
+            return Ok(());
+        }
+        if token.len() > 512 || !token.starts_with("K10") || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == ':') {
+            return Err("the coordinator sent a cluster token that is not one; k3s left as it is".into());
+        }
+        let config = sysconf::k3s_agent_config(&mesh::ip(&self.cfg.wg_subnet, 1), &mesh::ip(&self.cfg.wg_subnet, me));
+        let mut changed = false;
+        // The token is the secret; the config only says where things are.
+        for (path, mode, want) in [(sysconf::K3S_TOKEN, 0o600, format!("{token}\n")), (sysconf::K3S_CONFIG, 0o644, config)] {
+            if fsx::read_or_empty(self.path(path)) != want {
+                self.write(path, mode, &want)?;
+                let _ = fsx::chmod(self.path(path), mode);
+                changed = true;
+            }
+        }
+        let running = self.cmd(ctx, "systemctl", &["is-active", "--quiet", "k3s.service"]).is_ok();
+        if changed && running {
+            self.cmd(ctx, "systemctl", &["restart", "--no-block", "k3s.service"])
+        } else if !running {
+            self.cmd(ctx, "systemctl", &["start", "--no-block", "k3s.service"])
+        } else {
+            Ok(())
+        }
+    }
+
+    /// On the coordinator: puts the cluster's agent token where members
+    /// get it, and takes machines that are no longer members out of the
+    /// cluster.
+    pub fn k3s_share(&self, ctx: &Ctx, store: &Store, members: &[Member]) {
+        let token = fsx::read_or_empty(self.path(K3S_AGENT_TOKEN)).trim().to_string();
+        if token.is_empty() {
+            // k3s is not up yet; the next sync tries again.
+            return;
+        }
+        let _ = store.update(|s| {
+            if s.k3s_token != token {
+                s.k3s_token = token.clone();
+            }
+            Ok(())
+        });
+        let Ok(out) = self.run.output(ctx, &Cmd::new("k3s", &["kubectl", "get", "nodes", "-o", "name"]).quiet().stdout_only()) else {
+            return;
+        };
+        for name in out.lines().filter_map(|l| l.trim().strip_prefix("node/")) {
+            if name == self.hostname || !registry::valid_name(name) || members.iter().any(|m| m.name == name) {
+                continue;
+            }
+            eprintln!("dryserver: {name} is no longer a member: removing it from the cluster");
+            let _ = self.cmd(ctx, "k3s", &["kubectl", "delete", "node", name, "--timeout=20s"]);
+        }
     }
 
     /// Version of the newest signed list this server has verified, 0 if
@@ -640,6 +718,7 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     let cuts = q.reports();
     let sw = port_link(&n.switch_mac());
     let mut me = SelfInfo { host: 0, switch: sw };
+    let mut token = String::new();
     let members = if coordinator {
         me.host = 1;
         let (members, signed) = store.update(|s| {
@@ -658,7 +737,8 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
             return Err("not joined yet".into());
         }
         let lan = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).unwrap_or_default();
-        let (sent, env) = n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw, cuts })?;
+        let Fetched { members: sent, signed: env, k3s_token } = n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw, cuts })?;
+        token = k3s_token;
         match n.signed_members(me.host, &sent, &env) {
             Ok((members, status)) => {
                 n.note_signed(&status);
@@ -679,9 +759,18 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     if !coordinator && q.coordinator_cut() {
         return Ok(false);
     }
-    let members: Vec<Member> = members.into_iter().filter(|m| m.host == me.host || !q.blocks(m)).collect();
+    let all = members;
+    let members: Vec<Member> = all.iter().filter(|m| m.host == me.host || !q.blocks(m)).cloned().collect();
     n.apply(me, &members)?;
     n.reload_wg(ctx)?;
+    drop(_lock);
+    // The cluster follows the mesh: the coordinator shares the token and
+    // drops machines that left; a server joins once it has the token.
+    if coordinator {
+        n.k3s_share(ctx, store, &all);
+    } else if let Err(e) = n.k3s_join(ctx, me.host, &token) {
+        eprintln!("dryserver: k3s: {e}");
+    }
     Ok(true)
 }
 
@@ -829,6 +918,8 @@ mod tests {
         /// The "peers" reply; by default the coordinator and this node as
         /// host 2, signed as version 5.
         peers: Mutex<Option<String>>,
+        /// k3s command lines.
+        k3s: Mutex<Vec<String>>,
     }
 
     impl FakeCoord {
@@ -840,6 +931,7 @@ mod tests {
                 last: Mutex::new(None),
                 applied: Mutex::new(String::new()),
                 peers: Mutex::new(None),
+                k3s: Mutex::new(Vec::new()),
             })
         }
     }
@@ -852,6 +944,13 @@ mod tests {
                 "systemctl" | "ping" | "ip" | "agetty" | "networkctl" => return (String::new(), Ok(())),
                 // No blocked members in the firewall's set.
                 "nft" => return (String::new(), Err("no such set".into())),
+                // The cluster knows the coordinator, this node and one
+                // machine that is no longer a member.
+                "k3s" => {
+                    self.k3s.lock().unwrap().push(c.args.join(" "));
+                    let out = if c.args.contains(&"get".to_string()) { "node/coord\nnode/node-a\nnode/ghost\nnode/bad name\n" } else { "" };
+                    return (out.into(), Ok(()));
+                }
                 "wg-quick" => return ("[Interface]\nListenPort = 51820\n".into(), Ok(())),
                 "wg" => {
                     *self.applied.lock().unwrap() = std::fs::read_to_string(&c.args[2]).unwrap_or_default();
@@ -948,9 +1047,9 @@ mod tests {
         assert!(get(&n.root, "/etc/hosts").contains("10.66.0.1 coord") && n.load_state().host == 4, "hosts/state not updated");
         assert!(get(&n.root, SIGNED_FILE).contains(&env.sig), "the list that let this machine in must be remembered");
 
-        let (members, signed) = n.fetch_members(&ctx, &Heartbeat { lan_ip: "192.168.1.23".into(), switch: false, cuts: vec![] }).unwrap();
-        assert_eq!(members.len(), 2);
-        assert!(!signed.is_empty());
+        let f = n.fetch_members(&ctx, &Heartbeat { lan_ip: "192.168.1.23".into(), switch: false, cuts: vec![] }).unwrap();
+        assert_eq!(f.members.len(), 2);
+        assert!(!f.signed.is_empty() && f.k3s_token.is_empty());
         assert_eq!(fc.calls.lock().unwrap().last().unwrap(), "dryreg@10.66.0.1 peers", "sync must go over the mesh");
     }
 
@@ -1204,6 +1303,64 @@ mod tests {
         assert!(wg.contains(COORD_WG) && !wg.contains(OTHER_WG), "a cut member came back:\n{wg}");
         // This server itself is never left out of its own files.
         assert!(get(&n.root, "/etc/hosts").contains("node-a"));
+    }
+
+    #[test]
+    fn server_joins_the_cluster_with_the_coordinators_token() {
+        let (_dir, _tmp, n, fc) = joined();
+        let store = Store::new("/nonexistent");
+        let ctx = Ctx::new();
+        // No token yet (k3s on the coordinator is still starting).
+        assert!(sync(&ctx, &n, false, &store).unwrap());
+        assert!(get(&n.root, sysconf::K3S_TOKEN).is_empty() && get(&n.root, sysconf::K3S_CONFIG).is_empty());
+
+        let token = "K10abcdef0123::node:5ecre7";
+        let reply = |t: &str| {
+            let env = sign(&ADMIN, 5, vec![coord_entry(), node_entry(2)]);
+            serde_json::json!({ "members": [coord_member(), node_member(2)], "signed": env, "k3s_token": t }).to_string()
+        };
+        *fc.peers.lock().unwrap() = Some(reply(token));
+        assert!(sync(&ctx, &n, false, &store).unwrap());
+        assert_eq!(get(&n.root, sysconf::K3S_TOKEN), format!("{token}\n"));
+        let conf = get(&n.root, sysconf::K3S_CONFIG);
+        assert!(
+            conf.contains("server: https://10.66.0.1:6443") && conf.contains("node-ip: 10.66.0.2") && conf.contains("flannel-iface: wg0"),
+            "{conf}"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        for (f, mode) in [(sysconf::K3S_TOKEN, 0o600), (sysconf::K3S_CONFIG, 0o644)] {
+            assert_eq!(std::fs::metadata(n.path(f)).unwrap().permissions().mode() & 0o777, mode, "{f}");
+        }
+        // Junk in place of a token changes nothing.
+        for bad in ["not a token", "K10abc\nserver: https://evil", "K10;rm -rf", &"K10".repeat(400)] {
+            assert!(n.k3s_join(&ctx, 2, bad).is_err(), "{bad:?}");
+            assert_eq!(get(&n.root, sysconf::K3S_TOKEN), format!("{token}\n"));
+        }
+        // The coordinator itself and a machine without an address never join as agents.
+        n.k3s_join(&ctx, 1, "K10other::node:x").unwrap();
+        n.k3s_join(&ctx, 0, "K10other::node:x").unwrap();
+        assert_eq!(get(&n.root, sysconf::K3S_TOKEN), format!("{token}\n"));
+    }
+
+    #[test]
+    fn coordinator_shares_the_token_and_drops_left_machines() {
+        let (_dir, _tmp, n, fc) = joined();
+        let dir = TempDir::new();
+        let store = Store::new(dir.join("registry.json"));
+        let members = vec![coord_member(), node_member(2)];
+        let coord = Node { hostname: "coord".into(), ..n.clone() };
+        // k3s not up yet: nothing to share, nobody dropped.
+        coord.k3s_share(&Ctx::new(), &store, &members);
+        assert!(fc.k3s.lock().unwrap().is_empty());
+        put(&coord.root, K3S_AGENT_TOKEN, "K10abc::node:secret\n");
+        coord.k3s_share(&Ctx::new(), &store, &members);
+        assert_eq!(store.read().unwrap().k3s_token, "K10abc::node:secret");
+        let calls = fc.k3s.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec!["kubectl get nodes -o name".to_string(), "kubectl delete node ghost --timeout=20s".into()],
+            "only the machine that left goes"
+        );
     }
 
     #[test]

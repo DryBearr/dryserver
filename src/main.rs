@@ -2,6 +2,7 @@
 //! the setup screen and mesh tools on the servers it installs.
 
 mod admin;
+mod apps;
 mod assets;
 mod cidr;
 mod config;
@@ -61,6 +62,8 @@ commands:
 
   approve             approve or reject machines, remove members; every
                       decision is signed with secrets/signing_ed25519
+  apps                what runs on your cluster: start an app from a
+                      container image, remove one
 
 on servers:
   join                ask the coordinator to join (runs at boot until approved)
@@ -99,6 +102,7 @@ fn main() -> ExitCode {
         "flash" => run_flash(rest),
         "sysconf" => run_sysconf(rest),
         "ssh-config" => run_ssh_config(rest),
+        "apps" => run_apps(rest),
         "quarantine-all" => run_quarantine_all(rest),
         "quarantine" => run_quarantine(rest),
         "registry" => run_registry(rest),
@@ -205,17 +209,19 @@ fn run_app() -> Result<()> {
     loop {
         let mut app = tui::app::App::new(paths());
         tui::run(&mut app)?;
-        if !app.open_machines {
-            return Ok(());
-        }
-        // "Machines" in the menu: the approval screen, then the menu again.
+        // "Machines" and "Apps" in the menu: that screen, then the menu
+        // again.
         let f = Flags::parse("approve", &[], DESKTOP_FLAGS);
-        match desktop_admin(&f, "approve") {
-            Ok((a, _)) => tui::run(&mut tui::admin::Screen::new(a))?,
-            Err(e) => {
-                eprintln!("dryserver: {e}");
-                return Ok(());
-            }
+        let res = if app.open_machines {
+            desktop_admin(&f, "approve").and_then(|(a, _)| tui::run(&mut tui::admin::Screen::new(a)))
+        } else if app.open_apps {
+            desktop_cluster(&f, "apps").and_then(|c| tui::run(&mut tui::apps::Screen::new(Box::new(c))))
+        } else {
+            return Ok(());
+        };
+        if let Err(e) = res {
+            eprintln!("dryserver: {e}");
+            return Ok(());
         }
     }
 }
@@ -637,6 +643,30 @@ fn run_scan(args: &[String]) -> Result<()> {
         s.scanned = Time::now();
         Ok(())
     })
+}
+
+/// kubectl on the coordinator over the admin's SSH login, with the host
+/// key this desktop pinned for it.
+fn desktop_cluster(f: &Flags, cmd: &str) -> Result<apps::SshCluster> {
+    if fsx::is_root() {
+        bail!("run {cmd} as your normal user, not with sudo");
+    }
+    let cfg = Config::load(f.get("config"))?;
+    let host = if f.get("host").is_empty() { cfg.coord_lan_ip.clone() } else { f.get("host").to_string() };
+    Ok(apps::SshCluster {
+        host,
+        port: f.get("port").to_string(),
+        user: cfg.username,
+        known_hosts: paths().secrets.join(admin::KNOWN_HOSTS),
+    })
+}
+
+fn run_apps(args: &[String]) -> Result<()> {
+    let f = Flags::parse("apps", args, DESKTOP_FLAGS);
+    if Path::new(LIVE_CONFIG).exists() {
+        bail!("apps runs on your own computer:\n  ./dryserver apps\nOn the coordinator itself, use: k3s kubectl");
+    }
+    tui::run(&mut tui::apps::Screen::new(Box::new(desktop_cluster(&f, "apps")?)))
 }
 
 fn run_approve(args: &[String]) -> Result<()> {

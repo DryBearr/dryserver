@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod app;
+pub mod apps;
 pub mod build;
 pub mod flash;
 pub mod form;

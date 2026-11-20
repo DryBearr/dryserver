@@ -316,6 +316,28 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/dryserver sync
+===== /etc/systemd/system/k3s.service (0644)
+[Unit]
+Description=k3s server: control plane of your cluster
+Wants=network-online.target
+After=network-online.target nftables.service wg-quick@wg0.service
+ConditionPathExists=/etc/rancher/k3s/config.yaml
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/k3s server
+KillMode=process
+Delegate=yes
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+TimeoutStartSec=0
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
 ===== /etc/systemd/system/dryserver-sync.timer (0644)
 [Unit]
 Description=Update the WireGuard mesh every minute
@@ -341,3 +363,17 @@ WantedBy=multi-user.target
 ===== /etc/cron.d/dryserver-scan (0644)
 # dryserver: look for unknown devices on the network (report only).
 */15 * * * * root /usr/local/bin/dryserver scan >/dev/null 2>&1
+===== /etc/rancher/k3s/config.yaml (0644)
+# dryserver: k3s control plane on the mesh.
+node-ip: 10.66.0.1
+advertise-address: 10.66.0.1
+flannel-iface: wg0
+cluster-cidr: 10.42.0.0/16
+service-cidr: 10.43.0.0/16
+secrets-encryption: true
+write-kubeconfig-mode: "0640"
+write-kubeconfig-group: wheel
+disable:
+  - servicelb
+node-taint:
+  - "CriticalAddonsOnly=true:NoExecute"

@@ -273,6 +273,14 @@ impl Real {
 
         // dryserver itself, the registry key and this machine's keys.
         self.write("/usr/local/bin/dryserver", 0o755, fsx::read(&self.self_path)?)?;
+        // k3s from the stick, next to dryserver: checked against its
+        // checksum when the stick was built.
+        let k3s = fsx::dir(&self.self_path).join("k3s");
+        self.write(
+            "/usr/local/bin/k3s",
+            0o755,
+            fsx::read(&k3s).map_err(|e| e.wrap("this installer has no k3s; build the USB stick again"))?,
+        )?;
         let pub_key = PathBuf::from(format!("{}.pub", self.registry_key.display()));
         for (src, mode) in [(&self.registry_key, 0o600), (&pub_key, 0o644)] {
             let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -313,7 +321,10 @@ impl Real {
         }
 
         // Services from the bundles.
-        let mut enable = vec!["systemctl", "enable"];
+        // k3s starts by itself once it has what it needs: on the
+        // coordinator at once, on a server after it was approved and got
+        // its token (see the unit's condition).
+        let mut enable = vec!["systemctl", "enable", "k3s.service"];
         enable.extend(plan.services.iter().map(String::as_str));
         self.chroot(ctx, &enable)?;
         for c in &plan.user_commands {
@@ -596,6 +607,7 @@ mod tests {
         put(&target, "etc/ssh/ssh_host_ed25519_key.pub", "ssh-ed25519 AAAAhost root@new\n");
         let me = dir.join("dryserver");
         std::fs::write(&me, "binary").unwrap();
+        std::fs::write(dir.join("k3s"), "k3s binary").unwrap();
         let key = dir.join("registry_ed25519");
         std::fs::write(&key, "private").unwrap();
         std::fs::write(dir.join("registry_ed25519.pub"), "ssh-ed25519 AAAAreg dryserver-registry\n").unwrap();
@@ -703,6 +715,11 @@ mod tests {
         assert_eq!(read("/boot/loader/loader.conf"), LOADER_CONF);
         assert_eq!(mode(r.target("/etc/cryptsetup-keys.d/data0.key")), (0o400, 512), "data keyfile");
         assert!(read("/etc/crypttab").contains("data0 UUID=1111-uuid /etc/cryptsetup-keys.d/data0.key"), "{}", read("/etc/crypttab"));
+        assert_eq!(read("/usr/local/bin/k3s"), "k3s binary");
+        assert_eq!(mode(r.target("/usr/local/bin/k3s")).0, 0o755);
+        fr.index(&format!("arch-chroot {t} systemctl enable k3s.service"));
+        assert!(read("/etc/systemd/system/k3s.service").contains("ExecStart=/usr/local/bin/k3s agent"));
+        assert!(!r.target("/etc/rancher/k3s/config.yaml").exists(), "a server gets its k3s config when it is approved");
         assert_eq!(read("/etc/wireguard/wg0.key"), "PRIVATEKEY=\n");
         assert_eq!(r.state.lock().unwrap().wg_public, "PUBLICKEY=");
         // The join proof for this machine's name and keys; the secret
@@ -776,6 +793,13 @@ mod tests {
         let proof = registry::join_proof(JOIN_SECRET, "coord", "PUBLICKEY=", "ssh-ed25519 AAAAhost root@new");
         let reg = get(&r.target, "/var/lib/dryserver/registry.json");
         assert!(reg.contains(&format!(r#""coordinator_proof": "{proof}""#)) && !reg.contains(JOIN_SECRET), "{reg}");
+        // Coordinator: the k3s server, on the mesh address.
+        let k3s = get(&r.target, "/etc/rancher/k3s/config.yaml");
+        assert!(
+            k3s.contains("node-ip: 10.66.0.1") && k3s.contains("flannel-iface: wg0") && k3s.contains("secrets-encryption: true"),
+            "{k3s}"
+        );
+        assert!(get(&r.target, "/etc/systemd/system/k3s.service").contains("ExecStart=/usr/local/bin/k3s server"));
         // Coordinator: its code on the console until the admin signs it.
         let issue = get(&r.target, node::ISSUE_FILE);
         assert!(issue.contains("not signed yet") && issue.contains(&r.coordinator_code()) && r.coordinator_code().len() == 7, "{issue}");

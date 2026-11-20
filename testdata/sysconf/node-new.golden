@@ -326,6 +326,28 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/dryserver sync
+===== /etc/systemd/system/k3s.service (0644)
+[Unit]
+Description=k3s agent: runs your apps as part of the cluster
+Wants=network-online.target
+After=network-online.target nftables.service wg-quick@wg0.service
+ConditionPathExists=/etc/rancher/k3s/token
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/k3s agent
+KillMode=process
+Delegate=yes
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+TimeoutStartSec=0
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
 ===== /etc/systemd/system/dryserver-sync.timer (0644)
 [Unit]
 Description=Update the WireGuard mesh every minute

@@ -145,6 +145,10 @@ pub struct State {
     /// admin's USB stick (see join_proof). The coordinator cannot make one.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub coordinator_proof: String,
+    /// The cluster's token for joining as a k3s agent. The coordinator's
+    /// sync copies it here; only members get it, with the member list.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub k3s_token: String,
 }
 
 /// The 6-digit code both sides show. It covers the new node's keys and the
@@ -708,11 +712,11 @@ pub fn serve(
                 return Err("peers is only answered over the mesh".into());
             }
             let hb: HeartbeatIn = decode_first(input).ok_or_else(|| Error::new("bad heartbeat JSON"))?;
-            let (members, signed) = st.update(|s| {
+            let (members, signed, token) = st.update(|s| {
                 s.heartbeat(host, &hb.lan_ip, hb.switch, &hb.cuts, now)?;
-                Ok((s.members.clone(), s.signed.clone()))
+                Ok((s.members.clone(), s.signed.clone(), s.k3s_token.clone()))
             })?;
-            send(out, &serde_json::json!({ "members": members, "signed": signed }))
+            send(out, &serde_json::json!({ "members": members, "signed": signed, "k3s_token": token }))
         }
         ("signed", 1) => {
             // Not secret, and nobody can change it without the admin's key.
@@ -1205,6 +1209,21 @@ mod tests {
         let out: serde_json::Value = serde_json::from_str(&call(&st, "peers", "10.66.0.2 5000 22", hb).unwrap()).unwrap();
         let env: Envelope = serde_json::from_value(out["signed"].clone()).unwrap();
         assert_eq!(env.list(&ADMIN, |h| h < 255).unwrap(), list, "nodes must get the list exactly as it was signed");
+        // Members get the cluster token with it; nobody else, by any command.
+        st.update(|s| {
+            s.k3s_token = "K10abc::node:secret".into();
+            Ok(())
+        })
+        .unwrap();
+        let out = call(&st, "peers", "10.66.0.2 5000 22", hb).unwrap();
+        assert!(out.contains(r#""k3s_token":"K10abc::node:secret""#), "{out}");
+        for (cmd, stdin) in [
+            ("signed", String::new()),
+            ("admin", serde_json::to_string(&signed::seal_admin(&ADMIN, "state", t0().0.timestamp()).unwrap()).unwrap()),
+        ] {
+            let out = call(&st, cmd, "192.168.1.77 5000 22", &stdin).unwrap();
+            assert!(!out.contains("K10abc") && !out.contains("k3s_token"), "{cmd} leaks the cluster token: {out}");
+        }
         // The same list for anyone who asks from the LAN, and nothing else.
         let out = call(&st, "signed", "192.168.1.77 5000 22", "").unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();

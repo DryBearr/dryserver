@@ -26,6 +26,7 @@ approval.
 - [Networks](#networks)
 - [SSH between machines](#ssh-between-machines)
 - [Kill switch](#kill-switch)
+- [Apps](#apps)
 - [Security](#security)
 - [Commands](#commands)
 - [FAQ](#faq)
@@ -57,6 +58,8 @@ approval.
    only what you signed.
 4. All servers talk to each other directly over WireGuard, by name
    (`ssh node-a`, `ping node-b`), over a switch when cabled or else over WiFi.
+5. On top of that mesh they form one k3s cluster. You hand it apps from your
+   desktop (`./dryserver apps`); it decides where they run.
 
 ## Requirements
 
@@ -248,6 +251,39 @@ Limits for now:
 - The coordinator's IPv6 addresses on the WiFi/router network are not
   blocked. WireGuard is cut, and SSH still needs your key.
 
+## Apps
+
+Your servers run as one k3s cluster over the mesh: the control plane on the
+coordinator, an agent on every server. It needs no setup. A server joins the
+cluster by itself once you approved it, and leaves it when you remove it.
+You give the cluster an app; it picks a server, and moves the app when that
+server dies. Apps never run on the coordinator.
+
+```sh
+./dryserver apps           # or "Apps" in the menu
+```
+
+`n` starts an app from a container image: a name, the image, the port it
+listens on, and, if it should be reachable from outside, a public host name.
+The screen shows what runs on which server; `d` removes an app. Under it is
+plain Kubernetes: on the coordinator, `k3s kubectl` works for you without
+sudo.
+
+What dryserver sets up around every app (namespace `apps`):
+
+- nothing reaches an app unless allowed; an app takes connections on its
+  port from the ingress and from your other apps,
+- a public host name makes the built-in ingress (Traefik) route that name to
+  the app. The ingress has no port on any machine: what comes in from
+  outside reaches it through a tunnel that runs inside the cluster,
+- containers cannot gain privileges and get no cluster credentials,
+- the firewall on every machine is a wall around all pods: web out, never
+  your home network, never SSH on the machines; a NodePort or hostPort is
+  not a door from the mesh or the home network.
+
+k3s is one pinned release, downloaded from its GitHub releases when the USB
+stick is built and checked against the checksum dryserver was built with.
+
 ## Security
 
 - **Firewall first.** The live USB accepts no incoming connections and runs no
@@ -328,6 +364,7 @@ On your desktop:
 | `./dryserver disks` | list disks and which ones may be flashed |
 | `sudo ./dryserver flash --iso FILE` | flash any image to a USB drive |
 | `./dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed |
+| `./dryserver apps` | what runs on your cluster: start an app from a container image, remove one |
 | `./dryserver ssh-config` | SSH config for all servers |
 | `./dryserver quarantine-all` | kill switch: cut the coordinator off on every server |
 | `./dryserver install --demo` | try the laptop setup screen; changes nothing |
@@ -404,6 +441,7 @@ test/live-firewall.sh               # the generated firewall with real connectio
 test/live-quarantine.sh             # kill switch with real WireGuard and nftables, in private namespaces
 test/live-approve.sh                # signed approval: the real screen against a real sshd and registry
 test/qemu.sh coord                  # boot out/dryserver.iso in a UEFI VM with a blank disk
+test/qemu-lan.sh coord c1           # VMs wired like a swarm (own router each, shared switch); see its header
 BIOS=1 test/qemu.sh node            # legacy BIOS
 TPM=1 OVMF_CODE=... test/qemu.sh    # TPM tests need firmware that measures boot (Arch's edk2-ovmf)
 SWITCH=1 SSH_PORT=2201 ...          # shared switch NIC between VMs, SSH on localhost:2201
@@ -413,7 +451,8 @@ Layout: `src/main.rs` (CLI), `src/tui` (screens), `src/install`
 (installer), `src/sysconf.rs` (generated system files), `src/registry.rs`
 and `src/node.rs` (joining and sync), `src/mesh.rs` (WireGuard and SSH
 config), `src/quarantine.rs` (kill switch), `src/signed.rs` and
-`src/admin.rs` (signed member list and approval from the desktop), `assets/` (files embedded into the ISO and servers by `build.rs`).
+`src/admin.rs` (signed member list and approval from the desktop),
+`src/apps.rs` (apps on the cluster), `assets/` (files embedded into the ISO and servers by `build.rs`).
 Golden files for the generated system files are in `testdata/sysconf`;
 `UPDATE_GOLDEN=1 cargo test` rewrites them.
 

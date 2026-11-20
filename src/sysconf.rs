@@ -122,11 +122,15 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
         file("/etc/dryserver/role", 0o644, format!("{}\n", p.role)),
         file("/etc/systemd/system/dryserver-join.service", 0o644, JOIN_UNIT),
         file("/etc/systemd/system/dryserver-sync.service", 0o644, SYNC_UNIT),
+        file("/etc/systemd/system/k3s.service", 0o644, k3s_unit(p.role)),
         file("/etc/systemd/system/dryserver-sync.timer", 0o644, SYNC_TIMER),
         file("/etc/systemd/system/dryserver-tpm-enroll.service", 0o644, TPM_ENROLL_UNIT),
     ];
     if p.role == Role::Coordinator {
         files.push(file("/etc/cron.d/dryserver-scan", 0o644, SCAN_CRON));
+        let mesh1 = host_addr(&c.wg_subnet, 1).map(|a| a.split('/').next().unwrap_or("").to_string()).unwrap_or_default();
+        // No secret in it, and kubectl (run by the admin) reads it too.
+        files.push(file(K3S_CONFIG, 0o644, k3s_server_config(&mesh1)));
     }
     if !switch_addr.is_empty() && !p.switch_mac.is_empty() {
         files.push(file("/etc/systemd/network/10-switch.network", 0o644, switch_network(&p.switch_mac, &switch_addr)));
@@ -167,6 +171,86 @@ fn ports_of(ports: &[Port], proto: &str) -> Vec<u16> {
 
 fn hosts(hostname: &str) -> String {
     format!("127.0.0.1 localhost\n::1       localhost\n127.0.1.1 {hostname}\n")
+}
+
+pub const K3S_CONFIG: &str = "/etc/rancher/k3s/config.yaml";
+/// A server's token for joining the cluster, handed out by the coordinator
+/// to members over the mesh.
+pub const K3S_TOKEN: &str = "/etc/rancher/k3s/token";
+
+/// k3s runs your apps as one cluster over the mesh: the server (control
+/// plane) on the coordinator, an agent on every other machine. It starts
+/// when its condition holds: the coordinator has its config from the
+/// install, a server gets config and token once it is approved.
+fn k3s_unit(role: Role) -> String {
+    let (what, mode, needs) = match role {
+        Role::Coordinator => ("control plane of your cluster", "server", K3S_CONFIG),
+        Role::Node => ("runs your apps as part of the cluster", "agent", K3S_TOKEN),
+    };
+    format!(
+        "[Unit]
+Description=k3s {mode}: {what}
+Wants=network-online.target
+After=network-online.target nftables.service wg-quick@wg0.service
+ConditionPathExists={needs}
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/k3s {mode}
+KillMode=process
+Delegate=yes
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+TimeoutStartSec=0
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+"
+    )
+}
+
+/// The coordinator's k3s config.
+///
+/// - Everything on the mesh address: the API server is not reachable from
+///   the home network.
+/// - Secrets are encrypted in the cluster's database.
+/// - No ServiceLB: it would open ports 80 and 443 on every machine. The
+///   way in from outside is the tunnel, which runs as a pod.
+/// - Apps never run on the coordinator (taint); k3s's own parts may.
+/// - The admin user (wheel) may use kubectl without sudo.
+pub fn k3s_server_config(coord_mesh: &str) -> String {
+    format!(
+        "# dryserver: k3s control plane on the mesh.
+node-ip: {coord_mesh}
+advertise-address: {coord_mesh}
+flannel-iface: wg0
+cluster-cidr: {K3S_POD_CIDR}
+service-cidr: {K3S_SERVICE_CIDR}
+secrets-encryption: true
+write-kubeconfig-mode: \"0640\"
+write-kubeconfig-group: wheel
+disable:
+  - servicelb
+node-taint:
+  - \"CriticalAddonsOnly=true:NoExecute\"
+"
+    )
+}
+
+/// A server's k3s config, written once it knows its mesh address.
+pub fn k3s_agent_config(coord_mesh: &str, node_mesh: &str) -> String {
+    format!(
+        "# dryserver: k3s agent, joins the coordinator over the mesh.
+server: https://{coord_mesh}:6443
+token-file: {K3S_TOKEN}
+node-ip: {node_mesh}
+flannel-iface: wg0
+"
+    )
 }
 
 /// What the firewall is rendered from.
@@ -750,6 +834,34 @@ mod tests {
             assert!(nft.contains(want), "node nftables missing {want:?}:\n{nft}");
         }
         assert!(!nft.contains("6443, 10250"), "a server has no API server port");
+        // k3s units: the server on the coordinator, an agent elsewhere,
+        // each waiting for what it needs.
+        let unit = &find(&node, "/etc/systemd/system/k3s.service").content;
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/k3s agent\n") && unit.contains("ConditionPathExists=/etc/rancher/k3s/token\n"),
+            "{unit}"
+        );
+        assert!(!has(&node, K3S_CONFIG), "a server's k3s config needs its mesh address first");
+        let unit = &find(&coord, "/etc/systemd/system/k3s.service").content;
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/k3s server\n") && unit.contains("ConditionPathExists=/etc/rancher/k3s/config.yaml\n"),
+            "{unit}"
+        );
+        let conf = find(&coord, K3S_CONFIG);
+        assert_eq!(conf.mode, 0o644, "kubectl run by the admin reads it; it holds no secret");
+        for want in [
+            "node-ip: 10.66.0.1",
+            "advertise-address: 10.66.0.1",
+            "flannel-iface: wg0",
+            "secrets-encryption: true",
+            "- servicelb",
+            "CriticalAddonsOnly=true:NoExecute",
+            "cluster-cidr: 10.42.0.0/16",
+            "service-cidr: 10.43.0.0/16",
+        ] {
+            assert!(conf.content.contains(want), "coordinator k3s config missing {want:?}:\n{}", conf.content);
+        }
+        assert!(k3s_agent_config("10.66.0.1", "10.66.0.7").contains("node-ip: 10.66.0.7"));
         let coord_nft = &find(&coord, "/etc/nftables.conf").content;
         assert!(
             coord_nft.contains("chain mesh {\n\t\ttcp dport 22 accept"),
