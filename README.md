@@ -270,6 +270,12 @@ cluster by itself once you approved it, and leaves it when you remove it.
 You give the cluster an app; it picks a server, and moves the app when that
 server dies. Apps never run on the coordinator.
 
+When a server loses power, an app with one copy is back on another server
+after about a minute and a half (40 seconds until the cluster calls the
+server dead, 30 more until it moves the app). With two copies the app keeps
+answering; for the first 45 seconds about every second request still goes to
+the dead copy and fails.
+
 ```sh
 ./dryserver apps           # or "Apps" in the menu
 ```
@@ -290,7 +296,8 @@ What dryserver sets up around every app (namespace `apps`):
   the pod network,
 - a public host name makes the built-in ingress (Traefik) route that name to
   the app. The ingress has no port on any machine: what comes in from
-  outside reaches it through a tunnel that runs inside the cluster,
+  outside reaches it through a tunnel that runs inside the cluster. It runs
+  on every machine, so it does not go down with one server,
 - containers cannot gain privileges and get no cluster credentials,
 - the firewall on every machine is a wall around all pods: web out, never
   your home network, never SSH on the machines; a NodePort or hostPort is

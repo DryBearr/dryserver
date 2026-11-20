@@ -131,6 +131,7 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
         let mesh1 = host_addr(&c.wg_subnet, 1).map(|a| a.split('/').next().unwrap_or("").to_string()).unwrap_or_default();
         // No secret in it, and kubectl (run by the admin) reads it too.
         files.push(file(K3S_CONFIG, 0o644, k3s_server_config(&mesh1)));
+        files.push(file(K3S_INGRESS_CONFIG, 0o600, K3S_INGRESS));
     }
     if !switch_addr.is_empty() && !p.switch_mac.is_empty() {
         files.push(file("/etc/systemd/network/10-switch.network", 0o644, switch_network(&p.switch_mac, &switch_addr)));
@@ -181,6 +182,23 @@ pub const K3S_TOKEN: &str = "/etc/rancher/k3s/token";
 /// none of its own, k3s hands agents the server's token, and that one
 /// opens the control plane's own doors (its certificate authority).
 pub const K3S_AGENT_SECRET: &str = "/etc/rancher/k3s/agent-token";
+/// k3s applies what it finds in this directory on the coordinator.
+pub const K3S_INGRESS_CONFIG: &str = "/var/lib/rancher/k3s/server/manifests/dryserver-traefik.yaml";
+/// The ingress (Traefik, part of k3s) runs on every machine instead of as
+/// one pod on one server. With one pod, everything from outside stops for
+/// five minutes when the server that happens to hold it dies.
+const K3S_INGRESS: &str = "# dryserver: the ingress runs on every machine, so it does not go down
+# with the one server that happened to hold it.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    deployment:
+      kind: DaemonSet
+";
 /// While this file exists a server does not run k3s. It cut the
 /// coordinator off: what the coordinator's cluster started here is not
 /// trusted until the admin lifts the cut.
@@ -907,6 +925,14 @@ mod tests {
         }
         assert!(k3s_agent_config("10.66.0.1", "10.66.0.7").contains("node-ip: 10.66.0.7"));
         assert!(conf.content.contains("agent-token-file: /etc/rancher/k3s/agent-token\n"), "servers would get the control plane's token");
+        // The ingress on every machine, set where k3s picks it up.
+        let ingress = find(&coord, K3S_INGRESS_CONFIG);
+        assert!(
+            ingress.content.contains("kind: HelmChartConfig") && ingress.content.contains("deployment:\n      kind: DaemonSet\n"),
+            "{}",
+            ingress.content
+        );
+        assert!(!has(&node, K3S_INGRESS_CONFIG));
         // A server that cut the coordinator off does not start k3s.
         let unit = &find(&node, "/etc/systemd/system/k3s.service").content;
         assert!(unit.contains("ConditionPathExists=!/etc/dryserver/k3s.hold\n"), "{unit}");

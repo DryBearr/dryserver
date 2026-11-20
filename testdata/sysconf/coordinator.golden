@@ -393,3 +393,15 @@ disable:
   - servicelb
 node-taint:
   - "CriticalAddonsOnly=true:NoExecute"
+===== /var/lib/rancher/k3s/server/manifests/dryserver-traefik.yaml (0600)
+# dryserver: the ingress runs on every machine, so it does not go down
+# with the one server that happened to hold it.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    deployment:
+      kind: DaemonSet
