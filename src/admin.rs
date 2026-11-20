@@ -50,6 +50,35 @@ pub struct SshLink {
 }
 
 impl SshLink {
+    /// Everything about how to reach the coordinator, before the target.
+    fn options(&self) -> Vec<String> {
+        let port = if self.port.is_empty() { "22" } else { &self.port };
+        let mut o: Vec<String> = vec!["-i".into(), self.key.display().to_string(), "-p".into(), port.into()];
+        for opt in [
+            "BatchMode=yes",
+            "ConnectTimeout=5",
+            "IdentitiesOnly=yes",
+            "HostKeyAlgorithms=ssh-ed25519",
+            "StrictHostKeyChecking=accept-new",
+            "HashKnownHosts=no",
+            "GlobalKnownHostsFile=/dev/null",
+            "LogLevel=ERROR",
+            "ForwardAgent=no",
+            "ProxyJump=none",
+        ] {
+            o.extend(["-o".into(), opt.into()]);
+        }
+        o.extend(["-o".into(), format!("UserKnownHostsFile={}", self.known_hosts.display())]);
+        o
+    }
+
+    /// Where the shared connection's socket goes: the user's private
+    /// runtime directory. None without one (then every call connects).
+    fn control_path() -> Option<String> {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
+        Some(format!("ControlPath={}", Path::new(&dir).join("dryserver-%C").display()))
+    }
+
     /// The host as known_hosts writes it.
     fn known_name(&self) -> String {
         if self.port.is_empty() || self.port == "22" { self.host.clone() } else { format!("[{}]:{}", self.host, self.port) }
@@ -59,17 +88,28 @@ impl SshLink {
 impl Link for SshLink {
     fn call(&self, command: &str, stdin: &str) -> Result<String> {
         use std::io::Write;
-        let kh = format!("UserKnownHostsFile={}", self.known_hosts.display());
-        let port = if self.port.is_empty() { "22" } else { &self.port };
-        let mut child = Command::new("ssh")
-            .arg("-i")
-            .arg(&self.key)
-            .args(["-p", port])
-            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "IdentitiesOnly=yes"])
-            .args(["-o", "HostKeyAlgorithms=ssh-ed25519", "-o", "StrictHostKeyChecking=accept-new", "-o", "HashKnownHosts=no"])
-            .args(["-o", &kh, "-o", "GlobalKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"])
-            .args(["-o", "ForwardAgent=no", "-o", "ProxyJump=none"])
-            .arg(format!("{}@{}", sysconf::REGISTRY_USER, self.host))
+        let target = format!("{}@{}", sysconf::REGISTRY_USER, self.host);
+        let mut cmd = Command::new("ssh");
+        cmd.args(self.options());
+        // One connection for the whole session: the approval screen asks
+        // every few seconds, and the coordinator's firewall lets one
+        // address open only 10 SSH connections a minute. The connection is
+        // held by a master in the background, started with nothing
+        // attached: one that inherits our pipes would keep every call
+        // waiting until it exits. Without a master the call connects by
+        // itself and reports what is wrong.
+        if let Some(ctl) = Self::control_path() {
+            let quiet =
+                |c: &mut Command| c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+            if !quiet(Command::new("ssh").args(["-O", "check", "-o", &ctl]).arg(&target)) {
+                quiet(
+                    Command::new("ssh").args(self.options()).args(["-M", "-N", "-f", "-o", "ControlPersist=20", "-o", &ctl]).arg(&target),
+                );
+            }
+            cmd.args(["-o", "ControlMaster=no", "-o", &ctl]);
+        }
+        let mut child = cmd
+            .arg(&target)
             .arg(command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

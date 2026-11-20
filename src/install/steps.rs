@@ -449,9 +449,8 @@ impl Real {
         let switch_mac = self.state.lock().unwrap().switch_mac.clone();
         let sw = node::port_link(&switch_mac);
         code(n.request(ctx, &lan, sw)?);
-        let reply = n
-            .wait(ctx, Duration::from_secs(3))
-            .map_err(|e| if e.is(Kind::Rejected) { Error::with_kind(Kind::Rejected, REJECTED) } else { e })?;
+        let reply =
+            n.wait(ctx, node::JOIN_POLL).map_err(|e| if e.is(Kind::Rejected) { Error::with_kind(Kind::Rejected, REJECTED) } else { e })?;
         let plan = packages::resolve(&cfg.tool_list(), &cfg.extra_list())?;
         let params = Params { config: cfg.clone(), plan, hostname: ch.hostname.clone(), role: Role::Node, host_num: 0, switch_mac };
         n.activate(&reply, SelfInfo { host: 0, switch: sw }, &params)?;

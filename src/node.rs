@@ -43,6 +43,10 @@ pub const JOIN_PROOF: &str = "/etc/dryserver/join.proof";
 pub const SIGNED_FILE: &str = "/etc/dryserver/members.signed.json";
 /// What the last sync thought of the coordinator's list; a change is logged.
 pub const SIGNED_STATUS: &str = "/run/dryserver-signed.status";
+/// How often a machine waiting for approval asks the coordinator. The
+/// coordinator's firewall lets one address open 10 SSH connections a
+/// minute; asking every 3 or 5 seconds ran into that after a few minutes.
+pub const JOIN_POLL: Duration = Duration::from_secs(8);
 /// Shows join status on the console login screen.
 pub const ISSUE_FILE: &str = "/etc/issue.d/50-dryserver.issue";
 
@@ -587,7 +591,7 @@ pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> R
              Approve only if it shows this code:  {}",
             st.code
         ));
-        match n.wait(ctx, Duration::from_secs(5)) {
+        match n.wait(ctx, JOIN_POLL) {
             Ok(r) => {
                 // A cut may have landed while waiting: check again under
                 // the mesh lock, so the coordinator's peer is never added

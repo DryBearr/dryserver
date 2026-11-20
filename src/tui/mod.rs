@@ -246,6 +246,8 @@ impl Doc {
             self.lines.pop();
         }
         let (tl, tr, bl, br, h, v) = match border {
+            // The console font has no rounded corners.
+            Border::Rounded if theme::palette().console => ('┌', '┐', '└', '┘', '─', '│'),
             Border::Rounded => ('╭', '╮', '╰', '╯', '─', '│'),
             Border::Double => ('╔', '╗', '╚', '╝', '═', '║'),
         };

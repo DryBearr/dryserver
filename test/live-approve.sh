@@ -16,7 +16,7 @@ ok() { echo "  PASS $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL $*"; fail=$((fail + 1)); }
 check() { local msg=$1; shift; if "$@" >/dev/null 2>&1; then ok "$msg"; else bad "$msg"; fi; }
 check_not() { local msg=$1; shift; if "$@" >/dev/null 2>&1; then bad "$msg"; else ok "$msg"; fi; }
-cleanup() { [ -f "$S/sshd.pid" ] && kill "$(cat "$S/sshd.pid")" 2>/dev/null; rm -rf "$S"; }
+cleanup() { [ -f "$S/sshd.pid" ] && { pkill -P "$(cat "$S/sshd.pid")" 2>/dev/null; kill "$(cat "$S/sshd.pid")" 2>/dev/null; }; rm -rf "$S"; }
 trap cleanup EXIT
 
 mkdir -p "$S"/{root/etc/ssh,root/usr/local/share/dryserver,root/var/lib/dryserver,desk/secrets,thief/secrets,bin}
@@ -64,7 +64,9 @@ StrictModes no
 UsePAM no
 AllowUsers $USER
 EOF
-    [ -f "$S/sshd.pid" ] && kill "$(cat "$S/sshd.pid")" 2>/dev/null && sleep 0.3
+    # Its sessions go with it: the desktop keeps one connection open, and a
+    # reinstalled machine would not keep the old one's connections alive.
+    [ -f "$S/sshd.pid" ] && { pkill -P "$(cat "$S/sshd.pid")" 2>/dev/null; kill "$(cat "$S/sshd.pid")" 2>/dev/null; sleep 0.5; }
     /usr/sbin/sshd -f "$S/sshd.conf"
     sleep 0.3
 }
