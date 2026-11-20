@@ -248,6 +248,13 @@ impl Real {
         for f in files {
             self.write(&f.path, f.mode, &f.content)?;
         }
+        // k3s keeps its server directory to root. Made here first (for the
+        // ingress setting), it gets the same.
+        if ch.role() == Role::Coordinator {
+            for d in ["/var/lib/rancher/k3s/server", "/var/lib/rancher/k3s/server/manifests"] {
+                fsx::chmod(self.target(d), 0o700)?;
+            }
+        }
         let home = format!("/home/{}", cfg.username);
         self.chroot(ctx, &["chown", "-R", &format!("{0}:{0}", cfg.username), &format!("{home}/.ssh")])?;
         let _ = fsx::chmod(self.target(&format!("{home}/.ssh")), 0o700);
@@ -792,6 +799,14 @@ mod tests {
         fr.index(&format!("arch-chroot {t} grub-install --target=i386-pc /dev/sda"));
         fr.index("mkfs.ext4 -F -q -L boot /dev/sda1");
         fr.index(&format!("arch-chroot {t} useradd --system -m -d /var/lib/dryreg -s /bin/sh dryreg"));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for d in ["/var/lib/rancher/k3s/server", "/var/lib/rancher/k3s/server/manifests"] {
+                let mode = std::fs::metadata(fsx::under(&r.target, d)).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700, "{d} is open to read");
+            }
+            assert!(!get(&r.target, sysconf::K3S_INGRESS_CONFIG).is_empty());
+        }
         let secret = get(&r.target, sysconf::K3S_AGENT_SECRET);
         assert!(secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit()), "agent secret: {secret:?}");
         {
