@@ -9,6 +9,7 @@
 #   lan   the router (192.168.1.1), the coordinator's LAN address (.50),
 #         the admin's desktop (.99) and "the internet" (8.8.8.8)
 #   ct    a container (172.17.0.2)
+#   pod   a k3s pod (10.42.1.2) behind a bridge named cni0
 #
 # Needs nft, ip, python3 and unprivileged user namespaces.
 #
@@ -40,11 +41,11 @@ EOF
 
 pids=()
 ns() { unshare -n sleep 900 & pids+=($!); eval "$1=$!"; }
-ns SRV; ns MESH; ns LAN; ns CT
+ns SRV; ns MESH; ns LAN; ns CT; ns POD
 sleep 0.3
 trap 'kill "${pids[@]}" $(jobs -p) 2>/dev/null; rm -rf "$W"' EXIT
 in_() { local p=$1; shift; nsenter -t "$p" -n "$@"; }
-for p in $SRV $MESH $LAN $CT; do in_ $p ip link set lo up; done
+for p in $SRV $MESH $LAN $CT $POD; do in_ $p ip link set lo up; done
 
 # The mesh: named wg0 on the server so the rules match it.
 in_ $SRV ip link add wg0 type veth peer name m0 netns $MESH
@@ -66,10 +67,21 @@ in_ $SRV ip link add vethc type veth peer name c0 netns $CT
 in_ $SRV ip link set vethc master docker0; in_ $SRV ip link set vethc up
 in_ $CT ip addr add 172.17.0.2/16 dev c0; in_ $CT ip link set c0 up
 in_ $CT ip route add default via 172.17.0.1
+# A pod behind cni0, hidden behind the server's addresses when it leaves
+# the cluster, like flannel does it. A NodePort (30080) and a hostPort
+# (8443) lead to it, like kube-proxy and the CNI set them up.
+in_ $SRV ip link add cni0 type bridge
+in_ $SRV ip addr add 10.42.1.1/24 dev cni0; in_ $SRV ip link set cni0 up
+in_ $SRV ip link add vethp type veth peer name p0 netns $POD
+in_ $SRV ip link set vethp master cni0; in_ $SRV ip link set vethp up
+in_ $POD ip addr add 10.42.1.2/24 dev p0; in_ $POD ip link set p0 up
+in_ $POD ip route add default via 10.42.1.1
 in_ $SRV sysctl -qw net.ipv4.ip_forward=1
 in_ $SRV nft -f - <<'EOF'
 table ip dockernat {
-	chain post { type nat hook postrouting priority srcnat; ip saddr 172.17.0.0/16 oifname != "docker0" masquerade; }
+	chain post { type nat hook postrouting priority srcnat; ip saddr 172.17.0.0/16 oifname != "docker0" masquerade; ip saddr 10.42.0.0/16 ip daddr != 10.42.0.0/16 masquerade; }
+	chain pre { type nat hook prerouting priority dstnat; tcp dport { 30080, 8443 } dnat to 10.42.1.2:80; }
+	chain out { type nat hook output priority -100; ip daddr 10.43.0.10 tcp dport 80 dnat to 10.42.1.2:80; }
 }
 EOF
 
@@ -97,9 +109,10 @@ for spec in sys.argv[1:]:
 threading.Event().wait()
 PY
 }
-listen $SRV 0.0.0.0:22 0.0.0.0:8080 0.0.0.0:9000 0.0.0.0:5353/udp 0.0.0.0:7000/udp
-listen $MESH 10.66.0.1:22 10.66.0.1:9999 10.66.0.3:8080 10.66.0.3:22 10.66.0.3:5353/udp
-listen $LAN 8.8.8.8:443 8.8.8.8:80 8.8.8.8:53 8.8.8.8:25 8.8.8.8:25565 8.8.8.8:6667 8.8.8.8:53/udp 8.8.8.8:123/udp 8.8.8.8:27015/udp 8.8.8.8:9/udp \
+listen $SRV 0.0.0.0:22 0.0.0.0:8080 0.0.0.0:9000 0.0.0.0:10250 0.0.0.0:6443 0.0.0.0:5353/udp 0.0.0.0:7000/udp
+listen $POD 10.42.1.2:80
+listen $MESH 10.66.0.1:22 10.66.0.1:9999 10.66.0.1:6443 10.66.0.3:8080 10.66.0.3:22 10.66.0.3:10250 10.66.0.3:5353/udp
+listen $LAN 8.8.8.8:443 8.8.8.8:80 8.8.8.8:53 8.8.8.8:25 8.8.8.8:25565 8.8.8.8:6667 8.8.8.8:7844 8.8.8.8:53/udp 8.8.8.8:123/udp 8.8.8.8:27015/udp 8.8.8.8:9/udp 8.8.8.8:7844/udp \
     192.168.1.50:22 192.168.1.99:22 192.168.1.99:80 192.168.1.1:53/udp 192.168.1.1:80
 sleep 0.5
 
@@ -180,6 +193,30 @@ want "-> coordinator's LAN address :22" silent $CT 192.168.1.50 22
 want "-> mesh :8080 (MESH_PORTS)" open $CT 10.66.0.3 8080
 want "-> mesh :22" silent $CT 10.66.0.3 22
 
+echo "-- k3s: out of a pod"
+want "-> internet:443" open $POD 8.8.8.8 443
+want "-> internet:25" silent $POD 8.8.8.8 25
+want "-> internet:7844 (Cloudflare Tunnel)" open $POD 8.8.8.8 7844
+want "-> internet:7844/udp (Cloudflare Tunnel)" open $POD 8.8.8.8 7844 udp
+want "-> router:53/udp (DNS)" open $POD 192.168.1.1 53 udp
+want "-> desktop:80 (home network)" silent $POD 192.168.1.99 80
+want "-> API server on the coordinator, over the mesh" open $POD 10.66.0.1 6443
+want "-> coordinator :22 over the mesh" silent $POD 10.66.0.1 22
+want "-> a kubelet over the mesh" open $POD 10.66.0.3 10250
+want "-> mesh :8080 (MESH_PORTS)" open $POD 10.66.0.3 8080
+want "-> this machine's kubelet" open $POD 10.42.1.1 10250
+want "-> this machine's SSH" silent $POD 10.42.1.1 22
+want "-> this machine's API port (a server has none for pods)" silent $POD 10.42.1.1 6443
+echo "-- k3s: into the cluster"
+want "another server -> kubelet" open $MESH 10.66.0.3 10.66.0.2 10250
+want "another server -> :6443 (a server is no API server)" silent $MESH 10.66.0.3 10.66.0.2 6443
+want "this machine -> its pod" open $SRV 10.42.1.2 80
+want "this machine -> a service address" open $SRV 10.43.0.10 80
+want "another server -> NodePort" silent $MESH 10.66.0.3 10.66.0.2 30080
+want "home network -> NodePort" silent $LAN 192.168.1.99 192.168.1.20 30080
+want "home network -> hostPort" silent $LAN 192.168.1.99 192.168.1.20 8443
+want "a container -> a pod" silent $CT 10.42.1.2 80
+
 echo "== a member that knocks on closed ports is blocked"
 in_ $MESH python3 -I - <<'PY'
 import socket
@@ -202,6 +239,9 @@ in_ $SRV nft -f "$W/coord/etc/nftables.conf" || { echo "the coordinator firewall
 want "a server -> :22 (member list over SSH)" open $MESH 10.66.0.3 10.66.0.2 22
 want "a server -> :9000" silent $MESH 10.66.0.3 10.66.0.2 9000
 want "desktop -> :22" open $LAN 192.168.1.99 192.168.1.20 22
+want "a server -> API server :6443" open $MESH 10.66.0.3 10.66.0.2 6443
+want "a pod -> this machine's API port" open $POD 10.42.1.1 6443
+want "home network -> API server :6443" silent $LAN 192.168.1.99 192.168.1.20 6443
 want "-> internet:25" refused $SRV 8.8.8.8 25
 want "-> another machine at home :22" refused $SRV 192.168.1.99 22
 

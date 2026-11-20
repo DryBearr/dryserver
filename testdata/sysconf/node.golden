@@ -49,6 +49,13 @@ table inet dryserver {
 		icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
 		icmpv6 type echo-request limit rate 10/second accept
 
+		# Pods on this machine reach its kubelet (and on the coordinator
+		# the API server). Nothing else on this machine is for pods or
+		# containers: without the drop they would fall through to the
+		# rules for the home network below and reach SSH.
+		iifname "cni0" tcp dport 10250 accept
+		iifname { "cni0", "flannel.1", "docker0", "br-*" } drop
+
 		# Everything from the mesh is decided there, and ends there.
 		iifname "wg0" jump mesh
 
@@ -72,6 +79,10 @@ table inet dryserver {
 		udp dport { 53 } accept
 		icmp type echo-request accept
 		icmpv6 type echo-request accept
+		# k3s between members: API server and kubelets (both ask for
+		# certificates), and the pod network (VXLAN).
+		tcp dport 10250 accept
+		udp dport 8472 accept
 
 		# Anything else from a member is a try on a closed port. Too many
 		# and it is cut off here; every refusal is logged (at a limit).
@@ -88,6 +99,12 @@ table inet dryserver {
 		oif lo accept
 		# The mesh: the firewall on the other side decides.
 		oifname "wg0" accept
+		# This machine's own pods (health checks), the pod network and
+		# the cluster's service addresses. By address: a service address
+		# is rewritten to a pod's only after the route was chosen, so
+		# the interface still says "router" here.
+		oifname { "cni0", "flannel.1" } accept
+		ip daddr { 10.42.0.0/16, 10.43.0.0/16 } accept
 		meta l4proto { icmp, ipv6-icmp, igmp } accept
 		# DNS, time, web (updates, images), plus EGRESS_PORTS.
 		tcp dport { 53, 80, 443 } accept
@@ -107,6 +124,35 @@ table inet dryserver {
 		type filter hook forward priority filter - 5; policy accept;
 		ct state established,related accept
 		iifname { "docker0", "br-*" } jump containers
+		iifname "cni0" jump pods
+		# Nothing from outside the cluster starts a connection to a pod:
+		# a NodePort or hostPort is not a door from the home network.
+		# Pods are reached by other pods, by this machine, and through
+		# the ingress.
+		oifname "cni0" iifname != { "cni0", "flannel.1" } drop
+	}
+
+	# What a k3s pod may start. Which pod may talk to which is for
+	# NetworkPolicy; this is the wall around all of them.
+	chain pods {
+		oifname { "cni0", "flannel.1" } accept
+		# The API server and the kubelets, over the mesh.
+		oifname "wg0" ip daddr 10.66.0.1 tcp dport 6443 accept
+		oifname "wg0" tcp dport 10250 accept
+		oifname "wg0" tcp dport { 8080, 9000 } accept
+		oifname "wg0" udp dport { 53 } accept
+		oifname "wg0" limit rate 10/minute log prefix "dryserver-pod-drop: "
+		oifname "wg0" drop
+		udp dport { 53, 123 } accept
+		tcp dport 53 accept
+		ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } drop
+		ip6 daddr { fc00::/7, fe80::/10 } drop
+		tcp dport { 80, 443 } accept
+		# Cloudflare Tunnel (cloudflared runs as a pod).
+		meta l4proto { tcp, udp } th dport 7844 accept
+		meta l4proto { icmp, ipv6-icmp } accept
+		limit rate 10/minute log prefix "dryserver-pod-drop: "
+		drop
 	}
 
 	# What a container may start: the internet on the same ports as this

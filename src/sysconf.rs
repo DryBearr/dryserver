@@ -198,6 +198,10 @@ fn port_set(fixed: &[u16], extra: &[u16]) -> String {
     format!("{{ {} }}", all.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
 }
 
+/// k3s's own address ranges for pods and services (its defaults).
+pub const K3S_POD_CIDR: &str = "10.42.0.0/16";
+pub const K3S_SERVICE_CIDR: &str = "10.43.0.0/16";
+
 /// The mesh address counted as a knock on a closed port this often in a
 /// minute is blocked for an hour (see the mesh chain).
 pub const KNOCKS_PER_MINUTE: u32 = 30;
@@ -237,6 +241,16 @@ fn nftables(f: &Firewall) -> String {
         String::new()
     } else {
         format!("\n\t\toifname \"wg0\" udp dport {} accept", port_set(&[], &f.mesh_udp))
+    };
+    // k3s. The API server is on the coordinator; every machine has a
+    // kubelet and its part of the pod network.
+    let k3s_mesh = match f.role {
+        Role::Coordinator => "tcp dport { 6443, 10250 } accept",
+        Role::Node => "tcp dport 10250 accept",
+    };
+    let k3s_local = match f.role {
+        Role::Coordinator => "{ 6443, 10250 }",
+        Role::Node => "10250",
     };
     let web_tcp = port_set(&[80, 443], &f.out_tcp);
     let extra_udp = if f.out_udp.is_empty() { String::new() } else { format!("\n\t\tudp dport {} accept", port_set(&[], &f.out_udp)) };
@@ -285,6 +299,13 @@ table inet dryserver {{
 		icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert }} accept
 		icmpv6 type echo-request limit rate 10/second accept
 
+		# Pods on this machine reach its kubelet (and on the coordinator
+		# the API server). Nothing else on this machine is for pods or
+		# containers: without the drop they would fall through to the
+		# rules for the home network below and reach SSH.
+		iifname "cni0" tcp dport {k3s_local} accept
+		iifname {{ "cni0", "flannel.1", "docker0", "br-*" }} drop
+
 		# Everything from the mesh is decided there, and ends there.
 		iifname "wg0" jump mesh
 
@@ -303,6 +324,10 @@ table inet dryserver {{
 		{mesh_ssh}{mesh_tcp}{mesh_udp}
 		icmp type echo-request accept
 		icmpv6 type echo-request accept
+		# k3s between members: API server and kubelets (both ask for
+		# certificates), and the pod network (VXLAN).
+		{k3s_mesh}
+		udp dport 8472 accept
 
 		# Anything else from a member is a try on a closed port. Too many
 		# and it is cut off here; every refusal is logged (at a limit).
@@ -319,6 +344,12 @@ table inet dryserver {{
 		oif lo accept
 		# The mesh: the firewall on the other side decides.
 		oifname "wg0" accept
+		# This machine's own pods (health checks), the pod network and
+		# the cluster's service addresses. By address: a service address
+		# is rewritten to a pod's only after the route was chosen, so
+		# the interface still says "router" here.
+		oifname {{ "cni0", "flannel.1" }} accept
+		ip daddr {{ {pod_cidr}, {svc_cidr} }} accept
 		meta l4proto {{ icmp, ipv6-icmp, igmp }} accept
 		# DNS, time, web (updates, images), plus EGRESS_PORTS.
 		tcp dport {out_tcp} accept
@@ -337,6 +368,33 @@ table inet dryserver {{
 		type filter hook forward priority filter - 5; policy accept;
 		ct state established,related accept
 		iifname {{ "docker0", "br-*" }} jump containers
+		iifname "cni0" jump pods
+		# Nothing from outside the cluster starts a connection to a pod:
+		# a NodePort or hostPort is not a door from the home network.
+		# Pods are reached by other pods, by this machine, and through
+		# the ingress.
+		oifname "cni0" iifname != {{ "cni0", "flannel.1" }} drop
+	}}
+
+	# What a k3s pod may start. Which pod may talk to which is for
+	# NetworkPolicy; this is the wall around all of them.
+	chain pods {{
+		oifname {{ "cni0", "flannel.1" }} accept
+		# The API server and the kubelets, over the mesh.
+		oifname "wg0" ip daddr {coord_mesh} tcp dport 6443 accept
+		oifname "wg0" tcp dport 10250 accept{to_mesh_tcp}{to_mesh_udp}
+		oifname "wg0" limit rate 10/minute log prefix "dryserver-pod-drop: "
+		oifname "wg0" drop
+		udp dport {{ 53, 123 }} accept
+		tcp dport 53 accept
+		ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }} drop
+		ip6 daddr {{ fc00::/7, fe80::/10 }} drop
+		tcp dport {web_tcp} accept{extra_udp}
+		# Cloudflare Tunnel (cloudflared runs as a pod).
+		meta l4proto {{ tcp, udp }} th dport 7844 accept
+		meta l4proto {{ icmp, ipv6-icmp }} accept
+		limit rate 10/minute log prefix "dryserver-pod-drop: "
+		drop
 	}}
 
 	# What a container may start: the internet on the same ports as this
@@ -362,6 +420,9 @@ table inet dryserver {{
 {include}
 "#,
         include = quarantine::NFT_INCLUDE,
+        coord_mesh = f.coord_mesh,
+        pod_cidr = K3S_POD_CIDR,
+        svc_cidr = K3S_SERVICE_CIDR,
         knocks = KNOCKS_PER_MINUTE,
         offenders = OFFENDERS_SET,
     )
@@ -676,12 +737,29 @@ mod tests {
             assert!(nft.contains(want), "node nftables missing {want:?}:\n{nft}");
         }
         assert!(!nft.contains("\n\t\ttcp dport 22 accept\n\t\ttcp dport {"), "a server must not take SSH from every member");
+        // k3s: kubelet from members and from this machine's pods; the API
+        // port only on the coordinator; pods and containers end before
+        // the home network's rules; NodePorts are no door.
+        for want in [
+            "iifname \"cni0\" tcp dport 10250 accept\n\t\tiifname { \"cni0\", \"flannel.1\", \"docker0\", \"br-*\" } drop",
+            "tcp dport 10250 accept\n\t\tudp dport 8472 accept",
+            "ip daddr { 10.42.0.0/16, 10.43.0.0/16 } accept",
+            "oifname \"cni0\" iifname != { \"cni0\", \"flannel.1\" } drop",
+            "oifname \"wg0\" ip daddr 10.66.0.1 tcp dport 6443 accept",
+        ] {
+            assert!(nft.contains(want), "node nftables missing {want:?}:\n{nft}");
+        }
+        assert!(!nft.contains("6443, 10250"), "a server has no API server port");
         let coord_nft = &find(&coord, "/etc/nftables.conf").content;
         assert!(
             coord_nft.contains("chain mesh {\n\t\ttcp dport 22 accept"),
             "the coordinator serves the member list to every member:\n{coord_nft}"
         );
         assert!(!coord_nft.contains("ip daddr 192.168.1.50 tcp dport 22"), "the coordinator does not call its own registry");
+        assert!(
+            coord_nft.contains("tcp dport { 6443, 10250 } accept")
+                && coord_nft.contains("iifname \"cni0\" tcp dport { 6443, 10250 } accept")
+        );
         // EGRESS_PORTS open for the machine and its containers.
         let mut open = cs[0].1.clone();
         open.config.egress_ports = "25565/tcp 27015/udp".into();
