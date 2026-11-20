@@ -414,6 +414,7 @@ impl Real {
             switch: node::port_link(&switch_mac),
             approved: now,
             last_seen: now,
+            cuts: Vec::new(),
         };
         let store = Store::new(self.target(registry::DEFAULT_PATH));
         let m = me.clone();

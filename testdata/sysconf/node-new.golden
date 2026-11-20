@@ -7,8 +7,8 @@ node-9c1d
 ===== /etc/nftables.conf (0600)
 #!/usr/bin/nft -f
 # dryserver firewall, generated from config.env. To open more ports to the
-# mesh, change MESH_PORTS there. Only this table is touched, so Docker's own
-# rules survive reloads.
+# mesh, change MESH_PORTS there; for more outgoing ports, EGRESS_PORTS.
+# Only this table is touched, so Docker's own rules survive reloads.
 
 destroy table inet dryserver
 
@@ -25,8 +25,23 @@ table inet dryserver {
 		timeout 1m
 	}
 
+	# Members that tried closed ports: counted in knock4, and with more
+	# than 30 tries in a minute blocked in offenders4 for an hour.
+	# "dryserver sync" makes that a quarantine that lasts.
+	set knock4 {
+		type ipv4_addr
+		flags dynamic
+		timeout 1m
+	}
+	set offenders4 {
+		type ipv4_addr
+		flags dynamic, timeout
+		timeout 1h
+	}
+
 	chain input {
 		type filter hook input priority filter; policy drop;
+		iifname "wg0" ip saddr @offenders4 drop
 		ct state vmap { established : accept, related : accept, invalid : drop }
 		iif lo accept
 
@@ -34,6 +49,7 @@ table inet dryserver {
 		icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
 		icmpv6 type echo-request limit rate 10/second accept
 
+		# Everything from the mesh is decided there, and ends there.
 		iifname "wg0" jump mesh
 
 		# WireGuard from the WiFi/router network and the switch.
@@ -51,10 +67,66 @@ table inet dryserver {
 
 	# Traffic from other servers over WireGuard.
 	chain mesh {
-		tcp dport { 22, 8080, 9000 } accept
+		ip saddr 10.66.0.1 tcp dport 22 accept
+		tcp dport { 8080, 9000 } accept
 		udp dport { 53 } accept
 		icmp type echo-request accept
 		icmpv6 type echo-request accept
+
+		# Anything else from a member is a try on a closed port. Too many
+		# and it is cut off here; every refusal is logged (at a limit).
+		add @knock4 { ip saddr limit rate over 30/minute burst 30 packets } add @offenders4 { ip saddr } log prefix "dryserver-autocut: "
+		limit rate 10/minute log prefix "dryserver-mesh-drop: "
+		drop
+	}
+
+	# What this machine itself may start. Replies to what came in are
+	# always allowed.
+	chain output {
+		type filter hook output priority filter; policy drop;
+		ct state vmap { established : accept, related : accept, invalid : drop }
+		oif lo accept
+		# The mesh: the firewall on the other side decides.
+		oifname "wg0" accept
+		meta l4proto { icmp, ipv6-icmp, igmp } accept
+		# DNS, time, web (updates, images), plus EGRESS_PORTS.
+		tcp dport { 53, 80, 443 } accept
+		udp dport { 53, 123 } accept
+		# DHCP renewals, WireGuard to the other servers.
+		udp sport 68 udp dport 67 accept
+		udp sport 546 udp dport 547 accept
+		udp dport 51820 accept
+		ip daddr 192.168.1.50 tcp dport 22 accept
+
+		limit rate 10/minute log prefix "dryserver-out-drop: "
+		reject with icmpx admin-prohibited
+	}
+
+	# Containers. Before Docker's own chains; a drop here is final.
+	chain forward {
+		type filter hook forward priority filter - 5; policy accept;
+		ct state established,related accept
+		iifname { "docker0", "br-*" } jump containers
+	}
+
+	# What a container may start: the internet on the same ports as this
+	# machine, the mesh on MESH_PORTS, never the home network.
+	chain containers {
+		# Between containers Docker's own isolation decides.
+		oifname { "docker0", "br-*" } accept
+		oifname "wg0" tcp dport { 8080, 9000 } accept
+		oifname "wg0" udp dport { 53 } accept
+		oifname "wg0" limit rate 10/minute log prefix "dryserver-container-drop: "
+		oifname "wg0" drop
+		# DNS and time first: the resolver is often the home router.
+		udp dport { 53, 123 } accept
+		tcp dport 53 accept
+		ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } drop
+		ip6 daddr { fc00::/7, fe80::/10 } drop
+		tcp dport { 80, 443 } accept
+		meta l4proto { icmp, ipv6-icmp } accept
+		limit rate 10/minute log prefix "dryserver-container-drop: "
+		drop
 	}
 }
 
@@ -176,6 +248,7 @@ WG_PORT='51820'
 WG_TRANSPORT='auto'
 SWITCH_SUBNET='172.16.66.0/24'
 MESH_PORTS='8080/tcp 53/udp 9000/tcp'
+EGRESS_PORTS=''
 TOOLS='docker go rust cpp neovim'
 EXTRA_PACKAGES=''
 USERNAME='admin'

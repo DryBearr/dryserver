@@ -55,6 +55,9 @@ pub struct Cut {
     /// The wg0.conf blocks that were removed; -lift puts them back.
     pub peers: Vec<String>,
     pub since: Time,
+    /// Cut by this server itself, after the firewall caught the member
+    /// trying closed ports; not on the admin's order.
+    pub auto: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -83,6 +86,15 @@ impl State {
         v.sort();
         v.dedup();
         v
+    }
+
+    /// What this server tells the coordinator, for the admin's screen.
+    pub fn reports(&self) -> Vec<registry::CutReport> {
+        self.cuts
+            .iter()
+            .filter(|c| registry::valid_name(&c.name))
+            .map(|c| registry::CutReport { name: c.name.clone(), auto: c.auto })
+            .collect()
     }
 
     fn names(&self) -> String {
@@ -340,6 +352,7 @@ pub fn plan(cfg: &Config, me: u32, me_name: &str, peers: &[Peer], names: &[Strin
             wg_keys: found.iter().map(|x| x.key.clone()).filter(|k| !k.is_empty()).collect(),
             peers: found.iter().map(|x| x.block.clone()).collect(),
             since: now,
+            auto: false,
         });
         return Ok(p);
     }
@@ -376,6 +389,7 @@ pub fn plan(cfg: &Config, me: u32, me_name: &str, peers: &[Peer], names: &[Strin
             wg_keys: found.iter().map(|x| x.key.clone()).filter(|k| !k.is_empty()).collect(),
             peers: found.iter().map(|x| x.block.clone()).collect(),
             since: now,
+            auto: false,
         });
     }
     Ok(p)
@@ -459,8 +473,72 @@ fn joined(n: &Node, coordinator: bool) -> bool {
     coordinator || n.load_state().host > 0
 }
 
+/// Where automatic cuts are written down.
+pub const AUTO_LOG: &str = "/var/log/dryserver-cuts.log";
+
+/// Mesh addresses in `nft list set` output.
+fn set_addresses(out: &str) -> Vec<Ipv4Addr> {
+    let Some((_, elems)) = out.split_once("elements") else { return Vec::new() };
+    let mut v: Vec<Ipv4Addr> =
+        elems.split(|c: char| !(c.is_ascii_digit() || c == '.')).filter(|t| t.matches('.').count() == 3).filter_map(parse_ip4).collect();
+    v.dedup();
+    v
+}
+
+/// Makes the firewall's one-hour block of a member that tried closed ports
+/// a quarantine that lasts until the admin lifts it, and writes it down.
+/// The decision is this server's alone and holds for this server alone: it
+/// tells nobody else to cut, so a hacked machine can cut off only itself.
+pub fn auto_cut(ctx: &Ctx, n: &Node, coordinator: bool) -> Result<()> {
+    let listed = match n.run.output(ctx, &Cmd::new("nft", &["list", "set", "inet", "dryserver", crate::sysconf::OFFENDERS_SET]).quiet()) {
+        Ok(o) => o,
+        // No such set: the firewall is not loaded or is an older one.
+        Err(_) => return Ok(()),
+    };
+    let offenders = set_addresses(&listed);
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    let me = if coordinator { 1 } else { n.load_state().host };
+    let st = load(n)?;
+    let peers = parse_peers(&fsx::read_or_empty(n.path(node::WG_CONF)));
+    for ip in offenders {
+        let host = mesh::host_of(&n.cfg.wg_subnet, ip);
+        if host == 0 || host == me || st.cuts.iter().any(|c| c.hosts.contains(&host)) {
+            continue;
+        }
+        // Its name, as this server knows the member with that address.
+        let name =
+            peers.iter().find(|p| p.hosts(&n.cfg.wg_subnet).contains(&host)).map(|p| p.name.clone()).filter(|x| registry::valid_name(x));
+        let names: Vec<String> = match (host, name) {
+            (1, _) if !coordinator => Vec::new(),
+            (_, Some(name)) => vec![name],
+            _ => continue,
+        };
+        let mut said = Vec::new();
+        cut_as(ctx, n, coordinator, &names, true, &mut said)?;
+        let who = if names.is_empty() { "the coordinator".to_string() } else { names[0].clone() };
+        let line = format!(
+            "{} cut off {who} ({ip}) by itself: more than {} tries on closed ports in a minute. Undo: sudo dryserver quarantine -lift\n",
+            Time::now().0.format("%Y-%m-%d %H:%M:%S UTC"),
+            crate::sysconf::KNOCKS_PER_MINUTE
+        );
+        eprint!("dryserver: {line}");
+        let path = n.path(AUTO_LOG);
+        let _ = fsx::mkdir_all(fsx::dir(&path), 0o755);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+    Ok(())
+}
+
 /// Cuts names (the coordinator when empty) off this server.
 pub fn cut(ctx: &Ctx, n: &Node, coordinator: bool, names: &[String], out: &mut dyn Write) -> Result<()> {
+    cut_as(ctx, n, coordinator, names, false, out)
+}
+
+fn cut_as(ctx: &Ctx, n: &Node, coordinator: bool, names: &[String], auto: bool, out: &mut dyn Write) -> Result<()> {
     let me = if coordinator { 1 } else { n.load_state().host };
     let _lock = fsx::lock(n.path(MESH_LOCK))?;
     let mut st = match load(n) {
@@ -486,7 +564,8 @@ pub fn cut(ctx: &Ctx, n: &Node, coordinator: bool, names: &[String], out: &mut d
     for note in &plan.notes {
         let _ = writeln!(out, "note: {note}");
     }
-    for c in plan.cuts {
+    for mut c in plan.cuts {
+        c.auto = auto;
         st.add(c);
     }
     let keys: Vec<String> = st.cuts.iter().flat_map(|c| c.wg_keys.clone()).collect();
@@ -764,9 +843,10 @@ pub fn status(ctx: &Ctx, n: &Node, out: &mut dyn Write) -> Result<()> {
     let _ = writeln!(out, "{} is quarantined (firewall rules {}):", n.hostname, if loaded { "loaded" } else { "NOT loaded" });
     for c in &st.cuts {
         let who = if c.hosts.contains(&1) { format!("{} (coordinator)", shown(&c.name)) } else { shown(&c.name) };
+        let why = if c.auto { ", by this server itself (tries on closed ports)" } else { "" };
         let _ = writeln!(
             out,
-            "  {who} since {}: blocks {}; {} WireGuard key(s)",
+            "  {who} since {}{why}: blocks {}; {} WireGuard key(s)",
             c.since.0.format("%Y-%m-%d %H:%M UTC"),
             c.ips.join(", "),
             c.wg_keys.len()
@@ -1137,6 +1217,8 @@ PersistentKeepalive = 25
         /// What the coordinator's address answers to "signed"; None: ssh
         /// fails.
         signed: Mutex<Option<String>>,
+        /// `nft list set ... offenders4` output; None: no such set.
+        offenders: Mutex<Option<String>>,
     }
 
     impl Runner for Fake {
@@ -1149,6 +1231,12 @@ PersistentKeepalive = 25
                     Some(reply) => (reply, Ok(())),
                     None => (String::new(), Err("ssh: connect to host 192.168.1.50 port 22: No route to host".into())),
                 },
+                "nft" if c.args.first().map(String::as_str) == Some("list") && c.args.get(1).map(String::as_str) == Some("set") => {
+                    match self.offenders.lock().unwrap().clone() {
+                        Some(o) => (o, Ok(())),
+                        None => (String::new(), Err("No such file or directory".into())),
+                    }
+                }
                 "ip" => (format!("default via {} dev wlan0\n", self.gateway), Ok(())),
                 "wg-quick" => ("[Interface]\nListenPort = 51820\n".into(), Ok(())),
                 _ => (String::new(), Ok(())),
@@ -1328,6 +1416,70 @@ PersistentKeepalive = 25
         lift(&ctx, &n, false, &mut Vec::new()).unwrap();
         let wg0 = get(dir.path(), node::WG_CONF);
         assert!(wg0.contains(&wg(9)) && !wg0.contains(&wg(1)), "{wg0}");
+    }
+
+    #[test]
+    fn firewall_blocks_become_lasting_cuts() {
+        let listing = |elems: &str| {
+            format!(
+                "table inet dryserver {{\n\tset offenders4 {{\n\t\ttype ipv4_addr\n\t\tflags dynamic,timeout\n\t\ttimeout 1h\n{elems}\t}}\n}}\n"
+            )
+        };
+        assert!(set_addresses(&listing("")).is_empty(), "an empty set, although its timeout line has digits");
+        assert_eq!(
+            set_addresses(&listing("\t\telements = { 10.66.0.3 timeout 1h expires 59m12s340ms, 10.66.0.9 expires 3s }\n")),
+            vec!["10.66.0.3".parse::<Ipv4Addr>().unwrap(), "10.66.0.9".parse().unwrap()]
+        );
+
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        let ctx = Ctx::new();
+        // No such set (older firewall), then an empty one: nothing happens.
+        auto_cut(&ctx, &n, false).unwrap();
+        *fake.offenders.lock().unwrap() = Some(listing(""));
+        auto_cut(&ctx, &n, false).unwrap();
+        assert!(load(&n).unwrap().is_empty());
+
+        // node-c (10.66.0.3) knocked; so did this server's own address and
+        // an address nobody has: only node-c is cut.
+        *fake.offenders.lock().unwrap() = Some(listing(
+            "\t\telements = { 10.66.0.3 expires 59m, 10.66.0.2 expires 1m, 10.66.0.77 expires 1m, 192.168.1.9 expires 1m }\n",
+        ));
+        auto_cut(&ctx, &n, false).unwrap();
+        let st = load(&n).unwrap();
+        assert_eq!(st.cuts.len(), 1);
+        assert!(st.cuts[0].auto && st.cuts[0].name == "node-c" && st.cuts[0].hosts == vec![3], "{:?}", st.cuts);
+        assert!(!st.coordinator_cut());
+        assert!(!get(dir.path(), node::WG_CONF).contains(&wg(3)));
+        assert_eq!(st.reports(), vec![registry::CutReport { name: "node-c".into(), auto: true }]);
+        let log = get(dir.path(), AUTO_LOG);
+        assert!(log.contains("cut off node-c (10.66.0.3) by itself") && log.lines().count() == 1, "{log}");
+        let mut out = Vec::new();
+        status(&ctx, &n, &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("by this server itself (tries on closed ports)"));
+
+        // The next sync sees the same entry: no second cut, no second line.
+        auto_cut(&ctx, &n, false).unwrap();
+        assert_eq!(load(&n).unwrap(), st);
+        assert_eq!(get(dir.path(), AUTO_LOG).lines().count(), 1);
+
+        // The coordinator itself knocks: it is cut like anyone else, and
+        // sync stops talking to it.
+        *fake.offenders.lock().unwrap() = Some(listing("\t\telements = { 10.66.0.1 expires 59m }\n"));
+        auto_cut(&ctx, &n, false).unwrap();
+        let st = load(&n).unwrap();
+        assert!(st.coordinator_cut() && st.cuts.iter().all(|c| c.auto));
+        assert!(get(dir.path(), AUTO_LOG).contains("cut off the coordinator (10.66.0.1)"));
+
+        // On the coordinator its own address in the set means nothing.
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        *fake.offenders.lock().unwrap() = Some(listing("\t\telements = { 10.66.0.1 expires 59m, 10.66.0.3 expires 59m }\n"));
+        auto_cut(&ctx, &n, true).unwrap();
+        let st = load(&n).unwrap();
+        assert_eq!(st.cuts.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["node-c"]);
     }
 
     #[test]

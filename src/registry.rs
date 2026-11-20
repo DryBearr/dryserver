@@ -36,6 +36,20 @@ fn is_zero64(n: &u64) -> bool {
     *n == 0
 }
 
+/// A member tells the coordinator which other members it has cut off, so
+/// the admin sees it on the approval screen.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CutReport {
+    pub name: String,
+    /// Cut by the server itself (tries on closed ports), not on the
+    /// admin's order.
+    pub auto: bool,
+}
+
+/// At most this many cuts are kept per member.
+const MAX_CUT_REPORTS: usize = 32;
+
 /// An approved mesh node. The coordinator is member 1.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -50,6 +64,9 @@ pub struct Member {
     pub switch: bool,
     pub approved: Time,
     pub last_seen: Time,
+    /// What this member has cut off, as it reported last.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cuts: Vec<CutReport>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,6 +428,7 @@ impl State {
                         switch: req.is_some_and(|r| r.switch),
                         approved: now,
                         last_seen: now,
+                        cuts: Vec::new(),
                     }
                 }
             };
@@ -435,7 +453,7 @@ impl State {
 
     /// Records a member's current LAN IP and switch link. host identifies
     /// the member by its mesh address, which WireGuard ties to its key.
-    pub fn heartbeat(&mut self, host: u32, lan_ip: &str, sw: bool, now: Time) -> Result<()> {
+    pub fn heartbeat(&mut self, host: u32, lan_ip: &str, sw: bool, cuts: &[CutReport], now: Time) -> Result<()> {
         let Some(m) = self.members.iter_mut().find(|m| m.host == host) else {
             return Err("not a member".into());
         };
@@ -444,6 +462,8 @@ impl State {
         }
         m.switch = sw;
         m.last_seen = now;
+        // A member's word, shown to the admin: names only, and not many.
+        m.cuts = cuts.iter().filter(|c| valid_name(&c.name)).take(MAX_CUT_REPORTS).cloned().collect();
         Ok(())
     }
 
@@ -609,6 +629,8 @@ pub struct StatusReply {
 struct HeartbeatIn {
     lan_ip: String,
     switch: bool,
+    #[serde(deserialize_with = "null_default")]
+    cuts: Vec<CutReport>,
 }
 
 fn decode_first<T: serde::de::DeserializeOwned>(input: &mut dyn Read) -> Option<T> {
@@ -687,7 +709,7 @@ pub fn serve(
             }
             let hb: HeartbeatIn = decode_first(input).ok_or_else(|| Error::new("bad heartbeat JSON"))?;
             let (members, signed) = st.update(|s| {
-                s.heartbeat(host, &hb.lan_ip, hb.switch, now)?;
+                s.heartbeat(host, &hb.lan_ip, hb.switch, &hb.cuts, now)?;
                 Ok((s.members.clone(), s.signed.clone()))
             })?;
             send(out, &serde_json::json!({ "members": members, "signed": signed }))
@@ -916,12 +938,20 @@ mod tests {
     fn heartbeat_updates_member() {
         let mut s =
             State { members: vec![member(1, "coord"), Member { lan_ip: "192.168.1.5".into(), ..member(2, "a") }], ..State::default() };
-        s.heartbeat(2, "192.168.1.77", true, t0()).unwrap();
+        let cuts = vec![CutReport { name: "node-c".into(), auto: true }, CutReport { name: "x\u{1b}[2J evil".into(), auto: false }];
+        s.heartbeat(2, "192.168.1.77", true, &cuts, t0()).unwrap();
+        let m = s.members.iter().find(|m| m.host == 2).unwrap();
+        assert_eq!(m.cuts, vec![CutReport { name: "node-c".into(), auto: true }], "only real names are kept");
+        let many: Vec<CutReport> = (0..100).map(|i| CutReport { name: format!("n{i}"), auto: false }).collect();
+        s.heartbeat(2, "192.168.1.77", true, &many, t0()).unwrap();
+        assert_eq!(s.members.iter().find(|m| m.host == 2).unwrap().cuts.len(), MAX_CUT_REPORTS);
+        s.heartbeat(2, "192.168.1.77", true, &[], t0()).unwrap();
+        assert!(s.members.iter().find(|m| m.host == 2).unwrap().cuts.is_empty(), "a lifted cut must disappear");
         let m = &s.members[1];
         assert_eq!(m.lan_ip, "192.168.1.77");
         assert!(m.switch);
         assert_eq!(m.last_seen, t0());
-        assert!(s.heartbeat(9, "1.2.3.4", false, t0()).is_err(), "unknown host accepted");
+        assert!(s.heartbeat(9, "1.2.3.4", false, &[], t0()).is_err(), "unknown host accepted");
     }
 
     #[test]

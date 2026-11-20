@@ -284,6 +284,49 @@ check_not "brain's address not blocked" bash -c "nsenter -t $WK -n nft list tabl
 check "status shows sync running" bash -c "nsenter -t $WK -n $BIN quarantine -status | grep -q 'is running'"
 check "lift" inw "$BIN" quarantine -lift
 
+echo "== the generated firewall: a member that tries closed ports is cut off for good"
+cat > "$W/fw.env" <<EOF
+COORD_LAN_IP='192.168.1.50'
+WG_SUBNET='10.66.0.0/24'
+WG_PORT='51820'
+WG_TRANSPORT='auto'
+SWITCH_SUBNET='172.16.66.0/24'
+USERNAME='admin'
+ADMIN_SSH_PUBKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGVmCw4JXa0JQ1x0Z3ZJ3vY3lMSa7p4rG5Q6k8hO2c3d me@desk'
+TOOLS=''
+EOF
+"$BIN" sysconf --config "$W/fw.env" --out "$W/fw" --role node --hostname node-b --host 2 >/dev/null
+cp "$W/fw/etc/nftables.conf" /etc/nftables.conf
+check "the generated firewall loads" inw nft -f /etc/nftables.conf
+check "the coordinator still reaches the server over WireGuard" inb ping -c1 -W2 10.66.0.2
+out=$(inw "$BIN" sync 2>&1)
+check_not "sync cuts nobody while nobody knocks" grep -q "by itself" <<<"$out"
+check_not "no quarantine" test -e /etc/dryserver/quarantine.json
+# The coordinator (hacked, say) scans the server through the tunnel.
+inb python3 -I -c '
+import socket
+for port in range(9100, 9160):
+    s = socket.socket(); s.setblocking(False)
+    try: s.connect(("10.66.0.2", port))
+    except OSError: pass
+    s.close()'
+sleep 0.5
+check "the firewall blocked it at once" bash -c "nsenter -t $WK -n nft list set inet dryserver offenders4 | grep -q 10.66.0.1"
+check_not "it cannot even ping any more" inb ping -c1 -W1 10.66.0.2
+out=$(inw "$BIN" sync 2>&1); rc=$?
+check "sync made it a quarantine and says so ($rc)" grep -q "cut off the coordinator (10.66.0.1) by itself" <<<"$out"
+check "sync is paused" grep -q "paused" <<<"$out"
+check "saved as an automatic cut" grep -q '"auto": true' /etc/dryserver/quarantine.json
+check_not "coordinator peer out of the running wg0" bash -c "nsenter -t $WK -n wg show wg0 peers | grep -qF '$BP2'"
+check "status tells why" bash -c "nsenter -t $WK -n $BIN quarantine -status | grep -q 'by this server itself'"
+# The one-hour entry in the firewall is gone after a reload; the cut is not.
+inw nft -f /etc/nftables.conf
+check_not "the firewall's own entry is gone after a reload" bash -c "nsenter -t $WK -n nft list set inet dryserver offenders4 | grep -q 10.66.0.1"
+check "the quarantine table is loaded with it" inw nft list table inet dryserver_quarantine
+check_not "still cut off" inw ping -c1 -W1 10.66.0.1
+out=$(inw "$BIN" sync 2>&1)
+check_not "a second sync does not cut again" grep -q "by itself" <<<"$out"
+
 kill $BR $WK 2>/dev/null
 echo "== $pass passed, $fail failed"
 [ "$fail" = 0 ]

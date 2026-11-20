@@ -301,6 +301,12 @@ impl Model for Screen {
             }
         }
 
+        if !self.view.reports.is_empty() {
+            b.s("\nCut off:\n");
+            for r in &self.view.reports {
+                b.add(err(format!("  {r}"))).nl();
+            }
+        }
         if !self.view.warnings.is_empty() {
             b.nl();
             for w in &self.view.warnings {

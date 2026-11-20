@@ -25,6 +25,10 @@ pub struct Config {
     pub switch_subnet: String,
     /// Space-separated port/proto opened on wg0, e.g. "8080/tcp 53/udp".
     pub mesh_ports: String,
+    /// Extra ports the servers and their containers may connect to on the
+    /// internet, like "25565/tcp 27015/udp". DNS, time and web are always
+    /// allowed.
+    pub egress_ports: String,
     /// Space-separated optional bundle IDs, see packages::OPTIONAL.
     pub tools: String,
     /// Space-separated extra Arch packages.
@@ -48,6 +52,7 @@ impl Default for Config {
             wg_transport: TRANSPORT_AUTO.into(),
             switch_subnet: "172.16.66.0/24".into(),
             mesh_ports: String::new(),
+            egress_ports: String::new(),
             tools: packages::default_tools().join(" "),
             extra_packages: String::new(),
             username: "admin".into(),
@@ -58,7 +63,7 @@ impl Default for Config {
     }
 }
 
-const KEYS: [&str; 14] = [
+const KEYS: [&str; 15] = [
     "WIFI_SSID",
     "WIFI_PASS",
     "COORD_LAN_IP",
@@ -67,6 +72,7 @@ const KEYS: [&str; 14] = [
     "WG_TRANSPORT",
     "SWITCH_SUBNET",
     "MESH_PORTS",
+    "EGRESS_PORTS",
     "TOOLS",
     "EXTRA_PACKAGES",
     "USERNAME",
@@ -87,6 +93,7 @@ impl Config {
             "WG_TRANSPORT" => &mut self.wg_transport,
             "SWITCH_SUBNET" => &mut self.switch_subnet,
             "MESH_PORTS" => &mut self.mesh_ports,
+            "EGRESS_PORTS" => &mut self.egress_ports,
             "TOOLS" => &mut self.tools,
             "EXTRA_PACKAGES" => &mut self.extra_packages,
             "USERNAME" => &mut self.username,
@@ -107,6 +114,7 @@ impl Config {
             "WG_TRANSPORT" => &self.wg_transport,
             "SWITCH_SUBNET" => &self.switch_subnet,
             "MESH_PORTS" => &self.mesh_ports,
+            "EGRESS_PORTS" => &self.egress_ports,
             "TOOLS" => &self.tools,
             "EXTRA_PACKAGES" => &self.extra_packages,
             "USERNAME" => &self.username,
@@ -188,6 +196,7 @@ impl Config {
             check("switch subnet", valid_switch_subnet(&self.switch_subnet, &self.wg_subnet, &self.coord_lan_ip));
         }
         check("mesh ports", valid_mesh_ports(&self.mesh_ports));
+        check("outgoing ports", valid_mesh_ports(&self.egress_ports));
         check("tools", packages::valid_tools(&self.tool_list()));
         check("extra packages", packages::valid_extra(&self.extra_list()));
         check("username", valid_username(&self.username));

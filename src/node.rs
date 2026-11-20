@@ -90,6 +90,8 @@ pub struct Node {
 pub struct Heartbeat {
     pub lan_ip: String,
     pub switch: bool,
+    /// Members this node has cut off, for the admin's screen.
+    pub cuts: Vec<registry::CutReport>,
 }
 
 impl Node {
@@ -622,15 +624,22 @@ pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> R
 /// by `dryserver quarantine` are left out, and with the coordinator cut a
 /// node does not sync at all: false means paused.
 pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<bool> {
-    if !coordinator && quarantine::load(n)?.coordinator_cut() {
+    // First: a member the firewall blocked for trying closed ports is cut
+    // off for good, until the admin lifts it.
+    if let Err(e) = quarantine::auto_cut(ctx, n, coordinator) {
+        eprintln!("dryserver: automatic cut: {e}");
+    }
+    let q = quarantine::load(n)?;
+    if !coordinator && q.coordinator_cut() {
         return Ok(false);
     }
+    let cuts = q.reports();
     let sw = port_link(&n.switch_mac());
     let mut me = SelfInfo { host: 0, switch: sw };
     let members = if coordinator {
         me.host = 1;
         let (members, signed) = store.update(|s| {
-            s.heartbeat(1, &n.cfg.coord_lan_ip, sw, Time::now())?;
+            s.heartbeat(1, &n.cfg.coord_lan_ip, sw, &cuts, Time::now())?;
             Ok((s.members.clone(), s.signed_version > 0))
         })?;
         // Signed by the admin: the code on the console has done its job.
@@ -645,7 +654,7 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
             return Err("not joined yet".into());
         }
         let lan = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).unwrap_or_default();
-        let (sent, env) = n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw })?;
+        let (sent, env) = n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw, cuts })?;
         match n.signed_members(me.host, &sent, &env) {
             Ok((members, status)) => {
                 n.note_signed(&status);
@@ -837,6 +846,8 @@ mod tests {
             // Sync helpers: systemctl, ping, ip, wg-quick and wg.
             match c.name.as_str() {
                 "systemctl" | "ping" | "ip" | "agetty" | "networkctl" => return (String::new(), Ok(())),
+                // No blocked members in the firewall's set.
+                "nft" => return (String::new(), Err("no such set".into())),
                 "wg-quick" => return ("[Interface]\nListenPort = 51820\n".into(), Ok(())),
                 "wg" => {
                     *self.applied.lock().unwrap() = std::fs::read_to_string(&c.args[2]).unwrap_or_default();
@@ -933,7 +944,7 @@ mod tests {
         assert!(get(&n.root, "/etc/hosts").contains("10.66.0.1 coord") && n.load_state().host == 4, "hosts/state not updated");
         assert!(get(&n.root, SIGNED_FILE).contains(&env.sig), "the list that let this machine in must be remembered");
 
-        let (members, signed) = n.fetch_members(&ctx, &Heartbeat { lan_ip: "192.168.1.23".into(), switch: false }).unwrap();
+        let (members, signed) = n.fetch_members(&ctx, &Heartbeat { lan_ip: "192.168.1.23".into(), switch: false, cuts: vec![] }).unwrap();
         assert_eq!(members.len(), 2);
         assert!(!signed.is_empty());
         assert_eq!(fc.calls.lock().unwrap().last().unwrap(), "dryreg@10.66.0.1 peers", "sync must go over the mesh");

@@ -75,6 +75,7 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
     let c = &p.config;
     c.validate()?;
     let mesh_ports = config::parse_ports(&c.mesh_ports).unwrap_or_default();
+    let egress_ports = config::parse_ports(&c.egress_ports).unwrap_or_default();
 
     let mut switch_addr = String::new();
     if c.wg_transport == config::TRANSPORT_AUTO && p.host_num > 0 {
@@ -91,7 +92,17 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
         file(
             "/etc/nftables.conf",
             0o600,
-            nftables(&c.wg_port, &switch_subnet(c), &ports_of(&mesh_ports, "tcp"), &ports_of(&mesh_ports, "udp")),
+            nftables(&Firewall {
+                role: p.role,
+                wg_port: c.wg_port.clone(),
+                switch: switch_subnet(c),
+                coord_mesh: host_addr(&c.wg_subnet, 1).map(|a| a.split('/').next().unwrap_or("").to_string()).unwrap_or_default(),
+                coord_lan: c.coord_lan_ip.clone(),
+                mesh_tcp: ports_of(&mesh_ports, "tcp"),
+                mesh_udp: ports_of(&mesh_ports, "udp"),
+                out_tcp: ports_of(&egress_ports, "tcp"),
+                out_udp: ports_of(&egress_ports, "udp"),
+            }),
         ),
         file("/etc/ssh/sshd_config.d/10-dryserver.conf", 0o644, sshd(&c.username, p.role)),
         file(
@@ -158,21 +169,82 @@ fn hosts(hostname: &str) -> String {
     format!("127.0.0.1 localhost\n::1       localhost\n127.0.1.1 {hostname}\n")
 }
 
-fn nftables(wg_port: &str, switch: &str, mesh_tcp: &[u16], mesh_udp: &[u16]) -> String {
-    let switch_rule =
-        if switch.is_empty() { String::new() } else { format!("\n\n\t\t# Switch network: WireGuard only.\n\t\tip saddr {switch} drop") };
-    let tcp: String = mesh_tcp.iter().map(|p| format!(", {p}")).collect();
-    let udp_rule = if mesh_udp.is_empty() {
+/// What the firewall is rendered from.
+pub struct Firewall {
+    pub role: Role,
+    pub wg_port: String,
+    /// The switch subnet in auto mode, else "".
+    pub switch: String,
+    /// The coordinator's mesh and LAN addresses.
+    pub coord_mesh: String,
+    pub coord_lan: String,
+    /// MESH_PORTS: open to every member over the mesh.
+    pub mesh_tcp: Vec<u16>,
+    pub mesh_udp: Vec<u16>,
+    /// EGRESS_PORTS: extra ports this machine and its containers may
+    /// connect to on the internet.
+    pub out_tcp: Vec<u16>,
+    pub out_udp: Vec<u16>,
+}
+
+/// "{ 22, 8080 }" from a fixed list and a configured one, without repeats.
+fn port_set(fixed: &[u16], extra: &[u16]) -> String {
+    let mut all: Vec<u16> = Vec::new();
+    for p in fixed.iter().chain(extra) {
+        if !all.contains(p) {
+            all.push(*p);
+        }
+    }
+    format!("{{ {} }}", all.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
+}
+
+/// The mesh address counted as a knock on a closed port this often in a
+/// minute is blocked for an hour (see the mesh chain).
+pub const KNOCKS_PER_MINUTE: u32 = 30;
+/// The set of members blocked for knocking; sync reads it.
+pub const OFFENDERS_SET: &str = "offenders4";
+
+fn nftables(f: &Firewall) -> String {
+    let wg_port = &f.wg_port;
+    let switch_rule = if f.switch.is_empty() {
         String::new()
     } else {
-        let list = mesh_udp.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
-        format!("\n\t\tudp dport {{ {list} }} accept")
+        format!("\n\n\t\t# Switch network: WireGuard only.\n\t\tip saddr {} drop", f.switch)
     };
+    // SSH inside the mesh: on a server only from the coordinator (the path
+    // of "ssh <server>" from the admin's desktop); on the coordinator from
+    // every member (they fetch the member list over it).
+    let mesh_ssh = match f.role {
+        Role::Coordinator => "tcp dport 22 accept".to_string(),
+        Role::Node => format!("ip saddr {} tcp dport 22 accept", f.coord_mesh),
+    };
+    let mesh_tcp = if f.mesh_tcp.is_empty() { String::new() } else { format!("\n\t\ttcp dport {} accept", port_set(&[], &f.mesh_tcp)) };
+    let mesh_udp = if f.mesh_udp.is_empty() { String::new() } else { format!("\n\t\tudp dport {} accept", port_set(&[], &f.mesh_udp)) };
+    // A server reaches the coordinator's registry over the LAN to join and
+    // to check it again after a quarantine.
+    let registry = match f.role {
+        Role::Node if !f.coord_lan.is_empty() => format!("\n\t\tip daddr {} tcp dport 22 accept", f.coord_lan),
+        _ => String::new(),
+    };
+    let out_tcp = port_set(&[53, 80, 443], &f.out_tcp);
+    let out_udp = port_set(&[53, 123], &f.out_udp);
+    let to_mesh_tcp = if f.mesh_tcp.is_empty() {
+        String::new()
+    } else {
+        format!("\n\t\toifname \"wg0\" tcp dport {} accept", port_set(&[], &f.mesh_tcp))
+    };
+    let to_mesh_udp = if f.mesh_udp.is_empty() {
+        String::new()
+    } else {
+        format!("\n\t\toifname \"wg0\" udp dport {} accept", port_set(&[], &f.mesh_udp))
+    };
+    let web_tcp = port_set(&[80, 443], &f.out_tcp);
+    let extra_udp = if f.out_udp.is_empty() { String::new() } else { format!("\n\t\tudp dport {} accept", port_set(&[], &f.out_udp)) };
     format!(
         r#"#!/usr/bin/nft -f
 # dryserver firewall, generated from config.env. To open more ports to the
-# mesh, change MESH_PORTS there. Only this table is touched, so Docker's own
-# rules survive reloads.
+# mesh, change MESH_PORTS there; for more outgoing ports, EGRESS_PORTS.
+# Only this table is touched, so Docker's own rules survive reloads.
 
 destroy table inet dryserver
 
@@ -189,8 +261,23 @@ table inet dryserver {{
 		timeout 1m
 	}}
 
+	# Members that tried closed ports: counted in knock4, and with more
+	# than {knocks} tries in a minute blocked in {offenders} for an hour.
+	# "dryserver sync" makes that a quarantine that lasts.
+	set knock4 {{
+		type ipv4_addr
+		flags dynamic
+		timeout 1m
+	}}
+	set {offenders} {{
+		type ipv4_addr
+		flags dynamic, timeout
+		timeout 1h
+	}}
+
 	chain input {{
 		type filter hook input priority filter; policy drop;
+		iifname "wg0" ip saddr @{offenders} drop
 		ct state vmap {{ established : accept, related : accept, invalid : drop }}
 		iif lo accept
 
@@ -198,6 +285,7 @@ table inet dryserver {{
 		icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert }} accept
 		icmpv6 type echo-request limit rate 10/second accept
 
+		# Everything from the mesh is decided there, and ends there.
 		iifname "wg0" jump mesh
 
 		# WireGuard from the WiFi/router network and the switch.
@@ -212,16 +300,70 @@ table inet dryserver {{
 
 	# Traffic from other servers over WireGuard.
 	chain mesh {{
-		tcp dport {{ 22{tcp} }} accept{udp_rule}
+		{mesh_ssh}{mesh_tcp}{mesh_udp}
 		icmp type echo-request accept
 		icmpv6 type echo-request accept
+
+		# Anything else from a member is a try on a closed port. Too many
+		# and it is cut off here; every refusal is logged (at a limit).
+		add @knock4 {{ ip saddr limit rate over {knocks}/minute burst {knocks} packets }} add @{offenders} {{ ip saddr }} log prefix "dryserver-autocut: "
+		limit rate 10/minute log prefix "dryserver-mesh-drop: "
+		drop
+	}}
+
+	# What this machine itself may start. Replies to what came in are
+	# always allowed.
+	chain output {{
+		type filter hook output priority filter; policy drop;
+		ct state vmap {{ established : accept, related : accept, invalid : drop }}
+		oif lo accept
+		# The mesh: the firewall on the other side decides.
+		oifname "wg0" accept
+		meta l4proto {{ icmp, ipv6-icmp, igmp }} accept
+		# DNS, time, web (updates, images), plus EGRESS_PORTS.
+		tcp dport {out_tcp} accept
+		udp dport {out_udp} accept
+		# DHCP renewals, WireGuard to the other servers.
+		udp sport 68 udp dport 67 accept
+		udp sport 546 udp dport 547 accept
+		udp dport {wg_port} accept{registry}
+
+		limit rate 10/minute log prefix "dryserver-out-drop: "
+		reject with icmpx admin-prohibited
+	}}
+
+	# Containers. Before Docker's own chains; a drop here is final.
+	chain forward {{
+		type filter hook forward priority filter - 5; policy accept;
+		ct state established,related accept
+		iifname {{ "docker0", "br-*" }} jump containers
+	}}
+
+	# What a container may start: the internet on the same ports as this
+	# machine, the mesh on MESH_PORTS, never the home network.
+	chain containers {{
+		# Between containers Docker's own isolation decides.
+		oifname {{ "docker0", "br-*" }} accept{to_mesh_tcp}{to_mesh_udp}
+		oifname "wg0" limit rate 10/minute log prefix "dryserver-container-drop: "
+		oifname "wg0" drop
+		# DNS and time first: the resolver is often the home router.
+		udp dport {{ 53, 123 }} accept
+		tcp dport 53 accept
+		ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }} drop
+		ip6 daddr {{ fc00::/7, fe80::/10 }} drop
+		tcp dport {web_tcp} accept{extra_udp}
+		meta l4proto {{ icmp, ipv6-icmp }} accept
+		limit rate 10/minute log prefix "dryserver-container-drop: "
+		drop
 	}}
 }}
 
 # Kill switch rules from "dryserver quarantine", when there are any.
 {include}
 "#,
-        include = quarantine::NFT_INCLUDE
+        include = quarantine::NFT_INCLUDE,
+        knocks = KNOCKS_PER_MINUTE,
+        offenders = OFFENDERS_SET,
     )
 }
 
@@ -516,10 +658,41 @@ mod tests {
             "policy drop",
             "destroy table inet dryserver",
             "ip saddr 172.16.66.0/24 drop",
-            "tcp dport { 22, 8080, 9000 } accept",
+            // SSH inside the mesh only from the coordinator.
+            "ip saddr 10.66.0.1 tcp dport 22 accept",
+            "tcp dport { 8080, 9000 } accept",
             "udp dport { 53 } accept",
+            // The mesh chain ends in a drop, so nothing from the mesh
+            // reaches the LAN rules below it.
+            "limit rate 10/minute log prefix \"dryserver-mesh-drop: \"\n\t\tdrop\n\t}",
+            "iifname \"wg0\" ip saddr @offenders4 drop\n\t\tct state vmap",
+            // Outgoing: default drop, the registry on the coordinator's LAN
+            // address, containers kept off the home network.
+            "type filter hook output priority filter; policy drop;",
+            "ip daddr 192.168.1.50 tcp dport 22 accept",
+            "reject with icmpx admin-prohibited",
+            "ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } drop",
         ] {
-            assert!(nft.contains(want), "node nftables missing {want:?}");
+            assert!(nft.contains(want), "node nftables missing {want:?}:\n{nft}");
+        }
+        assert!(!nft.contains("\n\t\ttcp dport 22 accept\n\t\ttcp dport {"), "a server must not take SSH from every member");
+        let coord_nft = &find(&coord, "/etc/nftables.conf").content;
+        assert!(
+            coord_nft.contains("chain mesh {\n\t\ttcp dport 22 accept"),
+            "the coordinator serves the member list to every member:\n{coord_nft}"
+        );
+        assert!(!coord_nft.contains("ip daddr 192.168.1.50 tcp dport 22"), "the coordinator does not call its own registry");
+        // EGRESS_PORTS open for the machine and its containers.
+        let mut open = cs[0].1.clone();
+        open.config.egress_ports = "25565/tcp 27015/udp".into();
+        let nft2 = find(&render(&open).unwrap(), "/etc/nftables.conf").content.clone();
+        for want in [
+            "tcp dport { 53, 80, 443, 25565 } accept",
+            "udp dport { 53, 123, 27015 } accept",
+            "tcp dport { 80, 443, 25565 } accept",
+            "udp dport { 27015 } accept",
+        ] {
+            assert!(nft2.contains(want), "EGRESS_PORTS missing {want:?}:\n{nft2}");
         }
         assert!(!nft.contains("flush ruleset"), "nftables must not flush Docker's rules");
         assert!(nft.trim_end().ends_with(quarantine::NFT_INCLUDE), "quarantine rules must load after the main table:\n{nft}");

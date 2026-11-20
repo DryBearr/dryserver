@@ -182,6 +182,8 @@ pub struct View {
     /// install: compared before the first signature.
     pub coordinator_code: String,
     pub warnings: Vec<String>,
+    /// Cuts the members reported: who cut whom off.
+    pub reports: Vec<String>,
 }
 
 /// A machine at the coordinator's address with other keys than the ones
@@ -351,6 +353,17 @@ impl Admin {
             v.warnings.push(format!("Signed by you but not on the coordinator (or changed there): {}", missing.join(", ")));
         }
         v.members = members.iter().map(|m| (m.clone(), self.base.has(m))).collect();
+        // What members say they cut off. A member's word, relayed by the
+        // coordinator: something to look into, not a fact.
+        for m in &members {
+            for c in &m.cuts {
+                v.reports.push(if c.auto {
+                    format!("{} cut off {} by itself: {} tried closed ports on it. Check {}.", m.name, c.name, c.name, c.name)
+                } else {
+                    format!("{} has {} cut off (quarantine).", m.name, c.name)
+                });
+            }
+        }
 
         // Requests are untrusted too; the code is computed here from the
         // keys in the request and the coordinator key this desktop pinned.
@@ -1019,6 +1032,28 @@ pub mod tests {
         // Without the secret nothing can be judged: refused outright.
         std::fs::remove_file(dir.join("secrets").join(crate::iso::JOIN_SECRET)).unwrap();
         assert!(a.load().unwrap_err().to_string().contains("no join secret"));
+    }
+
+    #[test]
+    fn cuts_reported_by_members_are_shown() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        store
+            .update(|s| {
+                s.members.push(Member { host: 2, name: "node-a".into(), wg_key: key32(2), ..Member::default() });
+                let cuts =
+                    [registry::CutReport { name: "node-c".into(), auto: true }, registry::CutReport { name: "coord".into(), auto: false }];
+                s.heartbeat(2, "192.168.1.23", false, &cuts, Time::now())
+            })
+            .unwrap();
+        let v = a.load().unwrap();
+        assert_eq!(
+            v.reports,
+            vec![
+                "node-a cut off node-c by itself: node-c tried closed ports on it. Check node-c.".to_string(),
+                "node-a has coord cut off (quarantine).".to_string()
+            ]
+        );
     }
 
     #[test]

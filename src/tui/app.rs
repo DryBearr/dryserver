@@ -361,7 +361,11 @@ fn config_form(answers: ConfigAnswers) -> Form<ConfigAnswers> {
                 Field::input("WireGuard UDP port", |a: &A| a.cfg.wg_port.clone(), |a, v| a.cfg.wg_port = v).validate(|v, _| config::valid_port(v)),
                 Field::input("Extra ports open inside the mesh", |a: &A| a.cfg.mesh_ports.clone(), |a, v| a.cfg.mesh_ports = v)
                     .placeholder("8080/tcp 53/udp")
-                    .desc("SSH is always open. These never open to WiFi/router.")
+                    .desc("Between servers. SSH inside the mesh comes only from the coordinator. These never open to WiFi/router.")
+                    .validate(|v, _| config::valid_mesh_ports(v)),
+                Field::input("Extra outgoing ports", |a: &A| a.cfg.egress_ports.clone(), |a, v| a.cfg.egress_ports = v)
+                    .placeholder("25565/tcp 27015/udp")
+                    .desc("Servers and containers may only start connections for DNS, time and web (80, 443). Add what your apps need.")
                     .validate(|v, _| config::valid_mesh_ports(v)),
             ]),
             Group::new(vec![
@@ -469,9 +473,12 @@ mod tests {
         press(&mut a, &[Key::Char('1')]);
         // WiFi: SSID empty, no password.
         press(&mut a, &[Key::Enter, Key::Enter]);
-        // Mesh: coordinator IP, then accept the defaults.
+        // Mesh: coordinator IP, then accept the defaults (subnet, port,
+        // mesh ports), and one extra outgoing port.
         press(&mut a, &crate::tui::type_text("192.168.1.50"));
         press(&mut a, &[Key::Enter, Key::Enter, Key::Enter, Key::Enter]);
+        press(&mut a, &crate::tui::type_text("25565/tcp"));
+        press(&mut a, &[Key::Enter]);
         // Transport auto, switch subnet default, tools (all), extra packages.
         press(&mut a, &[Key::Enter, Key::Enter, Key::Enter, Key::Enter]);
         // Admin: username default, key, label, timezone.
@@ -484,6 +491,7 @@ mod tests {
         assert_eq!(c.coord_lan_ip, "192.168.1.50");
         assert_eq!(c.admin_ssh_pubkey, "ssh-ed25519 AAAAkey");
         assert_eq!(c.tools, "docker go rust cpp neovim");
+        assert_eq!(c.egress_ports, "25565/tcp");
         assert!(a.view().plain().contains("coordinator 192.168.1.50"));
     }
 

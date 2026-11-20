@@ -254,9 +254,27 @@ Limits for now:
   SSH server. Servers drop all incoming traffic except:
   - from WiFi/router: SSH and WireGuard
   - from the switch: WireGuard only
-  - over the mesh: SSH, ping and the ports you list in *Extra ports* (`MESH_PORTS`)
+  - over the mesh: ping and the ports you list in *Extra ports*
+    (`MESH_PORTS`); SSH only from the coordinator (that is the path of
+    `ssh node-a` from your desktop), on the coordinator from every member
 
   Docker publishes container ports on `127.0.0.1` unless you give an address.
+- **Outgoing traffic is limited too.** A server may start connections only
+  for DNS, time, web (80, 443), DHCP, WireGuard, the mesh, and the
+  coordinator's registry. Everything else is refused at once and logged.
+  Containers get the same internet ports, reach the mesh only on
+  `MESH_PORTS`, and never reach your home network (DNS excepted). Add ports
+  your apps need with *Extra outgoing ports* (`EGRESS_PORTS`).
+- **A member that tries closed ports is cut off.** More than 30 tries in a
+  minute and the firewall blocks that member at once; within a minute the
+  server makes it a quarantine that lasts until you lift it, writes it to
+  `/var/log/dryserver-cuts.log` and its console, and tells the coordinator,
+  so `./dryserver approve` shows who cut whom. Each server decides this for
+  itself only and tells no other server to cut, so a hacked server can cut
+  off only itself.
+- **Blocked traffic is logged** (at a limit) with the prefixes
+  `dryserver-mesh-drop`, `dryserver-out-drop`, `dryserver-container-drop`
+  and `dryserver-autocut`: `journalctl -k -g dryserver-`.
 - **SSH**: key login only, no root login, `MaxAuthTries 3`, rate limited.
 - **Accounts**: root is locked; sudo asks for your password.
 - **Disk encryption**: LUKS2 with argon2id; TPM unlock bound to the signed
@@ -346,7 +364,14 @@ which servers do not need.
 ### What are "Extra ports open inside the mesh"?
 Ports your servers may use on each other, e.g. `8080/tcp` for a web app on
 one server that the others need. They are never opened to WiFi. Leave empty
-if unsure: only SSH and ping work between servers then.
+if unsure: only ping works between servers then, and SSH from the
+coordinator.
+
+### What are "Extra outgoing ports"?
+Ports on the internet that your servers and their containers may connect to,
+besides DNS, time and web (80, 443), e.g. `25565/tcp` for a game server that
+calls out on that port. Leave empty if unsure; a refused connection shows up
+in `journalctl -k -g dryserver-out-drop`.
 
 ### Does the switch need to be connected to the router?
 No. Internet stays on WiFi; the switch only carries traffic between servers.
@@ -375,6 +400,7 @@ TPM refuses (firmware update, changed boot settings).
 ```sh
 make test                           # unit tests (cargo test)
 test/validate-sysconf.sh            # check generated firewall/SSH/sudo files with real nft and sshd
+test/live-firewall.sh               # the generated firewall with real connections: mesh, home network, containers
 test/live-quarantine.sh             # kill switch with real WireGuard and nftables, in private namespaces
 test/live-approve.sh                # signed approval: the real screen against a real sshd and registry
 test/qemu.sh coord                  # boot out/dryserver.iso in a UEFI VM with a blank disk
