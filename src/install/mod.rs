@@ -138,6 +138,10 @@ impl Step {
 
 pub type Progress = Arc<dyn Fn(Step) + Send + Sync>;
 
+/// How many steps Backend::install reports. The setup screen draws its
+/// progress ring from it.
+pub const INSTALL_STEPS: usize = 5;
+
 pub trait Backend: Send + Sync {
     fn probe(&self, ctx: &Ctx) -> Result<Machine>;
     fn scan_wifi(&self, ctx: &Ctx) -> Result<Vec<String>>;

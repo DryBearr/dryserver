@@ -323,7 +323,7 @@ On your desktop:
 
 | Command | What it does |
 |---|---|
-| `./dryserver` | menu: config, build, flash |
+| `./dryserver` | menu: config, build, flash, machines |
 | `./dryserver build` | build the ISO, log to stdout |
 | `./dryserver disks` | list disks and which ones may be flashed |
 | `sudo ./dryserver flash --iso FILE` | flash any image to a USB drive |

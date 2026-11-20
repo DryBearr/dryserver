@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{Doc, Emit, Event, Key, dim, err, ok, spinner, title, truncate};
+use super::{Doc, Emit, Event, Key, dim, err, faint, ok, sel, spinner, theme, truncate};
 use crate::ctx::Ctx;
 use crate::err::Error;
 use crate::iso::{self, Options};
@@ -100,13 +100,13 @@ impl Build {
     pub fn view(&self) -> Doc {
         let mut b = Doc::new();
         let iso = iso::iso_path(&self.opts.out_dir).display().to_string();
-        b.add(title("dryserver · build installer ISO")).s("\n\n");
+        b.append(theme::header("build installer ISO")).s("\n\n");
         match (&self.err, self.running) {
             (_, true) if self.stopping => {
                 b.add(err("Stopping build…")).nl();
             }
             (_, true) => {
-                b.s(format!("{} Building {iso}  ", spinner())).add(dim(super::since(self.started))).nl();
+                b.add(sel(spinner())).s(format!(" Building {iso}  ")).add(dim(super::since(self.started))).nl();
             }
             (Some(e), false) if e.is_canceled() => {
                 b.add(err("Build cancelled.")).nl();
@@ -122,13 +122,15 @@ impl Build {
         // Show as much of the log tail as fits under the header and above the footer.
         let n = (self.height as usize).saturating_sub(8).max(5);
         for l in &self.lines[self.lines.len().saturating_sub(n)..] {
-            b.add(dim(truncate(l, 200))).nl();
+            b.add(faint(truncate(l, 200))).nl();
         }
         b.nl();
         if self.running {
             b.add(dim("First build downloads ~1 GB and takes several minutes. ctrl+c cancels.")).nl();
         } else {
-            b.add(dim(format!("enter back to menu · full log in {}/{}", self.opts.out_dir.display(), iso::LOG_NAME))).nl();
+            b.append(theme::keys(&[("enter", "back to menu")]))
+                .add(dim(format!("   full log in {}/{}", self.opts.out_dir.display(), iso::LOG_NAME)))
+                .nl();
         }
         b
     }

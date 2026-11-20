@@ -8,6 +8,7 @@ pub mod build;
 pub mod flash;
 pub mod form;
 pub mod setup;
+pub mod theme;
 
 use std::io::stdout;
 use std::sync::mpsc;
@@ -109,20 +110,21 @@ pub fn type_text(s: &str) -> Vec<Key> {
 
 // ---- styled text ----
 
+// The colours and what each one means are in theme.rs.
 pub fn title_style() -> Style {
-    Style::new().fg(Color::LightBlue).add_modifier(Modifier::BOLD)
+    theme::palette().title()
 }
 pub fn dim_style() -> Style {
-    Style::new().fg(Color::DarkGray)
+    theme::palette().hint()
 }
 pub fn sel_style() -> Style {
-    Style::new().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+    theme::palette().selected()
 }
 pub fn err_style() -> Style {
-    Style::new().fg(Color::LightRed)
+    theme::palette().alarm()
 }
 pub fn ok_style() -> Style {
-    Style::new().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+    theme::palette().ok()
 }
 
 /// A piece of text with a style.
@@ -146,6 +148,10 @@ pub fn err(s: impl Into<String>) -> Seg {
 }
 pub fn err_bold(s: impl Into<String>) -> Seg {
     Seg(s.into(), err_style().add_modifier(Modifier::BOLD))
+}
+/// Structure that should recede: rules, empty progress.
+pub fn faint(s: impl Into<String>) -> Seg {
+    Seg(s.into(), Style::new().fg(theme::palette().ash))
 }
 pub fn ok(s: impl Into<String>) -> Seg {
     Seg(s.into(), ok_style())
@@ -202,6 +208,26 @@ impl Doc {
         }
         self.lines.extend(it);
         self
+    }
+
+    /// left and right side by side, gap cells apart. left is padded to its
+    /// widest line, so the right column starts in one place.
+    pub fn beside(left: Doc, gap: usize, right: Doc) -> Doc {
+        let width = left.lines.iter().map(|l| Doc::line_width(l)).max().unwrap_or(0);
+        let rows = left.lines.len().max(right.lines.len());
+        let (mut l, mut r) = (left.lines.into_iter(), right.lines.into_iter());
+        let mut out = Doc { lines: Vec::with_capacity(rows) };
+        for _ in 0..rows {
+            let mut line = l.next().unwrap_or_default();
+            let rest = r.next().unwrap_or_default();
+            if !rest.is_empty() {
+                let pad = width - Doc::line_width(&line) + gap;
+                line.push(plain(" ".repeat(pad)));
+                line.extend(rest);
+            }
+            out.lines.push(line);
+        }
+        out
     }
 
     /// The text without styles, for tests.
@@ -266,19 +292,19 @@ pub fn truncate(s: &str, n: usize) -> String {
 }
 
 /// The current frame of the busy spinner.
+/// The current frame of the busy spinner: an ember that glows and fades.
+/// Glyphs of code page 437 only, so it also shows on the Linux console
+/// (the braille spinner did not).
 pub fn spinner() -> &'static str {
-    const FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+    const FRAMES: [&str; 6] = ["·", "∙", "•", "■", "•", "∙"];
     static START: OnceLock<Instant> = OnceLock::new();
     let ms = START.get_or_init(Instant::now).elapsed().as_millis();
-    FRAMES[(ms / 100 % 8) as usize]
+    FRAMES[(ms / 130 % 6) as usize]
 }
 
 /// A progress bar of width cells for pct in 0..=1.
 pub fn progress_bar(pct: f64, width: usize) -> Doc {
-    let filled = ((pct.clamp(0.0, 1.0)) * width as f64).round() as usize;
-    let mut d = Doc::new();
-    d.add(Seg("█".repeat(filled), Style::new().fg(Color::LightMagenta))).add(dim("░".repeat(width - filled)));
-    d
+    theme::bar(pct, width)
 }
 
 /// Whole seconds since t, formatted like Go durations ("1m5s").
@@ -484,7 +510,19 @@ fn event_loop<M: Model>(
     let tick = Duration::from_millis(100);
     let mut last_tick = Instant::now();
     loop {
-        term.draw(|f| f.render_widget(Paragraph::new(model.view().into_text()), f.area()))?;
+        term.draw(|f| {
+            // With true colour the whole screen is coal with bone text;
+            // otherwise the terminal keeps its own colours.
+            let p = theme::palette();
+            let mut base = Style::new();
+            if let Some(c) = p.coal {
+                base = base.bg(c);
+            }
+            if let Some(c) = p.bone {
+                base = base.fg(c);
+            }
+            f.render_widget(Paragraph::new(model.view().into_text()).style(base), f.area());
+        })?;
         let wait = tick.saturating_sub(last_tick.elapsed());
         if event::poll(wait)? {
             let ev = match event::read()? {

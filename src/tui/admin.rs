@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{Doc, Emit, Event, Flow, Key, Model, dim, err, ok, sel, title};
+use super::{Doc, Emit, Event, Flow, Key, Model, dim, err, ok, sel, theme};
 use crate::admin::{Admin, NewCoordinator, View};
 use crate::err::{Error, Kind, Result};
 use crate::gotime::{Time, duration_string, round_ms};
@@ -224,7 +224,7 @@ impl Model for Screen {
     fn view(&self) -> Doc {
         let mut b = Doc::new();
         let now = (self.now)();
-        b.add(title("dryserver · machines")).s("  ").add(dim("decisions here are signed with this computer's key")).s("\n\n");
+        b.append(theme::header("machines")).s("   ").add(dim("what you decide here is signed with this computer's key")).s("\n\n");
         if let Some(e) = &self.err {
             b.add(err(format!("Cannot talk to the coordinator: {e}"))).s("\n\n");
             if e.is(Kind::HostKey) {
@@ -324,8 +324,12 @@ impl Model for Screen {
         } else if !self.notice.is_empty() {
             b.nl().s(&self.notice).nl();
         }
-        let first = if self.view.version == 0 { "S sign coordinator · " } else { "" };
-        b.nl().add(dim(format!("↑/↓ select · a approve · r reject · d remove · {first}p send list again · q quit"))).nl();
+        let mut keys = vec![("↑↓", "select"), ("a", "approve"), ("r", "reject"), ("d", "remove")];
+        if self.view.version == 0 {
+            keys.push(("S", "sign coordinator"));
+        }
+        keys.extend([("p", "send list again"), ("q", "quit")]);
+        b.nl().append(theme::keys(&keys)).nl();
         b
     }
 }

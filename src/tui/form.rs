@@ -310,7 +310,9 @@ impl<S: 'static> Form<S> {
         let g = &self.groups[self.gi];
         for (i, f) in g.fields.iter().enumerate() {
             let focused = i == self.fi;
-            let bar = if focused { title("┃ ") } else { plain("  ") };
+            // A half block: the heavy line the form used is not in the
+            // console font.
+            let bar = if focused { sel("▌ ") } else { plain("  ") };
             let desc = f.desc.as_ref().map(|d| d(&self.state)).unwrap_or_default();
             let line_start = |d: &mut Doc| {
                 d.add(bar.clone());
@@ -373,12 +375,13 @@ impl<S: 'static> Form<S> {
             }
             d.nl();
         }
-        let keys = match &self.field().kind {
-            Kind::Select { .. } => "↑/↓ choose · enter next",
-            Kind::Multi { .. } => "↑/↓ move · space toggle · enter next",
-            _ => "enter next",
+        let mut keys: Vec<(&str, &str)> = match &self.field().kind {
+            Kind::Select { .. } => vec![("↑↓", "choose"), ("enter", "next")],
+            Kind::Multi { .. } => vec![("↑↓", "move"), ("space", "toggle"), ("enter", "next")],
+            _ => vec![("enter", "next")],
         };
-        d.add(dim(format!("{keys} · shift+tab back · esc {}", self.esc_label))).nl();
+        keys.extend([("shift+tab", "back"), ("esc", self.esc_label.as_str())]);
+        d.append(super::theme::keys(&keys)).nl();
         d
     }
 }

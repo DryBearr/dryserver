@@ -3,11 +3,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ratatui::style::Color;
-
 use super::build::KEEP_LINES;
 use super::form::{Field, Form, Group, Status};
-use super::{Border, Doc, Emit, Event, Flow, Key, Model, Seg, TextInput, dim, err, err_bold, ok, sel, spinner, title, truncate};
+use super::{Border, Doc, Emit, Event, Flow, Key, Model, Seg, TextInput, dim, err, err_bold, faint, ok, sel, spinner, theme, truncate};
 use crate::config::Config;
 use crate::ctx::Ctx;
 use crate::disks::{Disk, human_size};
@@ -447,13 +445,21 @@ impl Setup {
 
     pub fn view(&self) -> Doc {
         let mut b = Doc::new();
-        b.add(title("dryserver · server setup")).s("\n\n");
+        // The ring greets on the first screens; later it is the progress.
+        match self.state {
+            State::Probe | State::Welcome => {
+                b.append(theme::brand("server setup", "turns this machine into one of your servers")).s("\n\n");
+            }
+            _ => {
+                b.append(theme::header("server setup")).s("\n\n");
+            }
+        }
         match self.state {
             State::Probe => {
-                b.s(format!("{} Looking at this machine…\n", spinner()));
+                b.add(sel(spinner())).s(" Looking at this machine…\n");
             }
             State::Busy => {
-                b.s(format!("{} {}\n", spinner(), self.busy));
+                b.add(sel(spinner())).s(format!(" {}\n", self.busy));
             }
             State::Check => {
                 b.s("Checking before anything is erased:\n\n");
@@ -461,7 +467,9 @@ impl Setup {
                 match &self.check_err {
                     Some(e) => {
                         b.nl().add(err(e.to_string())).nl();
-                        b.add(dim(format!("r retry · enter back to the answers · full log: {LOG_HINT}"))).nl();
+                        b.append(theme::keys(&[("r", "retry"), ("enter", "back to the answers")]))
+                            .add(dim(format!("   full log: {LOG_HINT}")))
+                            .nl();
                     }
                     None => {
                         b.nl().add(dim("Nothing has been changed yet. ctrl+c stops the check.")).nl();
@@ -482,20 +490,29 @@ impl Setup {
             State::Confirm => self.view_confirm(&mut b),
             State::Install => self.view_install(&mut b),
             State::Join => self.view_join(&mut b),
-            State::Done => self.view_done(&mut b),
+            State::Done => {
+                // The work is done: the snake has bitten its tail.
+                let mut text = Doc::new();
+                self.view_done(&mut text);
+                b.append(Doc::beside(theme::ring(Some(1.0)), 3, text));
+            }
             State::Failed => {
                 let e = self.err.as_ref().map(|e| e.to_string()).unwrap_or_default();
                 b.add(err(format!("Setup failed: {e}"))).s("\n\n");
                 if !self.lines.is_empty() {
                     for l in &self.lines[self.lines.len().saturating_sub(10)..] {
-                        b.add(dim(truncate(l, 200))).nl();
+                        b.add(faint(truncate(l, 200))).nl();
                     }
                     b.nl();
                 }
                 if self.can_retry {
-                    b.add(dim(format!("r: retry the install with the same answers · enter/q: leave to a shell (log: {LOG_HINT})"))).nl();
+                    b.append(theme::keys(&[("r", "retry with the same answers"), ("enter", "leave to a shell")]))
+                        .add(dim(format!("   log: {LOG_HINT}")))
+                        .nl();
                 } else {
-                    b.add(dim(format!("enter/q: leave to a shell (log: {LOG_HINT}) · run 'dryserver install' to start over"))).nl();
+                    b.append(theme::keys(&[("enter", "leave to a shell")]))
+                        .add(dim(format!("   log: {LOG_HINT}. Start over with: dryserver install")))
+                        .nl();
                 }
             }
         }
@@ -541,9 +558,11 @@ impl Setup {
         }
         b.nl();
         if m.online {
-            b.add(dim("enter start setup · w other WiFi · q quit to shell")).nl();
+            b.append(theme::keys(&[("enter", "start setup"), ("w", "other WiFi"), ("q", "quit to shell")])).nl();
         } else {
-            b.add(dim("enter connect to WiFi (or plug in a cable and restart) · q quit to shell")).nl();
+            b.append(theme::keys(&[("enter", "connect to WiFi"), ("q", "quit to shell")]))
+                .add(dim("   or plug in a cable and restart"))
+                .nl();
         }
     }
 
@@ -563,7 +582,7 @@ impl Setup {
         for d in &ch.data_disks {
             w.s(format!("{}  → /data\n", disk_title(&self.disk_by_path(d))));
         }
-        b.append(w.boxed(Border::Rounded, Color::LightRed, 1, 0, false)).s("\n\n");
+        b.append(w.boxed(Border::Rounded, theme::palette().ember, 1, 0, false)).s("\n\n");
 
         let row = |b: &mut Doc, name: &str, value: Seg| {
             b.s(format!("  {name:<11} ")).add(value).nl();
@@ -583,29 +602,40 @@ impl Setup {
         }
         b.nl();
         b.s("Type ").add(sel("YES")).s(" to erase and install: ").append(self.confirm.view()).nl();
-        b.nl().add(dim("enter confirm · esc change answers")).nl();
+        b.nl().append(theme::keys(&[("enter", "confirm"), ("esc", "change answers")])).nl();
     }
 
+    /// The steps with the ring beside them. The snake grows by one part for
+    /// each finished step and bites its tail when all are done.
     fn view_install(&self, b: &mut Doc) {
+        let mut list = Doc::new();
         for (i, st) in self.steps.iter().enumerate() {
+            if i > 0 {
+                list.nl();
+            }
             if st.done {
-                b.add(ok("  ✓ ")).s(&st.name).add(dim(format!("  {}", super::dur(st.took)))).nl();
+                list.add(ok(format!("{} ", theme::done_mark()))).s(&st.name).add(dim(format!("  {}", super::dur(st.took))));
             } else if i == self.steps.len() - 1 {
-                b.s(format!("  {} {}", spinner(), st.name)).add(dim(format!("  {}", super::since(st.start)))).nl();
+                list.add(sel(format!("{} ", spinner()))).s(&st.name).add(dim(format!("  {}", super::since(st.start))));
             } else {
-                b.s(format!("    {}\n", st.name));
+                list.s(format!("  {}", st.name));
             }
         }
+        let done = self.steps.iter().filter(|s| s.done).count();
+        // The install has a fixed number of steps; the checks before it
+        // vary, so the ring only closes when the last known one is done.
+        let total = if self.state == State::Install { install::INSTALL_STEPS } else { self.steps.len().max(1) };
+        b.append(Doc::beside(theme::ring(Some(done as f64 / total.max(1) as f64)), 3, list)).nl();
         b.nl();
         let n = (self.height as usize).saturating_sub(self.steps.len() + 9).max(3);
         for l in &self.lines[self.lines.len().saturating_sub(n)..] {
-            b.add(dim(truncate(l, 200))).nl();
+            b.add(faint(truncate(l, 200))).nl();
         }
     }
 
     fn view_join(&self, b: &mut Doc) {
         if self.code.is_empty() {
-            b.s(format!("{} Sending join request to the coordinator at {}…\n", spinner(), self.cfg.coord_lan_ip));
+            b.add(sel(spinner())).s(format!(" Sending join request to the coordinator at {}…\n", self.cfg.coord_lan_ip));
             return;
         }
         b.s("Installed. Now approve this machine on your own computer:\n\n");
@@ -613,9 +643,9 @@ impl Setup {
         b.s("Approve only if it shows the same code:\n\n");
         let mut code = Doc::new();
         code.s(&self.code);
-        b.append(code.boxed(Border::Double, Color::LightBlue, 4, 1, true)).s("\n\n");
-        b.s(format!("{} Waiting for approval…\n\n", spinner()));
-        b.add(dim("s skip: the server asks again after reboot and shows the code on its screen")).nl();
+        b.append(code.boxed(Border::Double, theme::palette().gold, 4, 1, true)).s("\n\n");
+        b.add(sel(spinner())).s(" Waiting for approval…\n\n");
+        b.append(theme::keys(&[("s", "skip")])).add(dim("   the server asks again after reboot and shows the code on its screen")).nl();
     }
 
     fn view_done(&self, b: &mut Doc) {
@@ -627,7 +657,7 @@ impl Setup {
                 b.s("Sign only if it shows the same code:\n\n");
                 let mut code = Doc::new();
                 code.s(&self.code);
-                b.append(code.boxed(Border::Double, Color::LightBlue, 4, 1, true)).s("\n\n");
+                b.append(code.boxed(Border::Double, theme::palette().gold, 4, 1, true)).s("\n\n");
                 b.add(dim("The code is also on this machine's screen after it restarts, until you signed.")).nl();
             }
         } else if let Some(e) = &self.join_err {
@@ -1009,7 +1039,7 @@ mod tests {
         let mut t = demo_setup(Role::Node, Encryption::None, demo(|_| {}));
         t.s.state = State::Install;
         t.send(Event::Msg(Msg::InstallDone(Some("Install packages: downloads failed".into()))));
-        assert!(t.view().contains("r: retry the install"), "no retry offered:\n{}", t.view());
+        assert!(t.view().contains("r retry with the same answers"), "no retry offered:\n{}", t.view());
         t.keys([Key::Char('r')]);
         assert_eq!(t.s.state, State::Install, "r must restart the install");
         t.drain(&[State::Install, State::Join]);

@@ -202,7 +202,22 @@ impl Flags {
 // ---- desktop commands ----
 
 fn run_app() -> Result<()> {
-    tui::run(&mut tui::app::App::new(paths()))
+    loop {
+        let mut app = tui::app::App::new(paths());
+        tui::run(&mut app)?;
+        if !app.open_machines {
+            return Ok(());
+        }
+        // "Machines" in the menu: the approval screen, then the menu again.
+        let f = Flags::parse("approve", &[], DESKTOP_FLAGS);
+        match desktop_admin(&f, "approve") {
+            Ok((a, _)) => tui::run(&mut tui::admin::Screen::new(a))?,
+            Err(e) => {
+                eprintln!("dryserver: {e}");
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn run_install(args: &[String]) -> Result<()> {

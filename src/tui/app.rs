@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use super::build::{Build, Out};
 use super::flash::Flash;
 use super::form::{Field, Form, Group, Status};
-use super::{Doc, Emit, Event, Flow, Key, Model, Seg, build, dim, err, flash, ok, sel, title};
+use super::{Doc, Emit, Event, Flow, Key, Model, Seg, build, dim, err, flash, ok, sel, theme};
 use crate::config::{self, Config};
 use crate::err::Error;
 use crate::iso::{self, Options};
@@ -31,7 +31,8 @@ pub enum Screen {
     Flash,
 }
 
-const MENU: [(&str, &str); 4] = [("1", "Edit config"), ("2", "Build installer ISO"), ("3", "Flash USB"), ("q", "Quit")];
+const MENU: [(&str, &str); 5] =
+    [("1", "Edit config"), ("2", "Build installer ISO"), ("3", "Flash USB"), ("4", "Machines: approve, remove, replace"), ("q", "Quit")];
 
 pub enum Msg {
     Build(build::Msg),
@@ -60,6 +61,9 @@ pub struct App {
     flash: Option<Flash>,
     width: u16,
     height: u16,
+    /// Set when the menu closes to open the machines screen; the caller
+    /// runs it and comes back.
+    pub open_machines: bool,
 }
 
 fn build_emit(emit: &Emit<Msg>) -> Emit<build::Msg> {
@@ -88,6 +92,7 @@ impl App {
             flash: None,
             width: 0,
             height: 24,
+            open_machines: false,
         };
         a.refresh();
         a
@@ -146,6 +151,14 @@ impl App {
                 self.flash = Some(f);
                 self.screen = Screen::Flash;
             }
+            "4" => {
+                if self.root {
+                    self.notice = "Machines are approved as your normal user, not with sudo.".into();
+                    return Flow::Continue;
+                }
+                self.open_machines = true;
+                return Flow::Quit;
+            }
             "q" => return Flow::Quit,
             _ => {}
         }
@@ -202,7 +215,7 @@ impl App {
                 } else {
                     "over WiFi/router".to_string()
                 };
-                b.s(format!("  {:<8} ", "Config")).add(ok("ok")).add(dim(format!("  coordinator {} · {wifi}", c.coord_lan_ip))).nl();
+                b.s(format!("  {:<8} ", "Config")).add(ok("ok")).add(dim(format!("  coordinator {}, {wifi}", c.coord_lan_ip))).nl();
                 row(b, "", dim(format!("  mesh {} {over}", c.wg_subnet)));
                 let mut tools = c.tool_list();
                 tools.extend(c.extra_list());
@@ -217,7 +230,7 @@ impl App {
                 let when = chrono::DateTime::<chrono::Local>::from(mtime).format("%Y-%m-%d %H:%M");
                 b.s(format!("  {:<8} ", "ISO"))
                     .add(ok("ready"))
-                    .add(dim(format!("  {} · built {when}", iso::iso_path(&self.paths.out_dir).display())))
+                    .add(dim(format!("  {}, built {when}", iso::iso_path(&self.paths.out_dir).display())))
                     .nl();
                 if self.cfg_err.is_none() {
                     let changed = std::fs::metadata(&self.paths.config).and_then(|m| m.modified()).is_ok_and(|t| t > mtime);
@@ -302,7 +315,7 @@ impl Model for App {
         match self.screen {
             Screen::Config => {
                 let mut b = Doc::new();
-                b.add(title("dryserver · config")).s("\n\n");
+                b.append(theme::header("config")).s("\n\n");
                 if let Some(f) = &self.form {
                     b.append(f.view());
                 }
@@ -313,7 +326,7 @@ impl Model for App {
             Screen::Menu => {}
         }
         let mut b = Doc::new();
-        b.add(title("dryserver · laptop server installer")).s("\n\n");
+        b.append(theme::brand("your own server swarm", "one USB stick, machines that guard each other")).s("\n\n");
         self.status(&mut b);
         b.nl();
         for (i, (k, label)) in MENU.iter().enumerate() {
@@ -327,7 +340,7 @@ impl Model for App {
         if !self.notice.is_empty() {
             b.nl().s(&self.notice).nl();
         }
-        b.nl().add(dim("↑/↓ move · enter or 1-3 select · q quit")).nl();
+        b.nl().append(theme::keys(&[("↑↓", "move"), ("enter", "open"), ("1-4", "jump"), ("q", "quit")])).nl();
         b
     }
 }

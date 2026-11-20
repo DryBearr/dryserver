@@ -2,10 +2,8 @@
 
 use std::time::{Duration, Instant};
 
-use ratatui::style::Color;
-
 use super::build::Out;
-use super::{Border, Doc, Emit, Event, Flow, Key, Model, TextInput, dim, err, err_bold, ok, progress_bar, sel, title};
+use super::{Border, Doc, Emit, Event, Flow, Key, Model, TextInput, dim, err, err_bold, ok, progress_bar, sel, theme};
 use crate::ctx::Ctx;
 use crate::disks::{self, Disk, human_size};
 use crate::err::{Error, Result};
@@ -200,7 +198,7 @@ impl Flash {
 
     pub fn view(&self) -> Doc {
         let mut b = Doc::new();
-        b.add(title("dryserver · flash installer USB")).nl();
+        b.append(theme::header("flash installer USB")).nl();
         b.add(dim(format!("image: {} ({})", self.iso, human_size(self.iso_size)))).s("\n\n");
         match self.state {
             State::Selecting => self.view_select(&mut b),
@@ -230,7 +228,7 @@ impl Flash {
                 b.s(format!("  {}", d.title())).nl();
             }
         }
-        b.nl().add(dim("↑/↓ move · enter select · r rescan · q back")).nl();
+        b.nl().append(theme::keys(&[("↑↓", "move"), ("enter", "select"), ("r", "rescan"), ("q", "back")])).nl();
         b.add(dim("Internal and system disks are never listed.")).nl();
     }
 
@@ -239,9 +237,9 @@ impl Flash {
         w.add(err_bold("ALL DATA ON THIS DRIVE WILL BE DESTROYED")).s("\n\n");
         w.s(self.target.title()).nl();
         write_parts(&mut w, &self.target);
-        b.append(w.boxed(Border::Rounded, Color::LightRed, 1, 0, false)).s("\n\n");
+        b.append(w.boxed(Border::Rounded, theme::palette().ember, 1, 0, false)).s("\n\n");
         b.s("Type ").add(sel(&self.target.name)).s(" to confirm: ").append(self.input.view()).nl();
-        b.nl().add(dim("enter confirm · esc back")).nl();
+        b.nl().append(theme::keys(&[("enter", "confirm"), ("esc", "back")])).nl();
     }
 
     fn view_flashing(&self, b: &mut Doc) {
