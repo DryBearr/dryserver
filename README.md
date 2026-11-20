@@ -273,6 +273,8 @@ What dryserver sets up around every app (namespace `apps`):
 
 - nothing reaches an app unless allowed; an app takes connections on its
   port from the ingress and from your other apps,
+- an app reaches your other apps, DNS and the internet, and nothing else:
+  not the cluster's own services, not the machines,
 - a public host name makes the built-in ingress (Traefik) route that name to
   the app. The ingress has no port on any machine: what comes in from
   outside reaches it through a tunnel that runs inside the cluster,
@@ -303,8 +305,9 @@ that runs as two pods in the cluster and dials out to Cloudflare:
 cluster. `t` again after you changed the file gives the tunnel the new
 token. The token is stored in the cluster as an encrypted secret. The tunnel
 pods run as a plain user with a read-only file system, no privileges and no
-cluster credentials, from one cloudflared image pinned by its digest, and
-nothing in the cluster may connect to them.
+cluster credentials, from one cloudflared image pinned by its digest.
+Nothing in the cluster may connect to them, and they may connect only to
+Cloudflare, DNS and the ingress.
 
 ### When a machine leaves
 

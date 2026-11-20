@@ -8,6 +8,8 @@
 //!
 //! - nothing reaches a pod there unless a policy allows it; an app is
 //!   reachable from the ingress and from the other apps, on its port;
+//! - an app reaches the other apps, DNS and the internet, and nothing
+//!   else in the cluster or on the machines;
 //! - a public host name makes the ingress (Traefik) route that name to it.
 //!   What comes in from outside reaches the ingress through the tunnel;
 //! - containers may not gain privileges and get no cluster credentials.
@@ -34,6 +36,25 @@ pub const TUNNEL_TOKEN_FILE: &str = "cloudflare_tunnel_token";
 /// What the tunnel's public host names point at, in the Cloudflare
 /// dashboard: the cluster's ingress.
 pub const TUNNEL_TARGET: &str = "http://traefik.kube-system.svc.cluster.local:80";
+
+/// Addresses that are never "the internet": every private network, so
+/// the machines, the mesh and the home network whatever their numbers.
+const PRIVATE_RANGES: &str = "[10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]";
+
+/// The egress rule that lets pods ask the cluster's DNS.
+const DNS_RULE: &str = r#"    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+"#;
 
 /// One app as the admin describes it.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -104,6 +125,24 @@ metadata:
 spec:
   podSelector: {{}}
   policyTypes: [Ingress]
+---
+# What an app may reach: the other apps, the cluster's DNS and the
+# internet. Not the machines, not the cluster's own services.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: outgoing
+  namespace: {NAMESPACE}
+spec:
+  podSelector: {{}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: {{}}
+{DNS_RULE}    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: {PRIVATE_RANGES}
 ---
 # {name} takes connections on its port from the ingress and from the
 # other apps.
@@ -261,6 +300,35 @@ metadata:
 spec:
   podSelector: {{}}
   policyTypes: [Ingress]
+---
+# The tunnel may reach Cloudflare, the cluster's DNS and the ingress.
+# Nothing else: it is the one thing here that talks to the internet all
+# day.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: outgoing
+  namespace: {TUNNEL_NAMESPACE}
+spec:
+  podSelector: {{}}
+  policyTypes: [Egress]
+  egress:
+{DNS_RULE}    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: {PRIVATE_RANGES}
+      ports:
+        - port: 7844
+          protocol: TCP
+        - port: 7844
+          protocol: UDP
 ---
 apiVersion: v1
 kind: Secret
@@ -534,10 +602,20 @@ pub mod tests {
         ] {
             assert!(y.contains(want), "manifest missing {want:?}:\n{y}");
         }
-        assert_eq!(y.matches("\n---\n").count(), 5);
+        assert_eq!(y.matches("\n---\n").count(), 6);
+        // Out: the other apps, DNS, the internet; no private address.
+        let out = &y[y.find("name: outgoing").unwrap()..y.find("# blog takes connections").unwrap()];
+        for want in [
+            "policyTypes: [Egress]",
+            "- to:\n        - podSelector: {}\n",
+            "k8s-app: kube-dns",
+            "cidr: 0.0.0.0/0\n            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]",
+        ] {
+            assert!(out.contains(want), "outgoing policy missing {want:?}:\n{out}");
+        }
         // Without a public name there is no way in from outside.
         let inside = App { host: String::new(), ..app() }.manifest().unwrap();
-        assert!(!inside.contains("kind: Ingress") && inside.matches("\n---\n").count() == 4);
+        assert!(!inside.contains("kind: Ingress") && inside.matches("\n---\n").count() == 5);
     }
 
     #[test]
@@ -656,6 +734,9 @@ pub mod tests {
         for want in [
             "name: edge\n  labels:\n    pod-security.kubernetes.io/enforce: restricted",
             "policyTypes: [Ingress]",
+            "policyTypes: [Egress]",
+            "app.kubernetes.io/name: traefik",
+            "- port: 7844\n          protocol: UDP",
             &format!("token: \"{token}\""),
             "image: \"docker.io/cloudflare/cloudflared:2026.11.1@sha256:",
             "args: [\"tunnel\", \"--no-autoupdate\", \"--metrics\", \"0.0.0.0:2000\", \"run\"]",
