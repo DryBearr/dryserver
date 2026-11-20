@@ -3,7 +3,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::cidr::Cidr;
+use crate::cidr::{Cidr, parse_ip4};
 use crate::config::{self, Config};
 use crate::registry::{self, Member};
 use crate::sysconf;
@@ -90,6 +90,8 @@ pub fn wg_config(cfg: &Config, me: SelfInfo, members: &[Member]) -> String {
 }
 
 pub const HOSTS_BEGIN: &str = "# dryserver mesh begin";
+/// Suffix of a server's LAN name: node-b.lan.
+pub const LAN_SUFFIX: &str = ".lan";
 pub const HOSTS_END: &str = "# dryserver mesh end";
 
 /// /etc/hosts with the mesh block replaced by current names.
@@ -106,8 +108,18 @@ pub fn hosts(current: &str, cfg: &Config, members: &[Member]) -> String {
         }
     }
     keep.push(HOSTS_BEGIN.into());
-    for m in sorted(members) {
+    let ms = sorted(members);
+    for m in &ms {
         keep.push(format!("{} {}", ip(&cfg.wg_subnet, m.host), m.name));
+    }
+    // LAN addresses as <name>.lan. Names have no dots, so these never clash
+    // with a server name. The desktop reads them for the kill switch.
+    for m in &ms {
+        if let Some(lan) = parse_ip4(&m.lan_ip)
+            && registry::valid_name(&m.name)
+        {
+            keep.push(format!("{lan} {}{LAN_SUFFIX}", m.name));
+        }
     }
     keep.push(HOSTS_END.into());
     keep.join("\n") + "\n"
@@ -149,10 +161,13 @@ fn sorted(members: &[Member]) -> Vec<Member> {
 // ---- desktop export ----
 
 /// One mesh member as seen from the desktop.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Server {
     pub name: String,
     pub mesh_ip: String,
+    /// "" when the server's hosts block has no <name>.lan line (older
+    /// dryserver, or its LAN address is not known).
+    pub lan_ip: String,
 }
 
 /// Reads the dryserver block of a server's /etc/hosts.
@@ -172,8 +187,26 @@ pub fn parse_hosts_block(hosts: &str) -> Vec<Server> {
             _ => {}
         }
         let f: Vec<&str> = l.split_whitespace().collect();
-        if inside && f.len() == 2 {
-            out.push(Server { name: f[1].into(), mesh_ip: f[0].into() });
+        if inside && f.len() == 2 && !f[1].ends_with(LAN_SUFFIX) {
+            out.push(Server { name: f[1].into(), mesh_ip: f[0].into(), lan_ip: String::new() });
+        }
+    }
+    // Second pass: <name>.lan lines may come in any order.
+    let mut inside = false;
+    for l in hosts.split('\n') {
+        match l.trim() {
+            HOSTS_BEGIN => inside = true,
+            HOSTS_END => inside = false,
+            _ => {}
+        }
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if !inside || f.len() != 2 || parse_ip4(f[0]).is_none() {
+            continue;
+        }
+        if let Some(name) = f[1].strip_suffix(LAN_SUFFIX)
+            && let Some(s) = out.iter_mut().find(|s| s.name == name)
+        {
+            s.lan_ip = f[0].into();
         }
     }
     out
@@ -184,6 +217,11 @@ pub fn parse_hosts_block(hosts: &str) -> Vec<Server> {
 /// connection through the coordinator; the key never leaves the desktop.
 /// ForwardAgent no is explicit so a "Host *" default in ~/.ssh/config cannot
 /// turn forwarding back on.
+///
+/// Each server with a known LAN address also gets "<name>.lan": straight to
+/// that address, never through the coordinator, checked against the same
+/// pinned host key (HostKeyAlias). The kill switch uses these when the
+/// coordinator cannot be trusted.
 pub fn desktop_ssh_config(user: &str, coord_name: &str, coord_lan_ip: &str, port: &str, known_hosts: &str, servers: &[Server]) -> String {
     let port_line = if !port.is_empty() && port != "22" { format!("    Port {port}\n") } else { String::new() };
     let mut b = format!(
@@ -199,6 +237,15 @@ pub fn desktop_ssh_config(user: &str, coord_name: &str, coord_lan_ip: &str, port
         b += &format!(
             "\nHost {}\n    HostName {}\n    User {user}\n    ProxyJump {coord_name}\n    ForwardAgent no\n    UserKnownHostsFile ~/.ssh/known_hosts {known_hosts}\n",
             s.name, s.mesh_ip
+        );
+    }
+    for s in servers {
+        if s.name == coord_name || parse_ip4(&s.lan_ip).is_none() {
+            continue;
+        }
+        b += &format!(
+            "\nHost {}{LAN_SUFFIX}\n    HostName {}\n    HostKeyAlias {}\n    User {user}\n    ProxyJump none\n    ForwardAgent no\n    UserKnownHostsFile ~/.ssh/known_hosts {known_hosts}\n",
+            s.name, s.lan_ip, s.name
         );
     }
     b
@@ -283,6 +330,16 @@ mod tests {
         let out = hosts(cur, &c, &members());
         assert!(!out.contains("old-node") && out.contains("printer") && out.contains("10.66.0.3 node-c"), "hosts:\n{out}");
         assert_eq!(hosts(&out, &c, &members()), out, "hosts rewrite must be stable");
+        assert!(out.contains("192.168.1.30 node-c.lan\n") && out.contains("192.168.1.50 coord.lan\n"), "hosts:\n{out}");
+        // A coordinator can send anything: bad names and addresses never
+        // become LAN lines.
+        let mut odd = members();
+        odd[0].name = "x archlinux.org".into();
+        odd[2].lan_ip = "not-an-ip".into();
+        odd[1].lan_ip = "::ffff:192.168.1.51".into();
+        let out = hosts("", &c, &odd);
+        assert!(!out.contains("archlinux.org.lan") && !out.contains("not-an-ip"), "hosts:\n{out}");
+        assert!(out.contains("192.168.1.51 coord.lan"), "mapped IPv4 must be written plainly:\n{out}");
     }
 
     #[test]
@@ -319,6 +376,20 @@ mod tests {
             assert!(conf.contains(want), "config missing {want:?}:\n{conf}");
         }
         assert!(!conf.contains("ForwardAgent yes"), "the desktop key must never be forwarded:\n{conf}");
+        assert_eq!(servers[2].lan_ip, "192.168.1.30");
+        assert!(
+            conf.contains("Host node-c.lan\n    HostName 192.168.1.30\n    HostKeyAlias node-c\n    User admin\n    ProxyJump none\n    ForwardAgent no\n"),
+            "LAN entry:\n{conf}"
+        );
+        assert!(!conf.contains("Host coord.lan"), "the coordinator is reached by LAN address already:\n{conf}");
+        // Servers from an older coordinator have no .lan lines: no LAN entries.
+        let old = parse_hosts_block("# dryserver mesh begin\n10.66.0.1 coord\n10.66.0.2 node-b\n# dryserver mesh end\n");
+        assert!(old.iter().all(|s| s.lan_ip.is_empty()) && old.len() == 2);
+        let conf = desktop_ssh_config("admin", "coord", "192.168.1.50", "22", "kh", &old);
+        assert!(!conf.contains(".lan"), "{conf}");
+        // A .lan line for an unknown name is ignored, not added as a server.
+        let stray = parse_hosts_block("# dryserver mesh begin\n10.66.0.1 coord\n192.168.1.9 ghost.lan\n# dryserver mesh end\n");
+        assert_eq!(stray, vec![Server { name: "coord".into(), mesh_ip: "10.66.0.1".into(), lan_ip: String::new() }]);
         let kh = desktop_known_hosts(&known_hosts(&c, &members()), "coord", "192.168.1.50", "22");
         assert!(kh.contains("coord,10.66.0.1,192.168.1.50 ssh-ed25519 AAAAa\n"), "{kh}");
         assert!(kh.contains("node-c,10.66.0.3 ssh-ed25519 AAAAc\n"), "{kh}");

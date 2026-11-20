@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 use crate::cidr::Cidr;
 use crate::config::{self, Config, Port};
 use crate::err::{Context, Result};
-use crate::{errf, fsx, packages};
+use crate::{errf, fsx, packages, quarantine};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Role {
@@ -217,7 +217,11 @@ table inet dryserver {{
 		icmpv6 type echo-request accept
 	}}
 }}
-"#
+
+# Kill switch rules from "dryserver quarantine", when there are any.
+{include}
+"#,
+        include = quarantine::NFT_INCLUDE
     )
 }
 
@@ -518,6 +522,7 @@ mod tests {
             assert!(nft.contains(want), "node nftables missing {want:?}");
         }
         assert!(!nft.contains("flush ruleset"), "nftables must not flush Docker's rules");
+        assert!(nft.trim_end().ends_with(quarantine::NFT_INCLUDE), "quarantine rules must load after the main table:\n{nft}");
         assert!(!find(&coord, "/etc/nftables.conf").content.contains("ip saddr 172.16"), "lan transport must not add a switch rule");
 
         let sshd = &find(&node, "/etc/ssh/sshd_config.d/10-dryserver.conf").content;

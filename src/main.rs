@@ -16,6 +16,7 @@ mod mesh;
 mod node;
 mod owner;
 mod packages;
+mod quarantine;
 mod registry;
 mod runner;
 mod sysconf;
@@ -52,11 +53,17 @@ commands:
   flash --iso FILE    select a USB drive and write FILE to it (needs root)
   sysconf --out DIR   write the system files a server would get (for review)
   ssh-config          write ~/.ssh/config.d/dryserver so "ssh <server>" works
+  quarantine-all      kill switch: cut the coordinator off on every server,
+                      over the WiFi/router network, never through it;
+                      -name a,b cuts those members instead, -lift undoes,
+                      -status shows
 
 on servers:
   approve             coordinator: approve or reject machines, remove members
   join                ask the coordinator to join (runs at boot until approved)
   sync                update the mesh from the member list (runs every minute)
+  quarantine          cut the coordinator (or -name a,b) off this server;
+                      -lift undoes it, -status shows it
   scan                coordinator: report unknown devices on the network
   tpm-enroll          let the TPM unlock the disk again (after a firmware change)
   registry            coordinator: SSH forced command for joining machines
@@ -89,6 +96,8 @@ fn main() -> ExitCode {
         "flash" => run_flash(rest),
         "sysconf" => run_sysconf(rest),
         "ssh-config" => run_ssh_config(rest),
+        "quarantine-all" => run_quarantine_all(rest),
+        "quarantine" => run_quarantine(rest),
         "registry" => run_registry(rest),
         "join" => run_join(rest),
         "sync" => run_sync(rest),
@@ -369,6 +378,14 @@ fn run_ssh_config(args: &[String]) -> Result<()> {
     let conf = mesh::desktop_ssh_config(&cfg.username, &coord_name, &host, port, "~/.ssh/known_hosts.d/dryserver", &servers);
     fsx::write_file(&conf_path, conf, 0o600)?;
     println!("Wrote {} ({} servers) and {}.", conf_path.display(), servers.len(), kh_path.display());
+    let no_lan: Vec<&str> = servers.iter().filter(|s| s.name != coord_name && s.lan_ip.is_empty()).map(|s| s.name.as_str()).collect();
+    if !no_lan.is_empty() {
+        println!(
+            "No LAN address yet for: {} (older dryserver on the coordinator, or not synced yet).\n\
+             The kill switch (dryserver quarantine-all) cannot reach them; run ssh-config again later.",
+            no_lan.join(", ")
+        );
+    }
     if !fsx::read_or_empty(home.join(".ssh/config")).contains("config.d/") {
         println!("Add this line at the top of ~/.ssh/config to use it:\n  Include config.d/*");
     }
@@ -424,7 +441,118 @@ fn run_sync(args: &[String]) -> Result<()> {
     Flags::parse("sync", args, &[]);
     let (n, _) = server_node()?;
     let ctx = Ctx::on_signals().with_timeout(Duration::from_secs(50));
-    node::sync(&ctx, &n, is_coordinator(), &registry::Store::default_path())
+    if !node::sync(&ctx, &n, is_coordinator(), &registry::Store::default_path())? {
+        println!("quarantined: the coordinator is cut off, sync is paused (sudo dryserver quarantine -lift resumes it)");
+    }
+    Ok(())
+}
+
+const QUARANTINE_FLAGS: &[(&str, &str, &str)] = &[
+    ("name", "", "members to cut, comma separated (default: the coordinator)"),
+    ("lift", "false", "undo every cut"),
+    ("status", "false", "show what is cut"),
+];
+
+/// The -lift/-status/-name combination, checked.
+fn quarantine_action(f: &Flags) -> Result<(Vec<String>, bool, bool)> {
+    let names = quarantine::parse_names(f.get("name"))?;
+    let (lift, status) = (f.on("lift"), f.on("status"));
+    if lift && status {
+        bail!("use -lift or -status, not both");
+    }
+    if (lift || status) && !names.is_empty() {
+        bail!("-lift and -status cover every cut; they take no -name");
+    }
+    Ok((names, lift, status))
+}
+
+fn run_quarantine(args: &[String]) -> Result<()> {
+    let f = Flags::parse("quarantine", args, QUARANTINE_FLAGS);
+    let (names, lift, status) = quarantine_action(&f)?;
+    let (n, _) = server_node()?;
+    // The admin's session may run through the machine being cut and hang
+    // up half way: finish anyway. Output errors are ignored for the same
+    // reason.
+    // SAFETY: setting signal dispositions; no handlers are installed.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    let ctx = Ctx::new();
+    let mut out = std::io::stdout();
+    if status {
+        quarantine::status(&ctx, &n, &mut out)
+    } else if lift {
+        quarantine::lift(&ctx, &n, is_coordinator(), &mut out)
+    } else {
+        quarantine::cut(&ctx, &n, is_coordinator(), &names, &mut out)
+    }
+}
+
+fn run_quarantine_all(args: &[String]) -> Result<()> {
+    let f = Flags::parse("quarantine-all", args, QUARANTINE_FLAGS);
+    let (names, lift, status) = quarantine_action(&f)?;
+    if fsx::is_root() {
+        bail!("run quarantine-all as your normal user, not with sudo");
+    }
+    let home = PathBuf::from(std::env::var("HOME").map_err(|_| errf!("$HOME is not defined"))?);
+    let conf_path = home.join(".ssh/config.d/dryserver");
+    let kh_path = home.join(".ssh/known_hosts.d/dryserver");
+    let conf = fsx::read_string(&conf_path)
+        .map_err(|e| e.wrap("no server list; run dryserver ssh-config while the coordinator is still trusted"))?;
+    let all = quarantine::remotes(&conf);
+    if !all.iter().any(|r| !r.coordinator) {
+        bail!(
+            "{} has no <name>.lan entries, so no server can be reached without the coordinator.\n\
+             Run dryserver ssh-config again once the servers run this dryserver version.",
+            conf_path.display()
+        );
+    }
+    let age = std::fs::metadata(&conf_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| gotime::duration_string(d.as_secs() as i64))
+        .unwrap_or_else(|| "?".into());
+    println!("Server list: {} (written {age} ago). Servers added since then are not in it.", conf_path.display());
+    let mut action = Vec::new();
+    if lift {
+        action.push("-lift".to_string());
+    } else if status {
+        action.push("-status".to_string());
+    } else if !names.is_empty() {
+        action.extend(["-name".to_string(), names.join(",")]);
+    }
+    let targets = if lift || status { all.clone() } else { quarantine::targets(&all, &names) };
+    let mut failed = Vec::new();
+    for r in &targets {
+        println!("\n== {} ({}){}", r.name, r.addr, if r.coordinator { ", the coordinator" } else { "" });
+        let st = Command::new("ssh").args(quarantine::remote_args(r, &kh_path.display().to_string(), &action)).status();
+        match st {
+            Ok(s) if s.success() => {}
+            Ok(s) if s.code() == Some(255) => failed.push(format!("{}: cannot connect over ssh to {}", r.name, r.addr)),
+            Ok(s) => failed.push(format!("{}: {}", r.name, runner::exit_text(s))),
+            Err(e) => bail!("ssh: {e}"),
+        }
+    }
+    println!();
+    if !lift && !status && names.is_empty() {
+        println!(
+            "Next: delete the tunnel in the Cloudflare dashboard, power off the coordinator and keep its disk \
+             for investigation. Reinstall it from the USB stick before lifting."
+        );
+    }
+    if !failed.is_empty() {
+        let still = if !lift && !status && names.is_empty() {
+            "\nThese servers still trust what was cut. Power the coordinator off now, and run this again \
+             when they are reachable (each server can also run: sudo dryserver quarantine)."
+        } else {
+            ""
+        };
+        bail!("not done on {} server(s):\n  {}{still}", failed.len(), failed.join("\n  "));
+    }
+    println!("Done on {} server(s).", targets.len());
+    Ok(())
 }
 
 fn run_scan(args: &[String]) -> Result<()> {

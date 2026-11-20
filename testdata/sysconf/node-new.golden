@@ -57,6 +57,9 @@ table inet dryserver {
 		icmpv6 type echo-request accept
 	}
 }
+
+# Kill switch rules from "dryserver quarantine", when there are any.
+include "/etc/dryserver/nft.d/*.nft"
 ===== /etc/ssh/sshd_config.d/10-dryserver.conf (0644)
 # dryserver SSH hardening. Login with the admin SSH key only.
 PasswordAuthentication no

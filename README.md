@@ -25,6 +25,7 @@ approval.
 - [What gets installed](#what-gets-installed)
 - [Networks](#networks)
 - [SSH between machines](#ssh-between-machines)
+- [Kill switch](#kill-switch)
 - [Security](#security)
 - [Commands](#commands)
 - [FAQ](#faq)
@@ -173,6 +174,62 @@ scp -3 node-a:file node-b: # copy between servers through the desktop
 Add `Include config.d/*` at the top of `~/.ssh/config` if it is not there.
 Servers refuse agent forwarding even if you ask for it with `ssh -A`.
 
+`ssh-config` also writes `<name>.lan` entries, for example `ssh node-a.lan`:
+straight to the server's WiFi/router address, not through the coordinator,
+checked against the same pinned host key. The kill switch uses them.
+
+## Kill switch
+
+If you think the coordinator is hacked, cut it off from every server:
+
+```sh
+./dryserver quarantine-all     # on the desktop
+```
+
+It connects to each server over the WiFi/router network (the `.lan` entries),
+never through the coordinator, and runs `sudo dryserver quarantine` there
+(sudo asks for your password on each one). On each server that:
+
+- removes the coordinator from WireGuard,
+- drops all traffic from and to its mesh, switch and WiFi/router addresses,
+  also connections that are already open,
+- pauses sync and join, so the coordinator cannot push anything,
+- stays in place after a reboot.
+
+The servers keep running and keep talking to each other. Then:
+
+1. delete the tunnel in the Cloudflare dashboard, if you use one,
+2. power off the coordinator and keep its disk for investigation,
+3. reinstall it from the USB stick.
+
+`quarantine` also prints the WireGuard peers each server keeps. A hacked
+coordinator may have added its own; cut any you do not know by name:
+`./dryserver quarantine-all -name rogue`. The same works for a hacked server:
+it is cut off on all the others.
+
+| Command | What it does |
+|---|---|
+| `./dryserver quarantine-all` | desktop: cut the coordinator off on every server |
+| `./dryserver quarantine-all -name a,b` | desktop: cut members a and b off on every other server |
+| `./dryserver quarantine-all -status` / `-lift` | desktop: show or undo on every server |
+| `sudo dryserver quarantine [-name a,b]` | on one server |
+| `sudo dryserver quarantine -status` / `-lift` | on one server |
+
+Run `./dryserver ssh-config` again after adding servers, while the
+coordinator is still trusted: `quarantine-all` only reaches servers in that
+list. Give servers a fixed address in your router (DHCP reservation), so the
+`.lan` entries stay right.
+
+Limits for now:
+
+- `-lift` is for a false alarm. After reinstalling the coordinator its keys
+  are new, and servers have to be paired with it again (not automated yet).
+- Servers installed by an older dryserver keep the cut over a reboot only for
+  WireGuard and sync; run `quarantine` again after a reboot to block the
+  addresses too, or reinstall them.
+- The coordinator's IPv6 addresses on the WiFi/router network are not
+  blocked. WireGuard is cut, and SSH still needs your key.
+
 ## Security
 
 - **Firewall first.** The live USB accepts no incoming connections and runs no
@@ -210,6 +267,7 @@ On your desktop:
 | `./dryserver disks` | list disks and which ones may be flashed |
 | `sudo ./dryserver flash --iso FILE` | flash any image to a USB drive |
 | `./dryserver ssh-config` | SSH config for all servers |
+| `./dryserver quarantine-all` | kill switch: cut the coordinator off on every server |
 | `./dryserver install --demo` | try the laptop setup screen; changes nothing |
 
 On servers:
@@ -218,6 +276,7 @@ On servers:
 |---|---|
 | `sudo dryserver approve` | coordinator: approve or reject machines, remove members, see unknown devices |
 | `sudo dryserver tpm-enroll` | let the TPM unlock the disk again (after a firmware change) |
+| `sudo dryserver quarantine` | kill switch on this server (`-name`, `-status`, `-lift`) |
 | `dryserver sync`, `join`, `scan`, `registry` | run automatically by systemd, cron and SSH |
 
 ## FAQ

@@ -77,6 +77,19 @@ pub fn dir(path: impl AsRef<Path>) -> PathBuf {
     }
 }
 
+/// Takes an exclusive flock on path, creating it (and its directory) if
+/// needed. The lock is held until the returned file is dropped.
+pub fn lock(path: impl AsRef<Path>) -> Result<fs::File> {
+    let p = path.as_ref();
+    mkdir_all(dir(p), 0o755)?;
+    let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(p).map_err(|e| op_err("open", p, e))?;
+    // SAFETY: flock on a valid open descriptor owned by f.
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), libc::LOCK_EX) } != 0 {
+        return Err(op_err("lock", p, io::Error::last_os_error()));
+    }
+    Ok(f)
+}
+
 pub fn geteuid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }

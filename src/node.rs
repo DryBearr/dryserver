@@ -17,7 +17,7 @@ use crate::mesh::{self, SelfInfo};
 use crate::registry::{self, Member, Status, StatusReply, Store};
 use crate::runner::{Cmd, Runner};
 use crate::sysconf::{self, Params};
-use crate::{errf, fsx};
+use crate::{errf, fsx, quarantine};
 
 // Files inside the server's root.
 pub const REGISTRY_KEY: &str = "/etc/dryserver/registry_ed25519";
@@ -304,7 +304,7 @@ impl Node {
 
     /// Applies wg0.conf to the running interface without dropping
     /// connections, or starts it.
-    fn reload_wg(&self, ctx: &Ctx) -> Result<()> {
+    pub fn reload_wg(&self, ctx: &Ctx) -> Result<()> {
         if self.cmd(ctx, "systemctl", &["is-active", "--quiet", "wg-quick@wg0.service"]).is_err() {
             return self.cmd(ctx, "systemctl", &["start", "wg-quick@wg0.service"]);
         }
@@ -347,6 +347,10 @@ pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> R
         let _ = n.cmd(ctx, "agetty", &["--reload"]);
     };
     loop {
+        if quarantine::blocks_join(n) {
+            show("dryserver: quarantined, the coordinator is cut off: not joining.\nUndo with: sudo dryserver quarantine -lift");
+            return Ok(());
+        }
         let mut st = n.load_state();
         if st.request_id.is_empty() {
             let sent = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).and_then(|lan| n.request(ctx, &lan, port_link(&n.switch_mac())));
@@ -366,7 +370,16 @@ pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> R
         ));
         match n.wait(ctx, Duration::from_secs(5)) {
             Ok(r) => {
+                // A cut may have landed while waiting: check again under
+                // the mesh lock, so the coordinator's peer is never added
+                // after it.
+                let lock = fsx::lock(n.path(quarantine::MESH_LOCK))?;
+                if quarantine::blocks_join(n) {
+                    show("dryserver: quarantined, the coordinator is cut off: not joining.\nUndo with: sudo dryserver quarantine -lift");
+                    return Ok(());
+                }
                 n.activate_live(ctx, &r, params)?;
+                drop(lock);
                 show(&format!("dryserver: joined the mesh as {}", mesh::ip(&n.cfg.wg_subnet, r.host)));
                 let _ = std::fs::remove_file(n.path(ISSUE_FILE));
                 let _ = n.cmd(ctx, "agetty", &["--reload"]);
@@ -387,8 +400,13 @@ pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> R
 }
 
 /// Refreshes the mesh from the member list. Nodes ask the coordinator over
-/// the mesh; the coordinator reads its own registry.
-pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<()> {
+/// the mesh; the coordinator reads its own registry. Members cut off by
+/// `dryserver quarantine` are left out, and with the coordinator cut a node
+/// does not sync at all: false means paused.
+pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<bool> {
+    if !coordinator && quarantine::load(n)?.coordinator_cut() {
+        return Ok(false);
+    }
     let sw = port_link(&n.switch_mac());
     let mut me = SelfInfo { host: 0, switch: sw };
     let members = if coordinator {
@@ -405,8 +423,19 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<()>
         let lan = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).unwrap_or_default();
         n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw })?
     };
-    n.apply(me, &n.check_switch(ctx, me, &members))?;
-    n.reload_wg(ctx)
+    // The switch pings take up to a second each: before the lock, so a cut
+    // never waits for them.
+    let members = n.check_switch(ctx, me, &members);
+    // Check again under the lock: a cut may have landed while fetching.
+    let _lock = fsx::lock(n.path(quarantine::MESH_LOCK))?;
+    let q = quarantine::load(n)?;
+    if !coordinator && q.coordinator_cut() {
+        return Ok(false);
+    }
+    let members: Vec<Member> = members.into_iter().filter(|m| m.host == me.host || !q.blocks(m)).collect();
+    n.apply(me, &members)?;
+    n.reload_wg(ctx)?;
+    Ok(true)
 }
 
 // ---- network info ----
@@ -668,6 +697,50 @@ mod tests {
     }
 
     #[test]
+    fn sync_respects_quarantine() {
+        let (_dir, mut n, _) = setup(vec![]);
+        n.save_state(&State { host: 2, ..State::default() }).unwrap();
+        put(&n.root, WG_KEY, "PRIVKEY=\n");
+        put(&n.root, KNOWN_HOSTS, format!("192.168.1.50,10.66.0.1 {COORD_KEY}\n"));
+        let tmp = TempDir::new();
+        n.tmp_dir = Some(tmp.path().to_path_buf());
+        let fc = FakeCoord::new(&n.root, vec![]);
+        n.run = fc.clone();
+        let store = Store::new("/nonexistent");
+
+        // Coordinator cut: no contact at all, nothing rewritten.
+        put(&n.root, quarantine::STATE_FILE, r#"{"cuts":[{"name":"coord","hosts":[1],"wg_keys":["C"]}]}"#);
+        put(&n.root, WG_CONF, "untouched\n");
+        assert!(!sync(&Ctx::new(), &n, false, &store).unwrap(), "sync must report paused");
+        assert!(fc.calls.lock().unwrap().is_empty(), "sync talked to a cut coordinator");
+        assert_eq!(get(&n.root, WG_CONF), "untouched\n");
+
+        // A damaged quarantine file stops sync instead of guessing.
+        put(&n.root, quarantine::STATE_FILE, "{oops");
+        assert!(sync(&Ctx::new(), &n, false, &store).is_err());
+        assert_eq!(get(&n.root, WG_CONF), "untouched\n");
+
+        // Only a worker cut: sync runs and leaves it out, by key.
+        put(&n.root, quarantine::STATE_FILE, r#"{"cuts":[{"name":"node-x","hosts":[9],"wg_keys":["C"]}]}"#);
+        assert!(sync(&Ctx::new(), &n, false, &store).unwrap());
+        let wg = get(&n.root, WG_CONF);
+        assert!(!wg.contains("PublicKey = C\n"), "a cut key came back:\n{wg}");
+        // This server itself is never left out of its own files.
+        assert!(get(&n.root, "/etc/hosts").contains("node-a"));
+    }
+
+    #[test]
+    fn join_stops_when_quarantined() {
+        let (_dir, n, fc) = setup(vec![StatusReply { status: Status::Pending, ..StatusReply::default() }]);
+        put(&n.root, quarantine::STATE_FILE, r#"{"cuts":[{"hosts":[1]}]}"#);
+        let plan = packages::resolve(&[], &[]).unwrap();
+        let params = Params { config: n.cfg.clone(), plan, hostname: "node-a".into(), ..Params::default() };
+        join_loop(&Ctx::new(), &n, &params, &mut Vec::new()).unwrap();
+        assert!(fc.calls.lock().unwrap().is_empty(), "join asked a cut coordinator");
+        assert!(get(&n.root, ISSUE_FILE).contains("quarantined"));
+    }
+
+    #[test]
     fn sync_keeps_private_key() {
         let (_dir, mut n, _) = setup(vec![]);
         n.save_state(&State { host: 2, ..State::default() }).unwrap();
@@ -677,7 +750,7 @@ mod tests {
         n.tmp_dir = Some(tmp.path().to_path_buf());
         let fc = FakeCoord::new(&n.root, vec![]);
         n.run = fc.clone();
-        sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap();
+        assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
         let applied = fc.applied.lock().unwrap().clone();
         assert!(applied.contains("PrivateKey = PRIVKEY="), "syncconf input lost the private key:\n{applied}");
         assert!(!get(&n.root, WG_CONF).contains("PRIVKEY"), "wg0.conf must not hold the private key");
