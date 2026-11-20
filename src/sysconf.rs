@@ -512,8 +512,34 @@ table inet dryserver {{
     )
 }
 
+/// Ceiling for everything the registry account runs. Its key is on every
+/// USB stick and server, so anyone holding it can log in (to the forced
+/// command only) as often as the firewall lets them. Without a ceiling,
+/// sessions that never end use up the coordinator's memory.
+pub const REGISTRY_SLICE: &str = "# dryserver: the registry account cannot starve the coordinator.
+[Slice]
+TasksMax=200
+MemoryMax=384M
+MemorySwapMax=0
+";
+
 fn sshd(user: &str, role: Role) -> String {
     let users = if role == Role::Coordinator { format!("{user} {REGISTRY_USER}") } else { user.to_string() };
+    // Last in the file: a Match block lasts to its end.
+    let registry = if role == Role::Coordinator {
+        format!(
+            "
+# The registry account runs one short command per connection. A connection
+# with nothing running, or a command that says nothing for a minute, is
+# closed.
+Match User {REGISTRY_USER}
+	UnusedConnectionTimeout 30
+	ChannelTimeout session=60
+"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "# dryserver SSH hardening. Login with the admin SSH key only.
 PasswordAuthentication no
@@ -531,9 +557,11 @@ PermitTunnel no
 # coordinator.
 AllowAgentForwarding no
 AllowTcpForwarding yes
-ClientAliveInterval 300
-ClientAliveCountMax 2
-"
+# A client that stopped answering (switched off, cable pulled) is dropped
+# after a minute and a half.
+ClientAliveInterval 30
+ClientAliveCountMax 3
+{registry}"
     )
 }
 
@@ -892,7 +920,13 @@ mod tests {
         for want in ["PasswordAuthentication no", "PermitRootLogin no", "AllowUsers admin\n", "AllowAgentForwarding no"] {
             assert!(sshd.contains(want), "sshd missing {want:?}");
         }
-        assert!(find(&coord, "/etc/ssh/sshd_config.d/10-dryserver.conf").content.contains("AllowUsers admin dryreg"));
+        let sshd_coord = &find(&coord, "/etc/ssh/sshd_config.d/10-dryserver.conf").content;
+        assert!(sshd_coord.contains("AllowUsers admin dryreg"));
+        // Connections do not pile up: dead clients go, and the registry
+        // account's idle ones too.
+        assert!(sshd_coord.ends_with("Match User dryreg\n\tUnusedConnectionTimeout 30\n\tChannelTimeout session=60\n"), "{sshd_coord}");
+        let sshd_node = &find(&node, "/etc/ssh/sshd_config.d/10-dryserver.conf").content;
+        assert!(sshd_node.contains("ClientAliveInterval 30\nClientAliveCountMax 3\n") && !sshd_node.contains("Match"), "{sshd_node}");
 
         let sw = &find(&node, "/etc/systemd/network/10-switch.network").content;
         assert!(sw.contains("Address=172.16.66.5/24") && sw.contains("MACAddress=52:54:66:aa:bb:cc"), "{sw}");

@@ -352,6 +352,15 @@ impl Real {
         let home = format!("/var/lib/{REGISTRY_USER}");
         self.chroot(ctx, &["useradd", "--system", "-m", "-d", &home, "-s", "/bin/sh", REGISTRY_USER])?;
         self.chroot(ctx, &["passwd", "-l", REGISTRY_USER])?;
+        // systemd names a user's slice by number.
+        let passwd = fsx::read_string(self.target("/etc/passwd"))?;
+        let uid = passwd
+            .lines()
+            .map(|l| l.split(':').collect::<Vec<_>>())
+            .find(|f| f.len() > 2 && f[0] == REGISTRY_USER)
+            .and_then(|f| f[2].parse::<u32>().ok())
+            .ok_or_else(|| errf!("the account {REGISTRY_USER} was not created"))?;
+        self.write(&format!("/etc/systemd/system/user-{uid}.slice.d/50-dryserver.conf"), 0o644, sysconf::REGISTRY_SLICE)?;
         let public = fsx::read_string(format!("{}.pub", self.registry_key.display()))?;
         let line = format!("restrict,command=\"/usr/local/bin/dryserver registry --subnet {}\" {}\n", self.cfg.wg_subnet, public.trim());
         self.write(&format!("{home}/.ssh/authorized_keys"), 0o644, line)?;
@@ -538,6 +547,13 @@ mod tests {
         fn run(&self, _: &Ctx, c: &Cmd) -> (String, Result<()>) {
             self.cmds.lock().unwrap().push(c.clone());
             let last = c.args.last().cloned().unwrap_or_default();
+            // useradd --system leaves the account in the target's passwd.
+            if c.name == "arch-chroot" && c.args.iter().any(|a| a == "--system") {
+                let passwd = PathBuf::from(&c.args[0]).join("etc/passwd");
+                let _ = std::fs::create_dir_all(passwd.parent().unwrap());
+                let text = std::fs::read_to_string(&passwd).unwrap_or_default();
+                let _ = std::fs::write(&passwd, format!("{text}{last}:x:967:967::/var/lib/{last}:/bin/sh\n"));
+            }
             let ok = |s: &str| (s.to_string(), Ok(()));
             match (c.name.as_str(), c.args.first().map(String::as_str)) {
                 ("sfdisk", _) => {
@@ -774,6 +790,8 @@ mod tests {
         fr.index(&format!("arch-chroot {t} grub-install --target=i386-pc /dev/sda"));
         fr.index("mkfs.ext4 -F -q -L boot /dev/sda1");
         fr.index(&format!("arch-chroot {t} useradd --system -m -d /var/lib/dryreg -s /bin/sh dryreg"));
+        let slice = get(&r.target, "/etc/systemd/system/user-967.slice.d/50-dryserver.conf");
+        assert!(slice.contains("[Slice]\nTasksMax=200\nMemoryMax=384M\n"), "the registry account has no ceiling: {slice}");
 
         let ak = get(&r.target, "/var/lib/dryreg/.ssh/authorized_keys");
         assert!(

@@ -248,5 +248,17 @@ check "servers can read the signed list from it" grep -q "BEGIN SSH SIGNATURE" <
 out=$(screen "$S/desk" "node-c" "" 2>&1)
 check_not "the screen is clean afterwards" grep -q "NOT SIGNED\|Cannot talk" <<<"$out"
 
+echo "== connections"
+# The screen asks the coordinator every few seconds over one shared
+# connection. Open for 20 seconds (four rounds), it must not leave a
+# connection per round behind, here or on the coordinator.
+conns() { pgrep -fc "[s]sh .*-p $PORT .*-N -f" || true; }
+screen "$S/desk" "this text never shows up" "" >/dev/null 2>&1
+n=$(conns)
+if [ "$n" -le 1 ]; then ok "four rounds of the screen share one connection ($n)"; else bad "the screen left $n connections behind"; fi
+# Nobody asks any more: the shared connection ends by itself.
+for _ in $(seq 30); do [ "$(conns)" -eq 0 ] && break; sleep 1; done
+check "the shared connection ends after the screen is closed" test "$(conns)" -eq 0
+
 echo "== $pass passed, $fail failed"
 [ "$fail" = 0 ]

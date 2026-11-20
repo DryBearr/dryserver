@@ -41,6 +41,22 @@ pub const TUNNEL_TARGET: &str = "http://traefik.kube-system.svc.cluster.local:80
 /// the machines, the mesh and the home network whatever their numbers.
 const PRIVATE_RANGES: &str = "[10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]";
 
+/// How long a pod stays assigned to a server that stopped answering
+/// before the cluster starts it elsewhere. Kubernetes waits 5 minutes by
+/// itself; a dead or cut machine should cost about a minute.
+const MOVE_AFTER_SECONDS: u32 = 30;
+
+/// Pod spec lines: leave a dead server soon.
+fn tolerations() -> String {
+    let mut y = String::from("      tolerations:\n");
+    for taint in ["unreachable", "not-ready"] {
+        y += &format!(
+            "        - key: node.kubernetes.io/{taint}\n          operator: Exists\n          effect: NoExecute\n          tolerationSeconds: {MOVE_AFTER_SECONDS}\n"
+        );
+    }
+    y
+}
+
 /// The egress rule that lets pods ask the cluster's DNS.
 const DNS_RULE: &str = r#"    - to:
         - namespaceSelector:
@@ -107,6 +123,7 @@ impl App {
     pub fn manifest(&self) -> Result<String> {
         self.validate()?;
         let App { name, image, port, host, copies } = self;
+        let tolerations = tolerations();
         let mut y = format!(
             r#"apiVersion: v1
 kind: Namespace
@@ -198,7 +215,7 @@ spec:
           labelSelector:
             matchLabels:
               app: {name}
-      containers:
+{tolerations}      containers:
         - name: {name}
           image: "{image}"
           ports:
@@ -284,6 +301,7 @@ pub fn valid_tunnel_token(t: &str) -> Result<()> {
 pub fn tunnel_manifest(token: &str) -> Result<String> {
     let token = token.trim();
     valid_tunnel_token(token)?;
+    let tolerations = tolerations();
     Ok(format!(
         r#"apiVersion: v1
 kind: Namespace
@@ -368,7 +386,7 @@ spec:
           labelSelector:
             matchLabels:
               app: cloudflared
-      containers:
+{tolerations}      containers:
         - name: cloudflared
           image: "{TUNNEL_IMAGE}"
           args: ["tunnel", "--no-autoupdate", "--metrics", "0.0.0.0:2000", "run"]
@@ -592,6 +610,8 @@ pub mod tests {
             "app.kubernetes.io/name: traefik",
             "replicas: 2",
             "topologyKey: kubernetes.io/hostname",
+            "- key: node.kubernetes.io/unreachable\n          operator: Exists\n          effect: NoExecute\n          tolerationSeconds: 30\n",
+            "- key: node.kubernetes.io/not-ready\n",
             "image: \"ghcr.io/me/blog:v2\"",
             "containerPort: 8080",
             "automountServiceAccountToken: false",
@@ -742,6 +762,7 @@ pub mod tests {
             "args: [\"tunnel\", \"--no-autoupdate\", \"--metrics\", \"0.0.0.0:2000\", \"run\"]",
             "path: /ready",
             "topologyKey: kubernetes.io/hostname",
+            "tolerationSeconds: 30",
             "runAsNonRoot: true",
             "readOnlyRootFilesystem: true",
             "drop: [\"ALL\"]",

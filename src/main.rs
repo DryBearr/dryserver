@@ -463,6 +463,13 @@ fn run_registry(args: &[String]) -> Result<()> {
     // from the caller: what the caller asks for is SSH_ORIGINAL_COMMAND.
     let f = Flags::parse("registry", args, &[("subnet", "", "mesh subnet"), ("root", "/", "directory holding this server's files")]);
     let root = Path::new(f.get("root"));
+    // Every command here is a read or a small write. A caller that sends
+    // nothing, or never finishes, does not get to keep a session.
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(30));
+        eprintln!("dryserver: registry command took too long");
+        std::process::exit(1);
+    });
     let host_key = fsx::read_string(fsx::under(root, "/etc/ssh/ssh_host_ed25519_key.pub"))?;
     let env = |k: &str| std::env::var(k).unwrap_or_default();
     registry::serve(

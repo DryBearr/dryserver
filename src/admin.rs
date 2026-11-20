@@ -74,15 +74,41 @@ impl SshLink {
 
     /// Where the shared connection's socket goes: the user's private
     /// runtime directory. None without one (then every call connects).
-    fn control_path() -> Option<String> {
+    ///
+    /// The name carries which key file and which pinned host key file the
+    /// connection was made with. A connection is checked against the
+    /// pinned key once, when it is made: one made from another directory
+    /// (another stick's secrets) must never be reused here.
+    fn control_path(&self) -> Option<String> {
         let dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
-        Some(format!("ControlPath={}", Path::new(&dir).join("dryserver-%C").display()))
+        let full = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let mut id: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in
+            full(&self.key).as_os_str().as_encoded_bytes().iter().chain(&[0]).chain(full(&self.known_hosts).as_os_str().as_encoded_bytes())
+        {
+            id = (id ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+        }
+        Some(format!("ControlPath={}", Path::new(&dir).join(format!("dryserver-%C-{id:016x}")).display()))
     }
 
     /// The host as known_hosts writes it.
     fn known_name(&self) -> String {
         if self.port.is_empty() || self.port == "22" { self.host.clone() } else { format!("[{}]:{}", self.host, self.port) }
     }
+}
+
+/// At most one try to start the shared connection per half minute,
+/// whatever the check says: a second guard against piling up connections.
+fn master_due() -> bool {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+        return false;
+    }
+    *last = Some(Instant::now());
+    true
 }
 
 impl Link for SshLink {
@@ -98,13 +124,20 @@ impl Link for SshLink {
         // attached: one that inherits our pipes would keep every call
         // waiting until it exits. Without a master the call connects by
         // itself and reports what is wrong.
-        if let Some(ctl) = Self::control_path() {
+        if let Some(ctl) = self.control_path() {
             let quiet =
                 |c: &mut Command| c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
-            if !quiet(Command::new("ssh").args(["-O", "check", "-o", &ctl]).arg(&target)) {
-                quiet(
-                    Command::new("ssh").args(self.options()).args(["-M", "-N", "-f", "-o", "ControlPersist=20", "-o", &ctl]).arg(&target),
-                );
+            // The check and the master get the same options. The socket's
+            // name (%C) is made from host, port and user: a check that
+            // looks under another name never finds the master, and every
+            // call would leave one more connection that never ends.
+            let mux = |extra: &[&str]| {
+                let mut c = Command::new("ssh");
+                c.args(self.options()).args(["-o", &ctl]).args(extra).arg(&target);
+                c
+            };
+            if !quiet(&mut mux(&["-O", "check"])) && master_due() {
+                quiet(&mut mux(&["-M", "-N", "-f", "-o", "ControlPersist=20"]));
             }
             cmd.args(["-o", "ControlMaster=no", "-o", &ctl]);
         }

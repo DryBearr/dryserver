@@ -195,8 +195,10 @@ PermitTunnel no
 # coordinator.
 AllowAgentForwarding no
 AllowTcpForwarding yes
-ClientAliveInterval 300
-ClientAliveCountMax 2
+# A client that stopped answering (switched off, cable pulled) is dropped
+# after a minute and a half.
+ClientAliveInterval 30
+ClientAliveCountMax 3
 ===== /home/admin/.ssh/authorized_keys (0600)
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest desktop
 ===== /etc/sudoers.d/10-wheel (0440)
