@@ -112,6 +112,17 @@ pub fn target(tunnel: &str) -> String {
     format!("{tunnel}.cfargotunnel.com")
 }
 
+/// What a token step replaces: the admin must see it before saying y.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Was {
+    Nothing,
+    /// The token of an older tunnel dryserver (deleted in the dashboard).
+    Older,
+    /// The token of a tunnel that is not the tunnel dryserver: one set up
+    /// by hand.
+    Other,
+}
+
 /// One change to make.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
@@ -119,9 +130,9 @@ pub enum Step {
     /// Route these host names (sorted) through the tunnel, 404 for the rest.
     PutConfig(Vec<String>),
     /// Save the tunnel's token in secrets/.
-    SaveToken,
+    SaveToken(Was),
     /// Run cloudflared in the cluster with the tunnel's token.
-    Connect,
+    Connect(Was),
     Delete {
         zone: String,
         id: String,
@@ -132,25 +143,40 @@ pub enum Step {
         zone: String,
         name: String,
     },
-    /// Point a record of ours at the tunnel, proxied.
+    /// Point a record at the tunnel, proxied and marked: one of ours, or
+    /// (from not empty, what it was) one taken over in place.
     Repoint {
         zone: String,
         id: String,
         name: String,
+        from: String,
     },
 }
 
 impl Step {
     pub fn describe(&self) -> String {
+        let file = cloudflare::TOKEN_FILE;
         match self {
             Step::CreateTunnel => format!("create the tunnel {TUNNEL_NAME} in Cloudflare"),
             Step::PutConfig(hosts) if hosts.is_empty() => "route no name through the tunnel (every request gets 404)".into(),
             Step::PutConfig(hosts) => format!("route {} through the tunnel", hosts.join(", ")),
-            Step::SaveToken => format!("save the tunnel's token in secrets/{}", cloudflare::TOKEN_FILE),
-            Step::Connect => "start the tunnel in the cluster with its token".into(),
+            Step::SaveToken(Was::Nothing) => format!("save the tunnel's token in secrets/{file}"),
+            Step::SaveToken(Was::Older) => format!("replace the older tunnel's token in secrets/{file} with this tunnel's"),
+            Step::SaveToken(Was::Other) => {
+                format!("replace the token in secrets/{file}, of a tunnel that is not {TUNNEL_NAME}, with the token of {TUNNEL_NAME}")
+            }
+            Step::Connect(Was::Nothing) => "start the tunnel in the cluster with its token".into(),
+            Step::Connect(Was::Older) => format!("switch the cluster from an older tunnel {TUNNEL_NAME} to this one"),
+            Step::Connect(Was::Other) => format!(
+                "switch the cluster from the tunnel it runs now (not {TUNNEL_NAME}) to {TUNNEL_NAME}: names routed to the old one in \
+                 the dashboard stop working"
+            ),
             Step::Delete { name, why, .. } => format!("delete the DNS record of {name} ({why})"),
             Step::Create { name, .. } => format!("add {name} to DNS, pointing at the tunnel"),
-            Step::Repoint { name, .. } => format!("point {name} at the tunnel"),
+            Step::Repoint { name, from, .. } if from.is_empty() => format!("point {name} at the tunnel"),
+            Step::Repoint { name, from, .. } => {
+                format!("take {name} over: change its {from} into a record pointing at the tunnel (it keeps resolving)")
+            }
         }
     }
 }
@@ -241,7 +267,11 @@ pub fn plan(seen: &Seen, want: &Want, open: bool) -> Plan {
     let dryserver = |t: &str| cloudflare::tunnel_of(t).is_some_and(|id| seen.tunnels.iter().any(|x| x.id == id));
     if token.is_none() || seen.saved_token != token {
         if open || seen.saved_token.as_deref().is_none_or(dryserver) {
-            p.steps.push(Step::SaveToken);
+            p.steps.push(Step::SaveToken(match seen.saved_token.as_deref() {
+                None => Was::Nothing,
+                Some(s) if dryserver(s) => Was::Older,
+                Some(_) => Was::Other,
+            }));
         } else {
             p.notes
                 .push(format!("secrets/{} holds the token of another tunnel; s on the Outside screen replaces it", cloudflare::TOKEN_FILE));
@@ -253,16 +283,16 @@ pub fn plan(seen: &Seen, want: &Want, open: bool) -> Plan {
         Some(m) => {
             let runs_ours = seen.saved_token.as_deref().is_some_and(|s| cloudflare::token_mark(s) == *m && dryserver(s));
             if open || runs_ours {
-                p.steps.push(Step::Connect);
+                p.steps.push(Step::Connect(if runs_ours { Was::Older } else { Was::Other }));
             } else {
                 p.notes.push(format!("the cluster runs another tunnel; s on the Outside screen switches it to the tunnel {TUNNEL_NAME}"));
             }
         }
-        None if open => p.steps.push(Step::Connect),
+        None if open => p.steps.push(Step::Connect(Was::Nothing)),
         None => p.notes.push("the tunnel is closed in the cluster; s on the Outside screen opens it".into()),
     }
-    // DNS, name by name.
-    let mut takeovers = Vec::new();
+    // DNS, name by name; a name's changes stay together, in the order
+    // they must be made.
     let mut fixes = Vec::new();
     for (host, app, zone) in &routed {
         let at: Vec<&Record> = seen
@@ -273,8 +303,21 @@ pub fn plan(seen: &Seen, want: &Want, open: bool) -> Plan {
         let (mine, theirs): (Vec<&Record>, Vec<&Record>) = at.into_iter().partition(|r| seen.ours(r));
         if !theirs.is_empty() {
             if want.takeover.iter().any(|t| t == host) {
+                // One CNAME is changed into ours in one step: the name
+                // never stops resolving.
+                if let ([r], true) = (theirs.as_slice(), mine.is_empty())
+                    && r.kind == "CNAME"
+                {
+                    fixes.push(Step::Repoint { zone: r.zone.clone(), id: r.id.clone(), name: r.name.clone(), from: holder(r) });
+                    continue;
+                }
+                // A CNAME shares its name with no other record, so ours
+                // can only be added once theirs are gone: until then the
+                // name does not resolve. Ours is added right after.
+                let gap = if mine.is_empty() { "; the name does not resolve until the tunnel's record is added next" } else { "" };
                 for r in &theirs {
-                    takeovers.push(Step::Delete { zone: r.zone.clone(), id: r.id.clone(), name: r.name.clone(), why: "taken over".into() });
+                    let why = format!("{}, taken over{gap}", holder(r));
+                    fixes.push(Step::Delete { zone: r.zone.clone(), id: r.id.clone(), name: r.name.clone(), why });
                 }
             } else if mine.is_empty()
                 && theirs.len() == 1
@@ -284,7 +327,9 @@ pub fn plan(seen: &Seen, want: &Want, open: bool) -> Plan {
                 p.notes.push(format!("{host} already points at the tunnel (a record made in the dashboard); left as it is"));
                 continue;
             } else {
-                p.conflicts.push(Conflict { host: host.to_string(), app: app.to_string(), holder: holder(theirs[0]) });
+                // Every record a takeover would delete is named.
+                let holder = theirs.iter().map(|r| holder(r)).collect::<Vec<_>>().join(" and ");
+                p.conflicts.push(Conflict { host: host.to_string(), app: app.to_string(), holder });
                 continue;
             }
         }
@@ -292,7 +337,9 @@ pub fn plan(seen: &Seen, want: &Want, open: bool) -> Plan {
         let keep = mine.iter().find(|r| good(r)).or(mine.first());
         match keep {
             None => fixes.push(Step::Create { zone: zone.id.clone(), name: host.to_string() }),
-            Some(r) if !good(r) => fixes.push(Step::Repoint { zone: r.zone.clone(), id: r.id.clone(), name: r.name.clone() }),
+            Some(r) if !good(r) => {
+                fixes.push(Step::Repoint { zone: r.zone.clone(), id: r.id.clone(), name: r.name.clone(), from: String::new() })
+            }
             Some(_) => {}
         }
         for r in mine.iter().filter(|r| Some(r.id.as_str()) != keep.map(|k| k.id.as_str())) {
@@ -311,7 +358,6 @@ pub fn plan(seen: &Seen, want: &Want, open: bool) -> Plan {
             stale.push(Step::Delete { zone: r.zone.clone(), id: r.id.clone(), name: r.name.clone(), why: "no app uses it".into() });
         }
     }
-    p.steps.extend(takeovers);
     p.steps.extend(fixes);
     p.steps.extend(stale);
     p
@@ -527,8 +573,8 @@ pub fn apply(api: &Api, ctx: &Ctx, c: &dyn Cluster, seen: &Seen, steps: &[Step],
                         NEED_TUNNEL,
                     )?;
                 }
-                Step::SaveToken => save_token(token_file, token.as_deref().ok_or_else(|| errf!("no tunnel token"))?)?,
-                Step::Connect => cloudflare::connect_tunnel(ctx, c, token.as_deref().ok_or_else(|| errf!("no tunnel token"))?)?,
+                Step::SaveToken(_) => save_token(token_file, token.as_deref().ok_or_else(|| errf!("no tunnel token"))?)?,
+                Step::Connect(_) => cloudflare::connect_tunnel(ctx, c, token.as_deref().ok_or_else(|| errf!("no tunnel token"))?)?,
                 Step::Delete { zone, id, .. } => {
                     let _: serde_json::Value = api.delete(&format!("/zones/{zone}/dns_records/{id}"), NEED_DNS)?;
                 }
@@ -536,7 +582,7 @@ pub fn apply(api: &Api, ctx: &Ctx, c: &dyn Cluster, seen: &Seen, steps: &[Step],
                     let _: serde_json::Value =
                         api.send("POST", &format!("/zones/{zone}/dns_records"), &record(name, &tunnel()?), NEED_DNS)?;
                 }
-                Step::Repoint { zone, id, name } => {
+                Step::Repoint { zone, id, name, .. } => {
                     let _: serde_json::Value =
                         api.send("PUT", &format!("/zones/{zone}/dns_records/{id}"), &record(name, &tunnel()?), NEED_DNS)?;
                 }
@@ -574,9 +620,16 @@ impl Sync<'_> {
         let seen = look(&api, saved, self.cluster_mark.clone())?;
         let p = plan(&seen, want, open);
         let mut r = super::Report { conflicts: p.conflicts, notes: p.notes, changes: Vec::new(), held: p.held };
+        let steps: Vec<String> = p.steps.iter().map(Step::describe).collect();
         if dry {
-            r.changes = p.steps.iter().map(Step::describe).collect();
+            r.changes = steps;
             return Ok(r);
+        }
+        // What the admin said y to is what is made: when Cloudflare, the
+        // cluster or the apps changed since the look, the plan is another
+        // one, and none of it is made unseen.
+        if want.confirmed.as_ref().is_some_and(|c| *c != steps) {
+            bail!("something changed since you looked, so nothing was changed. s looks again");
         }
         let (done, err) = apply(&api, ctx, c, &seen, &p.steps, self.token_file);
         r.changes = done;
@@ -973,7 +1026,8 @@ pub mod tests {
         let r = w.sync(&names, false).unwrap();
         assert_eq!(r.conflicts.len(), 1, "{r:?}");
         assert_eq!((r.conflicts[0].host.as_str(), r.conflicts[0].app.as_str()), ("blog.example.com", "blog"));
-        assert!(r.conflicts[0].holder.starts_with("A record 203.0.113.7") || r.conflicts[0].holder.starts_with("AAAA record"), "{r:?}");
+        // Every record a takeover would delete is named.
+        assert_eq!(r.conflicts[0].holder, "A record 203.0.113.7 and AAAA record 2001:db8::7", "{r:?}");
         let id = w.live();
         let recs = w.records();
         assert!(
@@ -983,13 +1037,69 @@ pub mod tests {
         assert_eq!(recs.len(), 3);
         // Running again does not touch it either.
         assert!(w.sync(&names, false).unwrap().changes.is_empty());
-        // The admin confirms the takeover: theirs go first, then ours.
+        // The admin confirms the takeover. A CNAME shares its name with no
+        // other record: theirs go first, ours right after, and each step
+        // says the name does not resolve in between.
         let mut take = names.clone();
         take.takeover = vec!["blog.example.com".into()];
+        let gap = "; the name does not resolve until the tunnel's record is added next)";
+        assert_eq!(
+            w.sync(&take, true).unwrap().changes,
+            vec![
+                format!("delete the DNS record of blog.example.com (A record 203.0.113.7, taken over{gap}"),
+                format!("delete the DNS record of blog.example.com (AAAA record 2001:db8::7, taken over{gap}"),
+                "add blog.example.com to DNS, pointing at the tunnel".to_string(),
+            ]
+        );
         let r = w.sync(&take, false).unwrap();
         assert!(r.conflicts.is_empty() && r.changes.len() == 3, "{r:?}");
         assert_eq!(w.records(), vec![ours("blog.example.com", &id), ours("shop.example.com", &id)]);
         assert!(w.sync(&names, false).unwrap().changes.is_empty());
+    }
+
+    #[test]
+    fn a_cname_is_taken_over_in_place() {
+        // One CNAME of someone else's: changed into ours in one step, so
+        // the name never stops resolving.
+        let w = World::new();
+        w.add("blog.example.com", "CNAME", "blog.example.net", "");
+        let names = want(&["blog.example.com"]);
+        let r = w.sync(&names, false).unwrap();
+        assert_eq!(r.conflicts[0].holder, "CNAME record blog.example.net", "{r:?}");
+        let id = w.live();
+        let before: Vec<String> = w.cf.cf.lock().unwrap().records.iter().map(|r| r.id.clone()).collect();
+        let take = Want { takeover: vec!["blog.example.com".into()], ..names.clone() };
+        let r = w.sync(&take, false).unwrap();
+        assert_eq!(
+            r.changes,
+            vec![
+                "take blog.example.com over: change its CNAME record blog.example.net into a record pointing at the tunnel (it keeps resolving)"
+            ]
+        );
+        assert!(!w.cf.calls.lock().unwrap().iter().any(|c| c.starts_with("DELETE")), "nothing deleted");
+        assert_eq!(w.records(), vec![ours("blog.example.com", &id)]);
+        let after: Vec<String> = w.cf.cf.lock().unwrap().records.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(before, after, "the same record, changed");
+        assert!(w.sync(&names, false).unwrap().changes.is_empty());
+    }
+
+    #[test]
+    fn what_was_confirmed_is_what_is_made() {
+        // The admin saw a plan and said y; meanwhile someone added a
+        // record. The plan now differs: nothing is made unseen.
+        let w = World::new();
+        let names = want(&["blog.example.com"]);
+        let seen = w.sync(&names, true).unwrap().changes;
+        w.add("shop.example.com", "CNAME", &target("11111111-2222-4333-8444-555555555555"), MARK);
+        let mut other = want(&["blog.example.com", "shop.example.com"]);
+        other.confirmed = Some(seen.clone());
+        let e = w.sync(&other, false).unwrap_err().to_string();
+        assert!(e.contains("something changed since you looked, so nothing was changed"), "{e}");
+        assert_eq!(w.cf.changes.load(SeqCst), 0);
+        assert!(w.cluster.calls.lock().unwrap().is_empty() && !w.token_file().exists());
+        // The same plan: made.
+        let yes = Want { confirmed: Some(seen.clone()), ..names.clone() };
+        assert_eq!(w.sync(&yes, false).unwrap().changes, seen);
     }
 
     #[test]
@@ -1024,7 +1134,7 @@ pub mod tests {
         assert_ne!(old, new);
         assert!(r.changes.contains(&"create the tunnel dryserver in Cloudflare".to_string()), "{r:?}");
         assert!(r.changes.contains(&"point blog.example.com at the tunnel".to_string()), "our record follows the new tunnel: {r:?}");
-        assert!(r.changes.contains(&"start the tunnel in the cluster with its token".to_string()), "{r:?}");
+        assert!(r.changes.contains(&"switch the cluster from an older tunnel dryserver to this one".to_string()), "{r:?}");
         assert_eq!(w.records(), vec![ours("blog.example.com", &new)]);
         assert_eq!(std::fs::read_to_string(w.token_file()).unwrap().trim(), token_of(&new));
         assert!(w.sync(&names, false).unwrap().changes.is_empty());
@@ -1105,14 +1215,19 @@ pub mod tests {
         assert_eq!(w.cf.changes.load(SeqCst), before);
         assert!(w.records().is_empty());
         let r = w.sync_with(&names, true, other, false).unwrap();
-        assert!(r.changes.iter().any(|c| c.contains("start the tunnel")), "{r:?}");
+        assert!(
+            r.changes.iter().any(|c| c.starts_with("switch the cluster from the tunnel it runs now (not dryserver) to dryserver")),
+            "the switch is named as one: {r:?}"
+        );
         assert_eq!(w.records(), vec![ours("blog.example.com", &w.live())]);
         // The cluster runs an older dryserver tunnel (deleted in the
         // dashboard): that one is replaced without asking.
         w.cf.cf.lock().unwrap().tunnels[0].2 = true;
         let r = w.sync_with(&names, false, mark_of(&w.cluster), false).unwrap();
         assert!(
-            r.changes.iter().any(|c| c.contains("start the tunnel")) && r.changes.iter().any(|c| c.contains("save the tunnel")),
+            r.changes.contains(&"switch the cluster from an older tunnel dryserver to this one".to_string())
+                && r.changes
+                    .contains(&"replace the older tunnel's token in secrets/cloudflare_tunnel_token with this tunnel's".to_string()),
             "{r:?}"
         );
         assert_eq!(mark_of(&w.cluster), Some(cloudflare::token_mark(&token_of(&w.live()))));
@@ -1137,8 +1252,16 @@ pub mod tests {
         // Nothing in Cloudflare either: no tunnel dryserver, no DNS name
         // that no connector would serve.
         assert_eq!(w.cf.changes.load(SeqCst), 0);
+        // s shows both replacements as what they are.
         let plan = w.sync_with(&want(&["blog.example.com"]), true, mark, true).unwrap();
-        assert!(plan.changes.iter().any(|c| c.contains("save the tunnel")) && plan.changes.iter().any(|c| c.contains("start the tunnel")));
+        assert!(
+            plan.changes.contains(
+                &"replace the token in secrets/cloudflare_tunnel_token, of a tunnel that is not dryserver, with the token of dryserver"
+                    .to_string()
+            ),
+            "{plan:?}"
+        );
+        assert!(plan.changes.iter().any(|c| c.contains("names routed to the old one in the dashboard stop working")), "{plan:?}");
         assert_eq!(cloudflare::tunnel_of(&manual).as_deref(), Some("99999999-9999-4999-8999-999999999999"));
         assert_eq!(cloudflare::tunnel_of("not base64 at all"), None);
     }

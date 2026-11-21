@@ -373,8 +373,11 @@ dashboard.
 2. Save the token on your computer as `secrets/cloudflare_api_token` and
    make it yours alone: `chmod 600 secrets/cloudflare_api_token`. dryserver
    refuses it while other users can read it.
-3. In `./dryserver outside` press `s` on the Cloudflare Tunnel. It shows
-   what it would change; `y` makes the changes.
+3. In `./dryserver outside` press `s` on the Cloudflare Tunnel. It lists
+   every change it would make, in order (`↑↓` scrolls a long list): a
+   token it replaces and a tunnel it switches the cluster to are named as
+   such. `y` makes exactly those; when something changed since the look,
+   it makes none and says so.
 
 What `s` does, every time, so running it again changes nothing and a run
 cut off half way is finished by the next one:
@@ -395,8 +398,12 @@ cut off half way is finished by the next one:
 dryserver only ever changes or deletes DNS records that carry that comment
 and point at a dryserver tunnel of your account. A record of the same name
 that points elsewhere (your home IP, another service) is shown as held by
-something else and left alone; `t` takes the name over after you confirm,
-deleting that record. When a call is refused, the message names the
+something else (every record there is named) and left alone. `t` takes
+the name over: like `s`, it lists every change first and asks. A single
+CNAME is changed into dryserver's in place, so the name keeps resolving.
+Other records are deleted first and dryserver's CNAME is added right
+after: a CNAME shares its name with no other record, so the name does not
+resolve for that moment, and the list says so. When a call is refused, the message names the
 permission the token lacks. When Cloudflare is down, nothing is changed and
 the running tunnel keeps working. With the API token saved, starting or
 removing an app with a Cloudflare host name syncs by itself, but only while

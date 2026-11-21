@@ -453,6 +453,9 @@ mod tests {
         w.open = true;
         let r = e.sync(&Ctx::new(), &Fake::default(), &seen, &w, true).unwrap();
         assert!(r.changes.iter().any(|c| c.contains("create the tunnel dryserver")), "{r:?}");
-        assert!(r.changes.iter().any(|c| c.contains("start the tunnel")), "the cluster runs another token: {r:?}");
+        assert!(
+            r.changes.iter().any(|c| c.contains("switch the cluster from the tunnel it runs now")),
+            "the cluster runs another token: {r:?}"
+        );
     }
 }

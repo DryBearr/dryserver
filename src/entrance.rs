@@ -90,6 +90,9 @@ pub struct Want {
     /// Start the entrance where it does not run: the admin asked for a
     /// set up. A sync after an app changed leaves a closed one closed.
     pub open: bool,
+    /// The changes the admin was shown and said y to, in order. A sync
+    /// that would now make other changes makes none.
+    pub confirmed: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

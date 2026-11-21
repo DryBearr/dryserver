@@ -34,15 +34,27 @@ pub enum Msg {
     Loaded(Result<Look>),
     /// A change ended: what to tell the admin.
     Done(String),
-    /// A sync ran: for this entrance, dry or not.
-    Synced(usize, bool, Result<Report>),
+    /// A sync ran: for this entrance, dry or not, taking over these names.
+    Synced {
+        door: usize,
+        dry: bool,
+        takeover: Vec<String>,
+        res: Result<Report>,
+    },
 }
 
 enum Job {
     Load,
     Open(usize),
     Close(usize),
-    Sync { door: usize, dry: bool, takeover: Vec<String> },
+    /// confirmed: the changes the admin was shown and said y to; a plan
+    /// that differs by then makes none of them.
+    Sync {
+        door: usize,
+        dry: bool,
+        takeover: Vec<String>,
+        confirmed: Option<Vec<String>>,
+    },
 }
 
 const LOADING: &str = "asking the coordinator";
@@ -78,20 +90,39 @@ fn run(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, limits: Limits, job: Job) 
                 Err(e) => format!("{} not closed: {}", d.title(), timed(e, limits.change)),
             })
         }
-        Job::Sync { door, dry, takeover } => {
+        Job::Sync { door, dry, takeover, confirmed } => {
             let res = (|| {
                 let d = doors.get(door).ok_or_else(|| Error::new("no such entrance"))?;
                 // What the apps want now, not what the screen saw a while ago.
                 let o = apps::overview(&ctx.with_timeout(limits.read), c).map_err(|e| timed(e, limits.read))?;
                 let (wants, _) = entrance::wants(&o.apps);
                 let mut want = wants.get(d.id()).cloned().unwrap_or_default();
-                want.takeover = takeover;
+                want.takeover = takeover.clone();
+                want.confirmed = confirmed;
                 // The admin asked for it: a closed entrance opens.
                 want.open = true;
                 d.sync(&change, c, &o, &want, dry).map_err(|e| timed(e, limits.change))
             })();
-            Msg::Synced(door, dry, res)
+            Msg::Synced { door, dry, takeover, res }
         }
+    }
+}
+
+/// A question waiting for "y", and what then happens.
+struct Confirm {
+    question: String,
+    /// The changes y makes, in order. Shown in full before y (scrolled
+    /// with the arrows when they do not fit): a sync may replace a token
+    /// or switch the cluster's tunnel, and the admin must see that.
+    steps: Vec<String>,
+    job: Job,
+    /// The first line of steps on screen.
+    scroll: usize,
+}
+
+impl Confirm {
+    fn new(question: String, job: Job) -> Confirm {
+        Confirm { question, steps: Vec::new(), job, scroll: 0 }
     }
 }
 
@@ -106,14 +137,14 @@ pub struct Screen {
     seen: Option<Instant>,
     err: Option<Error>,
     cursor: usize,
-    /// A question waiting for "y", and what then happens.
-    confirm: Option<(String, Job)>,
+    confirm: Option<Confirm>,
     pub notice: String,
     /// The last sync's report, for the entrance it belongs to.
     report: Option<(usize, bool, Report)>,
     last_load: Option<Instant>,
     quit_armed: bool,
     width: usize,
+    height: usize,
     /// Where to go after this screen closes.
     pub next: Option<Place>,
 }
@@ -137,6 +168,7 @@ impl Screen {
             last_load: None,
             quit_armed: false,
             width: 80,
+            height: 24,
             next: None,
         }
     }
@@ -185,20 +217,30 @@ impl Screen {
                 self.quit_armed = false;
                 self.load();
             }
-            Msg::Synced(door, dry, Ok(r)) => {
+            Msg::Synced { door, dry, takeover, res: Ok(r) } => {
                 let title = self.doors.get(door).map(|d| d.title()).unwrap_or("?");
                 self.notice = format!("{title}: {}.", r.summary(dry));
                 if dry && !r.changes.is_empty() {
-                    let q = format!("{title}: {}. Make them? y to confirm", r.summary(true));
-                    self.confirm = Some((q, Job::Sync { door, dry: false, takeover: Vec::new() }));
+                    // Every step is shown before y, and y makes exactly
+                    // those (confirmed), or nothing.
+                    let question = match takeover.as_slice() {
+                        [host] => format!("Take {host} over? {title} makes these changes, in order:"),
+                        _ => format!("{title}: {}, in order:", r.summary(true)),
+                    };
+                    let job = Job::Sync { door, dry: false, takeover: takeover.clone(), confirmed: Some(r.changes.clone()) };
+                    self.confirm = Some(Confirm { steps: r.changes.clone(), ..Confirm::new(question, job) });
                 }
-                self.report = Some((door, dry, r));
+                // A takeover's look keeps the last report: said no to, the
+                // name is still held, and t still offers it.
+                if !dry || takeover.is_empty() {
+                    self.report = Some((door, dry, r));
+                }
                 if !dry {
                     self.quit_armed = false;
                     self.load();
                 }
             }
-            Msg::Synced(door, dry, Err(e)) => {
+            Msg::Synced { door, dry, res: Err(e), .. } => {
                 let title = self.doors.get(door).map(|d| d.title()).unwrap_or("?");
                 self.notice = if dry { format!("{title}: cannot look: {e}") } else { format!("{title}: not synced: {e}") };
                 self.report = None;
@@ -222,13 +264,43 @@ impl Screen {
         }
     }
 
+    /// The plan's lines as shown, and how many fit on the screen.
+    fn plan_lines(&self, c: &Confirm) -> (Vec<String>, usize) {
+        let width = self.width.saturating_sub(4);
+        let mut lines = Vec::new();
+        for (i, s) in c.steps.iter().enumerate() {
+            let text = wrap(&format!("{:>3}. {s}", i + 1), width.saturating_sub(5));
+            for (j, l) in text.lines().enumerate() {
+                lines.push(if j == 0 { format!("  {l}") } else { format!("       {l}") });
+            }
+        }
+        // The header, the question, the scroll line and the keys take
+        // the rest.
+        let room = self.height.saturating_sub(4 + wrap(&c.question, width).lines().count() + 4).max(3);
+        (lines, room)
+    }
+
     fn key(&mut self, k: Key) -> Flow {
-        if let Some((_, job)) = self.confirm.take() {
-            if k == Key::Char('y') {
-                self.notice.clear();
-                self.send(job);
-            } else {
-                self.notice = "Nothing changed.".into();
+        if let Some(mut c) = self.confirm.take() {
+            let (lines, room) = self.plan_lines(&c);
+            let last = lines.len().saturating_sub(room);
+            let scroll = match k {
+                Key::Up | Key::Char('k') => Some(c.scroll.saturating_sub(1)),
+                Key::Down | Key::Char('j') => Some((c.scroll + 1).min(last)),
+                Key::PageUp => Some(c.scroll.saturating_sub(room)),
+                Key::PageDown | Key::Char(' ') => Some((c.scroll + room).min(last)),
+                _ => None,
+            };
+            match scroll {
+                Some(s) if !c.steps.is_empty() => {
+                    c.scroll = s;
+                    self.confirm = Some(c);
+                }
+                _ if k == Key::Char('y') => {
+                    self.notice.clear();
+                    self.send(c.job);
+                }
+                _ => self.notice = "Nothing changed.".into(),
             }
             return Flow::Continue;
         }
@@ -259,7 +331,7 @@ impl Screen {
             Key::Char('o') => {
                 self.notice.clear();
                 match self.doors.get(self.cursor).map(|d| d.open_question(&self.now)) {
-                    Some(Ok(q)) => self.confirm = Some((q, Job::Open(self.cursor))),
+                    Some(Ok(q)) => self.confirm = Some(Confirm::new(q, Job::Open(self.cursor))),
                     Some(Err(e)) => self.notice = e.to_string(),
                     None => {}
                 }
@@ -290,23 +362,22 @@ impl Screen {
                         if users.len() == 1 { "it" } else { "them" }
                     )
                 };
-                self.confirm = Some((q, Job::Close(self.cursor)));
+                self.confirm = Some(Confirm::new(q, Job::Close(self.cursor)));
             }
             Key::Char('s') => {
                 self.notice.clear();
-                self.send(Job::Sync { door: self.cursor, dry: true, takeover: Vec::new() });
+                self.send(Job::Sync { door: self.cursor, dry: true, takeover: Vec::new(), confirmed: None });
             }
             Key::Char('t') => {
                 // A name something else holds: taken over only on the
-                // admin's word, one name at a time.
+                // admin's word, one name at a time. A takeover is a whole
+                // sync (the name needs the tunnel to serve it), so it
+                // looks first and shows every change before y, as s does.
                 self.notice.clear();
                 match self.conflicts().first() {
                     Some(c) => {
-                        let q = format!(
-                            "Take {} over for {}? {title} deletes what holds it now ({}) and points it at itself. y to confirm",
-                            c.host, c.app, c.holder
-                        );
-                        self.confirm = Some((q, Job::Sync { door: self.cursor, dry: false, takeover: vec![c.host.clone()] }));
+                        let takeover = vec![c.host.clone()];
+                        self.send(Job::Sync { door: self.cursor, dry: true, takeover, confirmed: None });
                     }
                     None => self.notice = format!("No name of {title} is held by something else (s looks again)."),
                 }
@@ -341,8 +412,9 @@ impl Model for Screen {
                 }
                 Flow::Continue
             }
-            Event::Resize(w, _) => {
+            Event::Resize(w, h) => {
                 self.width = (w as usize).max(40);
+                self.height = (h as usize).max(12);
                 Flow::Continue
             }
         }
@@ -352,6 +424,21 @@ impl Model for Screen {
         let mut b = Doc::new();
         let width = self.width.saturating_sub(4);
         b.append(theme::header("outside")).s("   ").add(dim("the ways in from the internet to your apps")).s("\n\n");
+        // A plan to confirm takes the whole screen: every change it makes.
+        if let Some(c) = self.confirm.as_ref().filter(|c| !c.steps.is_empty()) {
+            let (lines, room) = self.plan_lines(c);
+            b.add(err(wrap(&c.question, width))).nl();
+            for l in lines.iter().skip(c.scroll).take(room) {
+                b.s(l).nl();
+            }
+            if lines.len() > room {
+                let shown =
+                    format!("  lines {}-{} of {}; ↑↓ to see the rest", c.scroll + 1, (c.scroll + room).min(lines.len()), lines.len());
+                b.add(dim(shown)).nl();
+            }
+            b.nl().append(theme::keys(&[("y", "make these changes"), ("↑↓", "scroll"), ("other keys", "change nothing")])).nl();
+            return b;
+        }
         if let Some(e) = &self.err {
             b.add(err(wrap(&format!("Cannot reach the cluster: {e}"), width))).nl();
             if let Some(t) = self.seen {
@@ -405,8 +492,8 @@ impl Model for Screen {
         if let Some(w) = self.waiting.view(self.limits.slow, "not answering") {
             b.nl().append(w).nl();
         }
-        if let Some((q, _)) = &self.confirm {
-            b.nl().add(err(wrap(q, width))).nl();
+        if let Some(c) = &self.confirm {
+            b.nl().add(err(wrap(&c.question, width))).nl();
         } else if !self.notice.is_empty() {
             b.nl().s(wrap(&self.notice, width)).nl();
         }
@@ -628,13 +715,30 @@ mod tests {
         let cf = Arc::new(fresh());
         let mut s = with_api(&fake, &dir, &cf);
         assert!(s.flat().contains("API token saved: s sets up the tunnel"), "{}", s.view());
-        // s shows what it would do, and asks.
+        // s shows every change it would make, and asks. The cluster runs
+        // another tunnel (LISTING's token mark): the switch and the token
+        // it replaces are named before y.
         s.key(Key::Char('s'));
         s.settle();
         let v = s.flat();
-        assert!(v.contains("Cloudflare Tunnel: 6 changes to make. Make them? y to confirm"), "{v}");
+        assert!(v.contains("Cloudflare Tunnel: 6 changes to make, in order:"), "{v}");
+        for step in [
+            "1. create the tunnel dryserver in Cloudflare",
+            "2. route blog.example.com, shop.example.com through the tunnel",
+            "3. save the tunnel's token in secrets/cloudflare_tunnel_token",
+            "4. switch the cluster from the tunnel it runs now (not dryserver) to",
+            "dryserver: names routed to the old one in the dashboard stop working",
+            "5. add blog.example.com to DNS",
+            "6. add shop.example.com to DNS",
+            "y make these changes",
+        ] {
+            assert!(v.contains(step), "{step:?} not shown:\n{}", s.view());
+        }
         assert_eq!(cf.changes.load(SeqCst), 0, "a look changes nothing");
         s.fits(24);
+        // Scrolling the list does not answer the question.
+        s.key(Key::Down);
+        assert!(s.s.confirm.is_some());
         s.key(Key::Char('y'));
         s.settle();
         assert!(s.s.notice.contains("Cloudflare Tunnel: 6 changes made."), "{:?}", s.s.notice);
@@ -682,22 +786,88 @@ mod tests {
         assert!(v.contains("blog.example.com (blog) is held by A record 203.0.113.7"), "{v}");
         assert!(v.contains("t take over"), "{v}");
         s.fits(24);
-        // The A record stays until the admin says so.
+        // The A record stays until the admin says so. t looks first and
+        // shows every change, the record it deletes and the gap included.
         assert!(cf.cf.lock().unwrap().records.iter().any(|r| r.kind == "A"));
+        let before = cf.changes.load(SeqCst);
         s.key(Key::Char('t'));
-        assert!(
-            s.flat().contains("Take blog.example.com over for blog? Cloudflare Tunnel deletes what holds it now (A record 203.0.113.7)"),
-            "{}",
-            s.view()
-        );
+        s.settle();
+        let v = s.flat();
+        // The fake cluster still says it runs the other tunnel: the
+        // takeover needs the switch too, and says so.
+        assert!(v.contains("Take blog.example.com over? Cloudflare Tunnel makes these changes, in order:"), "{}", s.view());
+        assert!(v.contains("1. switch the cluster from the tunnel it runs now"), "{}", s.view());
+        assert!(v.contains("2. delete the DNS record of blog.example.com (A record 203.0.113.7,"), "{}", s.view());
+        assert!(v.contains("taken over; the name does not resolve until the tunnel's record is"), "{}", s.view());
+        assert!(v.contains("3. add blog.example.com to DNS"), "{}", s.view());
+        assert_eq!(cf.changes.load(SeqCst), before, "a look changes nothing");
+        s.fits(24);
         s.key(Key::Char('n'));
+        assert!(s.s.notice.contains("Nothing changed"));
         assert!(cf.cf.lock().unwrap().records.iter().any(|r| r.kind == "A"));
+        assert!(s.flat().contains("t take over"), "said no to, the name is still offered: {}", s.view());
         s.key(Key::Char('t'));
+        s.settle();
         s.key(Key::Char('y'));
         s.settle();
         let recs = cf.cf.lock().unwrap().records.clone();
         assert!(!recs.iter().any(|r| r.kind == "A") && recs.iter().filter(|r| r.name == "blog.example.com").count() == 1, "{recs:?}");
         assert!(!s.flat().contains("t take over"), "{}", s.view());
+    }
+
+    #[test]
+    fn a_long_plan_scrolls() {
+        // Twenty apps: more changes than 24 rows hold. The list scrolls,
+        // the screen keeps to 80x24, and y still makes exactly those.
+        let fake = Arc::new(Fake::default());
+        let mut items = Vec::new();
+        for i in 0..20 {
+            items.push(format!(r#"{{"kind":"Deployment","metadata":{{"name":"app{i}","namespace":"apps","labels":{{"app":"app{i}"}}}},"spec":{{"replicas":1}},"status":{{}}}}"#));
+            items.push(format!(r#"{{"kind":"Ingress","metadata":{{"name":"app{i}","namespace":"apps","labels":{{"app":"app{i}"}}}},"spec":{{"rules":[{{"host":"app{i}.example.com"}}]}}}}"#));
+        }
+        *fake.listing.lock().unwrap() = format!(r#"{{"items":[{}]}}"#, items.join(","));
+        let dir = crate::testutil::TempDir::new();
+        let cf = Arc::new(fresh());
+        let mut s = with_api(&fake, &dir, &cf);
+        s.key(Key::Char('s'));
+        s.settle();
+        let v = s.flat();
+        assert!(v.contains("Cloudflare Tunnel: 24 changes to make, in order:") && v.contains("1. create the tunnel"), "{}", s.view());
+        assert!(v.contains("↑↓ to see the rest") && !v.contains("24. add app9.example.com"), "{}", s.view());
+        s.fits(24);
+        for _ in 0..40 {
+            s.key(Key::Down);
+        }
+        let v = s.flat();
+        assert!(v.contains("24. add app9.example.com to DNS") && !v.contains("1. create the tunnel"), "{}", s.view());
+        s.fits(24);
+        s.key(Key::PageUp);
+        s.key(Key::PageUp);
+        s.key(Key::PageUp);
+        assert!(s.flat().contains("1. create the tunnel"), "{}", s.view());
+        s.key(Key::Char('y'));
+        s.settle();
+        assert!(s.s.notice.contains("Cloudflare Tunnel: 24 changes made."), "{:?}", s.s.notice);
+        assert_eq!(cf.cf.lock().unwrap().records.len(), 20);
+    }
+
+    #[test]
+    fn a_plan_that_changed_since_the_look_is_not_made() {
+        let fake = Arc::new(Fake::default());
+        *fake.listing.lock().unwrap() = listing();
+        let dir = crate::testutil::TempDir::new();
+        let cf = Arc::new(fresh());
+        let mut s = with_api(&fake, &dir, &cf);
+        s.key(Key::Char('s'));
+        s.settle();
+        // Meanwhile one app goes: the plan the admin saw is not the one
+        // that would run.
+        *fake.listing.lock().unwrap() = listing().replace("shop.example.com", "");
+        s.key(Key::Char('y'));
+        s.settle();
+        assert!(s.s.notice.contains("not synced: something changed since you looked, so nothing was changed"), "{:?}", s.s.notice);
+        assert_eq!(cf.changes.load(SeqCst), 0);
+        assert!(!fake.calls.lock().unwrap().iter().any(|(a, _)| a == "apply -f -"));
     }
 
     #[test]
