@@ -135,14 +135,22 @@ pub const STAGE_REVERTING: &str = "reverting";
 /// The boot half of the revert guard. It runs before the firewall, the
 /// network and SSH, so they start with the files of the release that is
 /// kept. The previous binary goes first: the new one may be what is broken.
+///
+/// It runs before systemd-sysctl.service too: that one applies
+/// /etc/sysctl.d once at boot, and a revert at boot reloads nothing, so
+/// kernel settings it puts back would otherwise wait for the next restart.
+/// (systemd-sysctl then waits for the local file systems; nothing they need
+/// waits for it.) Since everything up to sysinit.target waits for this unit,
+/// it must never wait for systemd itself: see arm.
 pub const GUARD_UNIT_TEXT: &str = "# dryserver: after a restart, an update that was not confirmed in time
-# (or never finished applying) is reverted before the firewall, the network
-# and SSH start; one whose window is still open gets its revert timer back.
+# (or never finished applying) is reverted before the kernel settings, the
+# firewall, the network and SSH start; one whose window is still open gets
+# its revert timer back.
 [Unit]
 Description=Revert an unconfirmed dryserver update after a restart
 DefaultDependencies=no
 After=local-fs.target
-Before=sysinit.target shutdown.target nftables.service systemd-networkd.service sshd.service wg-quick@wg0.service k3s.service dryserver-sync.timer
+Before=sysinit.target shutdown.target systemd-sysctl.service nftables.service systemd-networkd.service sshd.service wg-quick@wg0.service k3s.service dryserver-sync.timer
 Conflicts=shutdown.target
 ConditionPathExists=/var/lib/dryserver-update/pending.json
 
@@ -899,24 +907,37 @@ fn timer_unit(id: &str) -> String {
 /// Arms the revert timer: after secs seconds (by the monotonic clock, so a
 /// clock that jumps does not move it) the previous binary reverts the
 /// update unless it was confirmed. The installed one is the fallback.
-fn arm(m: &Machine, ctx: &Ctx, id: &str, serial: u64, secs: i64) -> Result<()> {
-    let unit = timer_unit(id);
+///
+/// At boot (the guard unit, which runs before sysinit.target) this must
+/// not wait for systemd. systemd-run normally waits until the timer's start
+/// job is done, and a timer by default needs sysinit.target first; but
+/// sysinit.target waits for the guard, so the boot would stall until the
+/// guard's start timeout killed it, five minutes with no network and no
+/// SSH, and the update would lose its timer. So the timer goes without the
+/// default dependencies (it needs nothing that is not there when the guard
+/// runs: local file systems), keeping only its place at shutdown, and at
+/// boot systemd-run only queues it (--no-block). The service the timer
+/// starts keeps its defaults (after basic.target, so the revert can reload
+/// what runs); nothing the guard waits for waits for it, so that cannot
+/// stall the boot either. Outside the boot, systemd-run waits for the
+/// timer to be active, so an apply learns that it is armed before it
+/// changes anything.
+fn arm(m: &Machine, ctx: &Ctx, id: &str, serial: u64, secs: i64, boot: bool) -> Result<()> {
+    m.cmd(ctx, "systemd-run", &arm_args(m, id, serial, secs, boot).iter().map(String::as_str).collect::<Vec<_>>()).map(drop)
+}
+
+fn arm_args(m: &Machine, id: &str, serial: u64, secs: i64, boot: bool) -> Vec<String> {
     let (prev, bin) = (m.shown(PREV_BIN), m.shown(SERVER_BIN));
-    let script = format!("{prev} update guard --id {id} || {bin} update guard --id {id}");
-    m.cmd(
-        ctx,
-        "systemd-run",
-        &[
-            &format!("--unit={unit}"),
-            &format!("--on-active={secs}s"),
-            "--timer-property=AccuracySec=1s",
-            &format!("--description=Revert dryserver release {serial} unless it is confirmed"),
-            "/bin/sh",
-            "-c",
-            &script,
-        ],
-    )
-    .map(drop)
+    let mut args = vec![format!("--unit={}", timer_unit(id)), format!("--on-active={secs}s")];
+    if boot {
+        args.push("--no-block".into());
+    }
+    for p in ["AccuracySec=1s", "DefaultDependencies=no", "Conflicts=shutdown.target", "Before=shutdown.target"] {
+        args.push(format!("--timer-property={p}"));
+    }
+    args.push(format!("--description=Revert dryserver release {serial} unless it is confirmed"));
+    args.extend(["/bin/sh".into(), "-c".into(), format!("{prev} update guard --id {id} || {bin} update guard --id {id}")]);
+    args
 }
 
 fn disarm(m: &Machine, ctx: &Ctx, id: &str) {
@@ -1070,7 +1091,7 @@ pub fn apply(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, out: &mut dyn Write) -
         rest: BTreeMap::new(),
     };
     save_pending(m, &p)?;
-    if let Err(e) = arm(m, ctx, &p.id, p.serial, p.window) {
+    if let Err(e) = arm(m, ctx, &p.id, p.serial, p.window, false) {
         let _ = clear_pending(m);
         return Err(e.wrap("cannot arm the timer that reverts an unconfirmed update, nothing was changed"));
     }
@@ -1380,7 +1401,7 @@ pub fn guard_boot(m: &Machine, ctx: &Ctx, now: i64, out: &mut dyn Write) -> Resu
     p.boots += 1;
     save_pending(m, &p)?;
     disarm(m, ctx, &p.id);
-    if let Err(e) = arm(m, ctx, &p.id, p.serial, left) {
+    if let Err(e) = arm(m, ctx, &p.id, p.serial, left, true) {
         return revert(m, &rctx, p, &format!("its revert timer could not be armed again after the restart: {e}"), true, now, out);
     }
     tell(
@@ -2042,6 +2063,10 @@ mod tests {
         let timer = f.ran().into_iter().find(|c| c.starts_with("systemd-run")).unwrap();
         let id = &p.id;
         assert!(timer.contains("--on-active=600s"), "{timer}");
+        // While the machine runs, systemd-run waits until the timer is
+        // active: an apply that cannot arm it changes nothing.
+        assert!(!timer.contains("--no-block"), "{timer}");
+        assert!(timer.contains("--timer-property=DefaultDependencies=no"), "{timer}");
         assert!(
             timer.ends_with(&format!(
                 "/bin/sh -c /usr/local/bin/dryserver.prev update guard --id {id} || /usr/local/bin/dryserver update guard --id {id}"
@@ -2530,7 +2555,11 @@ mod tests {
         lab.fake.ran.lock().unwrap().clear();
         guard_boot(&lab.m(), &Ctx::new(), now() + 120, &mut Vec::new()).unwrap();
         lab.assert_new("rebooted");
-        assert!(lab.fake.has(&format!("systemd-run --unit=dryserver-update-revert-{id} --on-active=480s")), "{:?}", lab.fake.ran());
+        assert!(
+            lab.fake.has(&format!("systemd-run --unit=dryserver-update-revert-{id} --on-active=480s --no-block ")),
+            "{:?}",
+            lab.fake.ran()
+        );
         assert_eq!(lab.pending().unwrap().boots, 1);
         // The timer then fires and reverts.
         guard_timer(&lab.m(), &Ctx::new(), &id, now() + 600, &mut Vec::new()).unwrap();
@@ -2554,6 +2583,45 @@ mod tests {
         lab.script(|s| s.systemd_run_fails = true);
         guard_boot(&lab.m(), &Ctx::new(), now() + 60, &mut Vec::new()).unwrap();
         lab.assert_old("no timer after reboot");
+    }
+
+    #[test]
+    fn the_boot_never_waits_for_systemd() {
+        // The guard runs before sysinit.target, and a timer with the
+        // default dependencies starts only after it: systemd-run must not
+        // wait for that start, and the timer must not need sysinit.target.
+        let m = Lab::new().m();
+        let boot = arm_args(&m, "0123456789abcdef", 7, 480, true);
+        let running = arm_args(&m, "0123456789abcdef", 7, 480, false);
+        for (args, blocks) in [(&boot, false), (&running, true)] {
+            assert_eq!(!args.contains(&"--no-block".to_string()), blocks, "{args:?}");
+            for p in ["DefaultDependencies=no", "Conflicts=shutdown.target", "Before=shutdown.target", "AccuracySec=1s"] {
+                assert!(args.contains(&format!("--timer-property={p}")), "{p} missing: {args:?}");
+            }
+            // The service the timer starts keeps its defaults (after
+            // basic.target, which waits for nothing of the guard's).
+            assert!(!args.iter().any(|a| a.starts_with("--property") || a == "-p"), "{args:?}");
+            // Options come before the command, or sh would get them.
+            let cmd = args.iter().position(|a| a == "/bin/sh").unwrap();
+            assert!(args[..cmd].iter().all(|a| a.starts_with("--")) && cmd == args.len() - 3, "{args:?}");
+        }
+        // The guard itself waits for nothing that comes later in the boot.
+        let u = GUARD_UNIT_TEXT;
+        assert!(u.contains("DefaultDependencies=no\n") && u.contains("After=local-fs.target\n"), "{u}");
+        assert!(!u.contains("After=sysinit") && !u.contains("After=basic") && !u.contains("Requires="), "{u}");
+        // A reboot in the window: the timer comes back without the boot
+        // waiting for it.
+        let lab = Lab::new();
+        lab.apply(&rel(7, NEW)).unwrap();
+        lab.fake.ran.lock().unwrap().clear();
+        guard_boot(&lab.m(), &Ctx::new(), now() + 120, &mut Vec::new()).unwrap();
+        let ran = lab.fake.ran();
+        let timer = ran.iter().find(|c| c.starts_with("systemd-run")).expect("the timer is armed again");
+        assert!(timer.contains(" --no-block ") && timer.contains("--timer-property=DefaultDependencies=no"), "{timer}");
+        // Nothing else at boot waits for a systemd job either.
+        for c in &ran {
+            assert!(!c.starts_with("systemctl start") && !c.starts_with("systemctl restart") && !c.starts_with("systemctl reload"), "{c}");
+        }
     }
 
     #[test]
@@ -2867,7 +2935,7 @@ mod tests {
         for want in [
             "DefaultDependencies=no\n",
             "After=local-fs.target\n",
-            "Before=sysinit.target shutdown.target nftables.service systemd-networkd.service sshd.service wg-quick@wg0.service",
+            "Before=sysinit.target shutdown.target systemd-sysctl.service nftables.service systemd-networkd.service sshd.service wg-quick@wg0.service",
             &format!("ConditionPathExists={DIR}/pending.json\n"),
             &format!("ExecStart=/bin/sh -c '{PREV_BIN} update guard --boot || {SERVER_BIN} update guard --boot'\n"),
             "Type=oneshot\n",
