@@ -48,27 +48,74 @@ impl Job {
     }
 }
 
+/// What the cluster says now.
+fn listing(ctx: &Ctx, c: &dyn Cluster, limits: Limits) -> Result<Overview> {
+    apps::overview(&ctx.with_timeout(limits.read), c).map_err(|e| timed(e, limits.read))
+}
+
 /// Starts app, unless another app has its public name. The check uses
-/// what the cluster says now, not what the screen saw a while ago.
-fn deploy(ctx: &Ctx, c: &dyn Cluster, limits: Limits, app: &App) -> Result<()> {
-    let o = apps::overview(&ctx.with_timeout(limits.read), c).map_err(|e| timed(e, limits.read))?;
-    entrance::check_host(app, &o.apps)?;
-    apps::deploy(&ctx.with_timeout(limits.change), c, app).map_err(|e| timed(e, limits.change))
+/// what the cluster says now, not what the screen saw a while ago, which
+/// it returns.
+fn deploy(ctx: &Ctx, c: &dyn Cluster, limits: Limits, app: &App) -> Result<Overview> {
+    let before = listing(ctx, c, limits)?;
+    entrance::check_host(app, &before.apps)?;
+    apps::deploy(&ctx.with_timeout(limits.change), c, app).map_err(|e| timed(e, limits.change))?;
+    Ok(before)
+}
+
+/// The entrance an app's public name came in through, if it had one.
+fn came_through(before: &Overview, name: &str) -> Option<String> {
+    before.apps.iter().find(|a| a.name == name && !a.host.is_empty()).map(|a| a.entrance.clone())
+}
+
+/// After an app changed: the entrances its name came or comes through
+/// sync by themselves when they can (Cloudflare with an API token), from
+/// what the cluster says now. Returns what to add to the notice.
+fn sync_after(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, limits: Limits, ids: &[String]) -> String {
+    let mut said = String::new();
+    for d in doors.iter().filter(|d| d.automatic() && ids.iter().any(|id| id == d.id())) {
+        let res = listing(ctx, c, limits).and_then(|o| {
+            let want = entrance::wants(&o.apps).0.get(d.id()).cloned().unwrap_or_default();
+            d.sync(&ctx.with_timeout(limits.change), c, &o, &want, false).map_err(|e| timed(e, limits.change))
+        });
+        said += &match res {
+            Ok(r) if r.conflicts.is_empty() => format!("\n{}: {}.", d.title(), r.summary(false)),
+            Ok(r) => format!("\n{}: {} (the Outside screen shows which).", d.title(), r.summary(false)),
+            Err(e) => format!("\n{}: not synced: {e}", d.title()),
+        };
+    }
+    said
 }
 
 /// One job, on the worker thread.
 fn run(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, limits: Limits, job: Job) -> Msg {
     let change = ctx.with_timeout(limits.change);
+    let automatic = doors.iter().any(|d| d.automatic());
     match job {
         Job::Load => Msg::Loaded(look(ctx, c, doors, limits)),
         Job::Deploy(app) => Msg::Changed(match deploy(ctx, c, limits, &app) {
-            Ok(()) => format!("{} is starting. The cluster picks a server for it.", app.name),
+            Ok(before) => {
+                let mut ids: Vec<String> = came_through(&before, &app.name).into_iter().collect();
+                if !app.host.is_empty() {
+                    ids.push(app.entrance.clone());
+                }
+                let synced = if automatic { sync_after(ctx, c, doors, limits, &ids) } else { String::new() };
+                format!("{} is starting. The cluster picks a server for it.{synced}", app.name)
+            }
             Err(e) => format!("Not started: {e}"),
         }),
-        Job::Remove(name) => Msg::Changed(match apps::remove(&change, c, &name) {
-            Ok(()) => format!("{name} removed."),
-            Err(e) => format!("Not removed: {}", timed(e, limits.change)),
-        }),
+        Job::Remove(name) => {
+            // Which entrance to sync afterwards: only worth a look when one
+            // syncs by itself.
+            let before = if automatic { listing(ctx, c, limits).ok() } else { None };
+            Msg::Changed(match apps::remove(&change, c, &name) {
+                Ok(()) => {
+                    let ids: Vec<String> = before.and_then(|b| came_through(&b, &name)).into_iter().collect();
+                    format!("{name} removed.{}", sync_after(ctx, c, doors, limits, &ids))
+                }
+                Err(e) => format!("Not removed: {}", timed(e, limits.change)),
+            })
+        }
     }
 }
 
@@ -523,7 +570,7 @@ pub mod tests {
     }
 
     pub fn doors(dir: &crate::testutil::TempDir) -> Entrances {
-        Arc::new(vec![Box::new(Cloudflare { token_file: dir.join("cloudflare_tunnel_token") }), Box::new(Vps)])
+        Arc::new(vec![Box::new(Cloudflare::new(dir.path())), Box::new(Vps)])
     }
 
     fn open_with(fake: &Arc<Fake>, dir: &crate::testutil::TempDir, limits: Limits) -> Open<Screen> {
@@ -655,6 +702,9 @@ pub mod tests {
         fn ready(&self) -> bool {
             true
         }
+        fn automatic(&self) -> bool {
+            false
+        }
         fn state(&self, _: &Ctx, _: &Overview) -> State {
             State { health: Health::Up, summary: "up".into(), notes: vec![] }
         }
@@ -676,7 +726,7 @@ pub mod tests {
     fn the_way_in_is_chosen_when_there_is_a_choice() {
         let fake = Arc::new(Fake::default());
         let dir = crate::testutil::TempDir::new();
-        let two: Entrances = Arc::new(vec![Box::new(Cloudflare { token_file: dir.join("t") }), Box::new(Ready)]);
+        let two: Entrances = Arc::new(vec![Box::new(Cloudflare::new(dir.path())), Box::new(Ready)]);
         let mut s = Open::new(Screen::new(fake.clone(), two));
         s.settle();
         assert!(s.view().contains("From outside: Your VPS up"), "{}", s.view());
@@ -852,5 +902,74 @@ pub mod tests {
         drop(s);
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(fake.ended.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn cloudflare_follows_the_apps() {
+        use crate::entrance::cfsync::tests::{FakeCf, entrance, fresh};
+        // With an API token: starting an app with a Cloudflare name, then
+        // removing it, syncs Cloudflare after each.
+        let fake = Arc::new(Fake::default());
+        *fake.listing.lock().unwrap() = LISTING.into();
+        let dir = crate::testutil::TempDir::new();
+        let cf: Arc<FakeCf> = Arc::new(fresh());
+        let doors: Entrances = Arc::new(vec![Box::new(entrance(dir.path(), &cf, true)), Box::new(Vps)]);
+        let mut s = Open::new(Screen::new(fake.clone(), doors));
+        s.settle();
+        assert!(cf.calls.lock().unwrap().is_empty(), "a refresh does not ask Cloudflare");
+        s.key(Key::Char('n'));
+        for t in ["blog", "nginx:1.27", "80", "blog.example.com", ""] {
+            s.type_in(t);
+        }
+        s.settle();
+        let n = &s.s.notice;
+        assert!(n.contains("blog is starting") && n.contains("Cloudflare Tunnel: 4 changes made."), "{n:?}");
+        let names = |cf: &FakeCf| cf.cf.lock().unwrap().records.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&cf), vec!["blog.example.com"]);
+        // The cluster ran another tunnel's token: left running.
+        assert!(!fake.calls.lock().unwrap().iter().any(|(a, m)| a == "apply -f -" && m.contains("cloudflared")));
+        // Removed: its name goes too.
+        *fake.after_delete.lock().unwrap() = Some(LISTING.replace("\"host\":\"blog.example.com\"", "\"host\":\"\""));
+        s.key(Key::Down);
+        s.key(Key::Char('d'));
+        s.key(Key::Char('y'));
+        s.settle();
+        assert!(s.s.notice.contains("blog removed.") && s.s.notice.contains("Cloudflare Tunnel: 2 changes made."), "{:?}", s.s.notice);
+        assert!(names(&cf).is_empty());
+        s.fits(24);
+
+        // Without an API token nothing goes to Cloudflare.
+        let dir = crate::testutil::TempDir::new();
+        let cf: Arc<FakeCf> = Arc::new(fresh());
+        let doors: Entrances = Arc::new(vec![Box::new(entrance(dir.path(), &cf, false)), Box::new(Vps)]);
+        let mut s = Open::new(Screen::new(fake.clone(), doors));
+        s.settle();
+        s.key(Key::Char('n'));
+        for t in ["shop", "nginx:1.27", "80", "shop.example.com", ""] {
+            s.type_in(t);
+        }
+        s.settle();
+        assert!(s.s.notice.contains("shop is starting") && !s.s.notice.contains("Cloudflare"), "{:?}", s.s.notice);
+        assert!(cf.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cloudflare_down_does_not_stop_a_deploy() {
+        use crate::entrance::cfsync::tests::{FakeCf, entrance, fresh};
+        let fake = Arc::new(Fake::default());
+        let dir = crate::testutil::TempDir::new();
+        let cf: Arc<FakeCf> = Arc::new(fresh());
+        cf.down.store(true, SeqCst);
+        let doors: Entrances = Arc::new(vec![Box::new(entrance(dir.path(), &cf, true)), Box::new(Vps)]);
+        let mut s = Open::new(Screen::new(fake.clone(), doors));
+        s.settle();
+        s.key(Key::Char('n'));
+        for t in ["blog", "nginx:1.27", "80", "blog.example.com", ""] {
+            s.type_in(t);
+        }
+        s.settle();
+        let n = &s.s.notice;
+        assert!(n.contains("blog is starting") && n.contains("Cloudflare Tunnel: not synced:") && n.contains("having trouble"), "{n:?}");
+        assert_eq!(calls(&fake, "apply"), 1, "the app was started anyway");
     }
 }

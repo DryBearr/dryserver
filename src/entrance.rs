@@ -18,6 +18,8 @@
 //! runs. Its sync makes it serve exactly that; running it again changes
 //! nothing, and a run cut off half way is finished by the next one.
 
+pub mod cfapi;
+pub mod cfsync;
 pub mod cloudflare;
 
 use std::collections::BTreeMap;
@@ -85,6 +87,9 @@ pub struct Want {
     /// Names the admin confirmed this entrance may take over from
     /// whatever holds them now.
     pub takeover: Vec<String>,
+    /// Start the entrance where it does not run: the admin asked for a
+    /// set up. A sync after an app changed leaves a closed one closed.
+    pub open: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +163,9 @@ pub trait Entrance: Send + Sync {
     fn carries(&self) -> &'static [Traffic];
     /// Set up enough that apps may choose it. Asks nobody.
     fn ready(&self) -> bool;
+    /// Its sync changes things by itself (Cloudflare: with an API
+    /// token), so it runs after an app that uses it changed.
+    fn automatic(&self) -> bool;
     /// How it is doing, from what the cluster said (seen) and whatever
     /// else it needs to ask within ctx.
     fn state(&self, ctx: &Ctx, seen: &Overview) -> State;
@@ -254,6 +262,9 @@ impl Entrance for Vps {
         &[Traffic::Web, Traffic::Tcp, Traffic::Udp]
     }
     fn ready(&self) -> bool {
+        false
+    }
+    fn automatic(&self) -> bool {
         false
     }
     fn state(&self, _: &Ctx, _: &Overview) -> State {

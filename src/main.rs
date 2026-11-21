@@ -809,10 +809,7 @@ fn run_apps(args: &[String], place: tui::Place) -> Result<()> {
 /// The ways in from outside this desktop knows, with its secrets.
 fn desktop_doors() -> entrance::Entrances {
     let secrets = paths().secrets;
-    Arc::new(vec![
-        Box::new(entrance::cloudflare::Cloudflare { token_file: secrets.join(entrance::cloudflare::TOKEN_FILE) }),
-        Box::new(entrance::Vps),
-    ])
+    Arc::new(vec![Box::new(entrance::cloudflare::Cloudflare::new(&secrets)), Box::new(entrance::Vps)])
 }
 
 /// The apps and outside screens, starting at place; each can switch to

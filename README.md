@@ -345,7 +345,67 @@ for it only when more than one entrance is set up. A host name that
 another app already has is refused; one that two apps claim anyway (made
 with kubectl) is served by neither, and the Outside screen says so.
 
-To open the Cloudflare Tunnel by hand:
+The Cloudflare Tunnel can be set up two ways: from your computer with one
+API token, or by hand in the dashboard.
+
+#### Cloudflare from your computer
+
+With one API token, dryserver sets up the rest: no more visits to the
+dashboard.
+
+1. In the Cloudflare dashboard, My Profile, API Tokens, Create Token,
+   Create Custom Token. Give it these permissions:
+
+   | Scope | Item | Access |
+   |---|---|---|
+   | Account | Cloudflare Tunnel | Edit |
+   | Zone | DNS | Edit |
+   | Zone | Zone | Read |
+
+   Under Account Resources pick your account, under Zone Resources the
+   zone (domain) your apps' host names are in. Newer dashboards call Edit
+   "Write". Expiry and an IP filter (your home address) are a good idea.
+2. Save the token on your computer as `secrets/cloudflare_api_token` and
+   make it yours alone: `chmod 600 secrets/cloudflare_api_token`. dryserver
+   refuses it while other users can read it.
+3. In `./dryserver outside` press `s` on the Cloudflare Tunnel. It shows
+   what it would change; `y` makes the changes.
+
+What `s` does, every time, so running it again changes nothing and a run
+cut off half way is finished by the next one:
+
+- checks the token (a revoked or expired one is named as such), finds the
+  zone of each host name (only names inside a zone the token can see are
+  routed) and the account,
+- makes or reuses the tunnel `dryserver`, configured in Cloudflare.
+  Deleted in the dashboard, it is made again,
+- saves its token as `secrets/cloudflare_tunnel_token` (for you only) and
+  starts the tunnel in the cluster with it, as `o` does,
+- routes each host name that comes in through Cloudflare to the ingress,
+  sorted, and answers 404 for anything else,
+- adds a proxied CNAME `<host> -> <tunnel id>.cfargotunnel.com` per name,
+  with the comment `managed by dryserver`, and deletes the ones whose app
+  is gone.
+
+dryserver only ever changes or deletes DNS records that carry that comment
+and point at a dryserver tunnel of your account. A record of the same name
+that points elsewhere (your home IP, another service) is shown as held by
+something else and left alone; `t` takes the name over after you confirm,
+deleting that record. When a call is refused, the message names the
+permission the token lacks. When Cloudflare is down, nothing is changed and
+the running tunnel keeps working. With the API token saved, starting or
+removing an app with a Cloudflare host name syncs by itself; a tunnel you
+closed with `x` stays closed until you press `s`.
+
+Without an API token, the way by hand below keeps working. Coming from it:
+a sync after an app changed never replaces the token of a tunnel you made
+in the dashboard, neither in the cluster nor in
+`secrets/cloudflare_tunnel_token`. `s` says that it would switch to the
+tunnel `dryserver`, and does on `y`; the names you pointed at your own
+tunnel in the dashboard show as held by something else until you take them
+over with `t`.
+
+#### Cloudflare by hand
 
 1. In the Cloudflare dashboard (Zero Trust, Networks, Tunnels) create a
    tunnel and copy its token. Save it on your computer as
@@ -359,8 +419,11 @@ To open the Cloudflare Tunnel by hand:
 
 `x` closes the tunnel (it names the apps that still come in through it);
 the apps keep running, reachable only inside the cluster. `o` again after
-you changed the file gives the tunnel the new token. The token is stored in
-the cluster as an encrypted secret. The tunnel
+you changed the token file gives the tunnel the new token.
+
+#### The tunnel in the cluster
+
+The token is stored in the cluster as an encrypted secret. The tunnel
 pods run as a plain user with a read-only file system, no privileges and no
 cluster credentials, from one cloudflared image pinned by its digest.
 Nothing in the cluster may connect to them, and they may connect only to

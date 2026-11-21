@@ -86,6 +86,8 @@ fn run(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, limits: Limits, job: Job) 
                 let (wants, _) = entrance::wants(&o.apps);
                 let mut want = wants.get(d.id()).cloned().unwrap_or_default();
                 want.takeover = takeover;
+                // The admin asked for it: a closed entrance opens.
+                want.open = true;
                 d.sync(&change, c, &o, &want, dry).map_err(|e| timed(e, limits.change))
             })();
             Msg::Synced(door, dry, res)
@@ -211,6 +213,15 @@ impl Screen {
         self.states.get(i)
     }
 
+    /// The names the selected entrance found held by something else, in
+    /// its last look.
+    fn conflicts(&self) -> Vec<entrance::Conflict> {
+        match &self.report {
+            Some((door, _, r)) if *door == self.cursor => r.conflicts.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     fn key(&mut self, k: Key) -> Flow {
         if let Some((_, job)) = self.confirm.take() {
             if k == Key::Char('y') {
@@ -278,6 +289,21 @@ impl Screen {
             Key::Char('s') => {
                 self.notice.clear();
                 self.send(Job::Sync { door: self.cursor, dry: true, takeover: Vec::new() });
+            }
+            Key::Char('t') => {
+                // A name something else holds: taken over only on the
+                // admin's word, one name at a time.
+                self.notice.clear();
+                match self.conflicts().first() {
+                    Some(c) => {
+                        let q = format!(
+                            "Take {} over for {}? {title} deletes what holds it now ({}) and points it at itself. y to confirm",
+                            c.host, c.app, c.holder
+                        );
+                        self.confirm = Some((q, Job::Sync { door: self.cursor, dry: false, takeover: vec![c.host.clone()] }));
+                    }
+                    None => self.notice = format!("No name of {title} is held by something else (s looks again)."),
+                }
             }
             Key::Char('r') => {
                 self.notice = if self.load() { String::new() } else { "Already asking the coordinator.".into() };
@@ -378,17 +404,12 @@ impl Model for Screen {
         } else if !self.notice.is_empty() {
             b.nl().s(wrap(&self.notice, width)).nl();
         }
-        b.nl()
-            .append(theme::keys(&[
-                ("↑↓", "select"),
-                ("o", "open"),
-                ("s", "sync"),
-                ("x", "close"),
-                ("a", "apps"),
-                ("r", "refresh"),
-                ("q", "quit"),
-            ]))
-            .nl();
+        let mut keys = vec![("↑↓", "move"), ("o", "open"), ("s", "sync")];
+        if !self.conflicts().is_empty() {
+            keys.push(("t", "take over"));
+        }
+        keys.extend([("x", "close"), ("a", "apps"), ("r", "refresh"), ("q", "quit")]);
+        b.nl().append(theme::keys(&keys)).nl();
         b
     }
 }
@@ -561,6 +582,112 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(50));
         s.settle();
         assert!(s.view().contains("Cannot reach the cluster: the coordinator did not answer"), "{}", s.view());
+        s.fits(24);
+    }
+
+    fn with_api(fake: &Arc<Fake>, dir: &crate::testutil::TempDir, cf: &Arc<FakeCf>) -> Open<Screen> {
+        let doors: Entrances = Arc::new(vec![Box::new(entrance(dir.path(), cf, true)), Box::new(entrance::Vps)]);
+        let mut o = Open::new(Screen::new(fake.clone(), doors));
+        o.settle();
+        o
+    }
+
+    use crate::entrance::cfsync::tests::{FakeCf, entrance, fresh};
+    use std::sync::atomic::Ordering::SeqCst;
+
+    #[test]
+    fn set_up_cloudflare_from_here() {
+        let fake = Arc::new(Fake::default());
+        *fake.listing.lock().unwrap() = listing();
+        let dir = crate::testutil::TempDir::new();
+        let cf = Arc::new(fresh());
+        let mut s = with_api(&fake, &dir, &cf);
+        assert!(s.flat().contains("API token saved: s sets up the tunnel"), "{}", s.view());
+        // s shows what it would do, and asks.
+        s.key(Key::Char('s'));
+        s.settle();
+        let v = s.flat();
+        assert!(v.contains("Cloudflare Tunnel: 6 changes to make. Make them? y to confirm"), "{v}");
+        assert_eq!(cf.changes.load(SeqCst), 0, "a look changes nothing");
+        s.fits(24);
+        s.key(Key::Char('y'));
+        s.settle();
+        assert!(s.s.notice.contains("Cloudflare Tunnel: 6 changes made."), "{:?}", s.s.notice);
+        let records: Vec<String> = cf.cf.lock().unwrap().records.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(records, vec!["blog.example.com", "shop.example.com"]);
+        // The tunnel in the cluster got the new tunnel's token.
+        assert!(fake.calls.lock().unwrap().iter().any(|(a, m)| a == "apply -f -" && m.contains("name: cloudflared")));
+        // The cluster now runs that token. Again: nothing to do, nothing asked.
+        let mark = crate::entrance::cfsync::tests::mark_of(&fake).unwrap();
+        let now = fake.listing.lock().unwrap().replace("00aa11bb22cc33dd", &mark);
+        *fake.listing.lock().unwrap() = now;
+        s.key(Key::Char('r'));
+        s.settle();
+        s.key(Key::Char('s'));
+        s.settle();
+        assert!(s.s.notice.contains("Cloudflare Tunnel: nothing to change.") && s.s.confirm.is_none(), "{:?}", s.s.notice);
+    }
+
+    #[test]
+    fn a_name_held_by_something_else() {
+        let fake = Arc::new(Fake::default());
+        *fake.listing.lock().unwrap() = listing();
+        let dir = crate::testutil::TempDir::new();
+        let cf = Arc::new(fresh());
+        {
+            let mut c = cf.cf.lock().unwrap();
+            c.records.push(crate::entrance::cfsync::Record {
+                zone: crate::entrance::cfsync::tests::ZONE.into(),
+                id: "f".repeat(32),
+                name: "blog.example.com".into(),
+                kind: "A".into(),
+                content: "203.0.113.7".into(),
+                proxied: false,
+                comment: String::new(),
+            });
+        }
+        let mut s = with_api(&fake, &dir, &cf);
+        s.key(Key::Char('t'));
+        assert!(s.s.notice.contains("No name of Cloudflare Tunnel is held by something else"), "{:?}", s.s.notice);
+        s.key(Key::Char('s'));
+        s.settle();
+        s.key(Key::Char('y'));
+        s.settle();
+        let v = s.flat();
+        assert!(v.contains("blog.example.com (blog) is held by A record 203.0.113.7"), "{v}");
+        assert!(v.contains("t take over"), "{v}");
+        s.fits(24);
+        // The A record stays until the admin says so.
+        assert!(cf.cf.lock().unwrap().records.iter().any(|r| r.kind == "A"));
+        s.key(Key::Char('t'));
+        assert!(
+            s.flat().contains("Take blog.example.com over for blog? Cloudflare Tunnel deletes what holds it now (A record 203.0.113.7)"),
+            "{}",
+            s.view()
+        );
+        s.key(Key::Char('n'));
+        assert!(cf.cf.lock().unwrap().records.iter().any(|r| r.kind == "A"));
+        s.key(Key::Char('t'));
+        s.key(Key::Char('y'));
+        s.settle();
+        let recs = cf.cf.lock().unwrap().records.clone();
+        assert!(!recs.iter().any(|r| r.kind == "A") && recs.iter().filter(|r| r.name == "blog.example.com").count() == 1, "{recs:?}");
+        assert!(!s.flat().contains("t take over"), "{}", s.view());
+    }
+
+    #[test]
+    fn cloudflare_down() {
+        let fake = Arc::new(Fake::default());
+        *fake.listing.lock().unwrap() = listing();
+        let dir = crate::testutil::TempDir::new();
+        let cf = Arc::new(fresh());
+        cf.down.store(true, SeqCst);
+        let mut s = with_api(&fake, &dir, &cf);
+        s.key(Key::Char('s'));
+        s.settle();
+        assert!(s.s.notice.contains("Cloudflare Tunnel: cannot look: Cloudflare is having trouble"), "{:?}", s.s.notice);
+        assert!(s.flat().contains("tunnel keeps running"), "{}", s.view());
+        assert!(!fake.calls.lock().unwrap().iter().any(|(a, _)| a.contains("apply") || a.contains("delete")));
         s.fits(24);
     }
 }

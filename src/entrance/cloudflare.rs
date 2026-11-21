@@ -2,16 +2,23 @@
 //! dials out to Cloudflare, so no machine opens a port; Cloudflare sends
 //! what arrives for your host names through it to the ingress.
 //!
-//! The tunnel's token is saved on the desktop in secrets/. The host names
-//! are routed in the Cloudflare dashboard, each pointed at TARGET.
+//! Two ways to set it up:
+//!
+//! - by hand: a tunnel made in the dashboard, its token saved in
+//!   secrets/, the host names pointed at TARGET in the dashboard;
+//! - with an API token in secrets/: dryserver makes the tunnel, its
+//!   routes and the DNS names itself (cfsync), over the API (cfapi).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use super::{Entrance, Health, NAMESPACE, Report, State, Traffic, Want};
+use super::cfapi::{Curl, Http, valid_api_token};
+use super::{Entrance, Health, NAMESPACE, Report, State, Traffic, Want, cfsync};
 use crate::apps::{self, Cluster, Overview};
 use crate::ctx::Ctx;
-use crate::err::Result;
-use crate::registry;
+use crate::err::{Error, Result};
+use crate::runner::ExecRunner;
+use crate::{bail, fsx, registry};
 
 /// One pinned cloudflared release: the tag for people, the digest for the
 /// machine (the image index, so it fits every CPU type). A changed image
@@ -37,6 +44,18 @@ pub fn valid_tunnel_token(t: &str) -> Result<()> {
     let ok =
         (40..=4096).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
     if ok { Ok(()) } else { Err("not a tunnel token (copy the long token from the tunnel's page in the Cloudflare dashboard)".into()) }
+}
+
+/// The tunnel a token is for: it is base64 of {"a": account, "t":
+/// tunnel id, "s": secret}. None when it does not say.
+pub fn tunnel_of(token: &str) -> Option<String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+    let t = token.trim();
+    let raw = STANDARD.decode(t).or_else(|_| URL_SAFE.decode(t)).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let id = v["t"].as_str()?.to_ascii_lowercase();
+    super::cfapi::valid_uuid(&id).then_some(id)
 }
 
 /// Changes with the token and says nothing about it: the pods carry it,
@@ -199,13 +218,55 @@ pub fn tunnel_state(tunnel: Option<(u32, u32)>) -> State {
     State { health, summary, notes: Vec::new() }
 }
 
+/// The admin's Cloudflare API token, in secrets/. With it, dryserver sets
+/// up the tunnel, its routes and the DNS names by itself.
+pub const API_TOKEN_FILE: &str = "cloudflare_api_token";
+
+/// Makes the HTTPS client for an API token.
+pub type MakeHttp = Arc<dyn Fn(String) -> Box<dyn Http> + Send + Sync>;
+
 /// The Cloudflare entrance of this desktop.
 pub struct Cloudflare {
     /// Where the admin saves the tunnel's token (in secrets/).
     pub token_file: PathBuf,
+    /// Where the admin saves the API token (in secrets/).
+    pub api_token_file: PathBuf,
+    /// curl for real, a fake Cloudflare in tests.
+    pub http: MakeHttp,
 }
 
 impl Cloudflare {
+    /// The entrance with the files in secrets, talking to Cloudflare with
+    /// curl.
+    pub fn new(secrets: &Path) -> Cloudflare {
+        Cloudflare {
+            token_file: secrets.join(TOKEN_FILE),
+            api_token_file: secrets.join(API_TOKEN_FILE),
+            http: Arc::new(|token| Box::new(Curl { token, run: Arc::new(ExecRunner::silent()) })),
+        }
+    }
+
+    /// The API token, if the admin saved one. One that other users of
+    /// this computer can read is refused: it may be known already.
+    pub fn api_token(&self) -> Result<Option<String>> {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = match std::fs::metadata(&self.api_token_file) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::from(e).wrap(self.api_token_file.display())),
+        };
+        if meta.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "{} can be read by other users of this computer. Make it yours alone (chmod 600), and make a new token if \
+                 someone else may have read it",
+                self.api_token_file.display()
+            );
+        }
+        let text = fsx::read_string(&self.api_token_file)?;
+        valid_api_token(text.trim()).map_err(|e| e.wrap(self.api_token_file.display()))?;
+        Ok(Some(text.trim().to_string()))
+    }
+
     /// The token the admin saved, checked.
     pub fn saved_token(&self) -> Result<String> {
         let text = std::fs::read_to_string(&self.token_file).map_err(|_| {
@@ -232,8 +293,17 @@ impl Entrance for Cloudflare {
     fn ready(&self) -> bool {
         true
     }
+    fn automatic(&self) -> bool {
+        self.api_token_file.exists()
+    }
     fn state(&self, _: &Ctx, seen: &Overview) -> State {
-        tunnel_state(seen.tunnel)
+        let mut s = tunnel_state(seen.tunnel);
+        s.notes.push(match self.api_token() {
+            Ok(Some(_)) => "API token saved: s sets up the tunnel, its routes and the DNS names".into(),
+            Ok(None) => format!("no API token: names are routed in the dashboard (or save one as {API_TOKEN_FILE})"),
+            Err(e) => e.to_string(),
+        });
+        s
     }
     fn open_question(&self, seen: &Overview) -> Result<String> {
         self.saved_token()?;
@@ -247,9 +317,16 @@ impl Entrance for Cloudflare {
         connect_tunnel(ctx, c, &self.saved_token()?)?;
         Ok(format!("Tunnel starting. In the Cloudflare dashboard, point each public host name at {TARGET}"))
     }
-    /// Without the API the host names are routed in the dashboard: there
-    /// is nothing to change from here.
-    fn sync(&self, _: &Ctx, _: &dyn Cluster, _: &Overview, want: &Want, _: bool) -> Result<Report> {
+    /// With the API token: the tunnel, its routes and the DNS names, made
+    /// to match want (cfsync). Without it the host names are routed in the
+    /// dashboard: there is nothing to change from here.
+    fn sync(&self, ctx: &Ctx, c: &dyn Cluster, seen: &Overview, want: &Want, dry: bool) -> Result<Report> {
+        if let Some(token) = self.api_token()? {
+            let http = (self.http)(token);
+            let cluster_mark = seen.tunnel.map(|_| seen.tunnel_mark.clone());
+            let sync = cfsync::Sync { http: http.as_ref(), token_file: &self.token_file, cluster_mark };
+            return sync.run(ctx, c, want, want.open, dry);
+        }
         let mut r = Report::default();
         if !want.names.is_empty() {
             r.notes.push(format!(
@@ -333,7 +410,7 @@ mod tests {
         assert_eq!(tunnel_state(Some((1, 2))).health, Health::Partly);
         assert!(tunnel_state(Some((0, 2))).summary.contains("wrong token, or no way out to Cloudflare"));
         let dir = crate::testutil::TempDir::new();
-        let cf = Cloudflare { token_file: dir.join(TOKEN_FILE) };
+        let cf = Cloudflare::new(dir.path());
         assert!(cf.saved_token().unwrap_err().to_string().contains("No tunnel token yet"));
         std::fs::write(dir.join(TOKEN_FILE), "my password").unwrap();
         assert!(cf.saved_token().unwrap_err().to_string().contains("not a tunnel token"));
@@ -343,5 +420,39 @@ mod tests {
         let want = Want { names: vec![super::super::Name { host: "blog.example.com".into(), app: "blog".into() }], ..Want::default() };
         let r = cf.sync(&Ctx::new(), &Fake::default(), &Overview::default(), &want, true).unwrap();
         assert!(r.changes.is_empty() && r.notes[0].contains("point each of blog.example.com at http://traefik"), "{r:?}");
+        assert!(!cf.automatic());
+        assert!(cf.state(&Ctx::new(), &Overview::default()).notes[0].starts_with("no API token"));
+    }
+
+    #[test]
+    fn the_api_token() {
+        use crate::entrance::cfsync::tests::{entrance, fresh, want};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::testutil::TempDir::new();
+        let cf = std::sync::Arc::new(fresh());
+        let e = entrance(dir.path(), &cf, true);
+        assert_eq!(e.api_token().unwrap().as_deref(), Some(crate::entrance::cfapi::tests::API_TOKEN));
+        assert!(e.automatic());
+        assert!(e.state(&Ctx::new(), &Overview::default()).notes[0].starts_with("API token saved"));
+        // Readable by others: refused, and said where it matters.
+        std::fs::set_permissions(&e.api_token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = e.api_token().unwrap_err().to_string();
+        assert!(err.contains("can be read by other users") && err.contains("chmod 600"), "{err}");
+        assert!(e.state(&Ctx::new(), &Overview::default()).notes[0].contains("can be read by other users"));
+        assert!(e.sync(&Ctx::new(), &Fake::default(), &Overview::default(), &want(&["blog.example.com"]), true).is_err());
+        assert!(cf.calls.lock().unwrap().is_empty(), "nothing was sent with it");
+        // Not a token.
+        std::fs::write(&e.api_token_file, "my password\n").unwrap();
+        std::fs::set_permissions(&e.api_token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(e.api_token().unwrap_err().to_string().contains("not a Cloudflare API token"));
+        // With a good one, sync goes to Cloudflare; the cluster's tunnel
+        // mark is passed on.
+        let e = entrance(dir.path(), &cf, true);
+        let seen = Overview { tunnel: Some((2, 2)), tunnel_mark: "00".into(), ..Overview::default() };
+        let mut w = want(&["blog.example.com"]);
+        w.open = true;
+        let r = e.sync(&Ctx::new(), &Fake::default(), &seen, &w, true).unwrap();
+        assert!(r.changes.iter().any(|c| c.contains("create the tunnel dryserver")), "{r:?}");
+        assert!(r.changes.iter().any(|c| c.contains("start the tunnel")), "the cluster runs another token: {r:?}");
     }
 }

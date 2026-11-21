@@ -794,6 +794,8 @@ pub mod tests {
         /// Calls that have returned, and those that saw ctx end them.
         pub ended: std::sync::atomic::AtomicUsize,
         pub cut_off: std::sync::atomic::AtomicUsize,
+        /// The listing once something was deleted.
+        pub after_delete: Mutex<Option<String>>,
     }
 
     impl Cluster for Fake {
@@ -810,6 +812,11 @@ pub mod tests {
             }
             if let Some(e) = self.fail.lock().unwrap().clone() {
                 return Err(e.into());
+            }
+            if args.contains(&"delete")
+                && let Some(l) = self.after_delete.lock().unwrap().take()
+            {
+                *self.listing.lock().unwrap() = l;
             }
             Ok(if args.contains(&"get") {
                 self.listing.lock().unwrap().clone()

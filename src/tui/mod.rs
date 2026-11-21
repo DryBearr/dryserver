@@ -323,11 +323,15 @@ pub fn fit(s: &str, n: usize) -> String {
 /// its own line breaks stay. The screens do not wrap by themselves, and
 /// a long message would be cut at the edge.
 pub fn wrap(s: &str, width: usize) -> String {
-    let width = width.max(10);
     let mut out = Vec::new();
     for para in s.split('\n') {
+        // A line's indent starts each of its parts.
+        let body = para.trim_start_matches(' ');
+        let indent = &para[..para.len() - body.len()];
+        let width = width.saturating_sub(indent.len()).max(10);
+        let start = out.len();
         let mut line = String::new();
-        for word in para.split(' ') {
+        for word in body.split(' ') {
             let (lw, ww) = (line.width(), word.width());
             if lw > 0 && lw + 1 + ww > width {
                 out.push(std::mem::take(&mut line));
@@ -344,6 +348,9 @@ pub fn wrap(s: &str, width: usize) -> String {
             }
         }
         out.push(line);
+        for l in &mut out[start..] {
+            l.insert_str(0, indent);
+        }
     }
     out.join("\n")
 }
@@ -655,6 +662,7 @@ mod tests {
         let long =
             "Close Cloudflare Tunnel? blog, shop still come in through it: nothing from outside reaches them after that. y to confirm";
         assert!(wrap(long, 76).lines().all(|l| l.width() <= 76), "{}", wrap(long, 76));
+        assert_eq!(wrap("    one two three four", 14), "    one two\n    three four", "the indent stays");
         assert_eq!(fit("short", 10), "short");
         assert!(fit("node-a,node-b,node-c", 12).width() <= 12 && fit("node-a,node-b,node-c", 12).starts_with("node-a,no"));
     }
