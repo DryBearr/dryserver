@@ -10,6 +10,7 @@ pub mod flash;
 pub mod form;
 pub mod setup;
 pub mod theme;
+pub mod worker;
 
 use std::io::stdout;
 use std::sync::mpsc;

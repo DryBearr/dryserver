@@ -19,7 +19,8 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::err::{Error, Result};
+use crate::ctx::Ctx;
+use crate::err::{Error, Kind, Result};
 use crate::registry;
 use crate::{bail, errf};
 
@@ -438,14 +439,14 @@ spec:
 
 /// Starts the tunnel, or gives it another token. The pods carry a mark
 /// made from the token, so another token starts new pods by itself.
-pub fn connect_tunnel(c: &dyn Cluster, token: &str) -> Result<()> {
+pub fn connect_tunnel(ctx: &Ctx, c: &dyn Cluster, token: &str) -> Result<()> {
     let manifest = tunnel_manifest(token)?;
-    c.kubectl(&["apply", "-f", "-"], &manifest).map(|_| ())
+    c.kubectl(ctx, &["apply", "-f", "-"], &manifest).map(|_| ())
 }
 
 /// Closes the way in from outside. The apps keep running.
-pub fn remove_tunnel(c: &dyn Cluster) -> Result<()> {
-    c.kubectl(&["-n", TUNNEL_NAMESPACE, "delete", "deployment/cloudflared", "secret/tunnel", "--ignore-not-found"], "").map(|_| ())
+pub fn remove_tunnel(ctx: &Ctx, c: &dyn Cluster) -> Result<()> {
+    c.kubectl(ctx, &["-n", TUNNEL_NAMESPACE, "delete", "deployment/cloudflared", "secret/tunnel", "--ignore-not-found"], "").map(|_| ())
 }
 
 /// The cluster as the apps screen shows it.
@@ -468,9 +469,11 @@ pub struct Running {
     pub nodes: Vec<String>,
 }
 
-/// A way to run kubectl on the coordinator.
-pub trait Cluster {
-    fn kubectl(&self, args: &[&str], stdin: &str) -> Result<String>;
+/// A way to run kubectl on the coordinator. The screens call it from a
+/// worker thread; ctx carries the time limit, and the cancel when the
+/// screen closes.
+pub trait Cluster: Send + Sync {
+    fn kubectl(&self, ctx: &Ctx, args: &[&str], stdin: &str) -> Result<String>;
 }
 
 /// The most kubectl may answer: a full listing of a busy cluster is a
@@ -486,75 +489,237 @@ pub struct SshCluster {
     pub known_hosts: PathBuf,
 }
 
+impl SshCluster {
+    /// Everything about how to reach the coordinator, before the target.
+    /// The check, the shared connection and every call get exactly these:
+    /// the socket's name (%C) is made from host, port and user, and a
+    /// check that looked under another name would never find the
+    /// connection and start one more each time.
+    fn options(&self) -> Vec<String> {
+        let port = if self.port.is_empty() { "22" } else { &self.port };
+        let mut o: Vec<String> = vec!["-p".into(), port.into()];
+        for opt in [
+            "BatchMode=yes",
+            "ConnectTimeout=6",
+            "StrictHostKeyChecking=yes",
+            "GlobalKnownHostsFile=/dev/null",
+            "ForwardAgent=no",
+            "ProxyJump=none",
+            "LogLevel=ERROR",
+            // A coordinator that goes away mid-session: the shared
+            // connection notices within 15 seconds and ends.
+            "ServerAliveInterval=5",
+            "ServerAliveCountMax=3",
+        ] {
+            o.extend(["-o".into(), opt.into()]);
+        }
+        o.extend(["-o".into(), format!("UserKnownHostsFile={}", self.known_hosts.display())]);
+        o
+    }
+
+    /// Where the shared connection's socket goes: the user's private
+    /// runtime directory. None without one (then every call connects).
+    ///
+    /// The name carries the pinned host key file the connection was made
+    /// with: a connection is checked against the pinned key once, when it
+    /// is made, and one made from another directory (another stick's
+    /// secrets) must never be reused here.
+    fn control_path(&self, runtime_dir: Option<&std::ffi::OsStr>) -> Option<String> {
+        let dir = runtime_dir.filter(|d| !d.is_empty())?;
+        let full = std::path::absolute(&self.known_hosts).unwrap_or_else(|_| self.known_hosts.clone());
+        let mut id: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in full.as_os_str().as_encoded_bytes() {
+            id = (id ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+        }
+        let path = std::path::Path::new(dir).join(format!("dryserver-k3s-%C-{id:016x}")).display().to_string();
+        // ssh binds the socket under the name plus 17 characters first,
+        // with %C as 40; a socket's name has room for 107.
+        if path.len() - 2 + 40 + 17 > 107 {
+            return None;
+        }
+        Some(format!("ControlPath={path}"))
+    }
+}
+
+/// At most one try to start the shared connection per half minute,
+/// whatever the check says: a second guard against piling up connections.
+fn master_due() -> bool {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+        return false;
+    }
+    *last = Some(Instant::now());
+    true
+}
+
+/// What a finished child left.
+struct Ran {
+    status: std::process::ExitStatus,
+    out: Vec<u8>,
+    err: Vec<u8>,
+}
+
+/// Lets a child die with the thread that waits for it: a desktop killed
+/// while a call runs leaves no ssh behind.
+fn die_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: prctl is async-signal-safe and changes only the new process.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+}
+
+/// Runs cmd with stdin, keeping at most max bytes of what it prints. The
+/// child is killed when ctx is done (the time is up, or the screen
+/// closed) and when it prints more than max: no call outlives its screen.
+fn run_child(ctx: &Ctx, mut cmd: Command, stdin: &[u8], max: usize) -> Result<Ran> {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    die_with_parent(&mut cmd);
+    let mut child =
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| Error::from(e).wrap("ssh"))?;
+    let mut pipe = child.stdin.take().ok_or_else(|| Error::new("ssh: no stdin"))?;
+    let text = stdin.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = pipe.write_all(&text);
+    });
+    // The coordinator's answer is kept up to a limit; one that goes on
+    // and on ends the call.
+    let over = Arc::new(AtomicBool::new(false));
+    let reader = |mut pipe: Box<dyn Read + Send>, limit: usize| {
+        let over = over.clone();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            let mut buf = [0u8; 65536];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => return kept,
+                    Ok(n) if kept.len() + n > limit => {
+                        over.store(true, Ordering::SeqCst);
+                        return kept;
+                    }
+                    Ok(n) => kept.extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+    };
+    let stdout = reader(Box::new(child.stdout.take().ok_or_else(|| Error::new("ssh: no stdout"))?), max);
+    let stderr = reader(Box::new(child.stderr.take().ok_or_else(|| Error::new("ssh: no stderr"))?), 65536);
+    let too_long = || errf!("the coordinator's answer is longer than {} MiB; stopped reading", max >> 20);
+    let why = || {
+        if over.load(Ordering::SeqCst) {
+            return Some(too_long());
+        }
+        ctx.err().map(|e| {
+            if e.is(Kind::DeadlineExceeded) {
+                Error::with_kind(Kind::DeadlineExceeded, "the coordinator did not answer in time")
+            } else {
+                e
+            }
+        })
+    };
+    // Through a shared connection, ssh hands our pipes to the connection
+    // itself: they can stay open after this child is gone. So the readers
+    // are waited for within ctx too, and left behind when it ends (they
+    // end with the connection).
+    let mut exited = None;
+    loop {
+        if exited.is_none() {
+            exited = child.try_wait().map_err(|e| Error::from(e).wrap("ssh"))?;
+        }
+        if exited.is_some() && stdout.is_finished() && stderr.is_finished() {
+            break;
+        }
+        if let Some(e) = why() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    // What was not written is of no use to a child that ended.
+    drop(writer);
+    let (out, err) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
+    if over.load(Ordering::SeqCst) {
+        return Err(too_long());
+    }
+    Ok(Ran { status: exited.unwrap_or_default(), out, err })
+}
+
+/// Runs cmd with nothing attached, within ctx, and says whether it
+/// succeeded. The shared connection must start like this: one that
+/// inherits our pipes would keep every call waiting until it exits.
+fn quiet(ctx: &Ctx, mut cmd: Command) -> bool {
+    die_with_parent(&mut cmd);
+    let Ok(mut child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return false };
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) if ctx.done() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(15)),
+            Err(_) => return false,
+        }
+    }
+}
+
 impl Cluster for SshCluster {
-    fn kubectl(&self, args: &[&str], stdin: &str) -> Result<String> {
-        use std::io::Write;
+    fn kubectl(&self, ctx: &Ctx, args: &[&str], stdin: &str) -> Result<String> {
         if !self.known_hosts.exists() {
             bail!("this computer has not met the coordinator yet; run ./dryserver approve first");
         }
-        let port = if self.port.is_empty() { "22" } else { &self.port };
-        let mut child = Command::new("ssh")
-            .args(["-p", port])
-            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=yes"])
-            .args(["-o", "GlobalKnownHostsFile=/dev/null", "-o", "ForwardAgent=no", "-o", "LogLevel=ERROR"])
-            .arg("-o")
-            .arg(format!("UserKnownHostsFile={}", self.known_hosts.display()))
-            .arg(format!("{}@{}", self.user, self.host))
-            .args(["k3s", "kubectl"])
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::from(e).wrap("ssh"))?;
-        let mut pipe = child.stdin.take().ok_or_else(|| Error::new("ssh: no stdin"))?;
-        let text = stdin.to_string();
-        let writer = std::thread::spawn(move || {
-            let _ = pipe.write_all(text.as_bytes());
+        ctx.check()?;
+        let target = format!("{}@{}", self.user, self.host);
+        let mut cmd = Command::new("ssh");
+        cmd.args(self.options());
+        // One connection for the whole session: the screens ask every
+        // few seconds, and the coordinator's firewall lets one address
+        // open only 10 SSH connections a minute. A master in the
+        // background holds it and ends 20 seconds after the last call.
+        // When there is none and none starts, the call connects by itself
+        // and reports what is wrong.
+        let ctl = self.control_path(std::env::var_os("XDG_RUNTIME_DIR").as_deref());
+        let mux = |ctl: &str, extra: &[&str]| {
+            let mut c = Command::new("ssh");
+            c.args(self.options()).args(["-o", ctl]).args(extra).arg(&target);
+            c
+        };
+        let shared = ctl.filter(|ctl| {
+            quiet(ctx, mux(ctl, &["-O", "check"])) || (master_due() && quiet(ctx, mux(ctl, &["-M", "-N", "-f", "-o", "ControlPersist=20"])))
         });
-        // The coordinator's answer is kept up to a limit; one that goes on
-        // and on ends the call.
-        let over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let reader = |mut pipe: Box<dyn std::io::Read + Send>, limit: usize| {
-            let over = over.clone();
-            std::thread::spawn(move || {
-                let mut kept = Vec::new();
-                let mut buf = [0u8; 65536];
-                loop {
-                    match pipe.read(&mut buf) {
-                        Ok(0) | Err(_) => return kept,
-                        Ok(n) if kept.len() + n > limit => {
-                            over.store(true, std::sync::atomic::Ordering::SeqCst);
-                            return kept;
-                        }
-                        Ok(n) => kept.extend_from_slice(&buf[..n]),
-                    }
+        if let Some(ctl) = &shared {
+            cmd.args(["-o", "ControlMaster=no", "-o", ctl]);
+        }
+        // kubectl gives up by itself too, so nothing stays behind on the
+        // coordinator.
+        cmd.arg(&target).args(["k3s", "kubectl", "--request-timeout=60s"]).args(args);
+        let ran = match run_child(ctx, cmd, stdin.as_bytes(), MAX_ANSWER) {
+            Ok(r) => r,
+            Err(e) => {
+                // Cut off: the shared connection still carries the call
+                // and would live as long as it. It goes too; the next call
+                // makes a new one.
+                if let Some(ctl) = &shared {
+                    quiet(&Ctx::new().with_timeout(std::time::Duration::from_secs(3)), mux(ctl, &["-O", "exit"]));
                 }
-            })
-        };
-        let stdout = reader(Box::new(child.stdout.take().ok_or_else(|| Error::new("ssh: no stdout"))?), MAX_ANSWER);
-        let stderr = reader(Box::new(child.stderr.take().ok_or_else(|| Error::new("ssh: no stderr"))?), 65536);
-        let status = loop {
-            if let Some(st) = child.try_wait().map_err(|e| Error::from(e).wrap("ssh"))? {
-                break st;
+                return Err(e);
             }
-            if over.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("the coordinator's answer is longer than {} MiB; stopped reading", MAX_ANSWER >> 20);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(15));
         };
-        let _ = writer.join();
-        let (out, err) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
-        if over.load(std::sync::atomic::Ordering::SeqCst) {
-            bail!("the coordinator's answer is longer than {} MiB; stopped reading", MAX_ANSWER >> 20);
+        if ran.status.success() {
+            return Ok(String::from_utf8_lossy(&ran.out).into_owned());
         }
-        if status.success() {
-            return Ok(String::from_utf8_lossy(&out).into_owned());
-        }
-        let msg: String = String::from_utf8_lossy(&err).chars().filter(|c| !c.is_control() || *c == '\n').take(400).collect();
-        if status.code() == Some(255) {
+        let msg: String = String::from_utf8_lossy(&ran.err).chars().filter(|c| !c.is_control() || *c == '\n').take(400).collect();
+        if ran.status.code() == Some(255) {
             bail!("cannot log in to the coordinator at {} with your SSH key: {}", self.host, msg.trim());
         }
         Err(errf!("kubectl: {}", msg.trim()))
@@ -587,8 +752,8 @@ struct List {
 /// The apps and the tunnel, in one question to the cluster (each one is
 /// an SSH login). Names and hosts come from the cluster; they are checked
 /// before they are shown.
-pub fn overview(c: &dyn Cluster) -> Result<Overview> {
-    let out = c.kubectl(&["get", "deployments,ingresses,pods", "-A", "-l", "app", "-o", "json"], "")?;
+pub fn overview(ctx: &Ctx, c: &dyn Cluster) -> Result<Overview> {
+    let out = c.kubectl(ctx, &["get", "deployments,ingresses,pods", "-A", "-l", "app", "-o", "json"], "")?;
     if out.trim().is_empty() {
         return Ok(Overview::default());
     }
@@ -633,24 +798,25 @@ pub fn overview(c: &dyn Cluster) -> Result<Overview> {
     Ok(o)
 }
 
-pub fn deploy(c: &dyn Cluster, app: &App) -> Result<()> {
+pub fn deploy(ctx: &Ctx, c: &dyn Cluster, app: &App) -> Result<()> {
     let manifest = app.manifest()?;
-    c.kubectl(&["apply", "-f", "-"], &manifest)?;
+    c.kubectl(ctx, &["apply", "-f", "-"], &manifest)?;
     if app.host.is_empty() {
         // Started again without a public name: the old way in goes.
-        c.kubectl(&["-n", NAMESPACE, "delete", "ingress", &app.name, "--ignore-not-found"], "")?;
+        c.kubectl(ctx, &["-n", NAMESPACE, "delete", "ingress", &app.name, "--ignore-not-found"], "")?;
     }
     Ok(())
 }
 
 /// Removes an app's objects. The namespace and its default-deny policy
 /// stay.
-pub fn remove(c: &dyn Cluster, name: &str) -> Result<()> {
+pub fn remove(ctx: &Ctx, c: &dyn Cluster, name: &str) -> Result<()> {
     if !registry::valid_name(name) {
         bail!("not an app name");
     }
     let sel = format!("app={name}");
-    c.kubectl(&["-n", NAMESPACE, "delete", "deployment,service,ingress,networkpolicy", "-l", &sel, "--ignore-not-found"], "").map(|_| ())
+    c.kubectl(ctx, &["-n", NAMESPACE, "delete", "deployment,service,ingress,networkpolicy", "-l", &sel, "--ignore-not-found"], "")
+        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -753,11 +919,28 @@ pub mod tests {
         /// What "apply" prints.
         pub applied: Mutex<String>,
         pub fail: Mutex<Option<String>>,
+        /// A slow coordinator: each call takes this long, or until ctx
+        /// gives up.
+        pub delay: Mutex<std::time::Duration>,
+        /// One that does not even notice ctx: each call takes this long.
+        pub stubborn: Mutex<std::time::Duration>,
+        /// Calls that have returned, and those that saw ctx end them.
+        pub ended: std::sync::atomic::AtomicUsize,
+        pub cut_off: std::sync::atomic::AtomicUsize,
     }
 
     impl Cluster for Fake {
-        fn kubectl(&self, args: &[&str], stdin: &str) -> Result<String> {
+        fn kubectl(&self, ctx: &Ctx, args: &[&str], stdin: &str) -> Result<String> {
+            use std::sync::atomic::Ordering::SeqCst;
             self.calls.lock().unwrap().push((args.join(" "), stdin.to_string()));
+            let (delay, stubborn) = (*self.delay.lock().unwrap(), *self.stubborn.lock().unwrap());
+            std::thread::sleep(stubborn);
+            let slept = ctx.sleep(delay);
+            self.ended.fetch_add(1, SeqCst);
+            if let Err(e) = slept {
+                self.cut_off.fetch_add(1, SeqCst);
+                return Err(e);
+            }
             if let Some(e) = self.fail.lock().unwrap().clone() {
                 return Err(e.into());
             }
@@ -789,7 +972,7 @@ pub mod tests {
     fn list_deploy_remove() {
         let c = Fake::default();
         *c.listing.lock().unwrap() = LISTING.into();
-        let o = overview(&c).unwrap();
+        let o = overview(&Ctx::new(), &c).unwrap();
         assert_eq!(o.tunnel, Some((1, 2)));
         assert_eq!(
             o.apps,
@@ -808,27 +991,27 @@ pub mod tests {
         );
         assert_eq!(c.calls.lock().unwrap().len(), 1, "one question to the cluster per refresh");
 
-        deploy(&c, &app()).unwrap();
+        deploy(&Ctx::new(), &c, &app()).unwrap();
         let (args, stdin) = c.calls.lock().unwrap().last().unwrap().clone();
         assert_eq!(args, "apply -f -");
         assert_eq!(stdin, app().manifest().unwrap());
-        assert!(deploy(&c, &App { name: "no good".into(), ..app() }).is_err());
+        assert!(deploy(&Ctx::new(), &c, &App { name: "no good".into(), ..app() }).is_err());
         // Started again without a public name: the old way in is taken away.
-        deploy(&c, &App { host: String::new(), ..app() }).unwrap();
+        deploy(&Ctx::new(), &c, &App { host: String::new(), ..app() }).unwrap();
         assert_eq!(c.calls.lock().unwrap().last().unwrap().0, "-n apps delete ingress blog --ignore-not-found");
 
-        remove(&c, "blog").unwrap();
+        remove(&Ctx::new(), &c, "blog").unwrap();
         assert_eq!(
             c.calls.lock().unwrap().last().unwrap().0,
             "-n apps delete deployment,service,ingress,networkpolicy -l app=blog --ignore-not-found"
         );
-        assert!(remove(&c, "blog -A").is_err(), "a name must not carry kubectl arguments");
+        assert!(remove(&Ctx::new(), &c, "blog -A").is_err(), "a name must not carry kubectl arguments");
 
         // An empty cluster is an empty list; an unreachable one an error.
         *c.listing.lock().unwrap() = r#"{"items":[]}"#.into();
-        assert_eq!(overview(&c).unwrap(), Overview::default());
+        assert_eq!(overview(&Ctx::new(), &c).unwrap(), Overview::default());
         *c.fail.lock().unwrap() = Some("connection refused".into());
-        assert!(overview(&c).is_err());
+        assert!(overview(&Ctx::new(), &c).is_err());
     }
 
     #[test]
@@ -879,9 +1062,69 @@ pub mod tests {
         assert_ne!(mark(&y), mark(&other));
         assert!(mark(&y).len() < 60 && !mark(&y).contains(&token[..12]), "{}", mark(&y));
         let c = Fake::default();
-        connect_tunnel(&c, token).unwrap();
+        connect_tunnel(&Ctx::new(), &c, token).unwrap();
         assert_eq!(c.calls.lock().unwrap().iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(), vec!["apply -f -"]);
-        remove_tunnel(&c).unwrap();
+        remove_tunnel(&Ctx::new(), &c).unwrap();
         assert_eq!(c.calls.lock().unwrap().last().unwrap().0, "-n edge delete deployment/cloudflared secret/tunnel --ignore-not-found");
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("sh");
+        c.args(["-c", script]);
+        c
+    }
+
+    #[test]
+    fn a_call_never_outlives_its_time() {
+        use std::time::{Duration, Instant};
+        // Stdin goes in, stdout and stderr come back apart.
+        let r = run_child(&Ctx::new(), sh("cat; echo oops >&2; exit 3"), b"manifest", 1 << 20).unwrap();
+        assert_eq!((r.status.code(), r.out.as_slice(), r.err.as_slice()), (Some(3), &b"manifest"[..], &b"oops\n"[..]));
+        // A coordinator that does not answer: killed when the time is up,
+        // and the error says so.
+        let start = Instant::now();
+        let e = run_child(&Ctx::new().with_timeout(Duration::from_millis(200)), sh("sleep 30"), b"", 1 << 20).err().unwrap();
+        assert!(e.is(Kind::DeadlineExceeded) && e.to_string().contains("did not answer in time"), "{e}");
+        assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+        // The screen closed: cancelled at once, also while stdin is still
+        // being written.
+        let ctx = Ctx::new();
+        let c2 = ctx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            c2.cancel();
+        });
+        let start = Instant::now();
+        let e = run_child(&ctx, sh("sleep 30"), &vec![b'x'; 4 << 20], 1 << 20).err().unwrap();
+        assert!(e.is_canceled() && start.elapsed() < Duration::from_secs(3), "{e} {:?}", start.elapsed());
+        // An answer that never ends.
+        let e = run_child(&Ctx::new(), sh("yes"), b"", 1 << 20).err().unwrap();
+        assert!(e.to_string().contains("longer than 1 MiB"), "{e}");
+        // Done before it starts: nothing runs.
+        let done = Ctx::new();
+        done.cancel();
+        let c = SshCluster { host: "192.0.2.1".into(), port: String::new(), user: "admin".into(), known_hosts: "/dev/null".into() };
+        assert!(c.kubectl(&done, &["get", "pods"], "").unwrap_err().is_canceled());
+    }
+
+    #[test]
+    fn the_shared_connection() {
+        let c = SshCluster { host: "192.168.1.50".into(), port: "22".into(), user: "admin".into(), known_hosts: "a/known_hosts".into() };
+        let o = c.options().join(" ");
+        for want in ["StrictHostKeyChecking=yes", "BatchMode=yes", "ServerAliveInterval=5", "UserKnownHostsFile=a/known_hosts"] {
+            assert!(o.contains(want), "{o}");
+        }
+        assert_eq!(c.control_path(None), None, "without a private runtime directory every call connects");
+        assert_eq!(c.control_path(Some("".as_ref())), None);
+        let p = c.control_path(Some("/run/user/1000".as_ref())).unwrap();
+        assert!(p.starts_with("ControlPath=/run/user/1000/dryserver-k3s-%C-"), "{p}");
+        // Another stick's pinned key file: another connection.
+        let other = SshCluster { known_hosts: "b/known_hosts".into(), ..c };
+        assert_ne!(other.control_path(Some("/run/user/1000".as_ref())).unwrap(), p);
+        // A socket's name has room for 107 bytes, and ssh adds 17 while
+        // it makes one: a deep runtime directory means no sharing.
+        assert!(p.len() - "ControlPath=".len() - 2 + 40 + 17 <= 107, "{p}");
+        let deep = format!("/run/user/{}", "x".repeat(40));
+        assert_eq!(other.control_path(Some(deep.as_ref())), None);
     }
 }
