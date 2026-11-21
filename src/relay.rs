@@ -1610,14 +1610,18 @@ mod tests {
         healthy(&r, &[echo.addr]);
         let base = r.threads();
         let relay = tcp_addr(&r, 0);
-        let mut flood: Vec<TcpStream> = (0..100).map(|_| TcpStream::connect(relay).unwrap()).collect();
+        // Under load the relay's reset of a refused connection can reach the
+        // client before its connect() returns: that one is closed too.
+        let tries: Vec<std::io::Result<TcpStream>> = (0..100).map(|_| TcpStream::connect(relay)).collect();
+        let reset_early = tries.iter().filter(|t| t.is_err()).count();
+        let mut flood: Vec<TcpStream> = tries.into_iter().flatten().collect();
         wait_until("every connection decided", || {
             let c = r.counts();
             c.tcp_ip_full + r.open().0 as u64 == 100
         });
         assert_eq!(r.open().0, 8);
         assert!(r.threads() <= base + 8, "{} threads for 8 connections", r.threads());
-        let closed = flood.iter_mut().map(|c| closed_within(c, Duration::from_millis(200))).filter(|&x| x).count();
+        let closed = reset_early + flood.iter_mut().map(|c| closed_within(c, Duration::from_millis(200))).filter(|&x| x).count();
         assert_eq!(closed, 92, "refused connections are closed at once, the 8 let in stay open");
         drop(flood);
         wait_until("the flood to end", || r.open().0 == 0);
