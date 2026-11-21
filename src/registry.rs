@@ -4,11 +4,13 @@
 //! desktop (publish), after the admin compared the pairing code with the
 //! one on the new machine's screen.
 
+use std::ffi::CString;
 use std::fmt;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -516,36 +518,46 @@ impl Store {
         Store::new(DEFAULT_PATH)
     }
 
-    fn sibling(&self, ext: &str) -> PathBuf {
-        PathBuf::from(format!("{}{ext}", self.path.display()))
+    /// The file's name inside its directory.
+    fn name(&self) -> Result<String> {
+        match self.path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if !n.is_empty() => Ok(n.to_string()),
+            _ => Err(errf!("{} names no file", self.path.display())),
+        }
     }
 
     /// Loads the state, calls f and saves the result atomically while
     /// holding the lock.
+    ///
+    /// Root (the coordinator's sync) runs this too, in a directory the
+    /// registry account owns and may fill with anything, links included.
+    /// So every file in it is reached through the directory opened once,
+    /// and opened without following a link: a link planted under the lock
+    /// or temp file name would otherwise have root write, or hand over,
+    /// whatever file it points to.
     pub fn update<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        fsx::mkdir_all(fsx::dir(&self.path), 0o700)?;
-        let lock_path = self.sibling(".lock");
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&lock_path)
-            .map_err(|e| Error::from(e).wrap(format!("open {}", lock_path.display())))?;
-        fix_owner(&lock_path);
+        let parent = fsx::dir(&self.path);
+        fsx::mkdir_all(&parent, 0o700)?;
+        let dir = Dir::open(&parent)?;
+        let name = self.name()?;
+        let lock = dir.open_regular(&format!("{name}.lock"), libc::O_RDONLY | libc::O_CREAT)?;
+        dir.give(&lock);
         // SAFETY: flock on a valid open descriptor; the lock is released when
         // `lock` is closed at the end of this function.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        let mut s = self.load()?;
+        let mut s = match dir.open_regular(&name, libc::O_RDONLY) {
+            Ok(mut file) => {
+                let mut b = Vec::new();
+                file.read_to_end(&mut b).map_err(|e| Error::from(e).wrap(format!("read {}", self.path.display())))?;
+                serde_json::from_slice(&b)?
+            }
+            Err(e) if e.is_not_found() => State::default(),
+            Err(e) => return Err(e),
+        };
         let out = f(&mut s)?;
-        let b = serde_json::to_vec_pretty(&s)?;
-        let tmp = self.sibling(".tmp");
-        fsx::write_file(&tmp, b, 0o600)?;
-        fix_owner(&tmp);
-        fsx::rename(&tmp, &self.path)?;
+        dir.replace(&name, &serde_json::to_vec_pretty(&s)?)?;
         drop(lock);
         Ok(out)
     }
@@ -554,25 +566,139 @@ impl Store {
     pub fn read(&self) -> Result<State> {
         self.update(|s| Ok(s.clone()))
     }
+}
 
-    fn load(&self) -> Result<State> {
-        match std::fs::read(&self.path) {
-            Ok(b) => Ok(serde_json::from_slice(&b)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
-            Err(e) => Err(Error::from(e).wrap(format!("open {}", self.path.display()))),
+/// A directory opened once, for files opened inside it by name. Its own
+/// path is not looked up again, and a link in place of a file is refused.
+struct Dir {
+    fd: OwnedFd,
+    path: PathBuf,
+    uid: u32,
+    gid: u32,
+}
+
+/// The last OS error as an Error that names op and path.
+fn os_err(op: &str, path: &Path) -> Error {
+    Error::from(std::io::Error::last_os_error()).wrap(format!("{op} {}", path.display()))
+}
+
+fn c_string(s: &[u8], shown: &Path) -> Result<CString> {
+    CString::new(s).map_err(|_| errf!("{} holds a NUL byte", shown.display()))
+}
+
+impl Dir {
+    /// Opens path itself (not a link to it). Nobody but its owner may
+    /// write in it when root uses it (a test or a desktop may run with a
+    /// umask that lets its group write), never anyone at all; for anyone
+    /// but root it has to be ours, as files written in it go to its owner.
+    fn open(path: &Path) -> Result<Dir> {
+        let c = c_string(path.as_os_str().as_bytes(), path)?;
+        // SAFETY: c is a valid C string; the descriptor is owned below.
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(os_err("open", path));
         }
+        // SAFETY: fd was just opened and nothing else owns it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let st = fstat(fd.as_raw_fd()).map_err(|e| Error::from(e).wrap(format!("stat {}", path.display())))?;
+        let others = if fsx::is_root() { 0o022 } else { 0o002 };
+        if st.st_mode & others != 0 {
+            return Err(errf!("{} is writable by others", path.display()));
+        }
+        if !fsx::is_root() && st.st_uid != fsx::geteuid() {
+            return Err(errf!("{} belongs to someone else", path.display()));
+        }
+        Ok(Dir { fd, path: path.to_path_buf(), uid: st.st_uid, gid: st.st_gid })
+    }
+
+    /// A plain name in this directory, as the C string openat takes.
+    fn c_name(&self, name: &str) -> Result<CString> {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(errf!("{name:?} is not a file name"));
+        }
+        c_string(name.as_bytes(), &self.path.join(name))
+    }
+
+    /// Opens name in the directory: never a link, never something that is
+    /// not a regular file, and without blocking on a FIFO. With O_CREAT it
+    /// is made 0600 when missing.
+    fn open_regular(&self, name: &str, flags: libc::c_int) -> Result<File> {
+        let c = self.c_name(name)?;
+        let path = self.path.join(name);
+        let all = flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: valid directory descriptor and C string.
+        let fd = unsafe { libc::openat(self.fd.as_raw_fd(), c.as_ptr(), all, 0o600 as libc::c_uint) };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                return Err(errf!("{} is a symbolic link, not the file itself", path.display()));
+            }
+            return Err(Error::from(e).wrap(format!("open {}", path.display())));
+        }
+        // SAFETY: fd was just opened and nothing else owns it.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let st = fstat(fd).map_err(|e| Error::from(e).wrap(format!("stat {}", path.display())))?;
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(errf!("{} is not a regular file", path.display()));
+        }
+        Ok(file)
+    }
+
+    /// Hands a file root opened here to the directory's owner, so the
+    /// registry account can keep writing it. Only a file with no other name
+    /// anywhere (a hard link could be someone else's file) that is root's
+    /// or the owner's already.
+    fn give(&self, file: &File) {
+        if !fsx::is_root() {
+            return;
+        }
+        let Ok(st) = fstat(file.as_raw_fd()) else { return };
+        if st.st_nlink != 1 || (st.st_uid != 0 && st.st_uid != self.uid) {
+            return;
+        }
+        // SAFETY: fchown on a valid open descriptor.
+        let _ = unsafe { libc::fchown(file.as_raw_fd(), self.uid, self.gid) };
+    }
+
+    /// Replaces name with data whole or not at all: written to a temp file
+    /// only this call made (O_EXCL, a name of its own), then renamed over
+    /// name inside the same directory.
+    fn replace(&self, name: &str, data: &[u8]) -> Result<()> {
+        let tmp = format!("{name}.tmp.{}", fsx::hex(&fsx::random_bytes(8)));
+        let (c_tmp, c_name) = (self.c_name(&tmp)?, self.c_name(name)?);
+        let tmp_path = self.path.join(&tmp);
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: valid directory descriptor and C string.
+        let fd = unsafe { libc::openat(self.fd.as_raw_fd(), c_tmp.as_ptr(), flags, 0o600 as libc::c_uint) };
+        if fd < 0 {
+            return Err(os_err("open", &tmp_path));
+        }
+        // SAFETY: fd was just opened and nothing else owns it.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let done = file.write_all(data).map_err(|e| Error::from(e).wrap(format!("write {}", tmp_path.display()))).and_then(|()| {
+            self.give(&file);
+            // SAFETY: valid directory descriptor and C strings.
+            if unsafe { libc::renameat(self.fd.as_raw_fd(), c_tmp.as_ptr(), self.fd.as_raw_fd(), c_name.as_ptr()) } != 0 {
+                return Err(os_err("rename", &tmp_path));
+            }
+            Ok(())
+        });
+        if done.is_err() {
+            // SAFETY: valid directory descriptor and C string.
+            unsafe { libc::unlinkat(self.fd.as_raw_fd(), c_tmp.as_ptr(), 0) };
+        }
+        done
     }
 }
 
-/// Hands a file written by root back to the owner of its directory, so the
-/// registry user can keep writing it.
-fn fix_owner(path: &Path) {
-    if !fsx::is_root() {
-        return;
+fn fstat(fd: RawFd) -> std::io::Result<libc::stat> {
+    // SAFETY: an all-zero stat is a valid value to be filled in.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is a valid descriptor and st a valid out pointer.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    if let Ok(st) = std::fs::metadata(fsx::dir(path)) {
-        let _ = std::os::unix::fs::chown(path, Some(st.uid()), Some(st.gid()));
-    }
+    Ok(st)
 }
 
 // ---- scan report ----
@@ -1238,6 +1364,90 @@ mod tests {
         });
         let s = st.read().unwrap();
         assert_eq!(s.requests.len(), 10, "lost updates");
+    }
+
+    /// The registry account owns the directory and may plant links under
+    /// every name root uses there. Root (here: whoever runs the test, as
+    /// links are followed alike) never writes, creates or reads through
+    /// them; the store works again once they are gone.
+    #[test]
+    fn store_never_goes_through_planted_links() {
+        let dir = TempDir::new();
+        let path = dir.join("registry.json");
+        let st = Store::new(&path);
+        st.update(|s| s.add_request(req("node-a"), COORD_KEY, Time::now())).unwrap();
+        // Stands in for /etc/ld.so.preload, and for a file that is not
+        // there yet.
+        let target = dir.join("victim");
+        std::fs::write(&target, "untouched").unwrap();
+        let missing = dir.join("missing");
+        let link = |name: &str, to: &Path| {
+            let _ = std::fs::remove_file(dir.join(name));
+            std::os::unix::fs::symlink(to, dir.join(name)).unwrap();
+        };
+        let untouched = || {
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+            assert!(!missing.exists(), "a dangling link was followed");
+        };
+
+        // The old fixed temp name: not used any more, so not followed.
+        link("registry.json.tmp", &target);
+        st.update(|s| s.add_request(req("node-b"), COORD_KEY, Time::now())).unwrap();
+        untouched();
+        assert!(std::fs::symlink_metadata(dir.join("registry.json.tmp")).unwrap().file_type().is_symlink());
+        assert_eq!(st.read().unwrap().requests.len(), 2);
+
+        // The lock file, to a file that exists and to one that does not.
+        for to in [&target, &missing] {
+            link("registry.json.lock", to);
+            let e = st.update(|s| s.add_request(req("node-c"), COORD_KEY, Time::now())).unwrap_err().to_string();
+            assert!(e.contains("symbolic link"), "{e}");
+            assert!(st.read().is_err());
+            untouched();
+        }
+        // A FIFO in its place is refused, not waited on.
+        std::fs::remove_file(dir.join("registry.json.lock")).unwrap();
+        let fifo = std::ffi::CString::new(dir.join("registry.json.lock").as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(st.read().unwrap_err().to_string().contains("not a regular file"));
+        std::fs::remove_file(dir.join("registry.json.lock")).unwrap();
+
+        // The registry file itself: neither read nor written through.
+        std::fs::rename(&path, dir.join("saved.json")).unwrap();
+        link("registry.json", &target);
+        assert!(st.read().unwrap_err().to_string().contains("symbolic link"));
+        untouched();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(dir.join("saved.json"), &path).unwrap();
+
+        // Gone again: it works, and no temp file was left behind.
+        assert_eq!(st.read().unwrap().requests.len(), 2);
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("registry.json.tmp."))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// The directory itself: a link to one, or one anybody may write in,
+    /// is not used.
+    #[test]
+    fn store_refuses_a_linked_or_open_directory() {
+        let dir = TempDir::new();
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("linked")).unwrap();
+        let e = Store::new(dir.join("linked/registry.json")).read().unwrap_err().to_string();
+        assert!(e.contains("linked"), "{e}");
+        assert!(!dir.join("real/registry.json").exists() && !dir.join("real/registry.json.lock").exists());
+
+        std::fs::create_dir(dir.join("open")).unwrap();
+        fsx::chmod(dir.join("open"), 0o777).unwrap();
+        let e = Store::new(dir.join("open/registry.json")).read().unwrap_err().to_string();
+        assert!(e.contains("writable by others"), "{e}");
+        assert!(!dir.join("open/registry.json.lock").exists());
+        assert!(Store::new(dir.join("real/registry.json")).read().is_ok());
     }
 
     #[test]

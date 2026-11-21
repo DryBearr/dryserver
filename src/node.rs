@@ -1062,6 +1062,13 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
             let _ = std::fs::remove_file(n.path(ISSUE_FILE));
             let _ = n.cmd(ctx, "agetty", &["--reload"]);
         }
+        // The registry account writes that file: what it holds reaches the
+        // mesh files and the cluster only checked, like a server checks
+        // what the coordinator sends.
+        let (members, problems) = registry::check_members(members, |h| !mesh::ip(&n.cfg.wg_subnet, h).is_empty());
+        for p in &problems {
+            eprintln!("dryserver: sync: ignoring {p}");
+        }
         members
     } else {
         me.host = host;
@@ -2287,6 +2294,32 @@ mod tests {
             .unwrap();
         sync(&Ctx::new(), &n, true, &store).unwrap();
         assert!(get(&n.root, ISSUE_FILE).is_empty(), "the code must go once the admin signed");
+    }
+
+    /// On the coordinator the members come from the registry file, which
+    /// the registry account can write: a name with a newline there must
+    /// not add an SSH `Match exec` or anything else to root's files.
+    #[test]
+    fn coordinator_checks_the_registry_members() {
+        let (_dir, _tmp, n, _) = joined();
+        let store_dir = TempDir::new();
+        let store = Store::new(store_dir.join("registry.json"));
+        let evil = Member { name: "node-b\nMatch exec \"touch /tmp/pwned\"".into(), ..node_member(2) };
+        let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
+        let good = Member { name: "node-c".into(), wg_key: key, ..node_member(3) };
+        store
+            .update(|s| {
+                s.members = vec![coord_member(), evil, good];
+                Ok(())
+            })
+            .unwrap();
+        sync(&Ctx::new(), &Node { hostname: "coord".into(), ..n.clone() }, true, &store).unwrap();
+        for f in ["/etc/ssh/ssh_config.d/20-dryserver.conf", "/etc/ssh/ssh_known_hosts", "/etc/hosts", WG_CONF] {
+            let out = get(&n.root, f);
+            assert!(!out.contains("Match") && !out.contains("pwned"), "{f}:\n{out}");
+        }
+        let cfg = get(&n.root, "/etc/ssh/ssh_config.d/20-dryserver.conf");
+        assert!(cfg.contains("Host coord node-c\n") && !cfg.contains("node-b"), "{cfg}");
     }
 
     #[test]

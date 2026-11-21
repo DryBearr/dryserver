@@ -80,7 +80,7 @@ pub fn wg_config(cfg: &Config, me: SelfInfo, members: &[Member]) -> String {
         cfg.wg_port
     );
     for m in sorted(members) {
-        if m.host == me.host {
+        if m.host == me.host || m.wg_key.contains(|c: char| c.is_whitespace() || c.is_control()) {
             continue;
         }
         b += &format!("\n# {}\n[Peer]\nPublicKey = {}\nAllowedIPs = {}/32\n", m.name, m.wg_key, ip(&cfg.wg_subnet, m.host));
@@ -113,11 +113,7 @@ pub fn hosts(current: &str, cfg: &Config, members: &[Member]) -> String {
     }
     keep.push(HOSTS_BEGIN.into());
     for m in sorted(members) {
-        // Names reach this file only after registry::check_members; checked
-        // again here because a bad one would be a line of its own choosing.
-        if registry::valid_name(&m.name) {
-            keep.push(format!("{} {}", ip(&cfg.wg_subnet, m.host), m.name));
-        }
+        keep.push(format!("{} {}", ip(&cfg.wg_subnet, m.host), m.name));
     }
     keep.push(HOSTS_END.into());
     keep.join("\n") + "\n"
@@ -150,8 +146,13 @@ pub fn ssh_config(cfg: &Config, members: &[Member]) -> String {
     )
 }
 
+/// The members by host number, the ones with a name that is not a plain
+/// hostname left out. Names reach the files written from this only after
+/// registry::check_members; checked again here because a name with a
+/// newline would add lines of its own choosing to them (an SSH
+/// `Match exec`, a WireGuard peer).
 fn sorted(members: &[Member]) -> Vec<Member> {
-    let mut out = members.to_vec();
+    let mut out: Vec<Member> = members.iter().filter(|m| registry::valid_name(&m.name)).cloned().collect();
     out.sort_by_key(|m| m.host);
     out
 }
@@ -296,6 +297,25 @@ mod tests {
         odd[2].name = "a\n10.0.0.1 evil".into();
         let out = hosts("", &c, &odd);
         assert!(!out.contains("archlinux.org") && !out.contains("evil") && out.contains("10.66.0.1 coord"), "hosts:\n{out}");
+    }
+
+    /// On the brain the members come straight from the registry file,
+    /// which the registry account writes. A name with a newline must not
+    /// add lines to any file root writes from it.
+    #[test]
+    fn a_bad_name_adds_no_lines() {
+        let c = cfg(config::TRANSPORT_LAN);
+        let mut odd = members();
+        odd[0].name = "x\nMatch exec \"touch /tmp/pwned\"".into();
+        odd[2].name = "y\n[Peer]\nPublicKey = EVIL".into();
+        odd[1].wg_key = "KEYA\nAllowedIPs = 0.0.0.0/0".into();
+        let me = SelfInfo { host: 9, switch: false };
+        for out in [ssh_config(&c, &odd), known_hosts(&c, &odd), wg_config(&c, me, &odd), hosts("", &c, &odd)] {
+            assert!(!out.contains("Match") && !out.contains("EVIL") && !out.contains("0.0.0.0/0") && !out.contains("pwned"), "{out}");
+            assert!(!out.contains("node-c") && !out.contains("node-b"), "{out}");
+        }
+        assert!(ssh_config(&c, &odd).contains("Host coord\n"), "{}", ssh_config(&c, &odd));
+        assert!(!wg_config(&c, me, &odd).contains("KEYA"));
     }
 
     #[test]
