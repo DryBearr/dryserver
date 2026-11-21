@@ -134,11 +134,17 @@ pub struct Report {
     pub changes: Vec<String>,
     pub conflicts: Vec<Conflict>,
     pub notes: Vec<String>,
+    /// Why a sync after an app changed left everything as it is on
+    /// purpose (Cloudflare: the cluster runs a tunnel set up by hand).
+    pub held: Option<String>,
 }
 
 impl Report {
     /// One line for the screen.
     pub fn summary(&self, dry: bool) -> String {
+        if let Some(why) = &self.held {
+            return format!("left as it is: {why}");
+        }
         let n = self.changes.len();
         let mut s = match (n, dry) {
             (0, _) => "nothing to change".to_string(),

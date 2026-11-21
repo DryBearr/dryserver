@@ -910,30 +910,51 @@ pub mod tests {
 
     #[test]
     fn cloudflare_follows_the_apps() {
-        use crate::entrance::cfsync::tests::{FakeCf, entrance, fresh};
+        use crate::entrance::cfsync::tests::{FakeCf, entrance, fresh, mark_of};
         // With an API token: starting an app with a Cloudflare name, then
-        // removing it, syncs Cloudflare after each.
+        // removing it, syncs Cloudflare after each, while the cluster runs
+        // the tunnel dryserver.
         let fake = Arc::new(Fake::default());
         *fake.listing.lock().unwrap() = LISTING.into();
         let dir = crate::testutil::TempDir::new();
         let cf: Arc<FakeCf> = Arc::new(fresh());
         let doors: Entrances = Arc::new(vec![Box::new(entrance(dir.path(), &cf, true)), Box::new(Vps)]);
-        let mut s = Open::new(Screen::new(fake.clone(), doors));
+        let mut s = Open::new(Screen::new(fake.clone(), doors.clone()));
         s.settle();
         assert!(cf.calls.lock().unwrap().is_empty(), "a refresh does not ask Cloudflare");
-        s.key(Key::Char('n'));
-        for t in ["blog", "nginx:1.27", "80", "blog.example.com", ""] {
-            s.type_in(t);
-        }
-        s.settle();
-        let n = &s.s.notice;
-        assert!(n.contains("blog is starting") && n.contains("Cloudflare Tunnel: 4 changes made."), "{n:?}");
+        let deploy_blog = |s: &mut Open<Screen>| {
+            s.key(Key::Char('n'));
+            for t in ["blog", "nginx:1.27", "80", "blog.example.com", ""] {
+                s.type_in(t);
+            }
+            s.settle();
+        };
         let names = |cf: &FakeCf| cf.cf.lock().unwrap().records.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        // The cluster runs a tunnel set up by hand (LISTING's token mark):
+        // nothing in Cloudflare changes, and the screen says why. A tunnel
+        // dryserver with DNS names that no connector serves would answer
+        // every visitor with error 1033.
+        deploy_blog(&mut s);
+        let n = &s.s.notice;
+        assert!(n.contains("blog is starting") && n.contains("Cloudflare Tunnel: left as it is: the cluster runs a tunnel"), "{n:?}");
+        assert!(n.contains("s on the Outside screen switches to the tunnel dryserver"), "{n:?}");
+        assert_eq!(cf.changes.load(SeqCst), 0);
+        assert!(cf.cf.lock().unwrap().tunnels.is_empty() && names(&cf).is_empty());
+        assert!(!fake.calls.lock().unwrap().iter().any(|(a, m)| a == "apply -f -" && m.contains("cloudflared")), "left running");
+        s.fits(24);
+        // The admin switches on purpose (s on the Outside screen); the
+        // cluster then runs the tunnel dryserver.
+        let o = apps::overview(&Ctx::new(), fake.as_ref()).unwrap();
+        doors[0].sync(&Ctx::new(), fake.as_ref(), &o, &Want { open: true, ..Want::default() }, false).unwrap();
+        let mark = mark_of(&fake).unwrap();
+        *fake.listing.lock().unwrap() = LISTING.replace("00aa11bb22cc33dd", &mark);
+        deploy_blog(&mut s);
+        let n = &s.s.notice;
+        assert!(n.contains("blog is starting") && n.contains("Cloudflare Tunnel: 2 changes made."), "{n:?}");
         assert_eq!(names(&cf), vec!["blog.example.com"]);
-        // The cluster ran another tunnel's token: left running.
-        assert!(!fake.calls.lock().unwrap().iter().any(|(a, m)| a == "apply -f -" && m.contains("cloudflared")));
         // Removed: its name goes too.
-        *fake.after_delete.lock().unwrap() = Some(LISTING.replace("\"host\":\"blog.example.com\"", "\"host\":\"\""));
+        *fake.after_delete.lock().unwrap() =
+            Some(LISTING.replace("00aa11bb22cc33dd", &mark).replace("\"host\":\"blog.example.com\"", "\"host\":\"\""));
         s.key(Key::Down);
         s.key(Key::Char('d'));
         s.key(Key::Char('y'));

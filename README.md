@@ -395,12 +395,15 @@ something else and left alone; `t` takes the name over after you confirm,
 deleting that record. When a call is refused, the message names the
 permission the token lacks. When Cloudflare is down, nothing is changed and
 the running tunnel keeps working. With the API token saved, starting or
-removing an app with a Cloudflare host name syncs by itself; a tunnel you
-closed with `x` stays closed until you press `s`.
+removing an app with a Cloudflare host name syncs by itself, but only while
+the cluster runs the tunnel `dryserver`: a name pointed at a tunnel that no
+connector serves answers every visitor with Cloudflare's error 1033. While
+the tunnel is closed (`x`) or one you set up by hand runs, that sync changes
+nothing in Cloudflare and the apps screen says why; `s` sets it up.
 
 Without an API token, the way by hand below keeps working. Coming from it:
-a sync after an app changed never replaces the token of a tunnel you made
-in the dashboard, neither in the cluster nor in
+a sync after an app changed never touches Cloudflare, the token of the
+tunnel you made in the dashboard, the cluster or
 `secrets/cloudflare_tunnel_token`. `s` says that it would switch to the
 tunnel `dryserver`, and does on `y`; the names you pointed at your own
 tunnel in the dashboard show as held by something else until you take them

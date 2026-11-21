@@ -160,6 +160,37 @@ pub struct Plan {
     pub steps: Vec<Step>,
     pub conflicts: Vec<Conflict>,
     pub notes: Vec<String>,
+    /// Why a sync after an app changed leaves Cloudflare as it is.
+    pub held: Option<String>,
+}
+
+/// Why a sync after an app changed (not open) must not touch Cloudflare.
+///
+/// Such a sync only ever works for the tunnel the cluster runs. A tunnel
+/// it made, or DNS names it pointed at one, that no connector in the
+/// cluster serves would answer every visitor with Cloudflare's error 1033.
+/// So it goes ahead only while the cluster runs the tunnel dryserver, or
+/// an older one of that name (deleted in the dashboard), which it then
+/// replaces. A tunnel set up by hand keeps its names in the dashboard
+/// until the admin switches with s on the Outside screen.
+fn held(seen: &Seen) -> Option<String> {
+    let live = seen.live().and(seen.run_token.as_deref()).map(cloudflare::token_mark);
+    let ours = |m: &str| {
+        seen.saved_token.as_deref().is_some_and(|s| {
+            cloudflare::token_mark(s) == m && cloudflare::tunnel_of(s).is_some_and(|id| seen.tunnels.iter().any(|t| t.id == id))
+        })
+    };
+    match seen.cluster_mark.as_deref() {
+        None => Some(format!(
+            "the tunnel does not run in the cluster, so nothing changed in Cloudflare. s on the Outside screen sets up the tunnel \
+             {TUNNEL_NAME} and opens it"
+        )),
+        Some(m) if live.as_deref() == Some(m) || ours(m) => None,
+        Some(_) => Some(format!(
+            "the cluster runs a tunnel dryserver did not make (one set up by hand; its names are routed in the dashboard), so \
+             nothing changed in Cloudflare. s on the Outside screen switches to the tunnel {TUNNEL_NAME}"
+        )),
+    }
 }
 
 fn holder(r: &Record) -> String {
@@ -172,6 +203,10 @@ fn holder(r: &Record) -> String {
 /// without it a tunnel the admin closed stays closed.
 pub fn plan(seen: &Seen, want: &Want, open: bool) -> Plan {
     let mut p = Plan::default();
+    if !open && let Some(why) = held(seen) {
+        p.held = Some(why);
+        return p;
+    }
     let live = seen.live().map(|t| t.id.clone());
     if live.is_none() {
         p.steps.push(Step::CreateTunnel);
@@ -538,7 +573,7 @@ impl Sync<'_> {
         let saved = std::fs::read_to_string(self.token_file).ok().and_then(|t| cloudflare::tunnel_token(&t).ok());
         let seen = look(&api, saved, self.cluster_mark.clone())?;
         let p = plan(&seen, want, open);
-        let mut r = super::Report { conflicts: p.conflicts, notes: p.notes, changes: Vec::new() };
+        let mut r = super::Report { conflicts: p.conflicts, notes: p.notes, changes: Vec::new(), held: p.held };
         if dry {
             r.changes = p.steps.iter().map(Step::describe).collect();
             return Ok(r);
@@ -1045,19 +1080,33 @@ pub mod tests {
         let w = World::new();
         let names = want(&["blog.example.com"]);
         // After a deploy (not an explicit set up), a closed tunnel stays
-        // closed; the rest is done.
+        // closed, and nothing is made for it: names pointed at a tunnel
+        // no connector serves answer with error 1033.
         let r = w.sync_with(&names, false, None, false).unwrap();
-        assert!(!r.changes.iter().any(|c| c.contains("start the tunnel")), "{r:?}");
-        assert!(r.notes.iter().any(|n| n.contains("closed in the cluster")), "{r:?}");
+        assert!(r.changes.is_empty() && r.conflicts.is_empty(), "{r:?}");
+        assert!(r.summary(false).contains("left as it is: the tunnel does not run in the cluster"), "{r:?}");
         assert!(w.cluster.calls.lock().unwrap().is_empty());
-        assert_eq!(w.records().len(), 1);
+        assert_eq!(w.cf.changes.load(SeqCst), 0);
+        assert!(w.records().is_empty() && w.cf.cf.lock().unwrap().tunnels.is_empty());
         // The cluster runs another tunnel (one made in the dashboard): a
-        // sync after a deploy leaves it running; the admin switches it.
+        // sync after a deploy changes nothing in Cloudflare and says why;
+        // the admin switches it on purpose.
         let other = Some("0123456789abcdef".to_string());
         let r = w.sync_with(&names, false, other.clone(), false).unwrap();
-        assert!(r.changes.is_empty() && r.notes.iter().any(|n| n.contains("the cluster runs another tunnel")), "{r:?}");
+        assert!(r.changes.is_empty() && r.held.as_deref().is_some_and(|h| h.contains("a tunnel dryserver did not make")), "{r:?}");
+        assert!(r.summary(false).contains("s on the Outside screen switches to the tunnel dryserver"), "{r:?}");
+        assert_eq!(w.cf.changes.load(SeqCst), 0);
+        // Also with a tunnel dryserver in Cloudflare that the cluster does
+        // not run: no DNS name is pointed at it.
+        w.sync_with(&want(&[]), true, None, false).unwrap();
+        let before = w.cf.changes.load(SeqCst);
+        let r = w.sync_with(&names, false, other.clone(), false).unwrap();
+        assert!(r.changes.is_empty() && r.held.is_some(), "{r:?}");
+        assert_eq!(w.cf.changes.load(SeqCst), before);
+        assert!(w.records().is_empty());
         let r = w.sync_with(&names, true, other, false).unwrap();
-        assert_eq!(r.changes, vec!["start the tunnel in the cluster with its token"]);
+        assert!(r.changes.iter().any(|c| c.contains("start the tunnel")), "{r:?}");
+        assert_eq!(w.records(), vec![ours("blog.example.com", &w.live())]);
         // The cluster runs an older dryserver tunnel (deleted in the
         // dashboard): that one is replaced without asking.
         w.cf.cf.lock().unwrap().tunnels[0].2 = true;
@@ -1082,10 +1131,12 @@ pub mod tests {
         std::fs::write(w.token_file(), format!("{manual}\n")).unwrap();
         let mark = Some(cloudflare::token_mark(&manual));
         let r = w.sync_with(&want(&["blog.example.com"]), false, mark.clone(), false).unwrap();
-        assert!(!r.changes.iter().any(|c| c.contains("save the tunnel") || c.contains("start the tunnel")), "{r:?}");
-        assert!(r.notes.iter().any(|n| n.contains("holds the token of another tunnel")), "{r:?}");
+        assert!(r.changes.is_empty() && r.held.as_deref().is_some_and(|h| h.contains("set up by hand")), "{r:?}");
         assert_eq!(std::fs::read_to_string(w.token_file()).unwrap().trim(), manual);
         assert!(w.cluster.calls.lock().unwrap().is_empty());
+        // Nothing in Cloudflare either: no tunnel dryserver, no DNS name
+        // that no connector would serve.
+        assert_eq!(w.cf.changes.load(SeqCst), 0);
         let plan = w.sync_with(&want(&["blog.example.com"]), true, mark, true).unwrap();
         assert!(plan.changes.iter().any(|c| c.contains("save the tunnel")) && plan.changes.iter().any(|c| c.contains("start the tunnel")));
         assert_eq!(cloudflare::tunnel_of(&manual).as_deref(), Some("99999999-9999-4999-8999-999999999999"));
