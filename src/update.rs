@@ -2435,6 +2435,23 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_machine_refuses_an_older_release() {
+        // Nothing wrote installed.json (every fresh install): the dryserver
+        // that runs is the floor, so an old signed release sent again is
+        // refused, and changes nothing.
+        let lab = Lab::new();
+        assert!(load_installed(&lab.m()).unwrap().is_none());
+        let old = Release { dryserver: Binary { version: "0.0.0".into(), ..rel(7, NEW).dryserver }, ..rel(7, NEW) };
+        let e = lab.apply(&old).unwrap_err().to_string();
+        assert!(e.contains("older than the") && e.contains("this machine runs") && e.contains("rollback"), "{e}");
+        lab.assert_old("an older release on a fresh machine");
+        assert!(!lab.fake.has("systemd-run") && !lab.p(PREV_BIN).exists(), "something changed: {:?}", lab.fake.ran());
+        // Signed as a rollback, it is taken.
+        lab.apply(&Release { rollback: true, ..old }).unwrap();
+        lab.assert_new("a rollback on a fresh machine");
+    }
+
+    #[test]
     fn one_update_at_a_time() {
         let lab = Lab::new();
         // Another apply holds the lock.

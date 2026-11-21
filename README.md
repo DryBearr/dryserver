@@ -553,7 +553,8 @@ dryserver that cannot update itself.
 
 A hacked coordinator cannot change a release, make a server install an
 older one, or hand it a binary other than the signed one: each server
-checks for itself. It does decide when machines update (the window and
+checks for itself (one that never took an update counts the dryserver
+and k3s it was installed with as its own). It does decide when machines update (the window and
 the turns are its doing). A hacked server can fail or stall only its own
 turn, and a stalled turn ends after 20 minutes.
 

@@ -14,7 +14,9 @@
 //! - a serial that is not higher than the installed release's (an old
 //!   release sent again), or the installed serial with other content;
 //! - an older dryserver, k3s or Arch snapshot, unless the admin set
-//!   `rollback` (the serial still has to go up);
+//!   `rollback` (the serial still has to go up). A machine that never took
+//!   an update compares with what it runs: this binary's version and the
+//!   k3s iso.rs pins;
 //! - a k3s version that breaks Kubernetes' version skew rule.
 //!
 //! An expired release is not refused: it is reported as stale, so a feed
@@ -315,54 +317,92 @@ pub fn open(v: &dyn Verifier, e: &Envelope, now: i64) -> Result<Release> {
     Ok(r)
 }
 
-/// The rules between a valid release and the installed one.
+/// What a machine runs before its first update. Nothing wrote
+/// installed.json yet (every fresh install), but the machine runs this
+/// binary and the k3s its installer pinned, so a release is compared with
+/// those instead: otherwise a fresh machine would take any signed release,
+/// an old one sent again included. There is no serial to compare, and the
+/// Arch snapshot is not pinned in this binary, so those take any valid
+/// value.
+#[derive(Debug, Clone, Copy)]
+struct Floor<'a> {
+    dryserver: &'a str,
+    k3s: &'a str,
+}
+
+const RUNNING: Floor<'static> = Floor { dryserver: env!("CARGO_PKG_VERSION"), k3s: iso::K3S_VERSION };
+
+/// The rules between a valid release and the installed one (or, with
+/// none installed, what runs).
 pub fn decide(new: &Release, installed: Option<&Release>, place: Place, now: i64) -> Result<Verdict> {
+    decide_from(new, installed, RUNNING, place, now)
+}
+
+fn decide_from(new: &Release, installed: Option<&Release>, floor: Floor, place: Place, now: i64) -> Result<Verdict> {
     let stale = now >= new.expires;
-    if let Some(old) = installed {
-        if new.serial == old.serial {
-            if new == old {
-                return Ok(Verdict { install: false, stale });
+    let base_k3s = match installed {
+        Some(old) => {
+            if new.serial == old.serial {
+                if new == old {
+                    return Ok(Verdict { install: false, stale });
+                }
+                bail!(
+                    "release {} is not the installed release with the same serial: one serial was signed twice. \
+                     Sign a new release, it gets a higher serial",
+                    new.serial
+                );
             }
-            bail!(
-                "release {} is not the installed release with the same serial: one serial was signed twice. \
-                 Sign a new release, it gets a higher serial",
-                new.serial
-            );
+            if new.serial < old.serial {
+                bail!("release {} is older than the installed release {} (an old release sent again?)", new.serial, old.serial);
+            }
+            if !new.rollback {
+                let than = |o: &str| format!("the installed {o}");
+                no_older(new, &old.dryserver.version, &old.k3s.version, Some(&old.arch_date), &than)?;
+            }
+            old.k3s.version.as_str()
         }
-        if new.serial < old.serial {
-            bail!("release {} is older than the installed release {} (an old release sent again?)", new.serial, old.serial);
+        None => {
+            if !new.rollback {
+                let than = |o: &str| format!("the {o} this machine runs (it has no release installed yet)");
+                no_older(new, floor.dryserver, floor.k3s, None, &than)?;
+            }
+            floor.k3s
         }
-        if !new.rollback {
-            no_older(new, old)?;
-        }
-    }
-    skew(new, installed, place)?;
+    };
+    skew(new, base_k3s, place)?;
     Ok(Verdict { install: true, stale })
 }
 
-fn no_older(new: &Release, old: &Release) -> Result<()> {
+/// Refuses a release with an older dryserver, k3s or Arch snapshot than
+/// the ones given (no Arch snapshot: any). than says what they are, for
+/// the message.
+fn no_older(new: &Release, dryserver: &str, k3s: &str, arch_date: Option<&str>, than: &dyn Fn(&str) -> String) -> Result<()> {
     let back = |what: &str, n: &str, o: &str| {
-        errf!("release {} has {what} {n}, older than the installed {o}; to go back, sign it with rollback", new.serial)
+        errf!("release {} has {what} {n}, older than {}; to go back, sign it with rollback", new.serial, than(o))
     };
-    let (n, o) = (&new.dryserver.version, &old.dryserver.version);
-    if Version::parse(n)? < Version::parse(o).map_err(|e| e.wrap("installed release"))? {
-        return Err(back("dryserver", n, o));
+    let base = |e: Error| e.wrap(than("version"));
+    let n = &new.dryserver.version;
+    if Version::parse(n)? < Version::parse(dryserver).map_err(base)? {
+        return Err(back("dryserver", n, dryserver));
     }
-    let (n, o) = (&new.k3s.version, &old.k3s.version);
-    if K3sVersion::parse(n)? < K3sVersion::parse(o).map_err(|e| e.wrap("installed release"))? {
-        return Err(back("k3s", n, o));
+    let n = &new.k3s.version;
+    if K3sVersion::parse(n)? < K3sVersion::parse(k3s).map_err(base)? {
+        return Err(back("k3s", n, k3s));
     }
-    let (n, o) = (&new.arch_date, &old.arch_date);
-    if arch_day(n)? < arch_day(o).map_err(|e| e.wrap("installed release"))? {
-        return Err(back("Arch snapshot", n, o));
+    if let Some(o) = arch_date {
+        let n = &new.arch_date;
+        if arch_day(n)? < arch_day(o).map_err(base)? {
+            return Err(back("Arch snapshot", n, o));
+        }
     }
     Ok(())
 }
 
 /// Kubernetes' version skew rules for the k3s of a release. Minor
 /// versions count, as in the upstream policy: patch releases of one minor
-/// version mix freely.
-fn skew(new: &Release, installed: Option<&Release>, place: Place) -> Result<()> {
+/// version mix freely. base_k3s is the k3s the brain runs before this
+/// release: the installed release's, or the one its installer pinned.
+fn skew(new: &Release, base_k3s: &str, place: Place) -> Result<()> {
     let k = K3sVersion::parse(&new.k3s.version)?;
     match place {
         Place::Worker { brain_k3s } => {
@@ -381,11 +421,9 @@ fn skew(new: &Release, installed: Option<&Release>, place: Place) -> Result<()> 
         // one is unsupported upstream (stored objects are migrated one
         // step per version).
         Place::Brain => {
-            if let Some(old) = installed {
-                let o = K3sVersion::parse(&old.k3s.version).map_err(|e| e.wrap("installed release"))?;
-                if k.major != o.major || k.minor.abs_diff(o.minor) > 1 {
-                    bail!("the brain's k3s moves one minor version at a time, not from {} to {}", old.k3s.version, new.k3s.version);
-                }
+            let o = K3sVersion::parse(base_k3s).map_err(|e| e.wrap("the brain's k3s before this release"))?;
+            if k.major != o.major || k.minor.abs_diff(o.minor) > 1 {
+                bail!("the brain's k3s moves one minor version at a time, not from {base_k3s} to {}", new.k3s.version);
             }
         }
     }
@@ -862,8 +900,69 @@ mod tests {
         assert!(ok(&back, Some(&installed), Place::Brain).unwrap());
         let far_back = Release { rollback: true, ..with_k3s("v1.34.0+k3s1") };
         assert!(ok(&far_back, Some(&installed), Place::Brain).is_err());
-        // A new brain with nothing installed yet takes the release as is.
+        // A new brain with nothing installed yet runs the k3s its installer
+        // pinned: one minor version up from there is fine.
+        assert_eq!(iso::K3S_VERSION, "v1.37.2+k3s1", "the cases below assume this pin");
         assert!(ok(&with_k3s("v1.38.0+k3s1"), None, Place::Brain).unwrap());
+        let e = ok(&with_k3s("v1.39.0+k3s1"), None, Place::Brain).unwrap_err().to_string();
+        assert!(e.contains("one minor version at a time, not from v1.37.2+k3s1"), "{e}");
+    }
+
+    #[test]
+    fn nothing_installed_compares_with_what_runs() {
+        let floor = Floor { dryserver: "0.3.0", k3s: "v1.37.2+k3s1" };
+        let at = |dryserver: &str, k3s: &str, rollback: bool| Release {
+            dryserver: Binary { version: dryserver.into(), ..rel().dryserver },
+            k3s: K3s { version: k3s.into(), ..rel().k3s },
+            rollback,
+            ..rel()
+        };
+        let fresh = |r: &Release, place: Place| decide_from(r, None, floor, place, now());
+        for place in [Place::Brain, BRAIN] {
+            // The same or newer versions: taken, whatever the serial.
+            for r in [
+                at("0.3.0", "v1.37.2+k3s1", false),
+                at("0.3.1", "v1.37.3+k3s1", false),
+                Release { serial: 1, ..at("1.0.0", "v1.37.2+k3s1", false) },
+            ] {
+                assert_eq!(fresh(&r, place).unwrap(), Verdict { install: true, stale: false }, "{r:?}");
+            }
+            // Older dryserver or k3s than what runs: an old release sent
+            // again, refused unless the admin signed it as a rollback.
+            for (r, want) in [
+                (at("0.2.9", "v1.37.2+k3s1", false), "dryserver 0.2.9, older than the 0.3.0 this machine runs"),
+                (at("0.3.0", "v1.37.1+k3s1", false), "k3s v1.37.1+k3s1, older than the v1.37.2+k3s1 this machine runs"),
+                (at("0.3.0", "v1.37.2+k3s0", false), "older than the v1.37.2+k3s1"),
+            ] {
+                let e = fresh(&r, place).unwrap_err().to_string();
+                assert!(e.contains(want) && e.contains("sign it with rollback"), "{e}");
+                assert!(fresh(&Release { rollback: true, ..r }, place).unwrap().install);
+            }
+            // The Arch snapshot is not pinned in the binary: any day.
+            assert!(fresh(&Release { arch_date: "2020/01/01".into(), ..at("0.3.0", "v1.37.2+k3s1", false) }, place).unwrap().install);
+        }
+        // The brain's k3s still moves one minor version at a time from
+        // the pinned one, rollback or not.
+        for (k3s, ok) in [("v1.38.0+k3s1", true), ("v1.39.0+k3s1", false), ("v1.36.0+k3s1", true), ("v1.35.9+k3s1", false)] {
+            assert_eq!(fresh(&at("0.3.0", k3s, true), Place::Brain).is_ok(), ok, "{k3s}");
+        }
+
+        // The real floor is this binary and the pinned k3s; both must
+        // parse, or a fresh machine would refuse every release.
+        Version::parse(RUNNING.dryserver).unwrap();
+        K3sVersion::parse(RUNNING.k3s).unwrap();
+        assert_eq!((RUNNING.dryserver, RUNNING.k3s), (env!("CARGO_PKG_VERSION"), iso::K3S_VERSION));
+        let key = fake::Key("admin");
+        let ancient = Release { dryserver: Binary { version: "0.0.0".into(), ..rel().dryserver }, ..rel() };
+        for place in [Place::Brain, BRAIN] {
+            let e = refused(&ancient, None, place, now());
+            assert!(e.contains("this machine runs (it has no release installed yet)"), "{e}");
+            let back = Release { rollback: true, ..ancient.clone() };
+            assert!(check(&key, &seal(&key, &back).unwrap(), None, place, now()).unwrap().1.install);
+        }
+        // The release of this very binary is taken on a fresh machine.
+        let this = Release { dryserver: Binary { version: env!("CARGO_PKG_VERSION").into(), ..rel().dryserver }, ..rel() };
+        assert!(check(&key, &seal(&key, &this).unwrap(), None, Place::Brain, now()).unwrap().1.install);
     }
 
     #[test]
