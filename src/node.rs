@@ -26,6 +26,11 @@ pub const REGISTRY_KEY: &str = "/etc/dryserver/registry_ed25519";
 /// The pinned coordinator host key.
 pub const KNOWN_HOSTS: &str = "/etc/dryserver/known_hosts";
 pub const JOIN_STATE: &str = "/etc/dryserver/join.json";
+/// Written by leave before anything else (when and why), removed by the
+/// next approval. Only while it is there does a sync stop k3s again: a
+/// join.json that is lost or damaged says nothing about the admin's
+/// decision, and must never take a live server out of the cluster.
+pub const LEFT: &str = "/etc/dryserver/left";
 pub const WG_KEY: &str = "/etc/wireguard/wg0.key";
 pub const WG_PUB: &str = "/etc/wireguard/wg0.pub";
 pub const WG_CONF: &str = "/etc/wireguard/wg0.conf";
@@ -169,6 +174,33 @@ impl Node {
 
     pub fn load_state(&self) -> State {
         std::fs::read(self.path(JOIN_STATE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    /// The join state, for decisions that undo something: None when there
+    /// is no file (not asked to join yet, or it was lost), an error when it
+    /// cannot be read or parsed. load_state takes both for host 0, which is
+    /// right for "may it sync", not for "did it leave".
+    pub fn read_state(&self) -> Result<Option<State>> {
+        match std::fs::read(self.path(JOIN_STATE)) {
+            Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| Error::from(e).wrap(format!("{JOIN_STATE} is damaged"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::from(e).wrap(format!("read {JOIN_STATE}"))),
+        }
+    }
+
+    /// Whether leave's marker is there.
+    fn has_left(&self) -> bool {
+        std::fs::symlink_metadata(self.path(LEFT)).is_ok()
+    }
+
+    /// This machine is a member (approved, or in the admin's signed list):
+    /// an earlier leave is over. A marker that stays stops nothing while
+    /// join.json names a host, so a failure is only reported.
+    fn clear_left(&self) {
+        match std::fs::remove_file(self.path(LEFT)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => eprintln!("dryserver: cannot remove {LEFT}: {e}"),
+            _ => {}
+        }
     }
 
     pub fn save_state(&self, s: &State) -> Result<()> {
@@ -377,6 +409,10 @@ impl Node {
         let mut st = self.load_state();
         st.host = r.host;
         self.save_state(&st)?;
+        // A member again: an earlier leave is over. After the host number,
+        // so that between the two finish_leave sees a member and stops
+        // nothing.
+        self.clear_left();
         let mut plan = plan.clone();
         plan.host_num = r.host;
         for f in sysconf::render(&plan)? {
@@ -646,8 +682,12 @@ impl Node {
     ///
     /// The decision is recorded first and the work done after it: from then
     /// on every sync finishes what is left (finish_leave), so a stop that
-    /// did not take, or a reboot half way, is caught there.
+    /// did not take, or a reboot half way, is caught there. The record is
+    /// the LEFT marker, written before join.json says host 0: a reboot
+    /// between the two leaves a member with a marker, which stops nothing,
+    /// and its next sync hears of the removal again.
     pub(crate) fn leave(&self, ctx: &Ctx, env: &Envelope, why: &Error) {
+        self.record_leave(why);
         let _ = self.save_state(&State::default());
         if let Ok(text) = serde_json::to_string(env) {
             let _ = self.write(SIGNED_FILE, 0o600, &(text + "\n"));
@@ -659,15 +699,36 @@ impl Node {
         ));
     }
 
+    /// Writes the LEFT marker: when, and why. The first one stays, so it
+    /// tells when the admin's decision arrived.
+    fn record_leave(&self, why: &Error) {
+        if self.has_left() {
+            return;
+        }
+        let text = format!("left {:?}\n{}\n", Time::now(), why.to_string().replace('\n', " "));
+        if let Err(e) = self.write(LEFT, 0o600, &text) {
+            // The stop below still runs; only its repeats need the marker.
+            eprintln!("dryserver: cannot record the leave in {LEFT} ({e}): later syncs will not stop k3s again");
+        }
+    }
+
     /// Finishes what leave started, on every sync of a server that is no
     /// member: whatever of k3s is still there is stopped again, until
     /// nothing is. A stop can fail (systemctl timed out, a process escaped
     /// the kill), and k3s can be started again by hand; leave runs once
     /// and would not notice.
     ///
+    /// Only after a leave (its marker is there), and not once join.json
+    /// names a host. A join.json that is gone or damaged does not mean the
+    /// admin removed this server: without the marker nothing happens, and a
+    /// damaged one stops nothing even with it, which is said loudly.
+    ///
     /// A machine waiting for its first approval has nothing there, and
-    /// pays a few file reads for this: no command.
+    /// pays one file look for this: no command.
     pub(crate) fn finish_leave(&self, ctx: &Ctx) {
+        if !self.has_left() {
+            return;
+        }
         // The control plane is never stopped here, also on a coordinator
         // whose role file was lost: only the coordinator has its directory.
         if self.path(K3S_SERVER_DIR).exists() {
@@ -679,9 +740,9 @@ impl Node {
             return;
         }
         // Under the mesh lock, and only while this machine still is no
-        // member. An approval sets the host number under the same lock, and
-        // the token comes after it: a machine that joins again is never
-        // stopped here.
+        // member. An approval sets the host number and removes the marker
+        // under the same lock, and the token comes after it: a machine that
+        // joins again is never stopped here.
         let _lock = match fsx::lock(self.path(quarantine::MESH_LOCK)) {
             Ok(l) => l,
             Err(e) => {
@@ -689,8 +750,24 @@ impl Node {
                 return;
             }
         };
-        if self.load_state().host != 0 {
+        if !self.has_left() {
             return;
+        }
+        match self.read_state() {
+            Ok(Some(s)) if s.host != 0 => return,
+            // Host 0, or no file: an approval always writes one (and takes
+            // the marker away), and lifting a quarantine forgets the join
+            // request of a machine that is no member. The marker decides.
+            Ok(_) => {}
+            Err(e) => {
+                let status = format!(
+                    "NOT stopped: this machine left the swarm ({LEFT}), but {e}, so it cannot tell whether it joined again ({}). \
+                     Look at {JOIN_STATE}",
+                    left.join(", ")
+                );
+                self.note(K3S_LEFT_STATUS, &format!("k3s: {status}"), &status);
+                return;
+            }
         }
         let status = format!("still there although this machine is no member ({}): stopping it again", left.join(", "));
         self.note(K3S_LEFT_STATUS, &format!("k3s: {status}"), &status);
@@ -953,7 +1030,8 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     // A server that is no member runs nothing of the cluster: what its
     // leave did not stop is stopped now. Also while it is quarantined, and
     // whatever the quarantine file says.
-    let host = if coordinator { 1 } else { n.load_state().host };
+    let state = if coordinator { Ok(None) } else { n.read_state() };
+    let host = if coordinator { 1 } else { state.as_ref().ok().and_then(|s| s.as_ref()).map_or(0, |s| s.host) };
     if host == 0 {
         n.finish_leave(ctx);
     }
@@ -988,7 +1066,19 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     } else {
         me.host = host;
         if me.host == 0 {
-            return Err("not a member of the swarm: not joined yet, or removed by the admin (sudo dryserver join asks to join)".into());
+            return Err(match state {
+                // Not "no member": this machine does not know. It changes
+                // nothing, and says so at every sync.
+                Err(e) => errf!(
+                    "not a member of the swarm as far as this server can tell: {e}. \
+                     The mesh and k3s are left as they are; put back {JOIN_STATE} (it holds {{\"host\": N}}) or ask to join again"
+                ),
+                Ok(None) if !n.has_left() => errf!(
+                    "not a member of the swarm: there is no {JOIN_STATE}. Not joined yet (sudo dryserver join asks to join), \
+                     or the file was lost: then the mesh and k3s are left as they are; put it back (it holds {{\"host\": N}})"
+                ),
+                _ => "not a member of the swarm: not joined yet, or removed by the admin (sudo dryserver join asks to join)".into(),
+            });
         }
         let lan = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).unwrap_or_default();
         rep = n.full_report(ctx, false);
@@ -1016,6 +1106,9 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
         match n.signed_members(me.host, &sent, &env) {
             Ok((members, status)) => {
                 n.note_signed(&status);
+                // In the admin's list: a marker left by a leave that went
+                // down before it wrote host 0 goes.
+                n.clear_left();
                 members
             }
             Err(e) if e.is(Kind::Removed) => {
@@ -1847,6 +1940,7 @@ mod tests {
         let (_dir, _tmp, n, fc, _) = running_apps();
         // leave recorded the decision, then the machine went down. At boot
         // k3s found its token and started again.
+        n.record_leave(&Error::new("the admin removed this server from the swarm (signed list version 7)"));
         n.save_state(&State::default()).unwrap();
         cgroups(&n, true);
         fc.calls.lock().unwrap().clear();
@@ -1855,6 +1949,123 @@ mod tests {
         assert!(stopped(&fc) && get(&n.root, sysconf::K3S_TOKEN).is_empty() && get(&n.root, sysconf::K3S_CONFIG).is_empty());
         assert!(get(&n.root, K3S_LEFT_STATUS).contains("its token"));
         assert!(fc.calls.lock().unwrap().is_empty(), "no need to ask the coordinator again");
+    }
+
+    /// k3s still runs as it did: token, config, nothing killed or stopped.
+    fn untouched(n: &Node, fc: &FakeCoord, why: &str) {
+        assert!(!stopped(fc), "{why}: {:?}", fc.ran.lock().unwrap());
+        assert!(!get(&n.root, sysconf::K3S_TOKEN).is_empty() && !get(&n.root, sysconf::K3S_CONFIG).is_empty(), "{why}");
+        for cgroup in K3S_CGROUPS {
+            assert_eq!(get(&n.root, &format!("{cgroup}/cgroup.kill")), "", "{why}: {cgroup} killed");
+        }
+    }
+
+    #[test]
+    fn a_lost_or_damaged_join_state_never_stops_a_live_server() {
+        for (text, want) in [
+            (None, "there is no /etc/dryserver/join.json"),
+            (Some(""), "join.json is damaged"),
+            (Some("{\"host\": 2"), "join.json is damaged"),
+            (Some("{\"host\": \"two\"}"), "join.json is damaged"),
+            (Some("\0\0\0\0"), "join.json is damaged"),
+        ] {
+            let (_dir, _tmp, n, fc, _) = running_apps();
+            match text {
+                None => std::fs::remove_file(n.path(JOIN_STATE)).unwrap(),
+                Some(t) => put(&n.root, JOIN_STATE, t),
+            }
+            cgroups(&n, true);
+            for round in 0..2 {
+                let e = sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap_err().to_string();
+                // Said at every sync, with what to do.
+                assert!(e.contains(want) && e.contains("left as they are") && e.contains("{\"host\": N}"), "{text:?} round {round}: {e}");
+                untouched(&n, &fc, &format!("{text:?} round {round}"));
+                assert!(fc.ran.lock().unwrap().is_empty(), "{text:?}: {:?}", fc.ran.lock().unwrap());
+            }
+            n.finish_leave(&Ctx::new());
+            untouched(&n, &fc, &format!("{text:?}, finish_leave by itself"));
+            // It is not taken for host 0 anywhere it would undo something.
+            if let Some(t) = text {
+                assert!(n.read_state().is_err(), "{t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_damaged_join_state_after_a_leave_stops_nothing_and_says_so() {
+        let (_dir, _tmp, n, fc, _) = running_apps();
+        n.record_leave(&Error::new("removed"));
+        put(&n.root, JOIN_STATE, "{\"host\": 2");
+        cgroups(&n, true);
+        for round in 0..2 {
+            fc.ran.lock().unwrap().clear();
+            n.finish_leave(&Ctx::new());
+            untouched(&n, &fc, &format!("round {round}"));
+            let status = get(&n.root, K3S_LEFT_STATUS);
+            assert!(status.starts_with("NOT stopped") && status.contains("join.json is damaged"), "{status}");
+            assert!(!n.note(K3S_LEFT_STATUS, "", status.trim()), "logged once, not at every sync");
+        }
+    }
+
+    #[test]
+    fn the_leave_marker() {
+        let (_dir, _tmp, n, fc, _) = running_apps();
+        let (store, ctx) = (Store::new("/nonexistent"), Ctx::new());
+        *fc.peers.lock().unwrap() = Some(peers(&[coord_member()], &sign(&ADMIN, 7, vec![coord_entry(), other_entry()])));
+        assert!(sync(&ctx, &n, false, &store).unwrap_err().is(Kind::Removed));
+        // When and why, root's alone; a later leave keeps the first time.
+        let marker = get(&n.root, LEFT);
+        assert!(marker.starts_with("left 20") && marker.contains("signed list version 7"), "{marker}");
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(n.path(LEFT)).unwrap().permissions()) & 0o777, 0o600);
+        n.leave(&ctx, &sign(&ADMIN, 8, vec![coord_entry()]), &Error::new("again"));
+        assert_eq!(get(&n.root, LEFT), marker);
+
+        // Lifting a quarantine forgets a non-member's join.json: the
+        // marker still has k3s stopped.
+        std::fs::remove_file(n.path(JOIN_STATE)).unwrap();
+        put(&n.root, sysconf::K3S_TOKEN, "K10abc::node:secret\n");
+        cgroups(&n, true);
+        fc.ran.lock().unwrap().clear();
+        let e = sync(&ctx, &n, false, &store).unwrap_err().to_string();
+        assert!(e.contains("removed by the admin"), "{e}");
+        assert!(stopped(&fc) && n.path(LEFT).exists() && !n.path(sysconf::K3S_TOKEN).exists());
+
+        // Approved again (sudo dryserver join): the marker goes with the
+        // approval, so a later host 0 that is no leave (a join request
+        // that expired, say) stops nothing.
+        let env = sign(&ADMIN, 9, vec![coord_entry(), node_entry(4)]);
+        let params = Params {
+            config: n.cfg.clone(),
+            plan: packages::resolve(&[], &[]).unwrap(),
+            hostname: "node-a".into(),
+            role: sysconf::Role::Node,
+            switch_mac: "52:54:66:00:00:04".into(),
+            ..Params::default()
+        };
+        n.activate(&approved(4, env), SelfInfo { host: 0, switch: true }, &params).unwrap();
+        assert!(!n.path(LEFT).exists() && n.load_state().host == 4);
+        put(&n.root, sysconf::K3S_TOKEN, "K10abc::node:again\n");
+        put(&n.root, sysconf::K3S_CONFIG, "server: https://10.66.0.1:6443\n");
+        for cgroup in K3S_CGROUPS {
+            put(&n.root, &format!("{cgroup}/cgroup.kill"), "");
+        }
+        n.save_state(&State::default()).unwrap();
+        fc.ran.lock().unwrap().clear();
+        sync(&ctx, &n, false, &store).unwrap_err();
+        n.finish_leave(&ctx);
+        untouched(&n, &fc, "rejoined, then host 0 without a leave");
+    }
+
+    #[test]
+    fn a_member_drops_a_marker_its_leave_left_half_way() {
+        // leave wrote its marker and went down before join.json said host
+        // 0; meanwhile the admin signed this server in again.
+        let (_dir, _tmp, n, fc, _) = running_apps();
+        n.record_leave(&Error::new("removed"));
+        cgroups(&n, true);
+        assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
+        untouched(&n, &fc, "a member with a marker");
+        assert!(!n.path(LEFT).exists(), "the signed list says member: the marker goes");
     }
 
     #[test]
@@ -1895,7 +2106,10 @@ mod tests {
     #[test]
     fn only_what_is_there_is_stopped() {
         let (_dir, n, fc) = setup(vec![]);
-        // A token, no cgroups (k3s never started), no pod mounts.
+        // A server that left: a token, no cgroups (k3s never started), no
+        // pod mounts.
+        n.record_leave(&Error::new("removed"));
+        n.save_state(&State::default()).unwrap();
         put(&n.root, sysconf::K3S_TOKEN, "K10abc::node:secret\n");
         n.finish_leave(&Ctx::new());
         assert!(!n.path(sysconf::K3S_TOKEN).exists());

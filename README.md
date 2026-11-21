@@ -454,6 +454,10 @@ network when the mesh no longer answers). From then on every sync checks
 that nothing of k3s is left on it (its token, k3s.service, processes in its
 cgroups, pods' mounts) and stops it again if something is, until nothing
 is: a stop that timed out or a k3s started again by hand does not stay.
+That needs the record the leave writes first (`/etc/dryserver/left`, when
+and why; the next approval removes it): a server whose
+`/etc/dryserver/join.json` is lost or damaged stops nothing, and its sync
+says so every minute.
 A server that only lost contact
 keeps its apps running. To bring a removed server back, run
 `sudo dryserver join` on it and approve it like a new machine. A machine
