@@ -207,6 +207,9 @@ pub struct Pending {
     pub serial: u64,
     #[serde(deserialize_with = "report::lenient")]
     pub deadline: i64,
+    /// The release that ran before this one, if any.
+    #[serde(deserialize_with = "report::lenient")]
+    pub previous: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -226,6 +229,19 @@ pub struct Last {
 impl UpdateStatus {
     pub fn pending_serial(&self) -> u64 {
         self.pending.as_ref().map_or(0, |p| p.serial)
+    }
+
+    /// The release this machine runs for good. `update apply` records the
+    /// new release as installed at once; until it is confirmed it can still
+    /// go back, so the one before it is what counts meanwhile. Taking the
+    /// applied one let the brain count itself updated, stop settling its
+    /// own update and go back at the deadline (seen after a reboot inside
+    /// the window).
+    pub fn confirmed_serial(&self) -> u64 {
+        match &self.pending {
+            Some(p) if p.serial == self.installed.serial => p.previous.unwrap_or(0),
+            _ => self.installed.serial,
+        }
     }
 
     /// Why release serial went back, when it did.
@@ -995,8 +1011,8 @@ impl<'a> Machine<'a> {
     fn ready(&self, ctx: &Ctx, offer: &Offer, now: i64, l: &mut Local) -> std::result::Result<bool, Stop> {
         // The sync's own time running out ends up here too.
         let st = self.update().status(ctx).map_err(|e| Stop::Later(format!("cannot ask how its updates stand: {e}")))?;
-        if st.installed.serial >= offer.serial {
-            l.installed = st.installed.serial;
+        if st.confirmed_serial() >= offer.serial {
+            l.installed = st.confirmed_serial();
             self.save(l).map_err(Stop::Again)?;
             return Ok(false);
         }
@@ -1151,7 +1167,7 @@ impl<'a> Machine<'a> {
     fn settle(&self, ctx: &Ctx, l: &mut Local, rep: &Report, now: i64) -> Result<()> {
         let up = self.update();
         let st = up.status(ctx)?;
-        l.installed = st.installed.serial;
+        l.installed = st.confirmed_serial();
         let pending = st.pending_serial();
         if pending != 0 && pending != l.pending {
             // Another release waits: its own deadline settles it.
@@ -1181,7 +1197,7 @@ impl<'a> Machine<'a> {
             l.installed = l.installed.max(l.pending);
             return self.promote(l);
         }
-        if st.installed.serial >= l.pending {
+        if st.confirmed_serial() >= l.pending {
             // Confirmed meanwhile.
             return self.promote(l);
         }

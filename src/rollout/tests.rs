@@ -131,11 +131,15 @@ impl Runner for Fake {
                 let pending = if s.pending == 0 {
                     serde_json::Value::Null
                 } else {
-                    serde_json::json!({"serial": s.pending, "stage": "booted", "deadline": 0, "seconds_left": 300, "boots": 0, "files": []})
+                    serde_json::json!({"serial": s.pending, "previous": if s.installed == 0 { serde_json::Value::Null } else { s.installed.into() },
+                        "stage": "booted", "deadline": 0, "seconds_left": 300, "boots": 0, "files": []})
                 };
+                // Like the real `update status`: an applied release counts as
+                // installed at once, pending until it is confirmed.
+                let shown = if s.pending == 0 { s.installed } else { s.pending };
                 let st = serde_json::json!({
                     "running": "0.1.0",
-                    "installed": {"serial": s.installed, "version": "0.1.0", "k3s": K3S_VERSION},
+                    "installed": {"serial": shown, "version": "0.1.0", "k3s": K3S_VERSION},
                     "pending": pending,
                     "last": {"at": 0, "serial": s.last.0, "action": s.last.1, "ok": s.last.2, "message": s.last.3},
                     "problems": [],
