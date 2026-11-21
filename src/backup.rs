@@ -1456,7 +1456,13 @@ mod tests {
         assert!(f.pos("systemctl stop").is_none());
         assert!(status(&j.dir()).error.contains("not enough disk space"));
 
+        // Each case gets its own root: another test thread that forks a
+        // command at the wrong moment keeps a copy of a just-dropped lock
+        // open until its exec, so two runs on one root can collide.
+
         // No age.
+        let dir = TempDir::new();
+        let root = coordinator(&dir, AGE);
         let f = Fake::new(&dir.join("age"), "active");
         let mut j = job(&root, &dir.join("age"), &f);
         j.age = dir.join("no-such-age").display().to_string();
@@ -1465,15 +1471,18 @@ mod tests {
         assert!(f.pos("systemctl stop").is_none());
 
         // A needed file missing; optional ones missing are listed instead.
+        let dir = TempDir::new();
+        let root = coordinator(&dir, AGE);
         std::fs::remove_file(root.join("var/lib/rancher/k3s/server/token")).unwrap();
         let f = Fake::new(&dir.join("age"), "active");
         let j = job(&root, &dir.join("age"), &f);
         let e = j.run(&Ctx::new(), now(), &mut Vec::new()).unwrap_err().to_string();
         assert!(e.contains("/var/lib/rancher/k3s/server/token is missing"), "{e}");
         assert!(f.pos("systemctl stop").is_none());
-        put(&root, "var/lib/rancher/k3s/server/token", "K10token\n");
 
         // A bad backup key.
+        let dir = TempDir::new();
+        let root = coordinator(&dir, AGE);
         put(&root, "usr/local/share/dryserver/backup_ed25519.pub", "age1notansshkey\n");
         let f = Fake::new(&dir.join("age"), "active");
         let j = job(&root, &dir.join("age"), &f);

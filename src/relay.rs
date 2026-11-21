@@ -1200,8 +1200,26 @@ mod tests {
     }
 
     /// A port nothing listens on.
+    /// A port where connects are refused and that stays so: a socket bound
+    /// to it but never listening. The port of a dropped listener could be
+    /// handed to a test running in parallel, which would bring the "dead"
+    /// backend to life. The socket is left open on purpose until the test
+    /// process ends (a few per run).
     fn dead_port() -> SocketAddr {
-        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+        // SAFETY: plain socket calls on a descriptor owned here; the
+        // address structs are zeroed and sized for AF_INET.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert!(fd >= 0, "socket");
+            let mut a: libc::sockaddr_in = std::mem::zeroed();
+            a.sin_family = libc::AF_INET as libc::sa_family_t;
+            a.sin_addr.s_addr = u32::from(Ipv4Addr::LOCALHOST).to_be();
+            let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            assert_eq!(libc::bind(fd, &a as *const libc::sockaddr_in as *const libc::sockaddr, len), 0, "bind");
+            let mut got = len;
+            assert_eq!(libc::getsockname(fd, &mut a as *mut libc::sockaddr_in as *mut libc::sockaddr, &mut got), 0, "getsockname");
+            SocketAddr::from((Ipv4Addr::LOCALHOST, u16::from_be(a.sin_port)))
+        }
     }
 
     fn tcp_addr(r: &Relay, i: usize) -> SocketAddr {
