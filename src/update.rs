@@ -1190,13 +1190,15 @@ pub fn activate(m: &Machine, ctx: &Ctx, id: &str, out: &mut dyn Write) -> Result
     if try_lock(m)?.is_some() {
         bail!("update activate is a step of update apply and runs only inside it");
     }
+    // Sync, join and the kill switch change the mesh files under this lock;
+    // a cut that landed since apply looked counts too. The record is read
+    // under it as well: a revert that ran while this waited for the lock
+    // has cleared it or marked it reverting.
+    let _mesh = fsx::lock(m.path(quarantine::MESH_LOCK))?;
     let p = load_pending(m)?.ok_or_else(|| errf!("no update is being applied"))?;
     if p.id != id || p.stage != STAGE_INSTALLING {
         bail!("update {id:?} is not the one being applied");
     }
-    // Sync, join and the kill switch change the mesh files under this lock;
-    // a cut that landed since apply looked counts too.
-    let _mesh = fsx::lock(m.path(quarantine::MESH_LOCK))?;
     refuse_if_cut(m)?;
     let files = render_managed(m)?;
     let mut ch = Changes::new(m, p);
@@ -1248,9 +1250,18 @@ fn restore_binary(m: &Machine, p: &Pending) -> Result<&'static str> {
 /// reloads its units.
 fn revert(m: &Machine, ctx: &Ctx, mut p: Pending, why: &str, boot: bool, now: i64, out: &mut dyn Write) -> Result<()> {
     tell(m, out, now, &format!("reverting release {}: {why}", p.serial));
+    // An activate that still runs (its apply was cancelled or died) holds
+    // the mesh lock while it writes files and adds them to the record.
+    // Once it is done, the record is read again, so the files it added are
+    // put back too; marked reverting, it lets no activate start after.
+    let _mesh = fsx::lock(m.path(quarantine::MESH_LOCK)).ok();
+    if let Ok(Some(q)) = load_pending(m)
+        && q.id == p.id
+    {
+        p = q;
+    }
     p.stage = STAGE_REVERTING.into();
     let _ = save_pending(m, &p);
-    let _mesh = fsx::lock(m.path(quarantine::MESH_LOCK)).ok();
     let mut problems = Vec::new();
     match restore_binary(m, &p) {
         Ok(s) => say(out, s),
@@ -2432,6 +2443,51 @@ mod tests {
         // The window has limits.
         let a = Apply { window: 5, ..lab.opts(&rel(9, NEW), lab.staged(NEW)) };
         assert!(apply(&lab.m(), &Ctx::new(), &a, now(), &mut Vec::new()).unwrap_err().to_string().contains("window"));
+    }
+
+    #[test]
+    fn a_revert_puts_back_what_a_late_activate_added() {
+        // The revert was handed the record as it was before activate wrote
+        // the SSH settings and installed.json (apply cancelled while its
+        // activate still ran): it reads it again under the mesh lock.
+        let lab = Lab::new();
+        lab.apply(&rel(7, NEW)).unwrap();
+        let mut early = lab.pending().unwrap();
+        assert!(early.files.len() > 1);
+        early.files.truncate(1);
+        revert(&lab.m(), &Ctx::new(), early, "test", false, now(), &mut Vec::new()).unwrap();
+        lab.assert_old("files added after the record was read");
+        // A record of another update on disk is not taken for this one.
+        let lab = Lab::new();
+        lab.apply(&rel(7, NEW)).unwrap();
+        let mut other = lab.pending().unwrap();
+        other.id = "0123456789abcdef".into();
+        let mine = lab.pending().unwrap();
+        save_pending(&lab.m(), &other).unwrap();
+        revert(&lab.m(), &Ctx::new(), mine, "test", false, now(), &mut Vec::new()).unwrap();
+        lab.assert_old("its own record");
+    }
+
+    #[test]
+    fn an_activate_that_waited_for_a_revert_changes_nothing() {
+        let lab = Lab::new();
+        let id = "0123456789abcdef";
+        let p = Pending { format: PENDING_FORMAT, id: id.into(), stage: STAGE_INSTALLING.into(), serial: 7, ..Pending::default() };
+        save_pending(&lab.m(), &p).unwrap();
+        // apply holds its lock, and a revert holds the mesh lock while the
+        // new binary's activate starts and waits for it.
+        let _apply = try_lock(&lab.m()).unwrap().expect("the update lock");
+        let mesh = fsx::lock(lab.p(quarantine::MESH_LOCK)).unwrap();
+        let fake = lab.fake.clone();
+        let t = std::thread::spawn(move || activate(&fake.machine(), &Ctx::new(), id, &mut Vec::new()).map_err(|e| e.to_string()));
+        std::thread::sleep(Duration::from_millis(300));
+        // The revert finishes: the record goes, then the lock.
+        clear_pending(&lab.m()).unwrap();
+        drop(mesh);
+        let e = t.join().unwrap().unwrap_err();
+        assert!(e.contains("no update is being applied"), "{e}");
+        assert_eq!(lab.get(FIREWALL), OLD_FIREWALL, "activate wrote files after the revert");
+        assert!(lab.pending().is_none(), "activate brought the record back");
     }
 
     #[test]
