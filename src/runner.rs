@@ -134,12 +134,24 @@ fn exec(ctx: &Ctx, c: &Cmd, emit: LogFn) -> Result<Exec> {
         None
     };
     cmd.stdout(out_w);
-    let mut child = match cmd.spawn() {
-        Ok(ch) => ch,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Ok((String::new(), String::new(), Err(errf!("exec: {:?}: executable file not found in $PATH", c.name))));
+    // A program written a moment ago (a new dryserver binary before its
+    // self check, a test's fake tool) can still be open for writing in a
+    // child that another thread forked at that instant, until that child
+    // execs. Linux refuses to run it meanwhile (ETXTBSY), so try again
+    // briefly instead of failing.
+    let mut busy = 0;
+    let mut child = loop {
+        match cmd.spawn() {
+            Ok(ch) => break ch,
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && busy < 40 => {
+                busy += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok((String::new(), String::new(), Err(errf!("exec: {:?}: executable file not found in $PATH", c.name))));
+            }
+            Err(e) => return Ok((String::new(), String::new(), Err(Error::new(os_msg(&e))))),
         }
-        Err(e) => return Ok((String::new(), String::new(), Err(Error::new(os_msg(&e))))),
     };
     drop(cmd); // closes this side's copies of the pipe write ends
 
