@@ -20,7 +20,7 @@ podman run --rm --name "dryserver-validate-$$" --cap-add NET_ADMIN \
     --security-opt label=disable -v "$work:/r:ro" \
     docker.io/library/archlinux:latest bash -c '
 set -euo pipefail
-pacman -Sy --noconfirm --needed nftables openssh sudo jq >/dev/null 2>&1
+pacman -Syu --noconfirm --needed nftables openssh sudo jq >/dev/null 2>&1
 ssh-keygen -A >/dev/null
 useradd -m admin; useradd -m dryreg
 fail=0
