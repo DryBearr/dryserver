@@ -379,6 +379,25 @@ ExecStart=/usr/local/bin/dryserver tpm-enroll --first-boot
 
 [Install]
 WantedBy=multi-user.target
+===== /etc/systemd/system/dryserver-update-guard.service (0644)
+# dryserver: after a restart, an update that was not confirmed in time
+# (or never finished applying) is reverted before the firewall, the network
+# and SSH start; one whose window is still open gets its revert timer back.
+[Unit]
+Description=Revert an unconfirmed dryserver update after a restart
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target shutdown.target nftables.service systemd-networkd.service sshd.service wg-quick@wg0.service k3s.service dryserver-sync.timer
+Conflicts=shutdown.target
+ConditionPathExists=/var/lib/dryserver-update/pending.json
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '/usr/local/bin/dryserver.prev update guard --boot || /usr/local/bin/dryserver update guard --boot'
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=sysinit.target
 ===== /etc/systemd/network/10-switch.network (0644)
 # The Ethernet port used for the switch: fixed address 172.16.66.5/24 (no gateway)
 # plus DHCP in case the switch is connected to the router.

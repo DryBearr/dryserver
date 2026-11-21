@@ -2666,8 +2666,10 @@ mod tests {
         );
         assert!(f.has("visudo -c -q -f /etc/sudoers.d/10-wheel"));
         let reloads: Vec<usize> = f.ran().iter().enumerate().filter(|(_, c)| *c == "systemctl daemon-reload").map(|(i, _)| i).collect();
-        assert_eq!(reloads.len(), 2, "one for the boot unit, one for the changed units: {:?}", f.ran());
-        assert!(f.index("systemd-analyze").unwrap() < reloads[1], "verified after the reload: {:?}", f.ran());
+        // The installer already put the boot unit in place (sysconf renders
+        // it), so only the changed units need a reload.
+        assert_eq!(reloads.len(), 1, "one for the changed units: {:?}", f.ran());
+        assert!(f.index("systemd-analyze").unwrap() < reloads[0], "verified before the reload: {:?}", f.ran());
         assert_eq!(std::fs::metadata(lab.p("/etc/sudoers.d/10-wheel")).unwrap().permissions().mode() & 0o777, 0o440);
         // A unit that fails verify reverts the update.
         let lab = Lab::new();
@@ -2877,6 +2879,19 @@ mod tests {
         // Not under the registry account's directory on the coordinator.
         assert!(!format!("{DIR}/").starts_with(&format!("{}/", fsx::dir(registry::DEFAULT_PATH).display())));
         assert_eq!(effect(GUARD_UNIT_PATH), Some(Effect::Units));
+    }
+
+    #[test]
+    fn a_machine_installed_before_the_boot_unit_gets_it_first() {
+        let lab = Lab::new();
+        std::fs::remove_file(lab.p(GUARD_UNIT_PATH)).unwrap();
+        lab.apply(&rel(7, NEW)).unwrap();
+        assert_eq!(lab.get(GUARD_UNIT_PATH), GUARD_UNIT_TEXT);
+        let ran = lab.fake.ran();
+        let reload = ran.iter().position(|c| c == "systemctl daemon-reload").expect("a reload for the new unit");
+        let enable = ran.iter().position(|c| c.starts_with("systemctl enable --quiet dryserver-update-guard.service")).expect("enabled");
+        let timer = ran.iter().position(|c| c.starts_with("systemd-run")).expect("timer");
+        assert!(reload < enable && enable < timer, "the boot unit is in place before anything is armed: {ran:?}");
     }
 
     #[test]

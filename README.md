@@ -384,6 +384,27 @@ yet; to look inside one:
 **Back up `secrets/backup_ed25519`** with your other secrets: without it no
 backup can be opened.
 
+## Updates
+
+A machine changes only to a release you signed on your computer (namespace
+`dryserver-release`, so a signed member list can never pass as one). Each
+release has a serial that only goes up, so an old one cannot be sent again,
+and the checksum and size of every file in it.
+
+On each machine, `sudo dryserver update apply` checks the release, puts the
+new binary beside the old one and swaps it in one rename (a power cut leaves
+one of the two, never half a file), lets the new binary check itself, then
+rewrites the system files it manages from `/etc/dryserver/config.env`, each
+validated first (`nft -c`, `sshd -t`, `systemd-analyze verify`). Before it
+changes anything it arms a revert: unless `sudo dryserver update confirm`
+follows within 10 minutes, the machine puts the old binary and files back by
+itself. That needs no network and no coordinator, and a boot unit
+(`dryserver-update-guard.service`) carries it across a reboot. A machine
+whose kill switch has cut the coordinator off takes no update.
+
+Handing releases out and updating the machines one at a time (coordinator
+first) is the next step; so are Arch and k3s updates.
+
 ## Security
 
 - **Firewall first.** The live USB accepts no incoming connections and runs no
@@ -480,6 +501,8 @@ On servers:
 | `sudo dryserver quarantine` | kill switch on this server (`-name`, `-status`, `-lift`) |
 | `dryserver report` | this machine's health as JSON, the same report it sends with every sync (`sudo` adds the firewall and WireGuard) |
 | `sudo dryserver backup` | coordinator: make an encrypted backup now (a timer does it every night) |
+| `sudo dryserver update apply` | install a release the admin signed; it reverts by itself unless `update confirm` follows in time (`update status`, `update revert`) |
+| `sudo dryserver selfcheck` | check this binary, its settings, the firewall, SSH and wg0.conf, without the network |
 | `dryserver sync`, `join`, `scan`, `registry`, `cluster-dns` | run automatically by systemd, cron and SSH |
 
 ### Health reports

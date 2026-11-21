@@ -341,7 +341,8 @@ impl Real {
         // k3s starts by itself once it has what it needs: on the
         // coordinator at once, on a server after it was approved and got
         // its token (see the unit's condition).
-        let mut enable = vec!["systemctl", "enable", "k3s.service"];
+        // The update guard runs at boot and reverts an update a reboot cut short.
+        let mut enable = vec!["systemctl", "enable", "k3s.service", crate::update::GUARD_UNIT];
         if ch.role() == Role::Coordinator {
             // Keeps the cluster's DNS on two machines; backs up every night.
             enable.extend([sysconf::DNS_TIMER, sysconf::BACKUP_TIMER]);
@@ -756,7 +757,7 @@ mod tests {
         assert!(read("/etc/crypttab").contains("data0 UUID=1111-uuid /etc/cryptsetup-keys.d/data0.key"), "{}", read("/etc/crypttab"));
         assert_eq!(read("/usr/local/bin/k3s"), "k3s binary");
         assert_eq!(mode(r.target("/usr/local/bin/k3s")).0, 0o755);
-        fr.index(&format!("arch-chroot {t} systemctl enable k3s.service"));
+        fr.index(&format!("arch-chroot {t} systemctl enable k3s.service dryserver-update-guard.service"));
         assert!(!fr.strings().iter().any(|c| c.contains("dryserver-dns")), "the DNS timer is the coordinator's");
         assert!(!fr.strings().iter().any(|c| c.contains("dryserver-backup")), "the backup timer is the coordinator's");
         assert!(!r.target(crate::backup::RECIPIENT).exists(), "only the coordinator makes backups");
@@ -833,7 +834,9 @@ mod tests {
                 assert!(!fsx::under(&r.target, "/var/lib/rancher/k3s/server/manifests").join(f).exists(), "{f} is k3s's");
             }
         }
-        fr.index(&format!("arch-chroot {t} systemctl enable k3s.service dryserver-dns.timer dryserver-backup.timer"));
+        fr.index(&format!(
+            "arch-chroot {t} systemctl enable k3s.service dryserver-update-guard.service dryserver-dns.timer dryserver-backup.timer"
+        ));
         // The backup key's public half, where `dryserver backup` reads it.
         assert_eq!(get(&r.target, crate::backup::RECIPIENT), "ssh-ed25519 AAAAbackup dryserver-backup\n");
         assert_eq!(std::fs::metadata(r.target(crate::backup::RECIPIENT)).unwrap().permissions().mode() & 0o777, 0o644);

@@ -125,6 +125,9 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
         file("/etc/systemd/system/k3s.service", 0o644, k3s_unit(p.role)),
         file("/etc/systemd/system/dryserver-sync.timer", 0o644, SYNC_TIMER),
         file("/etc/systemd/system/dryserver-tpm-enroll.service", 0o644, TPM_ENROLL_UNIT),
+        // Reverts an update that was not confirmed in time, also after a
+        // reboot in the middle of one (see src/update.rs).
+        file(crate::update::GUARD_UNIT_PATH, 0o644, crate::update::GUARD_UNIT_TEXT),
     ];
     if p.role == Role::Coordinator {
         files.push(file("/etc/cron.d/dryserver-scan", 0o644, SCAN_CRON));
