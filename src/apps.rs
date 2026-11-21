@@ -357,21 +357,27 @@ impl SshCluster {
         o
     }
 
-    /// Where the shared connection's socket goes: the user's private
-    /// runtime directory. None without one (then every call connects).
+    /// Where the shared connection's socket goes: a directory of this
+    /// user's alone in the user's runtime directory (socket_dir). None
+    /// without one (then every call connects).
+    fn control_path(&self, runtime_dir: Option<&std::ffi::OsStr>) -> Option<String> {
+        let runtime = std::path::Path::new(runtime_dir.filter(|d| !d.is_empty())?);
+        self.socket_name(&socket_dir(runtime, crate::fsx::geteuid())?)
+    }
+
+    /// The socket's name in dir, as ssh's ControlPath option.
     ///
     /// The name carries the pinned host key file the connection was made
     /// with: a connection is checked against the pinned key once, when it
     /// is made, and one made from another directory (another stick's
     /// secrets) must never be reused here.
-    fn control_path(&self, runtime_dir: Option<&std::ffi::OsStr>) -> Option<String> {
-        let dir = runtime_dir.filter(|d| !d.is_empty())?;
+    fn socket_name(&self, dir: &std::path::Path) -> Option<String> {
         let full = std::path::absolute(&self.known_hosts).unwrap_or_else(|_| self.known_hosts.clone());
         let mut id: u64 = 0xcbf2_9ce4_8422_2325;
         for b in full.as_os_str().as_encoded_bytes() {
             id = (id ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
         }
-        let path = std::path::Path::new(dir).join(format!("dryserver-k3s-%C-{id:016x}")).display().to_string();
+        let path = dir.join(format!("k3s-%C-{id:016x}")).display().to_string();
         // ssh binds the socket under the name plus 17 characters first,
         // with %C as 40; a socket's name has room for 107.
         if path.len() - 2 + 40 + 17 > 107 {
@@ -379,6 +385,33 @@ impl SshCluster {
         }
         Some(format!("ControlPath={path}"))
     }
+}
+
+/// The directory for the shared connection's sockets: dryserver/ in the
+/// runtime directory, made for uid alone. None when it is not safe.
+///
+/// Every call goes through whatever listens on the socket, the tunnel's
+/// token on stdin included: a socket someone else put there would get it.
+/// So the directory must be a real one (not a link), owned by uid and
+/// mode 0700, and it must sit in a runtime directory nobody else can
+/// rename it out of: owned by uid or root, writable by nobody else unless
+/// sticky. One that is not like that is left as it is, and every call
+/// connects by itself.
+fn socket_dir(runtime: &std::path::Path, uid: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let parent = std::fs::symlink_metadata(runtime).ok()?;
+    let others_write = parent.mode() & 0o022 != 0 && parent.mode() & 0o1000 == 0;
+    if !parent.is_dir() || !(parent.uid() == uid || parent.uid() == 0) || others_write {
+        return None;
+    }
+    let dir = runtime.join("dryserver");
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    let m = std::fs::symlink_metadata(&dir).ok()?;
+    (m.is_dir() && m.uid() == uid && m.mode() & 0o777 == 0o700).then_some(dir)
 }
 
 /// At most one try to start the shared connection per half minute,
@@ -977,21 +1010,74 @@ pub mod tests {
         }
         assert_eq!(c.control_path(None), None, "without a private runtime directory every call connects");
         assert_eq!(c.control_path(Some("".as_ref())), None);
-        let p = c.control_path(Some("/run/user/1000".as_ref())).unwrap();
-        assert!(p.starts_with("ControlPath=/run/user/1000/dryserver-k3s-%C-"), "{p}");
+        let run = std::path::Path::new("/run/user/1000/dryserver");
+        let p = c.socket_name(run).unwrap();
+        assert!(p.starts_with("ControlPath=/run/user/1000/dryserver/k3s-%C-"), "{p}");
         // Another stick's pinned key file: another connection.
         let other = SshCluster { known_hosts: "b/known_hosts".into(), ..c };
-        assert_ne!(other.control_path(Some("/run/user/1000".as_ref())).unwrap(), p);
+        assert_ne!(other.socket_name(run).unwrap(), p);
         // A socket's name has room for 107 bytes, and ssh adds 17 while
         // it makes one: a deep runtime directory means no sharing.
         assert!(p.len() - "ControlPath=".len() - 2 + 40 + 17 <= 107, "{p}");
-        let deep = format!("/run/user/{}", "x".repeat(40));
-        assert_eq!(other.control_path(Some(deep.as_ref())), None);
+        let deep = format!("/run/user/{}/dryserver", "x".repeat(40));
+        assert_eq!(other.socket_name(deep.as_ref()), None);
+        // The runtime directory is used through a directory of ours.
+        // (The temporary directory may be too deep for a socket.)
+        let t = crate::testutil::TempDir::new();
+        let ours = socket_dir(t.path(), crate::fsx::geteuid()).unwrap();
+        assert_eq!(other.control_path(Some(t.path().as_os_str())), other.socket_name(&ours));
         // Which cut-off calls take the shared connection down.
         use std::time::Duration;
         assert!(hung(&Error::with_kind(Kind::DeadlineExceeded, "late"), Duration::from_secs(15)));
         assert!(hung(&Error::canceled(), Duration::from_secs(5)), "quit during a call that hangs");
         assert!(!hung(&Error::canceled(), Duration::from_millis(200)), "quit during a quick refresh");
         assert!(!hung(&Error::new("too long"), Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn the_socket_directory_is_ours_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let me = crate::fsx::geteuid();
+        let mode = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        let chmod = |p: &std::path::Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        let t = crate::testutil::TempDir::new();
+        chmod(t.path(), 0o700);
+        let dir = t.join("dryserver");
+        // Made for this user alone, and found again.
+        assert_eq!(socket_dir(t.path(), me), Some(dir.clone()));
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(socket_dir(t.path(), me), Some(dir.clone()));
+        // Someone else's (here: owned by another uid than asked for).
+        assert_eq!(socket_dir(t.path(), me + 1), None);
+        // Open to others: not shared, and left as it is.
+        chmod(&dir, 0o755);
+        assert_eq!(socket_dir(t.path(), me), None);
+        assert_eq!(mode(&dir), 0o755);
+        // A link to a directory that would pass: not followed.
+        std::fs::remove_dir(&dir).unwrap();
+        let elsewhere = t.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        chmod(&elsewhere, 0o700);
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        assert_eq!(socket_dir(t.path(), me), None);
+        // A file in its place.
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::write(&dir, "").unwrap();
+        assert_eq!(socket_dir(t.path(), me), None);
+        std::fs::remove_file(&dir).unwrap();
+        // A runtime directory others may write to could have ours renamed
+        // away and replaced; with the sticky bit (like /tmp) it cannot.
+        chmod(t.path(), 0o777);
+        assert_eq!(socket_dir(t.path(), me), None);
+        assert!(!dir.exists(), "nothing made there");
+        chmod(t.path(), 0o1777);
+        assert_eq!(socket_dir(t.path(), me), Some(dir.clone()));
+        chmod(t.path(), 0o700);
+        // No runtime directory at all.
+        assert_eq!(socket_dir(&t.join("missing"), me), None);
+        // Without a safe directory, kubectl connects by itself.
+        let c = SshCluster { host: "192.0.2.1".into(), port: String::new(), user: "admin".into(), known_hosts: "k".into() };
+        chmod(&dir, 0o750);
+        assert_eq!(c.control_path(Some(t.path().as_os_str())), None);
     }
 }

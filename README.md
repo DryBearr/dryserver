@@ -293,7 +293,10 @@ The screen never waits for the coordinator: every question and change runs
 in the background with a time limit (15 seconds for a look, a minute for a
 change), and the screen says when the coordinator does not answer. Both
 screens share one SSH connection, which ends by itself 20 seconds after the
-last call.
+last call. Its socket lives in `dryserver/` in your runtime directory
+(`$XDG_RUNTIME_DIR`), made for you alone; when that directory is a link,
+someone else's or open to others, nothing is shared and each call connects
+by itself.
 
 What dryserver sets up around every app (namespace `apps`):
 
