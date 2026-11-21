@@ -18,6 +18,10 @@ mod install;
 mod iso;
 mod mesh;
 mod node;
+// Not called yet: `dryserver update apply` calls it for the k3s binary
+// and the Arch snapshot of a release once it is wired.
+#[allow(dead_code)]
+mod osupdate;
 mod owner;
 mod packages;
 mod quarantine;
