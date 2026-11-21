@@ -16,7 +16,7 @@ set -uo pipefail
 BIN=$(realpath "${1:-$(dirname "$0")/../target/debug/dryserver}")
 # Short: the shared connection's socket lives in here.
 S=$(mktemp -d /tmp/dsa.XXXXXX)
-PORT=2211
+PORT=${PORT:-2211}  # another with PORT=NNNN when two runs share a machine
 pass=0 fail=0
 ok() { echo "  PASS $*"; pass=$((pass + 1)); }
 bad() { echo "  FAIL $*"; fail=$((fail + 1)); }
