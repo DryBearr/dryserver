@@ -35,6 +35,7 @@ mod sysconf;
 #[cfg(test)]
 mod testutil;
 mod tui;
+mod update;
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
@@ -90,6 +91,13 @@ on servers:
                       (run by a timer)
   backup              coordinator: encrypted backup into /var/lib/dryserver/backups
                       (run by a timer every night)
+  update apply --release FILE --binary FILE [--brain-k3s V] [--window SECS]
+                      install a dryserver release the admin signed; it
+                      reverts by itself unless confirmed within the window
+  update confirm [--serial N] | revert | status [--json]
+                      keep the applied release, undo it, or show the state
+  selfcheck           check this binary, config.env, the firewall, SSH,
+                      wg0.conf and the state files (no network needed)
 "#;
 
 /// Where the ISO build puts the config.
@@ -132,6 +140,8 @@ fn main() -> ExitCode {
         "cluster-dns" => run_cluster_dns(rest),
         "backup" => run_backup(rest),
         "backup-pull" => run_backup_pull(rest),
+        "update" => run_update(rest),
+        "selfcheck" => run_selfcheck(rest),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
@@ -843,6 +853,118 @@ fn run_tpm_enroll(args: &[String]) -> Result<()> {
     let _ = Command::new("systemctl").args(["disable", "dryserver-tpm-enroll.service"]).status();
     println!("TPM enrolled; the disk now unlocks by itself.");
     Ok(())
+}
+
+// ---- updates ----
+
+fn update_machine() -> Result<update::Machine> {
+    if !fsx::is_root() {
+        bail!("run as root (sudo)");
+    }
+    Ok(update::Machine::installed(Arc::new(ExecRunner::silent())))
+}
+
+/// An update keeps going when the admin's SSH session drops half way (a
+/// firewall reload may do that); output errors are ignored for the same
+/// reason.
+fn keep_going_on_hangup() {
+    // SAFETY: setting signal dispositions; no handlers are installed.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
+fn run_update(args: &[String]) -> Result<()> {
+    const HELP: &str = "usage: dryserver update apply|confirm|revert|status (see dryserver help)";
+    let Some((sub, rest)) = args.split_first() else { bail!("{HELP}") };
+    let name = format!("update {sub}");
+    let now = chrono::Utc::now().timestamp();
+    let mut out = std::io::stdout();
+    match sub.as_str() {
+        "apply" => {
+            let window = update::WINDOW.to_string();
+            let f = Flags::parse(
+                &name,
+                rest,
+                &[
+                    ("release", "", "the signed release (JSON envelope)"),
+                    ("binary", "", "the dryserver binary it names"),
+                    ("brain-k3s", "", "the k3s version the coordinator runs (default: this server's own)"),
+                    ("window", &window, "seconds until an unconfirmed update reverts by itself"),
+                ],
+            );
+            if f.get("release").is_empty() || f.get("binary").is_empty() {
+                bail!("update apply: --release and --binary are required");
+            }
+            let window = f.get("window").parse().map_err(|_| errf!("update apply: --window must be a number of seconds"))?;
+            let m = update_machine()?;
+            keep_going_on_hangup();
+            let a = update::Apply {
+                release: f.get("release").into(),
+                binary: f.get("binary").into(),
+                brain_k3s: f.get("brain-k3s").into(),
+                window,
+            };
+            update::apply(&m, &Ctx::on_signals(), &a, now, &mut out)
+        }
+        "confirm" => {
+            let f = Flags::parse(&name, rest, &[("serial", "", "the release that must be the one waiting")]);
+            let serial = match f.get("serial") {
+                "" => None,
+                s => Some(s.parse().map_err(|_| errf!("update confirm: --serial must be a number"))?),
+            };
+            let m = update_machine()?;
+            keep_going_on_hangup();
+            update::confirm(&m, &Ctx::new(), serial, now, &mut out)
+        }
+        "revert" => {
+            Flags::parse(&name, rest, &[]);
+            let m = update_machine()?;
+            keep_going_on_hangup();
+            update::revert_by_hand(&m, &Ctx::new(), now, &mut out)
+        }
+        "status" => {
+            let f = Flags::parse(&name, rest, &[("json", "false", "print JSON, for the machine report and the monitor")]);
+            let s = update::status(&update_machine()?, now);
+            if f.on("json") {
+                println!("{}", serde_json::to_string_pretty(&s)?);
+            } else {
+                update::print_status(&s, &mut out);
+            }
+            Ok(())
+        }
+        // Run by the revert timer and the boot unit.
+        "guard" => {
+            let f = Flags::parse(
+                &name,
+                rest,
+                &[("id", "", "the update the timer was armed for"), ("boot", "false", "the machine just started")],
+            );
+            let m = update_machine()?;
+            keep_going_on_hangup();
+            match (f.get("id"), f.on("boot")) {
+                ("", true) => update::guard_boot(&m, &Ctx::new(), now, &mut out),
+                (id, false) if !id.is_empty() => update::guard_timer(&m, &Ctx::new(), id, now, &mut out),
+                _ => bail!("update guard: give --id or --boot"),
+            }
+        }
+        // The new binary's half of apply; apply runs it.
+        "activate" => {
+            let f = Flags::parse(&name, rest, &[("id", "", "the update being applied")]);
+            let m = update_machine()?;
+            keep_going_on_hangup();
+            update::activate(&m, &Ctx::on_signals(), f.get("id"), &mut out)
+        }
+        _ => bail!("unknown update command {sub:?}\n{HELP}"),
+    }
+}
+
+fn run_selfcheck(args: &[String]) -> Result<()> {
+    Flags::parse("selfcheck", args, &[]);
+    let m = update_machine()?;
+    let ctx = Ctx::on_signals().with_timeout(Duration::from_secs(30));
+    update::print_checks(&update::selfcheck(&m, &ctx), &mut std::io::stdout())
 }
 
 #[cfg(test)]
