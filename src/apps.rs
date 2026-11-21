@@ -493,6 +493,15 @@ fn run_child(ctx: &Ctx, mut cmd: Command, stdin: &[u8], max: usize) -> Result<Ra
     Ok(Ran { status: exited.unwrap_or_default(), out, err })
 }
 
+/// Whether a call that was cut off had hung. Such a call still runs
+/// through the shared connection, which would live as long as it: the
+/// connection goes too, and the next call makes a new one. A call cut off
+/// right away (the screen closed or switched during a quick refresh)
+/// leaves the connection for the next screen; it ends by itself.
+fn hung(e: &Error, ran: std::time::Duration) -> bool {
+    e.is(Kind::DeadlineExceeded) || (e.is_canceled() && ran >= std::time::Duration::from_secs(3))
+}
+
 /// Runs cmd with nothing attached, within ctx, and says whether it
 /// succeeded. The shared connection must start like this: one that
 /// inherits our pipes would keep every call waiting until it exits.
@@ -543,13 +552,13 @@ impl Cluster for SshCluster {
         // kubectl gives up by itself too, so nothing stays behind on the
         // coordinator.
         cmd.arg(&target).args(["k3s", "kubectl", "--request-timeout=60s"]).args(args);
+        let started = std::time::Instant::now();
         let ran = match run_child(ctx, cmd, stdin.as_bytes(), MAX_ANSWER) {
             Ok(r) => r,
             Err(e) => {
-                // Cut off: the shared connection still carries the call
-                // and would live as long as it. It goes too; the next call
-                // makes a new one.
-                if let Some(ctl) = &shared {
+                if let Some(ctl) = &shared
+                    && hung(&e, started.elapsed())
+                {
                     quiet(&Ctx::new().with_timeout(std::time::Duration::from_secs(3)), mux(ctl, &["-O", "exit"]));
                 }
                 return Err(e);
@@ -957,5 +966,11 @@ pub mod tests {
         assert!(p.len() - "ControlPath=".len() - 2 + 40 + 17 <= 107, "{p}");
         let deep = format!("/run/user/{}", "x".repeat(40));
         assert_eq!(other.control_path(Some(deep.as_ref())), None);
+        // Which cut-off calls take the shared connection down.
+        use std::time::Duration;
+        assert!(hung(&Error::with_kind(Kind::DeadlineExceeded, "late"), Duration::from_secs(15)));
+        assert!(hung(&Error::canceled(), Duration::from_secs(5)), "quit during a call that hangs");
+        assert!(!hung(&Error::canceled(), Duration::from_millis(200)), "quit during a quick refresh");
+        assert!(!hung(&Error::new("too long"), Duration::from_secs(5)));
     }
 }

@@ -169,14 +169,14 @@ echo "== the screen lists the apps over one shared connection"
 out=$(screen "blog" "r" "1/1 running" "" 2>&1)
 check "the screen shows the app from the coordinator" grep -q "blog .*1/1 running" <<<"$out"
 check "it ended at once" grep -Eq "exit after [0-9]{1,3} ms" <<<"$out"
-check "the calls went through the shared connection" test "$(masters)" -eq 1
+check "the calls went through the shared connection ($(masters))" test "$(masters)" -eq 1
 check "no call is left running" test "$(clients)" -eq 0
 
 echo "== a new app"
 out=$(screen "blog" "n" "Name" $'web\r' "Image" $'nginx:1.27\r' "Port" $'80\r' "Public host name" $'\r\r' "web is starting|Not started" "" 2>&1)
 check "the screen says it is starting" grep -q "web is starting" <<<"$out"
 check "the coordinator got the manifest on stdin" grep -q 'name: "web"' "$S/applied"
-check "still one shared connection" test "$(masters)" -eq 1
+check "still one shared connection ($(masters))" test "$(masters)" -eq 1
 
 echo "== the ways in from outside"
 out=$(screen "blog" "o" "Your VPS +not set up" "a" "n new app" "" 2>&1)
