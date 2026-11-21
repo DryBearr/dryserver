@@ -593,8 +593,9 @@ struct Item {
     status: serde_json::Value,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
+/// kubectl's list. items must be there: an answer without it says
+/// nothing about what runs.
+#[derive(Deserialize)]
 struct List {
     items: Vec<Item>,
 }
@@ -602,12 +603,17 @@ struct List {
 /// The apps and the tunnel, in one question to the cluster (each one is
 /// an SSH login). Names and hosts come from the cluster; they are checked
 /// before they are shown.
+///
+/// Only a real list with no items is an empty cluster. An empty or broken
+/// answer (a cut connection, a kubectl that printed nothing) is an error:
+/// read as "no apps", the sync that follows would delete every DNS name.
 pub fn overview(ctx: &Ctx, c: &dyn Cluster) -> Result<Overview> {
     let out = c.kubectl(ctx, &["get", "deployments,ingresses,pods", "-A", "-l", "app", "-o", "json"], "")?;
     if out.trim().is_empty() {
-        return Ok(Overview::default());
+        bail!("the cluster sent an empty answer; what runs there is not known");
     }
-    let l: List = serde_json::from_str(&out).map_err(|e| Error::from(e).wrap("kubectl output"))?;
+    let l: List =
+        serde_json::from_str(&out).map_err(|_| errf!("the cluster sent an answer that is not a list; what runs there is not known"))?;
     let mut o = Overview::default();
     for it in l.items.iter().filter(|i| i.kind == "Deployment") {
         let (ready, copies) = (it.status["readyReplicas"].as_u64().unwrap_or(0) as u32, it.spec["replicas"].as_u64().unwrap_or(0) as u32);
@@ -787,7 +793,11 @@ pub mod tests {
         }
     }
 
-    /// Records kubectl calls and answers "get" with a fixed listing.
+    /// A listing that makes the fake answer nothing at all.
+    pub const SILENT: &str = "(nothing)";
+
+    /// Records kubectl calls and answers "get" with a fixed listing: an
+    /// empty cluster until one is set, nothing at all with SILENT.
     #[derive(Default)]
     pub struct Fake {
         pub calls: Mutex<Vec<(String, String)>>,
@@ -828,7 +838,11 @@ pub mod tests {
                 *self.listing.lock().unwrap() = l;
             }
             Ok(if args.contains(&"get") {
-                self.listing.lock().unwrap().clone()
+                match self.listing.lock().unwrap().as_str() {
+                    "" => r#"{"items":[]}"#.into(),
+                    SILENT => String::new(),
+                    l => l.to_string(),
+                }
             } else if args.contains(&"apply") {
                 self.applied.lock().unwrap().clone()
             } else {
@@ -904,6 +918,13 @@ pub mod tests {
         // An empty cluster is an empty list; an unreachable one an error.
         *c.listing.lock().unwrap() = r#"{"items":[]}"#.into();
         assert_eq!(overview(&Ctx::new(), &c).unwrap(), Overview::default());
+        // An answer that is not a list is not an empty cluster: nothing,
+        // blanks, null, no items, half a list.
+        for bad in [SILENT, " \n", "null", "{}", r#"{"items":null}"#, r#"{"items":[{"kind":"Deployment""#, "[]"] {
+            *c.listing.lock().unwrap() = bad.into();
+            let e = overview(&Ctx::new(), &c).unwrap_err().to_string();
+            assert!(e.contains("what runs there is not known"), "{bad:?}: {e}");
+        }
         *c.fail.lock().unwrap() = Some("connection refused".into());
         assert!(overview(&Ctx::new(), &c).is_err());
     }

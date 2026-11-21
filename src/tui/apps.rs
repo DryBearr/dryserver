@@ -106,13 +106,17 @@ fn run(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, limits: Limits, job: Job) 
         }),
         Job::Remove(name) => {
             // Which entrance to sync afterwards: only worth a look when one
-            // syncs by itself.
-            let before = if automatic { listing(ctx, c, limits).ok() } else { None };
+            // syncs by itself. Without the look nothing is synced, and the
+            // admin hears why.
+            let before = if automatic { Some(listing(ctx, c, limits)) } else { None };
             Msg::Changed(match apps::remove(&change, c, &name) {
-                Ok(()) => {
-                    let ids: Vec<String> = before.and_then(|b| came_through(&b, &name)).into_iter().collect();
-                    format!("{name} removed.{}", sync_after(ctx, c, doors, limits, &ids))
-                }
+                Ok(()) => match before {
+                    Some(Err(e)) => format!("{name} removed.\nThe ways in from outside were not synced: {e}"),
+                    before => {
+                        let ids: Vec<String> = before.and_then(|b| b.ok()).and_then(|b| came_through(&b, &name)).into_iter().collect();
+                        format!("{name} removed.{}", sync_after(ctx, c, doors, limits, &ids))
+                    }
+                },
                 Err(e) => format!("Not removed: {}", timed(e, limits.change)),
             })
         }
@@ -951,6 +955,54 @@ pub mod tests {
         s.settle();
         assert!(s.s.notice.contains("shop is starting") && !s.s.notice.contains("Cloudflare"), "{:?}", s.s.notice);
         assert!(cf.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_empty_answer_is_not_an_empty_cluster() {
+        use crate::apps::tests::SILENT;
+        use crate::entrance::cfsync::tests::{FakeCf, entrance, fresh};
+        // The coordinator answers nothing (a cut connection, a kubectl
+        // that printed nothing): the screen says so, and no sync reads it
+        // as "no apps" and deletes their names.
+        let fake = Arc::new(Fake::default());
+        *fake.listing.lock().unwrap() = SILENT.into();
+        let dir = crate::testutil::TempDir::new();
+        let cf: Arc<FakeCf> = Arc::new(fresh());
+        let doors: Entrances = Arc::new(vec![Box::new(entrance(dir.path(), &cf, true)), Box::new(Vps)]);
+        let mut s = Open::new(Screen::new(fake.clone(), doors));
+        s.settle();
+        assert!(s.flat().contains("Cannot reach the cluster: the cluster sent an empty answer"), "{}", s.view());
+        assert!(!s.view().contains("No apps yet"), "{}", s.view());
+        // A deploy looks first, and stops.
+        s.key(Key::Char('n'));
+        for t in ["blog", "nginx:1.27", "80", "blog.example.com", ""] {
+            s.type_in(t);
+        }
+        s.settle();
+        assert!(s.s.notice.contains("Not started: the cluster sent an empty answer"), "{:?}", s.s.notice);
+        assert_eq!(calls(&fake, "apply"), 0);
+        // A remove whose look comes back empty, or whose look afterwards
+        // does: removed, not synced, and said.
+        *fake.listing.lock().unwrap() = LISTING.into();
+        s.key(Key::Char('r'));
+        s.settle();
+        *fake.after_delete.lock().unwrap() = Some(SILENT.into());
+        s.key(Key::Down);
+        s.key(Key::Char('d'));
+        s.key(Key::Char('y'));
+        s.settle();
+        let n = &s.s.notice;
+        assert!(n.contains("blog removed.") && n.contains("not synced: the cluster sent an empty answer"), "{n:?}");
+        *fake.listing.lock().unwrap() = SILENT.into();
+        s.s.now = apps::overview(&Ctx::new(), &Fake { listing: LISTING.to_string().into(), ..Fake::default() }).unwrap();
+        s.key(Key::Up);
+        s.key(Key::Char('d'));
+        s.key(Key::Char('y'));
+        s.settle();
+        let n = &s.s.notice;
+        assert!(n.contains("api removed.") && n.contains("were not synced: the cluster sent an empty answer"), "{n:?}");
+        assert!(cf.calls.lock().unwrap().is_empty(), "nothing went to Cloudflare");
+        s.fits(24);
     }
 
     #[test]
