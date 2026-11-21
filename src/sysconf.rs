@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 use crate::cidr::Cidr;
 use crate::config::{self, Config, Port};
 use crate::err::{Context, Result};
-use crate::{coredns, errf, fsx, packages, quarantine};
+use crate::{backup, coredns, errf, fsx, packages, quarantine};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Role {
@@ -135,6 +135,8 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
         files.push(file(coredns::PDB_PATH, 0o600, coredns::PDB));
         files.push(file(format!("/etc/systemd/system/{DNS_NAME}.service"), 0o644, DNS_UNIT));
         files.push(file(format!("/etc/systemd/system/{DNS_TIMER}"), 0o644, DNS_TIMER_UNIT));
+        files.push(file("/etc/systemd/system/dryserver-backup.service", 0o644, BACKUP_UNIT_TEMPLATE.replace("{mark}", backup::K3S_MARK)));
+        files.push(file(format!("/etc/systemd/system/{BACKUP_TIMER}"), 0o644, BACKUP_TIMER_UNIT));
     }
     if !switch_addr.is_empty() && !p.switch_mac.is_empty() {
         files.push(file("/etc/systemd/network/10-switch.network", 0o644, switch_network(&p.switch_mac, &switch_addr)));
@@ -222,6 +224,34 @@ Description=Check where the cluster's DNS runs, every two minutes
 [Timer]
 OnBootSec=3min
 OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+";
+
+/// On the coordinator: the nightly backup (see backup.rs). Missed nights
+/// run at the next boot (Persistent); the random delay keeps it off the
+/// hour other jobs like.
+pub const BACKUP_TIMER: &str = "dryserver-backup.timer";
+const BACKUP_UNIT_TEMPLATE: &str = "[Unit]
+Description=Back up the coordinator, encrypted for the admin's desktop
+After=k3s.service time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dryserver backup
+# However the backup ends (a crash, a kill, the timeout) while it has k3s
+# stopped for the copy, k3s starts again.
+ExecStopPost=/usr/bin/sh -c 'if [ -e {mark} ]; then rm -f {mark}; systemctl start --no-block k3s.service; fi'
+TimeoutStartSec=3h
+";
+const BACKUP_TIMER_UNIT: &str = "[Unit]
+Description=Back up the coordinator every night
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=20min
+Persistent=true
 
 [Install]
 WantedBy=timers.target
@@ -974,6 +1004,18 @@ mod tests {
         for f in [coredns::PDB_PATH, "/etc/systemd/system/dryserver-dns.timer", "/etc/systemd/system/dryserver-dns.service"] {
             assert!(!has(&node, f), "{f} on a server");
         }
+        // The nightly backup, on the coordinator only.
+        let timer = &find(&coord, "/etc/systemd/system/dryserver-backup.timer").content;
+        for want in ["OnCalendar=*-*-* 02:30:00", "RandomizedDelaySec=", "Persistent=true", "WantedBy=timers.target"] {
+            assert!(timer.contains(want), "{want}: {timer}");
+        }
+        let svc = &find(&coord, "/etc/systemd/system/dryserver-backup.service").content;
+        assert!(svc.contains("Type=oneshot\nExecStart=/usr/local/bin/dryserver backup\n"), "{svc}");
+        assert!(
+            svc.contains("ExecStopPost=/usr/bin/sh -c 'if [ -e /run/dryserver-backup.k3s-stopped ]; then rm -f /run/dryserver-backup.k3s-stopped; systemctl start --no-block k3s.service; fi'\n"),
+            "k3s must start again when the backup dies: {svc}"
+        );
+        assert!(!has(&node, "/etc/systemd/system/dryserver-backup.timer") && !has(&node, "/etc/systemd/system/dryserver-backup.service"));
         // A server that cut the coordinator off does not start k3s.
         let unit = &find(&node, "/etc/systemd/system/k3s.service").content;
         assert!(unit.contains("ConditionPathExists=!/etc/dryserver/k3s.hold\n"), "{unit}");

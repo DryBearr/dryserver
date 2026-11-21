@@ -21,6 +21,13 @@ pub const KEY_NAME: &str = "registry_ed25519";
 /// secrets/ on the desktop; only SIGNING_PUB goes into the ISO.
 pub const SIGNING_KEY_NAME: &str = "signing_ed25519";
 pub const SIGNING_PUB: &str = "signing_ed25519.pub";
+/// The keypair backups of the coordinator are encrypted to. Only the
+/// public half goes into the ISO and onto the coordinator, which can then
+/// make backups but never read them; the private half stays in secrets/.
+/// Not the signing key: a key that opens backups must not also be able to
+/// let machines in, and the other way round.
+pub const BACKUP_KEY_NAME: &str = "backup_ed25519";
+pub const BACKUP_PUB: &str = "backup_ed25519.pub";
 /// The secret installers use to prove a join request comes from this
 /// stick. On the stick and in secrets/; never on an installed machine.
 pub const JOIN_SECRET: &str = "join_secret";
@@ -93,6 +100,7 @@ pub fn run(ctx: &Ctx, o: &Options, log: &mut (dyn Write + Send)) -> Result<()> {
 
     let key = ensure_registry_key(ctx, &o.secrets_dir, &mut tee)?;
     let signing_pub = ensure_signing_key(ctx, &o.secrets_dir, &mut tee)?;
+    let backup_pub = ensure_backup_key(ctx, &o.secrets_dir, &mut tee)?;
     let join_secret = ensure_join_secret(&o.secrets_dir, &mut tee)?;
 
     let stage = out_dir.join("stage");
@@ -100,7 +108,8 @@ pub fn run(ctx: &Ctx, o: &Options, log: &mut (dyn Write + Send)) -> Result<()> {
     let _rm = Defer(|| {
         let _ = std::fs::remove_dir_all(&stage_c);
     });
-    write_stage(&stage, &me, &o.config, &key, &signing_pub, &join_secret).map_err(|e| e.wrap("prepare build files"))?;
+    let staged = Staged { key: &key, signing_pub: &signing_pub, backup_pub: &backup_pub, join_secret: &join_secret };
+    write_stage(&stage, &me, &o.config, &staged).map_err(|e| e.wrap("prepare build files"))?;
 
     let _ = writeln!(tee, "==> Starting {IMAGE} (first run downloads ~1 GB)");
     let start = Instant::now();
@@ -253,29 +262,81 @@ fn key_body(line: &str) -> String {
 ///   make a new pair (servers already trust the old one);
 /// - the two halves must belong together.
 fn ensure_signing_key(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<PathBuf> {
+    ensure_keypair(
+        ctx,
+        dir,
+        &Pair {
+            name: SIGNING_KEY_NAME,
+            pub_name: SIGNING_PUB,
+            comment: "dryserver-signing",
+            what: "signing key",
+            does: "signs the list of machines in your swarm",
+            lost: "servers installed with this key accept only lists signed by it",
+            lost_new: "servers installed before will not trust the new key",
+        },
+        log,
+    )
+}
+
+/// Makes sure secrets/ holds the keypair backups are encrypted to, and
+/// returns the path of its public half. The same rules as for the signing
+/// key: a coordinator installed with this key makes backups only it opens.
+fn ensure_backup_key(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<PathBuf> {
+    ensure_keypair(
+        ctx,
+        dir,
+        &Pair {
+            name: BACKUP_KEY_NAME,
+            pub_name: BACKUP_PUB,
+            comment: "dryserver-backup",
+            what: "backup key",
+            does: "opens the coordinator's encrypted backups",
+            lost: "backups made by a coordinator installed with this key open only with it",
+            lost_new: "backups made before open only with the old key",
+        },
+        log,
+    )
+}
+
+/// An ed25519 keypair in secrets/ whose private half never leaves it.
+struct Pair {
+    name: &'static str,
+    pub_name: &'static str,
+    comment: &'static str,
+    what: &'static str,
+    /// What the key is for, and what losing it means.
+    does: &'static str,
+    lost: &'static str,
+    lost_new: &'static str,
+}
+
+fn ensure_keypair(ctx: &Ctx, dir: &Path, p: &Pair, log: &mut dyn Write) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    let key = dir.join(SIGNING_KEY_NAME);
-    let pubkey = dir.join(SIGNING_PUB);
+    let key = dir.join(p.name);
+    let pubkey = dir.join(p.pub_name);
     ctx.check()?;
     if !key.exists() {
         if pubkey.exists() {
             return Err(errf!(
-                "{} is missing but {} is there. Restore the private key from your backup: servers installed with this \
-                 key accept only lists signed by it. To start over with a new key instead, remove the .pub file \
-                 (servers installed before will not trust the new key).",
+                "{} is missing but {} is there. Restore the private key from your backup: {}. To start over with a \
+                 new key instead, remove the .pub file ({}).",
                 key.display(),
-                pubkey.display()
+                pubkey.display(),
+                p.lost,
+                p.lost_new
             ));
         }
         fsx::mkdir_all(dir, 0o700)?;
         let _ = writeln!(
             log,
-            "==> Generating signing key {} (signs the list of machines in your swarm).\n    \
+            "==> Generating {} {} ({}).\n    \
              It stays on this computer; back up {} and keep it private.",
+            p.what,
             key.display(),
+            p.does,
             dir.display()
         );
-        ssh_keygen(|c| c.args(["-q", "-t", "ed25519", "-N", "", "-C", "dryserver-signing", "-f"]).arg(&key))?;
+        ssh_keygen(|c| c.args(["-q", "-t", "ed25519", "-N", "", "-C", p.comment, "-f"]).arg(&key))?;
     }
     // The private half is for this user only, whatever it was restored as.
     let mode = std::fs::metadata(&key).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
@@ -298,7 +359,7 @@ fn ensure_signing_key(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<Path
             ));
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fsx::write_file(&pubkey, format!("{derived} dryserver-signing\n"), 0o644)?;
+            fsx::write_file(&pubkey, format!("{derived} {}\n", p.comment), 0o644)?;
         }
         Err(e) => return Err(Error::from(e).wrap(format!("open {}", pubkey.display()))),
     }
@@ -330,10 +391,20 @@ fn ensure_join_secret(dir: &Path, log: &mut dyn Write) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The keys and secrets that go onto the stick.
+struct Staged<'a> {
+    key: &'a Path,
+    signing_pub: &'a Path,
+    backup_pub: &'a Path,
+    join_secret: &'a Path,
+}
+
 /// Lays out the directory mounted at /stage in the container: the embedded
 /// assets plus this binary, the config, the registry key and the public
-/// half of the signing key. The signing private key is never staged.
-fn write_stage(stage: &Path, me: &Path, cfg: &Config, key: &Path, signing_pub: &Path, join_secret: &Path) -> Result<()> {
+/// halves of the signing and backup keys. Their private halves are never
+/// staged.
+fn write_stage(stage: &Path, me: &Path, cfg: &Config, k: &Staged) -> Result<()> {
+    let Staged { key, signing_pub, backup_pub, join_secret } = *k;
     match std::fs::remove_dir_all(stage) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
@@ -353,6 +424,7 @@ fn write_stage(stage: &Path, me: &Path, cfg: &Config, key: &Path, signing_pub: &
     copy_file(key, &etc.join(KEY_NAME), 0o600)?;
     copy_file(&PathBuf::from(format!("{}.pub", key.display())), &etc.join(format!("{KEY_NAME}.pub")), 0o644)?;
     copy_file(signing_pub, &etc.join(SIGNING_PUB), 0o644)?;
+    copy_file(backup_pub, &etc.join(BACKUP_PUB), 0o644)?;
     copy_file(join_secret, &etc.join(JOIN_SECRET), 0o600)?;
     fsx::write_file(stage.join("k3s.env"), format!("K3S_VERSION='{K3S_VERSION}'\nK3S_SHA256='{K3S_SHA256}'\n"), 0o644)
 }
@@ -380,15 +452,20 @@ mod tests {
         std::fs::write(dir.join(SIGNING_KEY_NAME), "signing private").unwrap();
         std::fs::write(dir.join(SIGNING_PUB), "ssh-ed25519 AAAAsign dryserver-signing\n").unwrap();
         std::fs::write(dir.join(JOIN_SECRET), "0123456789abcdef0123456789abcdef\n").unwrap();
-        write_stage(&stage, &me, &cfg, &key, &dir.join(SIGNING_PUB), &dir.join(JOIN_SECRET)).unwrap();
+        std::fs::write(dir.join(BACKUP_KEY_NAME), "backup private").unwrap();
+        std::fs::write(dir.join(BACKUP_PUB), "ssh-ed25519 AAAAbackup dryserver-backup\n").unwrap();
+        let (signing, backup, secret) = (dir.join(SIGNING_PUB), dir.join(BACKUP_PUB), dir.join(JOIN_SECRET));
+        write_stage(&stage, &me, &cfg, &Staged { key: &key, signing_pub: &signing, backup_pub: &backup, join_secret: &secret }).unwrap();
 
         let key_pub = format!("overlay/airootfs/etc/dryserver/{KEY_NAME}.pub");
         let key_priv = format!("overlay/airootfs/etc/dryserver/{KEY_NAME}");
         let signing_pub = format!("overlay/airootfs/etc/dryserver/{SIGNING_PUB}");
         let join_secret = format!("overlay/airootfs/etc/dryserver/{JOIN_SECRET}");
-        let want: [(&str, u32); 9] = [
+        let backup_pub = format!("overlay/airootfs/etc/dryserver/{BACKUP_PUB}");
+        let want: [(&str, u32); 10] = [
             (&join_secret, 0o600),
             (&signing_pub, 0o644),
+            (&backup_pub, 0o644),
             ("build.sh", 0),
             ("packages.extra", 0),
             ("overlay/airootfs/etc/motd", 0),
@@ -409,7 +486,9 @@ mod tests {
         let pin = std::fs::read_to_string(stage.join("k3s.env")).unwrap();
         assert_eq!(pin, format!("K3S_VERSION='{K3S_VERSION}'\nK3S_SHA256='{K3S_SHA256}'\n"));
         assert!(K3S_SHA256.len() == 64 && K3S_SHA256.bytes().all(|b| b.is_ascii_hexdigit()) && K3S_VERSION.starts_with('v'));
-        // The signing private key must never reach the stick, under any name.
+        assert_eq!(std::fs::read_to_string(stage.join(&backup_pub)).unwrap(), "ssh-ed25519 AAAAbackup dryserver-backup\n");
+        // The signing and backup private keys must never reach the stick,
+        // under any name.
         fn files(d: &Path, out: &mut Vec<PathBuf>) {
             for e in std::fs::read_dir(d).unwrap().flatten() {
                 if e.path().is_dir() { files(&e.path(), out) } else { out.push(e.path()) }
@@ -418,13 +497,44 @@ mod tests {
         let mut all = Vec::new();
         files(&stage, &mut all);
         for f in all {
-            assert!(
-                !std::fs::read(&f).unwrap().windows(15).any(|w| w == b"signing private"),
-                "signing private key staged in {}",
-                f.display()
-            );
+            let b = std::fs::read(&f).unwrap();
+            for secret in [&b"signing private"[..], b"backup private"] {
+                assert!(!b.windows(secret.len()).any(|w| w == secret), "private key staged in {}", f.display());
+            }
             assert_ne!(f.file_name().unwrap(), SIGNING_KEY_NAME, "{}", f.display());
+            assert_ne!(f.file_name().unwrap(), BACKUP_KEY_NAME, "{}", f.display());
         }
+    }
+
+    #[test]
+    fn backup_key_lifecycle() {
+        if !in_path("ssh-keygen") {
+            return;
+        }
+        let dir = TempDir::new();
+        let secrets = dir.join("secrets");
+        let ctx = Ctx::new();
+        let mut log = Vec::new();
+        let signing = ensure_signing_key(&ctx, &secrets, &mut log).unwrap();
+        let p = ensure_backup_key(&ctx, &secrets, &mut log).unwrap();
+        let text = String::from_utf8_lossy(&log).into_owned();
+        assert!(text.contains("backup key") && text.contains("opens the coordinator's encrypted backups"), "{text}");
+        let first = std::fs::read_to_string(&p).unwrap();
+        assert!(first.starts_with("ssh-ed25519 ") && first.trim_end().ends_with("dryserver-backup"), "{first}");
+        assert_ne!(key_body(&first), key_body(&std::fs::read_to_string(&signing).unwrap()), "a key of its own, not the signing key");
+        let key = secrets.join(BACKUP_KEY_NAME);
+        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        // Kept across builds; a lost public half comes back from the
+        // private one; a lost private half never makes a new pair.
+        ensure_backup_key(&ctx, &secrets, &mut Vec::new()).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), first);
+        std::fs::remove_file(&p).unwrap();
+        ensure_backup_key(&ctx, &secrets, &mut Vec::new()).unwrap();
+        assert_eq!(key_body(&std::fs::read_to_string(&p).unwrap()), key_body(&first));
+        std::fs::remove_file(&key).unwrap();
+        let e = ensure_backup_key(&ctx, &secrets, &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("Restore the private key") && e.contains("backups made before open only with the old key"), "{e}");
+        assert!(!key.exists());
     }
 
     #[test]

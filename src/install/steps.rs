@@ -321,6 +321,14 @@ impl Real {
         };
         let proof = registry::join_proof(&secret, &ch.hostname, &wg, &host_key);
         if ch.role() == Role::Coordinator {
+            // The key nightly backups are encrypted to: its public half
+            // only, so this machine can make backups but never open one.
+            let backup = fsx::dir(&self.registry_key).join(iso::BACKUP_PUB);
+            let line = fsx::read_string(&backup).map_err(|e| e.wrap("this installer has no backup key; build the USB stick again"))?;
+            if !line.trim_start().starts_with("ssh-ed25519 ") || line.trim().lines().count() != 1 {
+                return Err(errf!("{} is not one ed25519 public key (the backup key); build the USB stick again", backup.display()));
+            }
+            self.write(crate::backup::RECIPIENT, 0o644, line)?;
             // The cluster's secret for agents, made here and never shown.
             self.write(sysconf::K3S_AGENT_SECRET, 0o600, fsx::hex(&fsx::random_bytes(32)))?;
             self.setup_registry_user(ctx)?;
@@ -335,8 +343,8 @@ impl Real {
         // its token (see the unit's condition).
         let mut enable = vec!["systemctl", "enable", "k3s.service"];
         if ch.role() == Role::Coordinator {
-            // Keeps the cluster's DNS on two machines.
-            enable.push(sysconf::DNS_TIMER);
+            // Keeps the cluster's DNS on two machines; backs up every night.
+            enable.extend([sysconf::DNS_TIMER, sysconf::BACKUP_TIMER]);
         }
         enable.extend(plan.services.iter().map(String::as_str));
         self.chroot(ctx, &enable)?;
@@ -642,6 +650,7 @@ mod tests {
         std::fs::write(&key, "private").unwrap();
         std::fs::write(dir.join("registry_ed25519.pub"), "ssh-ed25519 AAAAreg dryserver-registry\n").unwrap();
         std::fs::write(dir.join(iso::SIGNING_PUB), "ssh-ed25519 AAAAsign dryserver-signing\n").unwrap();
+        std::fs::write(dir.join(iso::BACKUP_PUB), "ssh-ed25519 AAAAbackup dryserver-backup\n").unwrap();
         std::fs::write(dir.join(iso::JOIN_SECRET), format!("{JOIN_SECRET}\n")).unwrap();
 
         let cfg = Config {
@@ -749,6 +758,8 @@ mod tests {
         assert_eq!(mode(r.target("/usr/local/bin/k3s")).0, 0o755);
         fr.index(&format!("arch-chroot {t} systemctl enable k3s.service"));
         assert!(!fr.strings().iter().any(|c| c.contains("dryserver-dns")), "the DNS timer is the coordinator's");
+        assert!(!fr.strings().iter().any(|c| c.contains("dryserver-backup")), "the backup timer is the coordinator's");
+        assert!(!r.target(crate::backup::RECIPIENT).exists(), "only the coordinator makes backups");
         assert!(!r.target(crate::coredns::PDB_PATH).exists());
         assert!(read("/etc/systemd/system/k3s.service").contains("ExecStart=/usr/local/bin/k3s agent"));
         assert!(!r.target("/etc/rancher/k3s/config.yaml").exists(), "a server gets its k3s config when it is approved");
@@ -822,7 +833,11 @@ mod tests {
                 assert!(!fsx::under(&r.target, "/var/lib/rancher/k3s/server/manifests").join(f).exists(), "{f} is k3s's");
             }
         }
-        fr.index(&format!("arch-chroot {t} systemctl enable k3s.service dryserver-dns.timer"));
+        fr.index(&format!("arch-chroot {t} systemctl enable k3s.service dryserver-dns.timer dryserver-backup.timer"));
+        // The backup key's public half, where `dryserver backup` reads it.
+        assert_eq!(get(&r.target, crate::backup::RECIPIENT), "ssh-ed25519 AAAAbackup dryserver-backup\n");
+        assert_eq!(std::fs::metadata(r.target(crate::backup::RECIPIENT)).unwrap().permissions().mode() & 0o777, 0o644);
+        assert!(get(&r.target, "/etc/systemd/system/dryserver-backup.service").contains("ExecStart=/usr/local/bin/dryserver backup"));
         assert!(get(&r.target, "/etc/systemd/system/dryserver-dns.service").contains("dryserver cluster-dns"));
         let secret = get(&r.target, sysconf::K3S_AGENT_SECRET);
         assert!(secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit()), "agent secret: {secret:?}");
@@ -873,6 +888,27 @@ mod tests {
     // A used laptop: an old LVM volume (mounted), swap, and a LUKS mapping
     // left open by an earlier setup attempt. All must be released before
     // sfdisk.
+    #[test]
+    fn coordinator_needs_the_backup_key() {
+        for bad in [None, Some("garbage\n"), Some("ssh-ed25519 AAAAone x\nssh-ed25519 AAAAtwo y\n")] {
+            let (dir, r, _) = test_real(false, FakeRunner::default());
+            match bad {
+                None => std::fs::remove_file(dir.join(iso::BACKUP_PUB)).unwrap(),
+                Some(text) => std::fs::write(dir.join(iso::BACKUP_PUB), text).unwrap(),
+            }
+            let ch = Choices {
+                role: Some(Role::Coordinator),
+                hostname: "coord".into(),
+                system_disk: "/dev/sda".into(),
+                encryption: Some(Encryption::None),
+                user_password: USER_PASS.into(),
+                ..Choices::default()
+            };
+            let err = r.install(&Ctx::new(), &r.cfg, &ch, Arc::new(|_| {})).unwrap_err().to_string();
+            assert!(err.contains("backup key") && err.contains("build the USB stick again"), "{err}");
+        }
+    }
+
     #[test]
     fn install_releases_old_disk() {
         let old = r#"{"blockdevices":[{"name":"/dev/nvme0n1","type":"disk","size":256060514304,"mountpoints":[null],"children":[

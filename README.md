@@ -27,6 +27,7 @@ approval.
 - [SSH between machines](#ssh-between-machines)
 - [Kill switch](#kill-switch)
 - [Apps](#apps)
+- [Backups](#backups)
 - [Security](#security)
 - [Commands](#commands)
 - [FAQ](#faq)
@@ -143,7 +144,8 @@ Passwords are typed on the laptop and never stored on the USB.
 ## What gets installed
 
 **Always**: SSH, git, cron, tmux, htop/btop, curl, wget, rsync, jq, ripgrep,
-fd, fzf, man pages, network and disk-health tools, WireGuard, `arch-audit`.
+fd, fzf, man pages, network and disk-health tools, WireGuard, `arch-audit`,
+`age` (encrypts the coordinator's backups).
 
 **Chosen in the config** (all on by default): Docker + Compose, Go, Rust
 (rustup, stable toolchain), C/C++ (gcc, clang, cmake, ninja, gdb), Neovim.
@@ -353,6 +355,35 @@ keeps its apps running. To bring a removed server back, run
 installed again under a name the cluster knows takes that name over: the
 coordinator forgets the old machine first.
 
+## Backups
+
+The coordinator backs itself up every night, around 02:30: the cluster's
+datastore and token, the list of machines, its WireGuard and SSH keys and
+dryserver's settings. Each backup is encrypted to
+`secrets/backup_ed25519.pub`, a key the first USB build makes on your
+computer. The coordinator has only that public half: it can make backups
+but cannot read one. For the copy of the cluster's datastore k3s pauses
+for a moment; the apps keep running.
+
+```sh
+./dryserver backup-pull    # copy the newest backups into secrets/backups/
+```
+
+It copies them over your own SSH login, checks each one's size and the
+coordinator's signature, and never replaces a file you already have. Both
+sides keep the newest backup of each of the last 7 days and of each of the
+last 4 weeks that have one. Pull now and then: if the coordinator's disk
+dies, the backups on it die with it.
+
+On the coordinator, `sudo dryserver backup` makes one now,
+`/var/lib/dryserver/backups/last.json` says how the last one went, and
+`journalctl -u dryserver-backup` has the details. Restoring is not built
+yet; to look inside one:
+`age -d -i secrets/backup_ed25519 FILE | tar -tv`.
+
+**Back up `secrets/backup_ed25519`** with your other secrets: without it no
+backup can be opened.
+
 ## Security
 
 - **Firewall first.** The live USB accepts no incoming connections and runs no
@@ -438,6 +469,7 @@ On your desktop:
 | `./dryserver apps` | what runs on your cluster: start an app from a container image, remove one |
 | `./dryserver ssh-config` | SSH config for all servers |
 | `./dryserver quarantine-all` | kill switch: cut the coordinator off on every server |
+| `./dryserver backup-pull` | copy the coordinator's newest encrypted backups into `secrets/backups/` |
 | `./dryserver install --demo` | try the laptop setup screen; changes nothing |
 
 On servers:
@@ -447,6 +479,7 @@ On servers:
 | `sudo dryserver tpm-enroll` | let the TPM unlock the disk again (after a firmware change) |
 | `sudo dryserver quarantine` | kill switch on this server (`-name`, `-status`, `-lift`) |
 | `dryserver report` | this machine's health as JSON, the same report it sends with every sync (`sudo` adds the firewall and WireGuard) |
+| `sudo dryserver backup` | coordinator: make an encrypted backup now (a timer does it every night) |
 | `dryserver sync`, `join`, `scan`, `registry`, `cluster-dns` | run automatically by systemd, cron and SSH |
 
 ### Health reports
@@ -554,6 +587,8 @@ Golden files for the generated system files are in `testdata/sysconf`;
 | `secrets/join_secret` | proves a join request comes from a machine installed from your stick; on the stick and here, never on an installed machine; not committed. **Back it up** |
 | `secrets/members.signed.json` | this computer's copy of the last machine list you signed: the backup of who is in your swarm |
 | `secrets/signing_ed25519` | key that signs the list of machines in your swarm; created by the first build, never leaves this computer, not committed. **Back it up.** Only `signing_ed25519.pub` goes onto the USB stick and the servers |
+| `secrets/backup_ed25519` | opens the coordinator's backups; created by the first build, never leaves this computer, not committed. **Back it up.** Only `backup_ed25519.pub` goes onto the USB stick and the coordinator |
+| `secrets/backups/` | the coordinator's backups, copied by `./dryserver backup-pull` (encrypted) |
 | `out/dryserver.iso`, `out/build.log` | built installer image and its log |
 
 ## License

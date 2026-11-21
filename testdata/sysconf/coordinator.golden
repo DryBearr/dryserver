@@ -435,3 +435,26 @@ OnUnitActiveSec=2min
 
 [Install]
 WantedBy=timers.target
+===== /etc/systemd/system/dryserver-backup.service (0644)
+[Unit]
+Description=Back up the coordinator, encrypted for the admin's desktop
+After=k3s.service time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dryserver backup
+# However the backup ends (a crash, a kill, the timeout) while it has k3s
+# stopped for the copy, k3s starts again.
+ExecStopPost=/usr/bin/sh -c 'if [ -e /run/dryserver-backup.k3s-stopped ]; then rm -f /run/dryserver-backup.k3s-stopped; systemctl start --no-block k3s.service; fi'
+TimeoutStartSec=3h
+===== /etc/systemd/system/dryserver-backup.timer (0644)
+[Unit]
+Description=Back up the coordinator every night
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

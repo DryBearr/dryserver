@@ -90,6 +90,37 @@ pub fn lock(path: impl AsRef<Path>) -> Result<fs::File> {
     Ok(f)
 }
 
+/// Like lock, but gives up at once: None when another process holds it.
+pub fn try_lock(path: impl AsRef<Path>) -> Result<Option<fs::File>> {
+    let p = path.as_ref();
+    mkdir_all(dir(p), 0o755)?;
+    let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(p).map_err(|e| op_err("open", p, e))?;
+    // SAFETY: flock on a valid open descriptor owned by f.
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        return Err(op_err("lock", p, e));
+    }
+    Ok(Some(f))
+}
+
+/// The size of the filesystem holding path and the space on it that is
+/// free for anyone (root's reserve not counted), in bytes.
+pub fn space(path: impl AsRef<Path>) -> Result<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = path.as_ref();
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| Error::new(format!("statvfs {}: bad path", p.display())))?;
+    // SAFETY: c is a valid C string and st a plain struct statvfs fills in.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(op_err("statvfs", p, io::Error::last_os_error()));
+    }
+    let unit = st.f_frsize as u64;
+    Ok((st.f_blocks as u64 * unit, st.f_bavail as u64 * unit))
+}
+
 pub fn geteuid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }

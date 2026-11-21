@@ -4,6 +4,7 @@
 mod admin;
 mod apps;
 mod assets;
+mod backup;
 mod cidr;
 mod config;
 mod coredns;
@@ -72,6 +73,8 @@ commands:
                       decision is signed with secrets/signing_ed25519
   apps                what runs on your cluster: start an app from a
                       container image, remove one
+  backup-pull         copy the coordinator's newest backups into
+                      secrets/backups (encrypted; signed by the coordinator)
 
 on servers:
   join                ask the coordinator to join (runs at boot until approved)
@@ -85,6 +88,8 @@ on servers:
   registry            coordinator: SSH forced command for joining machines
   cluster-dns         coordinator: keep the cluster's DNS on two machines
                       (run by a timer)
+  backup              coordinator: encrypted backup into /var/lib/dryserver/backups
+                      (run by a timer every night)
 "#;
 
 /// Where the ISO build puts the config.
@@ -125,6 +130,8 @@ fn main() -> ExitCode {
         "approve" => run_approve(rest),
         "tpm-enroll" => run_tpm_enroll(rest),
         "cluster-dns" => run_cluster_dns(rest),
+        "backup" => run_backup(rest),
+        "backup-pull" => run_backup_pull(rest),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
@@ -695,6 +702,66 @@ fn run_cluster_dns(args: &[String]) -> Result<()> {
         return Ok(());
     }
     coredns::tend(&ctx, &run, Time::now(), &mut std::io::stdout()).map(|_| ())
+}
+
+fn run_backup(args: &[String]) -> Result<()> {
+    Flags::parse("backup", args, &[]);
+    if !fsx::is_root() {
+        bail!("run as root (sudo)");
+    }
+    let host = fsx::read_or_empty("/proc/sys/kernel/hostname").trim().to_string();
+    let run = ExecRunner::silent();
+    let ctx = Ctx::on_signals();
+    let res = backup::Job::new(&run, &host).run(&ctx, Time::now(), &mut std::io::stdout());
+    if let Err(e) = &res
+        && std::env::var_os("JOURNAL_STREAM").is_some()
+    {
+        // In the journal at error level, for whoever looks (a future
+        // monitor reads the status file).
+        eprintln!("<3>dryserver backup failed: {e}");
+    }
+    res.map(|_| ())
+}
+
+fn run_backup_pull(args: &[String]) -> Result<()> {
+    use crate::admin::Link;
+    let f = Flags::parse("backup-pull", args, DESKTOP_FLAGS);
+    if fsx::is_root() {
+        bail!("run backup-pull as your normal user, not with sudo");
+    }
+    if Path::new(LIVE_CONFIG).exists() {
+        bail!("backup-pull runs on your own computer:\n  ./dryserver backup-pull");
+    }
+    let cfg = Config::load(f.get("config"))?;
+    let secrets = paths().secrets;
+    let host = if f.get("host").is_empty() { cfg.coord_lan_ip.clone() } else { f.get("host").to_string() };
+    let known_hosts = secrets.join(admin::KNOWN_HOSTS);
+    // The coordinator's host key as this computer pinned it (approve):
+    // it signs every backup, and only what it signed is kept.
+    let link = admin::SshLink {
+        key: secrets.join(iso::KEY_NAME),
+        known_hosts: known_hosts.clone(),
+        host: host.clone(),
+        port: f.get("port").into(),
+    };
+    let host_key = link.host_key().map_err(|e| e.wrap("this computer has not met the coordinator yet; run ./dryserver approve first"))?;
+    let dir = secrets.join("backups");
+    fsx::mkdir_all(&dir, 0o700)?;
+    let signer = dir.join(".coordinator.pub");
+    fsx::write_file(&signer, format!("{host_key}\n"), 0o600)?;
+    let verifier = signed::SshVerifier { pubkey: signer.clone(), tmp_dir: std::env::temp_dir() };
+    let brain = backup::SshBrain::new(&host, f.get("port"), &cfg.username, known_hosts);
+    let res = backup::pull(&brain, &verifier, &dir, &mut std::io::stdout());
+    let _ = fsx::remove(&signer);
+    let r = res?;
+    for n in &r.removed {
+        println!("removed {n} (older than the {} daily and {} weekly kept)", backup::KEEP_DAILY, backup::KEEP_WEEKLY);
+    }
+    println!("{} new backup(s) in {}.", r.fetched.len(), dir.display());
+    if !r.problems.is_empty() {
+        bail!("not everything was copied:\n  {}", r.problems.join("\n  "));
+    }
+    Ok(())
 }
 
 /// kubectl on the coordinator over the admin's SSH login, with the host

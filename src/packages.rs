@@ -40,6 +40,8 @@ pub const SYSTEM: Bundle = Bundle {
         "nftables",
         "sudo",
         "zram-generator",
+        // Encrypts the coordinator's nightly backup to the admin's key.
+        "age",
     ],
     services: &["systemd-networkd", "systemd-resolved", "iwd", "sshd", "nftables", "systemd-timesyncd"],
     ..EMPTY
@@ -213,7 +215,7 @@ mod tests {
     #[test]
     fn resolve_merges_bundles() {
         let p = resolve(&v(&["docker", "rust"]), &v(&["python", "git"])).unwrap();
-        for want in ["base", "openssh", "git", "cronie", "docker", "rustup", "python"] {
+        for want in ["base", "openssh", "age", "git", "cronie", "docker", "rustup", "python"] {
             assert!(p.packages.iter().any(|x| x == want), "missing package {want}");
         }
         for not in ["go", "neovim", "clang"] {
