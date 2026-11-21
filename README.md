@@ -296,7 +296,8 @@ screens share one SSH connection, which ends by itself 20 seconds after the
 last call. Its socket lives in `dryserver/` in your runtime directory
 (`$XDG_RUNTIME_DIR`), made for you alone; when that directory is a link,
 someone else's or open to others, nothing is shared and each call connects
-by itself.
+by itself. Switching between the two screens (`o`, `a`) waits until a
+change that runs (a deploy and its DNS sync) is done.
 
 What dryserver sets up around every app (namespace `apps`):
 

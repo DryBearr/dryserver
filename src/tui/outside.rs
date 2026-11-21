@@ -245,6 +245,12 @@ impl Screen {
                 _ => return Flow::Quit,
             },
             Key::Char('a') => {
+                // Switching closes this screen and its worker: a sync
+                // would stop half way.
+                if let Some(what) = self.waiting.change() {
+                    self.notice = format!("Still {what}. a goes to the apps once that is done.");
+                    return Flow::Continue;
+                }
                 self.next = Some(Place::Apps);
                 return Flow::Quit;
             }
@@ -492,6 +498,25 @@ mod tests {
         s.settle();
         s.key(Key::Char('x'));
         assert!(s.flat().contains("Close Cloudflare Tunnel? No app comes in through it"), "{}", s.view());
+    }
+
+    #[test]
+    fn switching_screens_waits_for_a_change() {
+        let fake = Arc::new(Fake::default());
+        *fake.listing.lock().unwrap() = listing();
+        let dir = crate::testutil::TempDir::new();
+        let mut s = open(&fake, &dir);
+        *fake.delay.lock().unwrap() = Duration::from_millis(300);
+        s.key(Key::Char('x'));
+        s.key(Key::Char('y'));
+        assert_eq!(s.key(Key::Char('a')), Flow::Continue);
+        assert!(s.s.notice.contains("Still closing Cloudflare Tunnel. a goes to the apps once that is done"), "{:?}", s.s.notice);
+        assert_eq!(s.s.next, None);
+        s.settle();
+        assert!(s.s.notice.contains("Cloudflare Tunnel closed"), "{:?}", s.s.notice);
+        assert_eq!(fake.cut_off.load(std::sync::atomic::Ordering::SeqCst), 0, "the close ran to its end");
+        assert_eq!(s.key(Key::Char('a')), Flow::Quit);
+        assert_eq!(s.s.next, Some(Place::Apps));
     }
 
     #[test]

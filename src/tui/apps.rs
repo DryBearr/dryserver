@@ -365,6 +365,12 @@ impl Screen {
                 }
             }
             Key::Char('o') => {
+                // Switching closes this screen and its worker: a deploy
+                // and the DNS sync after it would stop half way.
+                if let Some(what) = self.waiting.change() {
+                    self.notice = format!("Still {what}. o goes to the Outside screen once that is done.");
+                    return Flow::Continue;
+                }
                 self.next = Some(Place::Outside);
                 return Flow::Quit;
             }
@@ -888,6 +894,29 @@ pub mod tests {
         assert_eq!(s.key(Key::Char('q')), Flow::Quit);
         // ctrl+c never asks.
         assert_eq!(s.key(Key::Ctrl('c')), Flow::Quit);
+    }
+
+    #[test]
+    fn switching_screens_waits_for_a_change() {
+        // o closes this screen and its worker. During a refresh that is
+        // fine; during a deploy (and the DNS sync after it) it waits.
+        let fake = Arc::new(Fake::default());
+        let dir = crate::testutil::TempDir::new();
+        let mut s = open(&fake, &dir);
+        *fake.delay.lock().unwrap() = Duration::from_millis(300);
+        s.key(Key::Char('n'));
+        for t in ["blog", "nginx:1.27", "80", "", ""] {
+            s.type_in(t);
+        }
+        assert_eq!(s.key(Key::Char('o')), Flow::Continue);
+        assert!(s.s.notice.contains("Still starting blog. o goes to the Outside screen once that is done"), "{:?}", s.s.notice);
+        assert_eq!(s.s.next, None);
+        s.settle();
+        assert!(s.s.notice.contains("blog is starting"), "{:?}", s.s.notice);
+        assert_eq!((calls(&fake, "apply"), fake.cut_off.load(SeqCst)), (1, 0), "the deploy ran to its end");
+        s.key(Key::Char('r'));
+        assert_eq!(s.key(Key::Char('o')), Flow::Quit, "a refresh does not hold it");
+        assert_eq!(s.s.next, Some(Place::Outside));
     }
 
     #[test]
