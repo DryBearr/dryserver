@@ -1,45 +1,30 @@
 //! The admin's screen for apps on the cluster: what runs where, start one
-//! from an image, remove one, and open or close the way in from outside.
+//! from an image, remove one. The ways in from outside have their own
+//! screen (o goes there).
 //!
 //! Every question and change goes to the coordinator over SSH, which can
 //! be slow or not answer at all. They run on the screen's worker thread,
 //! one at a time, each with a time limit; the screen keeps drawing and
 //! taking keys, and shows what it is waiting for.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::form::{Field, Form, Group, Status};
-use super::worker::{Waiting, Worker};
-use super::{Doc, Emit, Event, Flow, Key, Model, dim, err, ok, sel, theme};
+use super::outside::{Look, look};
+use super::worker::{Limits, Waiting, Worker, timed};
+use super::{Doc, Emit, Event, Flow, Key, Model, Place, dim, err, fit, ok, sel, theme, wrap};
 use crate::apps::{self, App, Cluster, Overview};
 use crate::ctx::Ctx;
-use crate::err::{Error, Kind, Result};
+use crate::entrance::{self, Entrances, Health, State};
+use crate::err::{Error, Result};
 
 /// Each refresh asks the coordinator once, over the shared connection.
 const REFRESH: Duration = Duration::from_secs(15);
 
-/// How long the coordinator may take to answer.
-#[derive(Debug, Clone, Copy)]
-pub struct Limits {
-    /// A question: the listing.
-    pub read: Duration,
-    /// A change: kubectl apply waits for the cluster to take it.
-    pub change: Duration,
-    /// After this long without an answer the screen says so.
-    pub slow: Duration,
-}
-
-impl Default for Limits {
-    fn default() -> Limits {
-        Limits { read: Duration::from_secs(15), change: Duration::from_secs(60), slow: Duration::from_secs(4) }
-    }
-}
-
 /// What the worker answers; one message per job, in the order sent.
 pub enum Msg {
-    Loaded(Result<Overview>),
+    Loaded(Result<Look>),
     /// A change ended: what to tell the admin.
     Changed(String),
 }
@@ -49,8 +34,6 @@ enum Job {
     Load,
     Deploy(App),
     Remove(String),
-    Open(String),
-    Close,
 }
 
 const LOADING: &str = "asking the coordinator";
@@ -61,56 +44,42 @@ impl Job {
             Job::Load => LOADING.into(),
             Job::Deploy(a) => format!("starting {}", a.name),
             Job::Remove(n) => format!("removing {n}"),
-            Job::Open(_) => "opening the tunnel".into(),
-            Job::Close => "closing the tunnel".into(),
         }
     }
 }
 
-/// A call that ran out of time says how long it was given.
-fn timed(e: Error, limit: Duration) -> Error {
-    if e.is(Kind::DeadlineExceeded) {
-        Error::with_kind(Kind::DeadlineExceeded, format!("the coordinator did not answer within {}s. Is it on?", limit.as_secs()))
-    } else {
-        e
-    }
+/// Starts app, unless another app has its public name. The check uses
+/// what the cluster says now, not what the screen saw a while ago.
+fn deploy(ctx: &Ctx, c: &dyn Cluster, limits: Limits, app: &App) -> Result<()> {
+    let o = apps::overview(&ctx.with_timeout(limits.read), c).map_err(|e| timed(e, limits.read))?;
+    entrance::check_host(app, &o.apps)?;
+    apps::deploy(&ctx.with_timeout(limits.change), c, app).map_err(|e| timed(e, limits.change))
 }
 
 /// One job, on the worker thread.
-fn run(ctx: &Ctx, c: &dyn Cluster, limits: Limits, job: Job) -> Msg {
+fn run(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, limits: Limits, job: Job) -> Msg {
     let change = ctx.with_timeout(limits.change);
-    let said = |r: Result<()>, done: String, failed: &str| match r {
-        Ok(()) => done,
-        Err(e) => format!("{failed}: {}", timed(e, limits.change)),
-    };
     match job {
-        Job::Load => Msg::Loaded(apps::overview(&ctx.with_timeout(limits.read), c).map_err(|e| timed(e, limits.read))),
-        Job::Deploy(app) => Msg::Changed(said(
-            apps::deploy(&change, c, &app),
-            format!("{} is starting. The cluster picks a server for it.", app.name),
-            "Not started",
-        )),
-        Job::Remove(name) => Msg::Changed(said(apps::remove(&change, c, &name), format!("{name} removed."), "Not removed")),
-        Job::Open(token) => Msg::Changed(said(
-            apps::connect_tunnel(&change, c, &token),
-            format!("Tunnel starting. In the Cloudflare dashboard, point each public host name at\n{}", apps::TUNNEL_TARGET),
-            "Tunnel not started",
-        )),
-        Job::Close => Msg::Changed(said(
-            apps::remove_tunnel(&change, c),
-            "Tunnel closed. Nothing from outside reaches your apps.".into(),
-            "Tunnel not closed",
-        )),
+        Job::Load => Msg::Loaded(look(ctx, c, doors, limits)),
+        Job::Deploy(app) => Msg::Changed(match deploy(ctx, c, limits, &app) {
+            Ok(()) => format!("{} is starting. The cluster picks a server for it.", app.name),
+            Err(e) => format!("Not started: {e}"),
+        }),
+        Job::Remove(name) => Msg::Changed(match apps::remove(&change, c, &name) {
+            Ok(()) => format!("{name} removed."),
+            Err(e) => format!("Not removed: {}", timed(e, limits.change)),
+        }),
     }
 }
 
 /// What the admin types for a new app.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct Draft {
     name: String,
     image: String,
     port: String,
     host: String,
+    entrance: String,
     copies: String,
 }
 
@@ -121,15 +90,29 @@ impl Draft {
             image: self.image.trim().into(),
             port: self.port.trim().parse().unwrap_or(0),
             host: self.host.trim().to_ascii_lowercase(),
+            entrance: self.entrance.clone(),
             copies: if self.copies.trim().is_empty() { 1 } else { self.copies.trim().parse().unwrap_or(0) },
         }
     }
 }
 
-fn new_app_form() -> Form<Draft> {
+/// The form for a new app. taken: (host name, app) pairs the cluster has
+/// now; doors: the entrances apps may choose (id, title). With only one
+/// the choice is not asked.
+fn new_app_form(taken: Vec<(String, String)>, doors: Vec<(String, String)>) -> Form<Draft> {
     type D = Draft;
+    let first = doors.first().map(|d| d.0.clone()).unwrap_or_else(|| entrance::DEFAULT.into());
+    let choose = doors.len() > 1;
+    let draft = Draft {
+        name: String::new(),
+        image: String::new(),
+        port: String::new(),
+        host: String::new(),
+        entrance: first,
+        copies: String::new(),
+    };
     Form::new(
-        Draft::default(),
+        draft,
         vec![
             Group::new(vec![
                 Field::input("Name", |d: &D| d.name.clone(), |d, v| d.name = v)
@@ -151,8 +134,22 @@ fn new_app_form() -> Form<Draft> {
             Group::new(vec![
                 Field::input("Public host name (optional)", |d: &D| d.host.clone(), |d, v| d.host = v)
                     .placeholder("blog.example.com")
-                    .desc("Leave empty to keep the app inside the cluster. With a name, the ingress\nroutes that name to it; point the name at your tunnel.")
-                    .validate(|v, _| apps::valid_host(&v.trim().to_ascii_lowercase())),
+                    .desc("Leave empty to keep the app inside the cluster. With a name, the ingress\nroutes that name to it; the Outside screen shows how it comes in.")
+                    .validate(move |v, d| {
+                        let host = v.trim().to_ascii_lowercase();
+                        apps::valid_host(&host)?;
+                        match taken.iter().find(|(h, a)| *h == host && *a != d.name.trim()) {
+                            Some((_, other)) => Err(crate::errf!("already the public name of {other}")),
+                            None => Ok(()),
+                        }
+                    }),
+            ]),
+            Group::new(vec![
+                Field::select("Way in from outside", move |_| doors.iter().map(|(id, t)| (t.clone(), id.clone())).collect(), |d: &D| d.entrance.clone(), |d, v| d.entrance = v)
+                    .desc("Which entrance brings this name from the internet to the app."),
+            ])
+            .hide_if(move |d| !choose || d.host.trim().is_empty()),
+            Group::new(vec![
                 Field::input("Copies", |d: &D| d.copies.clone(), |d, v| d.copies = v)
                     .placeholder("1")
                     .desc("How many to run. More than one spreads over your servers.")
@@ -169,56 +166,53 @@ fn new_app_form() -> Form<Draft> {
     )
 }
 
-/// What waits for a "y".
-#[derive(Debug, Clone, PartialEq)]
-enum Confirm {
-    None,
-    /// Remove this app.
-    Remove(String),
-    /// Open the tunnel with this token.
-    Open(String),
-    Close,
-}
-
 pub struct Screen {
     cluster: Arc<dyn Cluster>,
-    /// Where the admin saves the tunnel's token (in secrets/).
-    token_file: PathBuf,
+    doors: Entrances,
     limits: Limits,
     /// Started when the screen opens; dropped with it, which cancels the
     /// call that runs.
     worker: Option<Worker<Job>>,
     waiting: Waiting,
     now: Overview,
+    /// How each entrance is doing, in the order of doors.
+    states: Vec<State>,
     /// When the coordinator last answered a refresh.
     seen: Option<Instant>,
     err: Option<Error>,
     cursor: usize,
     form: Option<Form<Draft>>,
-    confirm: Confirm,
+    /// An app to remove once the admin says y.
+    confirm: Option<String>,
     pub notice: String,
     last_load: Option<Instant>,
     /// q was pressed once while a change was still being sent.
     quit_armed: bool,
+    width: usize,
+    /// Where to go after this screen closes.
+    pub next: Option<Place>,
 }
 
 impl Screen {
-    pub fn new(cluster: Arc<dyn Cluster>, token_file: PathBuf) -> Screen {
+    pub fn new(cluster: Arc<dyn Cluster>, doors: Entrances) -> Screen {
         Screen {
             cluster,
-            token_file,
+            doors,
             limits: Limits::default(),
             worker: None,
             waiting: Waiting::default(),
             now: Overview::default(),
+            states: Vec::new(),
             seen: None,
             err: None,
             cursor: 0,
             form: None,
-            confirm: Confirm::None,
+            confirm: None,
             notice: String::new(),
             last_load: None,
             quit_armed: false,
+            width: 80,
+            next: None,
         }
     }
 
@@ -230,8 +224,8 @@ impl Screen {
 
     /// Starts the worker; its answers come back through emit.
     fn start(&mut self, emit: &Emit<Msg>) {
-        let (c, limits, emit) = (self.cluster.clone(), self.limits, emit.clone());
-        self.worker = Some(Worker::start(move |ctx, job| emit(run(ctx, c.as_ref(), limits, job))));
+        let (c, doors, limits, emit) = (self.cluster.clone(), self.doors.clone(), self.limits, emit.clone());
+        self.worker = Some(Worker::start(move |ctx, job| emit(run(ctx, c.as_ref(), &doors, limits, job))));
     }
 
     fn send(&mut self, job: Job) {
@@ -257,8 +251,9 @@ impl Screen {
     fn answer(&mut self, m: Msg) {
         self.waiting.pop();
         match m {
-            Msg::Loaded(Ok(o)) => {
+            Msg::Loaded(Ok((o, states))) => {
                 self.now = o;
+                self.states = states;
                 self.err = None;
                 self.seen = Some(Instant::now());
             }
@@ -272,33 +267,10 @@ impl Screen {
         self.cursor = self.cursor.min(self.now.apps.len().saturating_sub(1));
     }
 
-    /// "t": reads the token the admin saved and asks before opening.
-    fn ask_open(&mut self) {
-        let text = match std::fs::read_to_string(&self.token_file) {
-            Ok(t) => t,
-            Err(_) => {
-                self.notice = format!(
-                    "No tunnel token yet. In the Cloudflare dashboard (Zero Trust, Networks, Tunnels) create a tunnel\nand save its token as {}. Then press t again.",
-                    self.token_file.display()
-                );
-                return;
-            }
-        };
-        match apps::tunnel_token(&text) {
-            Ok(t) => self.confirm = Confirm::Open(t),
-            Err(e) => self.notice = format!("{}: {e}", self.token_file.display()),
-        }
-    }
-
-    fn confirmed(&mut self, what: Confirm) {
-        let job = match what {
-            Confirm::None => return,
-            Confirm::Remove(name) => Job::Remove(name),
-            Confirm::Open(token) => Job::Open(token),
-            Confirm::Close => Job::Close,
-        };
-        self.notice.clear();
-        self.send(job);
+    fn open_form(&mut self) {
+        let taken = self.now.apps.iter().filter(|a| !a.host.is_empty()).map(|a| (a.host.clone(), a.name.clone())).collect();
+        let doors = self.doors.iter().filter(|d| d.ready()).map(|d| (d.id().to_string(), d.title().to_string())).collect();
+        self.form = Some(new_app_form(taken, doors));
     }
 
     pub fn key(&mut self, k: Key) -> Flow {
@@ -318,12 +290,12 @@ impl Screen {
             }
             return Flow::Continue;
         }
-        if self.confirm != Confirm::None {
-            let what = std::mem::replace(&mut self.confirm, Confirm::None);
+        if let Some(name) = self.confirm.take() {
             if k == Key::Char('y') {
-                self.confirmed(what);
+                self.notice.clear();
+                self.send(Job::Remove(name));
             } else {
-                self.notice = if matches!(what, Confirm::Remove(_)) { "Nothing removed." } else { "Tunnel left as it is." }.into();
+                self.notice = "Nothing removed.".into();
             }
             return Flow::Continue;
         }
@@ -341,34 +313,50 @@ impl Screen {
                     _ => return Flow::Quit,
                 }
             }
+            Key::Char('o') => {
+                self.next = Some(Place::Outside);
+                return Flow::Quit;
+            }
             Key::Up | Key::Char('k') => self.cursor = self.cursor.saturating_sub(1),
             Key::Down | Key::Char('j') => self.cursor = (self.cursor + 1).min(self.now.apps.len().saturating_sub(1)),
             Key::Char('n') => {
                 self.notice.clear();
-                self.form = Some(new_app_form());
+                self.open_form();
             }
             Key::Char('d') => match self.now.apps.get(self.cursor) {
-                Some(a) => self.confirm = Confirm::Remove(a.name.clone()),
+                Some(a) => self.confirm = Some(a.name.clone()),
                 None => self.notice = "No app selected.".into(),
             },
-            Key::Char('t') => {
-                self.notice.clear();
-                self.ask_open();
-            }
-            Key::Char('T') => {
-                self.notice.clear();
-                if self.now.tunnel.is_some() {
-                    self.confirm = Confirm::Close;
-                } else {
-                    self.notice = "No tunnel to close.".into();
-                }
-            }
             Key::Char('r') => {
                 self.notice = if self.load() { String::new() } else { "Already asking the coordinator.".into() };
             }
             _ => {}
         }
         Flow::Continue
+    }
+
+    /// The ways in that are set up, on one line.
+    fn outside(&self, b: &mut Doc) {
+        b.s("  From outside: ");
+        let open: Vec<(&str, &State)> =
+            self.doors.iter().zip(&self.states).filter(|(_, s)| s.health != Health::NotSetUp).map(|(d, s)| (d.title(), s)).collect();
+        if self.seen.is_none() {
+            b.add(dim("not known yet"));
+        } else if open.is_empty() {
+            b.add(dim("closed. o shows the ways in from the internet."));
+        }
+        for (i, (title, s)) in open.iter().enumerate() {
+            if i > 0 {
+                b.s("; ");
+            }
+            let text = format!("{title} {}", s.summary);
+            if s.health == Health::Up {
+                b.add(ok(text));
+            } else {
+                b.add(err(text));
+            }
+        }
+        b.nl();
     }
 }
 
@@ -393,12 +381,16 @@ impl Model for Screen {
                 }
                 Flow::Continue
             }
-            Event::Resize(..) => Flow::Continue,
+            Event::Resize(w, _) => {
+                self.width = (w as usize).max(40);
+                Flow::Continue
+            }
         }
     }
 
     fn view(&self) -> Doc {
         let mut b = Doc::new();
+        let width = self.width.saturating_sub(2);
         if let Some(f) = &self.form {
             b.append(theme::header("new app")).s("\n\n");
             b.append(f.view());
@@ -407,9 +399,9 @@ impl Model for Screen {
             }
             return b;
         }
-        b.append(theme::header("apps")).s("   ").add(dim("the cluster picks a server for each and moves it when one dies")).s("\n\n");
+        b.append(theme::header("apps")).s("   ").add(dim("the cluster picks a server for each, and moves it")).s("\n\n");
         if let Some(e) = &self.err {
-            b.add(err(format!("Cannot reach the cluster: {e}"))).nl();
+            b.add(err(wrap(&format!("Cannot reach the cluster: {e}"), width))).nl();
             match self.seen {
                 Some(t) => b.add(dim(format!("  What you see is from {} ago. r asks again.", super::since(t)))),
                 None => b.add(dim("  r asks again.")),
@@ -418,117 +410,127 @@ impl Model for Screen {
         }
         // The way in from outside comes first: it decides who can reach
         // anything below.
-        b.s("  From outside: ");
-        match self.now.tunnel {
-            _ if self.seen.is_none() => b.add(dim("not known yet")),
-            None => b.add(dim("closed. t opens a Cloudflare Tunnel to the apps with a public name.")),
-            Some((ready, want)) if ready > 0 && ready == want => {
-                b.add(ok(format!("Cloudflare Tunnel connected, {ready} of {want} copies")))
-            }
-            Some((0, want)) => {
-                b.add(err(format!("Cloudflare Tunnel not connected, 0 of {want} copies (wrong token, or no way out to Cloudflare)")))
-            }
-            Some((ready, want)) => b.add(err(format!("Cloudflare Tunnel connected with {ready} of {want} copies"))),
-        };
-        b.s("\n\n");
+        self.outside(&mut b);
+        b.nl();
         if self.now.apps.is_empty() && self.err.is_none() && self.seen.is_some() {
             b.add(dim("  No apps yet. Press n to start one from a container image.")).nl();
         }
         for (i, a) in self.now.apps.iter().enumerate() {
             let on = if a.nodes.is_empty() { "-".to_string() } else { a.nodes.join(",") };
-            let text = format!("{:<16} {:<18} {:<26} {}", a.name, on, if a.host.is_empty() { "inside only" } else { &a.host }, a.image);
+            let host = if a.host.is_empty() { "inside only" } else { &a.host };
+            let state = format!("{}/{} running", a.ready, a.copies);
+            // Name, state and name from outside first: on a narrow screen
+            // the image is what gets cut.
+            // A wider screen gives the servers more room first.
+            let nodes = 12 + width.saturating_sub(78).min(20);
+            let on = fit(&on, nodes);
+            let line = format!("{:<14} {:<12} {:<26} {on:<nodes$} {}", fit(&a.name, 14), state, fit(host, 26), a.image);
+            let line = fit(&line, width.saturating_sub(2));
+            let healthy = a.copies > 0 && a.ready == a.copies;
             if i == self.cursor {
-                b.add(sel(format!("> {text}")));
+                b.add(sel(format!("> {line}"))).nl();
+            } else if healthy {
+                b.s(format!("  {line}")).nl();
             } else {
-                b.s(format!("  {text}"));
+                b.s("  ").add(err(line)).nl();
             }
-            let state = format!("  {}/{} running", a.ready, a.copies);
-            if a.copies > 0 && a.ready == a.copies {
-                b.add(ok(state)).nl()
-            } else {
-                b.add(err(state)).nl()
-            };
         }
         if let Some(w) = self.waiting.view(self.limits.slow, "the coordinator is not answering") {
             b.nl().append(w).nl();
         }
-        match &self.confirm {
-            Confirm::Remove(name) => b.nl().add(err(format!("Remove {name}? Its containers stop. y to confirm"))).nl(),
-            Confirm::Open(_) => {
-                let what = if self.now.tunnel.is_some() { "Give the tunnel the token from" } else { "Open the tunnel with the token from" };
-                b.nl()
-                    .add(err(format!(
-                        "{what} {}? Cloudflare then sends what arrives for your public host names to the ingress. y to confirm",
-                        self.token_file.display()
-                    )))
-                    .nl()
-            }
-            Confirm::Close => b.nl().add(err("Close the tunnel? Nothing from outside reaches your apps after that. y to confirm")).nl(),
-            Confirm::None if !self.notice.is_empty() => b.nl().s(&self.notice).nl(),
-            Confirm::None => &mut b,
-        };
+        if let Some(name) = &self.confirm {
+            b.nl().add(err(format!("Remove {name}? Its containers stop. y to confirm"))).nl();
+        } else if !self.notice.is_empty() {
+            b.nl().s(wrap(&self.notice, width)).nl();
+        }
         b.nl()
-            .append(theme::keys(&[
-                ("↑↓", "select"),
-                ("n", "new app"),
-                ("d", "remove"),
-                ("t", "tunnel"),
-                ("T", "close tunnel"),
-                ("r", "refresh"),
-                ("q", "quit"),
-            ]))
+            .append(theme::keys(&[("↑↓", "select"), ("n", "new app"), ("d", "remove"), ("o", "outside"), ("r", "refresh"), ("q", "quit")]))
             .nl();
         b
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::apps::tests::{Fake, LISTING};
+    use crate::entrance::cloudflare::Cloudflare;
+    use crate::entrance::{Entrance, Report, Traffic, Vps, Want};
     use crate::tui::collector;
     use std::sync::atomic::Ordering::SeqCst;
     use std::sync::mpsc::Receiver;
 
-    struct Open {
-        s: Screen,
-        rx: Receiver<Msg>,
-        emit: Emit<Msg>,
+    pub struct Open<S: Model> {
+        pub s: S,
+        pub rx: Receiver<S::Msg>,
+        pub emit: Emit<S::Msg>,
     }
 
-    impl Open {
+    pub trait Busy {
+        fn busy(&self) -> bool;
+    }
+
+    impl Busy for Screen {
+        fn busy(&self) -> bool {
+            !self.waiting.is_empty()
+        }
+    }
+
+    impl<S: Model + Busy> Open<S> {
+        pub fn new(mut s: S) -> Open<S> {
+            let (emit, rx) = collector();
+            s.init(&emit);
+            Open { s, rx, emit }
+        }
+
         /// Feeds the worker's answers to the screen until nothing waits.
-        fn settle(&mut self) {
-            while !self.s.waiting.is_empty() {
+        pub fn settle(&mut self) {
+            while self.s.busy() {
                 let m = self.rx.recv_timeout(Duration::from_secs(10)).expect("the worker did not answer");
                 self.s.update(Event::Msg(m), &self.emit);
             }
         }
 
-        fn key(&mut self, k: Key) {
-            self.s.update(Event::Key(k), &self.emit);
+        pub fn key(&mut self, k: Key) -> Flow {
+            self.s.update(Event::Key(k), &self.emit)
         }
 
-        fn type_in(&mut self, text: &str) {
+        pub fn type_in(&mut self, text: &str) {
             for k in crate::tui::type_text(text) {
                 self.key(k);
             }
             self.key(Key::Enter);
         }
 
-        fn view(&self) -> String {
+        pub fn view(&self) -> String {
             self.s.view().plain()
+        }
+
+        /// The view as one line: wrapped text reads as it was written.
+        pub fn flat(&self) -> String {
+            self.view().replace('\n', " ")
+        }
+
+        /// The screen fits 80 columns and the given number of rows.
+        pub fn fits(&self, rows: usize) {
+            use unicode_width::UnicodeWidthStr;
+            let v = self.view();
+            for l in v.lines() {
+                assert!(l.width() <= 80, "wider than 80 columns ({}): {l:?}\n{v}", l.width());
+            }
+            assert!(v.lines().count() <= rows, "more than {rows} rows:\n{v}");
         }
     }
 
-    fn open_with(fake: &Arc<Fake>, dir: &crate::testutil::TempDir, limits: Limits) -> Open {
-        let mut s = Screen::new(fake.clone(), dir.join("cloudflare_tunnel_token")).with_limits(limits);
-        let (emit, rx) = collector();
-        s.init(&emit);
-        Open { s, rx, emit }
+    pub fn doors(dir: &crate::testutil::TempDir) -> Entrances {
+        Arc::new(vec![Box::new(Cloudflare { token_file: dir.join("cloudflare_tunnel_token") }), Box::new(Vps)])
     }
 
-    fn open(fake: &Arc<Fake>, dir: &crate::testutil::TempDir) -> Open {
+    fn open_with(fake: &Arc<Fake>, dir: &crate::testutil::TempDir, limits: Limits) -> Open<Screen> {
+        Open::new(Screen::new(fake.clone(), doors(dir)).with_limits(limits))
+    }
+
+    fn open(fake: &Arc<Fake>, dir: &crate::testutil::TempDir) -> Open<Screen> {
         let mut o = open_with(fake, dir, Limits::default());
         o.settle();
         o
@@ -544,14 +546,18 @@ mod tests {
         let dir = crate::testutil::TempDir::new();
         let mut s = open(&fake, &dir);
         assert!(s.view().contains("No apps yet. Press n"), "{}", s.view());
+        assert!(s.view().contains("From outside: closed. o shows the ways in"), "{}", s.view());
+        s.fits(24);
 
-        // A new app: name, image, port, then no public name and one copy.
+        // A new app: name, image, port, then a public name and one copy.
+        // With one entrance there is no choice to make.
         s.key(Key::Char('n'));
         assert!(s.view().contains("dryserver  new app"));
         s.type_in("blog");
         s.type_in("ghcr.io/me/blog:v2");
         s.type_in("8080");
         s.type_in("Blog.Example.com");
+        assert!(!s.view().contains("Way in from outside"), "{}", s.view());
         s.type_in("");
         s.settle();
         assert!(s.s.notice.contains("blog is starting"), "{:?}\n{}", s.s.notice, s.view());
@@ -561,6 +567,7 @@ mod tests {
         assert!(
             manifest.contains("image: \"ghcr.io/me/blog:v2\"")
                 && manifest.contains("- host: \"blog.example.com\"")
+                && manifest.contains("dryserver/entrance: \"cloudflare\"")
                 && manifest.contains("replicas: 1"),
             "{manifest}"
         );
@@ -571,8 +578,14 @@ mod tests {
         s.key(Key::Char('r'));
         s.settle();
         let v = s.view();
-        assert!(v.contains("blog") && v.contains("node-a,node-b") && v.contains("blog.example.com") && v.contains("1/2 running"), "{v}");
+        assert!(v.contains("blog") && v.contains("node-a,node") && v.contains("blog.example.com") && v.contains("1/2 running"), "{v}");
         assert!(v.contains("api") && v.contains("inside only") && v.contains("0/1 running"), "{v}");
+        assert!(v.contains("From outside: Cloudflare Tunnel connected with 1 of 2 copies"), "{v}");
+        s.fits(24);
+        // A wider terminal shows all of it.
+        s.s.update(Event::Resize(120, 40), &s.emit.clone());
+        assert!(s.view().contains("node-a,node-b") && s.view().contains(" ghcr.io/me/blog:v2"), "{}", s.view());
+        s.s.update(Event::Resize(80, 24), &s.emit.clone());
 
         // Remove asks first; the cursor is on api, the first by name.
         s.key(Key::Char('d'));
@@ -585,6 +598,107 @@ mod tests {
         s.settle();
         assert!(s.s.notice.contains("blog removed"), "{:?}", s.s.notice);
         assert!(fake.calls.lock().unwrap().iter().any(|(a, _)| a.contains("delete") && a.contains("-l app=blog")));
+
+        // o goes to the Outside screen.
+        assert_eq!(s.key(Key::Char('o')), Flow::Quit);
+        assert_eq!(s.s.next, Some(Place::Outside));
+    }
+
+    #[test]
+    fn one_name_one_app() {
+        let fake = Arc::new(Fake::default());
+        *fake.listing.lock().unwrap() = LISTING.into();
+        let dir = crate::testutil::TempDir::new();
+        let mut s = open(&fake, &dir);
+        // The form says so at once.
+        s.key(Key::Char('n'));
+        for t in ["shop", "nginx:1.27", "80", "blog.example.com"] {
+            s.type_in(t);
+        }
+        assert!(s.view().contains("already the public name of blog"), "{}", s.view());
+        s.key(Key::Esc);
+        // The same app may keep its name.
+        s.key(Key::Char('n'));
+        for t in ["blog", "nginx:1.27", "80", "blog.example.com", ""] {
+            s.type_in(t);
+        }
+        s.settle();
+        assert!(s.s.notice.contains("blog is starting"), "{:?}", s.s.notice);
+        // The cluster changed while the form was open: the deploy checks
+        // again before it applies anything.
+        s.key(Key::Char('n'));
+        for t in ["news", "nginx:1.27", "80", "news.example.com"] {
+            s.type_in(t);
+        }
+        let mut taken = LISTING.to_string();
+        taken = taken.replace("\"host\":\"blog.example.com\"", "\"host\":\"news.example.com\"");
+        *fake.listing.lock().unwrap() = taken;
+        let applied = calls(&fake, "apply");
+        s.type_in("");
+        s.settle();
+        assert!(s.s.notice.contains("Not started: news.example.com is already the public name of blog"), "{:?}", s.s.notice);
+        assert_eq!(calls(&fake, "apply"), applied, "nothing was applied");
+    }
+
+    /// An entrance that is set up, for the choice in the form.
+    struct Ready;
+    impl Entrance for Ready {
+        fn id(&self) -> &'static str {
+            entrance::VPS
+        }
+        fn title(&self) -> &'static str {
+            "Your VPS"
+        }
+        fn carries(&self) -> &'static [Traffic] {
+            &[Traffic::Web]
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn state(&self, _: &Ctx, _: &Overview) -> State {
+            State { health: Health::Up, summary: "up".into(), notes: vec![] }
+        }
+        fn open_question(&self, _: &Overview) -> Result<String> {
+            Ok("open?".into())
+        }
+        fn open(&self, _: &Ctx, _: &dyn Cluster) -> Result<String> {
+            Ok("opened".into())
+        }
+        fn sync(&self, _: &Ctx, _: &dyn Cluster, _: &Overview, _: &Want, _: bool) -> Result<Report> {
+            Ok(Report::default())
+        }
+        fn close(&self, _: &Ctx, _: &dyn Cluster) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_way_in_is_chosen_when_there_is_a_choice() {
+        let fake = Arc::new(Fake::default());
+        let dir = crate::testutil::TempDir::new();
+        let two: Entrances = Arc::new(vec![Box::new(Cloudflare { token_file: dir.join("t") }), Box::new(Ready)]);
+        let mut s = Open::new(Screen::new(fake.clone(), two));
+        s.settle();
+        assert!(s.view().contains("From outside: Your VPS up"), "{}", s.view());
+        s.key(Key::Char('n'));
+        for t in ["game", "nginx:1.27", "80", "play.example.com"] {
+            s.type_in(t);
+        }
+        let v = s.view();
+        assert!(v.contains("Way in from outside") && v.contains("> Cloudflare Tunnel") && v.contains("Your VPS"), "{v}");
+        s.key(Key::Down);
+        s.key(Key::Enter);
+        s.type_in("");
+        s.settle();
+        let calls = fake.calls.lock().unwrap().clone();
+        let (_, manifest) = calls.iter().find(|(a, _)| a == "apply -f -").expect("nothing applied");
+        assert!(manifest.contains("dryserver/entrance: \"vps\""), "{manifest}");
+        // Without a public name the choice is not asked.
+        s.key(Key::Char('n'));
+        for t in ["inside", "nginx:1.27", "80", ""] {
+            s.type_in(t);
+        }
+        assert!(s.view().contains("Copies") && !s.view().contains("Way in from outside"), "{}", s.view());
     }
 
     #[test]
@@ -609,69 +723,6 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_from_the_saved_token() {
-        let fake = Arc::new(Fake::default());
-        let dir = crate::testutil::TempDir::new();
-        let file = dir.join("cloudflare_tunnel_token");
-        let mut s = open(&fake, &dir);
-        let applied = |f: &Fake| f.calls.lock().unwrap().iter().filter(|(a, _)| a == "apply -f -").count();
-        assert!(s.view().contains("From outside: closed. t opens a Cloudflare Tunnel"), "{}", s.view());
-
-        // No token saved: says where it goes, starts nothing.
-        s.key(Key::Char('t'));
-        assert!(s.s.notice.contains("No tunnel token yet") && s.s.notice.contains("cloudflare_tunnel_token"), "{:?}", s.s.notice);
-        s.key(Key::Char('T'));
-        assert!(s.s.notice.contains("No tunnel to close"));
-        // Something that is not a token.
-        std::fs::write(&file, "my password\n").unwrap();
-        s.key(Key::Char('t'));
-        assert!(s.s.notice.contains("not a tunnel token"), "{:?}", s.s.notice);
-        assert_eq!(applied(&fake), 0);
-
-        // The dashboard's command line, pasted whole. Asks first.
-        let token = "eyJhIjoiMTIzNDU2Nzg5MGFiY2RlZiIsInQiOiJhYmNkZWYiLCJzIjoiWldGemVTQjBieUJ6WldVPSJ9";
-        std::fs::write(&file, format!("cloudflared service install {token}\n")).unwrap();
-        s.key(Key::Char('t'));
-        let v = s.view();
-        assert!(v.contains("Open the tunnel with the token from") && v.contains("y to confirm"), "{v}");
-        assert!(!v.contains(token), "the token is never shown");
-        s.key(Key::Char('x'));
-        assert!(s.s.notice.contains("Tunnel left as it is") && applied(&fake) == 0);
-        s.key(Key::Char('t'));
-        s.key(Key::Char('y'));
-        assert!(!s.view().contains(token), "the token is never shown, also while it is sent");
-        s.settle();
-        assert!(
-            s.s.notice.contains("Tunnel starting") && s.s.notice.contains("http://traefik.kube-system.svc.cluster.local:80"),
-            "{:?}",
-            s.s.notice
-        );
-        let calls = fake.calls.lock().unwrap().clone();
-        let (_, manifest) = calls.iter().find(|(a, _)| a == "apply -f -").expect("nothing applied");
-        assert!(manifest.contains(&format!("token: \"{token}\"")) && manifest.contains("kind: Secret"), "{manifest}");
-        assert!(calls.iter().all(|(a, _)| !a.contains(token)), "the token travels on stdin, never in a command line");
-
-        // One of two copies holds a connection.
-        *fake.listing.lock().unwrap() = LISTING.into();
-        s.key(Key::Char('r'));
-        s.settle();
-        assert!(s.view().contains("Cloudflare Tunnel connected with 1 of 2 copies"), "{}", s.view());
-
-        // Close asks first.
-        s.key(Key::Char('T'));
-        assert!(s.view().contains("Close the tunnel? Nothing from outside reaches your apps"));
-        s.key(Key::Esc);
-        assert!(!fake.calls.lock().unwrap().iter().any(|(a, _)| a.contains("delete")));
-        s.key(Key::Char('T'));
-        s.key(Key::Char('y'));
-        s.settle();
-        assert!(s.s.notice.contains("Tunnel closed"), "{:?}", s.s.notice);
-        assert!(
-            fake.calls.lock().unwrap().iter().any(|(a, _)| a == "-n edge delete deployment/cloudflared secret/tunnel --ignore-not-found")
-        );
-    }
-
-    #[test]
     fn keys_work_while_the_coordinator_is_slow() {
         let fake = Arc::new(Fake::default());
         *fake.delay.lock().unwrap() = Duration::from_millis(400);
@@ -681,7 +732,7 @@ mod tests {
         assert!(s.view().contains("asking the coordinator…") && s.view().contains("From outside: not known yet"), "{}", s.view());
         // Every key answers at once while the call runs.
         let start = Instant::now();
-        for k in [Key::Down, Key::Up, Key::Char('n'), Key::Esc, Key::Char('d'), Key::Char('t')] {
+        for k in [Key::Down, Key::Up, Key::Char('n'), Key::Esc, Key::Char('d'), Key::Char('x')] {
             s.key(k);
         }
         assert!(start.elapsed() < Duration::from_millis(100), "keys waited for the coordinator: {:?}", start.elapsed());
@@ -726,7 +777,8 @@ mod tests {
         s.key(Key::Char('r'));
         s.settle();
         let order: Vec<String> = fake.calls.lock().unwrap().iter().map(|(a, _)| a.split(' ').next().unwrap_or("").to_string()).collect();
-        assert_eq!(order, vec!["get", "apply", "-n", "get"], "{order:?}");
+        // The deploy looks at the cluster first, then applies.
+        assert_eq!(order, vec!["get", "get", "apply", "-n", "get"], "{order:?}");
         assert!(s.s.notice.contains("blog is starting"), "{:?}", s.s.notice);
     }
 
@@ -742,11 +794,11 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(s.view().contains("Cannot reach the cluster: the coordinator did not answer within 0s. Is it on?"), "{}", s.view());
         // A change gives up too, and says what did not happen.
-        std::fs::write(dir.join("cloudflare_tunnel_token"), "eyJhIjoiMTIzNDU2Nzg5MGFiY2RlZiIsInQiOiJhYmNkZWYifQ==\n").unwrap();
-        s.key(Key::Char('t'));
+        s.s.now = apps::overview(&Ctx::new(), &Fake { listing: LISTING.to_string().into(), ..Fake::default() }).unwrap();
+        s.key(Key::Char('d'));
         s.key(Key::Char('y'));
         s.settle();
-        assert!(s.s.notice.starts_with("Tunnel not started: the coordinator did not answer"), "{:?}", s.s.notice);
+        assert!(s.s.notice.starts_with("Not removed: the coordinator did not answer"), "{:?}", s.s.notice);
         assert_eq!(fake.cut_off.load(SeqCst), fake.calls.lock().unwrap().len(), "every call was cut off by its limit");
     }
 
@@ -758,7 +810,7 @@ mod tests {
         let mut s = open_with(&fake, &dir, Limits::default());
         std::thread::sleep(Duration::from_millis(50));
         // Quitting during a refresh is immediate.
-        assert_eq!(s.s.update(Event::Key(Key::Char('q')), &s.emit.clone()), Flow::Quit);
+        assert_eq!(s.key(Key::Char('q')), Flow::Quit);
         let start = Instant::now();
         drop(s);
         assert!(start.elapsed() < Duration::from_secs(1), "closing waited {:?}", start.elapsed());
@@ -771,18 +823,17 @@ mod tests {
         let dir = crate::testutil::TempDir::new();
         let mut s = open(&fake, &dir);
         *fake.delay.lock().unwrap() = Duration::from_secs(30);
-        *fake.listing.lock().unwrap() = LISTING.into();
         s.s.now = apps::overview(&Ctx::new(), &Fake { listing: LISTING.to_string().into(), ..Fake::default() }).unwrap();
         s.key(Key::Char('d'));
         s.key(Key::Char('y'));
-        assert_eq!(s.s.update(Event::Key(Key::Char('q')), &s.emit.clone()), Flow::Continue);
+        assert_eq!(s.key(Key::Char('q')), Flow::Continue);
         assert!(s.s.notice.contains("Still removing api. Press q again"), "{:?}", s.s.notice);
         // Another key disarms it; q then asks again.
         s.key(Key::Down);
-        assert_eq!(s.s.update(Event::Key(Key::Char('q')), &s.emit.clone()), Flow::Continue);
-        assert_eq!(s.s.update(Event::Key(Key::Char('q')), &s.emit.clone()), Flow::Quit);
+        assert_eq!(s.key(Key::Char('q')), Flow::Continue);
+        assert_eq!(s.key(Key::Char('q')), Flow::Quit);
         // ctrl+c never asks.
-        assert_eq!(s.s.update(Event::Key(Key::Ctrl('c')), &s.emit.clone()), Flow::Quit);
+        assert_eq!(s.key(Key::Ctrl('c')), Flow::Quit);
     }
 
     #[test]

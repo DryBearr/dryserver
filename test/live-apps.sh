@@ -73,8 +73,10 @@ EOF
 chmod +x "$S/bin/ssh"
 export PATH="$S/bin:$PATH" XDG_RUNTIME_DIR="$S/r"
 
-# Drives the apps screen: pairs of WAIT_FOR KEYS, then q. Prints what was
-# drawn, then "exit after N ms" for how long the last q took to end it.
+# Drives the apps screen (or SCREEN=outside) at 80x24: pairs of WAIT_FOR
+# KEYS, then q. A small terminal in Python keeps what is on the screen,
+# since only changed cells are drawn. Prints every screen it saw (squeezed
+# to one line each), then "exit after N ms" for how long the last q took.
 screen_raw() {
     python3 -I - "$BIN" "$PORT" "$S/desk" "$@" <<'PY'
 import os, pty, re, select, sys, time
@@ -85,19 +87,54 @@ if pid == 0:
     fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     os.chdir(cwd)
     os.environ["TERM"] = "xterm-256color"
-    os.execv(binp, [binp, "apps", "--config", "config.env", "--host", "127.0.0.1", "--port", port])
-seen = ""
+    os.execv(binp, [binp, os.environ.get("SCREEN", "apps"), "--config", "config.env", "--host", "127.0.0.1", "--port", port])
+rows, cols = 24, 80
+cells = [[" "] * cols for _ in range(rows)]
+y = x = 0
+pending = ""
+screens = []
+def feed(text):
+    global y, x, pending
+    text = pending + text
+    pending = ""
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\x1b":
+            m = re.match(r"\x1b\[([0-9;?]*)([ -/]*)([@-~])", text[i:])
+            if not m:
+                if len(text) - i < 16: pending = text[i:]; return
+                i += 1; continue
+            args, cmd = m.group(1), m.group(3)
+            nums = [int(n) if n.isdigit() else 0 for n in args.replace("?", "").split(";")] if args else []
+            if cmd in "Hf":
+                y = max((nums[0] if nums else 1) - 1, 0); x = max((nums[1] if len(nums) > 1 else 1) - 1, 0)
+            elif cmd == "J" and not args.startswith("?"):
+                for r in cells: r[:] = [" "] * cols
+            elif cmd == "K":
+                cells[min(y, rows - 1)][x:] = [" "] * (cols - x)
+            elif cmd == "C":
+                x += nums[0] if nums and nums[0] else 1
+            i += len(m.group(0)); continue
+        if c == "\r": x = 0
+        elif c == "\n": y = min(y + 1, rows - 1)
+        elif c >= " ":
+            if y < rows and x < cols: cells[y][x] = c
+            x += 1
+        i += 1
+def now():
+    return re.sub(r"\s+", " ", " ".join("".join(r) for r in cells))
 def read_until(pat, timeout):
-    global seen
     end = time.time() + timeout
     while time.time() < end:
         r, _, _ = select.select([fd], [], [], 0.1)
         if r:
             try: data = os.read(fd, 65536)
             except OSError: return False
-            seen += re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b[()][A-Z0-9]|\x1b[=>]", " ", data.decode("utf-8", "replace"))
-            seen = re.sub(r"\s+", " ", seen)
-        if re.search(pat, seen): return True
+            feed(data.decode("utf-8", "replace"))
+            s = now()
+            if not screens or screens[-1] != s: screens.append(s)
+        if re.search(pat, now()): return True
     return False
 okay = True
 for i in range(0, len(steps), 2):
@@ -118,7 +155,7 @@ while time.time() - start < 10:
     try: os.read(fd, 65536)
     except OSError: pass
     time.sleep(0.02)
-print(seen)
+print("\n".join(screens))
 print("exit after %d ms" % (gone * 1000) if gone is not None else "did not exit")
 sys.exit(0 if okay else 1)
 PY
@@ -130,7 +167,7 @@ masters() { pgrep -fc "[s]sh .*-p $PORT .*-M -N -f" || true; }
 
 echo "== the screen lists the apps over one shared connection"
 out=$(screen "blog" "r" "1/1 running" "" 2>&1)
-check "the screen shows the app from the coordinator" grep -q "nginx:1.27 .*1/1" <<<"$out"
+check "the screen shows the app from the coordinator" grep -q "blog .*1/1 running" <<<"$out"
 check "it ended at once" grep -Eq "exit after [0-9]{1,3} ms" <<<"$out"
 check "the calls went through the shared connection" test "$(masters)" -eq 1
 check "no call is left running" test "$(clients)" -eq 0
@@ -140,6 +177,14 @@ out=$(screen "blog" "n" "Name" $'web\r' "Image" $'nginx:1.27\r' "Port" $'80\r' "
 check "the screen says it is starting" grep -q "web is starting" <<<"$out"
 check "the coordinator got the manifest on stdin" grep -q 'name: "web"' "$S/applied"
 check "still one shared connection" test "$(masters)" -eq 1
+
+echo "== the ways in from outside"
+out=$(screen "blog" "o" "Your VPS +not set up" "a" "n new app" "" 2>&1)
+check "o goes to the Outside screen" grep -q "Cloudflare Tunnel .*not set up" <<<"$out"
+check "a comes back to the apps" grep -Eq "Your VPS.*n new app" <<<"$(tr '\n' ' ' <<<"$out")"
+out=$(SCREEN=outside screen "Your VPS +not set up" "j" "> Your VPS" "x" "nothing to close" "" 2>&1)
+check "./dryserver outside opens it directly" grep -q "Your VPS is not set up; there is nothing to close" <<<"$out"
+check "both screens share one connection" test "$(masters)" -eq 1
 
 echo "== three rounds of refreshes (about 35 seconds)"
 before=$(wc -l < "$S/calls")

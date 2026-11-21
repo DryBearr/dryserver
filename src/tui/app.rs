@@ -31,12 +31,13 @@ pub enum Screen {
     Flash,
 }
 
-const MENU: [(&str, &str); 6] = [
+const MENU: [(&str, &str); 7] = [
     ("1", "Edit config"),
     ("2", "Build installer ISO"),
     ("3", "Flash USB"),
     ("4", "Machines: approve, remove, replace"),
     ("5", "Apps: what runs on your cluster"),
+    ("6", "Outside: the ways in from the internet"),
     ("q", "Quit"),
 ];
 
@@ -70,8 +71,8 @@ pub struct App {
     /// Set when the menu closes to open the machines screen; the caller
     /// runs it and comes back.
     pub open_machines: bool,
-    /// The same for the apps screen.
-    pub open_apps: bool,
+    /// The same for the apps or outside screen.
+    pub open_cluster: Option<super::Place>,
 }
 
 fn build_emit(emit: &Emit<Msg>) -> Emit<build::Msg> {
@@ -101,7 +102,7 @@ impl App {
             width: 0,
             height: 24,
             open_machines: false,
-            open_apps: false,
+            open_cluster: None,
         };
         a.refresh();
         a
@@ -168,12 +169,12 @@ impl App {
                 self.open_machines = true;
                 return Flow::Quit;
             }
-            "5" => {
+            "5" | "6" => {
                 if self.root {
                     self.notice = "Apps are managed as your normal user, not with sudo.".into();
                     return Flow::Continue;
                 }
-                self.open_apps = true;
+                self.open_cluster = Some(if k == "5" { super::Place::Apps } else { super::Place::Outside });
                 return Flow::Quit;
             }
             "q" => return Flow::Quit,
@@ -357,7 +358,7 @@ impl Model for App {
         if !self.notice.is_empty() {
             b.nl().s(&self.notice).nl();
         }
-        b.nl().append(theme::keys(&[("↑↓", "move"), ("enter", "open"), ("1-5", "jump"), ("q", "quit")])).nl();
+        b.nl().append(theme::keys(&[("↑↓", "move"), ("enter", "open"), ("1-6", "jump"), ("q", "quit")])).nl();
         b
     }
 }

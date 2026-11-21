@@ -10,6 +10,7 @@ mod config;
 mod coredns;
 mod ctx;
 mod disks;
+mod entrance;
 mod err;
 mod flash;
 mod fsx;
@@ -80,6 +81,8 @@ commands:
                       container image, remove one
   backup-pull         copy the coordinator's newest backups into
                       secrets/backups (encrypted; signed by the coordinator)
+  outside             the ways in from the internet: open, sync or close
+                      the Cloudflare Tunnel, see which names use it
 
 on servers:
   join                ask the coordinator to join (runs at boot until approved)
@@ -131,7 +134,8 @@ fn main() -> ExitCode {
         "flash" => run_flash(rest),
         "sysconf" => run_sysconf(rest),
         "ssh-config" => run_ssh_config(rest),
-        "apps" => run_apps(rest),
+        "apps" => run_apps(rest, tui::Place::Apps),
+        "outside" => run_apps(rest, tui::Place::Outside),
         "quarantine-all" => run_quarantine_all(rest),
         "quarantine" => run_quarantine(rest),
         "registry" => run_registry(rest),
@@ -244,14 +248,13 @@ fn run_app() -> Result<()> {
     loop {
         let mut app = tui::app::App::new(paths());
         tui::run(&mut app)?;
-        // "Machines" and "Apps" in the menu: that screen, then the menu
-        // again.
+        // "Machines", "Apps" and "Outside" in the menu: that screen, then
+        // the menu again.
         let f = Flags::parse("approve", &[], DESKTOP_FLAGS);
         let res = if app.open_machines {
             desktop_admin(&f, "approve").and_then(|(a, _)| tui::run(&mut tui::admin::Screen::new(a)))
-        } else if app.open_apps {
-            desktop_cluster(&f, "apps")
-                .and_then(|c| tui::run(&mut tui::apps::Screen::new(Arc::new(c), paths().secrets.join(apps::TUNNEL_TOKEN_FILE))))
+        } else if let Some(place) = app.open_cluster {
+            cluster_screens(&f, place)
         } else {
             return Ok(());
         };
@@ -794,12 +797,45 @@ fn desktop_cluster(f: &Flags, cmd: &str) -> Result<apps::SshCluster> {
     })
 }
 
-fn run_apps(args: &[String]) -> Result<()> {
-    let f = Flags::parse("apps", args, DESKTOP_FLAGS);
+fn run_apps(args: &[String], place: tui::Place) -> Result<()> {
+    let cmd = if place == tui::Place::Apps { "apps" } else { "outside" };
+    let f = Flags::parse(cmd, args, DESKTOP_FLAGS);
     if Path::new(LIVE_CONFIG).exists() {
-        bail!("apps runs on your own computer:\n  ./dryserver apps\nOn the coordinator itself, use: k3s kubectl");
+        bail!("{cmd} runs on your own computer:\n  ./dryserver {cmd}\nOn the coordinator itself, use: k3s kubectl");
     }
-    tui::run(&mut tui::apps::Screen::new(Arc::new(desktop_cluster(&f, "apps")?), paths().secrets.join(apps::TUNNEL_TOKEN_FILE)))
+    cluster_screens(&f, place)
+}
+
+/// The ways in from outside this desktop knows, with its secrets.
+fn desktop_doors() -> entrance::Entrances {
+    let secrets = paths().secrets;
+    Arc::new(vec![
+        Box::new(entrance::cloudflare::Cloudflare { token_file: secrets.join(entrance::cloudflare::TOKEN_FILE) }),
+        Box::new(entrance::Vps),
+    ])
+}
+
+/// The apps and outside screens, starting at place; each can switch to
+/// the other. They share one SSH connection to the coordinator.
+fn cluster_screens(f: &Flags, place: tui::Place) -> Result<()> {
+    let c: Arc<dyn apps::Cluster> = Arc::new(desktop_cluster(f, "apps")?);
+    let doors = desktop_doors();
+    let mut next = Some(place);
+    while let Some(place) = next {
+        next = match place {
+            tui::Place::Apps => {
+                let mut s = tui::apps::Screen::new(c.clone(), doors.clone());
+                tui::run(&mut s)?;
+                s.next
+            }
+            tui::Place::Outside => {
+                let mut s = tui::outside::Screen::new(c.clone(), doors.clone());
+                tui::run(&mut s)?;
+                s.next
+            }
+        };
+    }
+    Ok(())
 }
 
 fn run_approve(args: &[String]) -> Result<()> {

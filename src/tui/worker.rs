@@ -16,8 +16,36 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use super::{Doc, dim, err, sel, spinner};
+use super::{Doc, dim, err, sel, spinner, theme};
 use crate::ctx::Ctx;
+use crate::err::{Error, Kind};
+
+/// How long the other side may take to answer.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// A question: the cluster's listing.
+    pub read: Duration,
+    /// A change: kubectl apply waits for the cluster to take it; a sync
+    /// with Cloudflare is a few dozen small requests.
+    pub change: Duration,
+    /// After this long without an answer the screen says so.
+    pub slow: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { read: Duration::from_secs(15), change: Duration::from_secs(60), slow: Duration::from_secs(4) }
+    }
+}
+
+/// A call that ran out of time says how long it was given.
+pub fn timed(e: Error, limit: Duration) -> Error {
+    if e.is(Kind::DeadlineExceeded) {
+        Error::with_kind(Kind::DeadlineExceeded, format!("the coordinator did not answer within {}s. Is it on?", limit.as_secs()))
+    } else {
+        e
+    }
+}
 
 /// What a screen sent its worker and has not heard back about, in the
 /// order sent. Each job answers with exactly one message, so the oldest
@@ -74,7 +102,7 @@ impl Waiting {
     pub fn view(&self, slow: Duration, silent: &str) -> Option<Doc> {
         let first = self.jobs.front()?;
         let mut d = Doc::new();
-        d.s("  ").add(sel(spinner())).s(format!(" {}…", first.label));
+        d.s("  ").add(sel(spinner())).s(format!(" {}{}", first.label, theme::ellipsis()));
         if self.jobs.len() > 1 {
             let rest: Vec<&str> = self.jobs.iter().skip(1).map(|j| j.label.as_str()).collect();
             d.add(dim(format!("  then {}", rest.join(", "))));

@@ -130,6 +130,11 @@ pub fn done_mark() -> &'static str {
     if palette().console { "√" } else { "✓" }
 }
 
+/// "…", which the console font may not have.
+pub fn ellipsis() -> &'static str {
+    if palette().console { "..." } else { "…" }
+}
+
 /// The ring, 5 lines of 11 cells. Full and half blocks only.
 const RING: [&str; 5] = ["  ▄▄███▄▄  ", " ██▀   ▀██ ", " ██     ██ ", " ██▄   ▄██ ", "  ▀▀███▀▀  "];
 #[cfg(test)]

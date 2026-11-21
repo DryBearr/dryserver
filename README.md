@@ -257,8 +257,8 @@ Limits for now:
   After a real break-in (not a false alarm), reinstall the servers too.
 - A server that ran a copy of the Cloudflare Tunnel knows the tunnel's
   token. After you cut off or removed a server you do not trust, make a new
-  token in the Cloudflare dashboard, save it and press `t` in
-  `./dryserver apps`.
+  token in the Cloudflare dashboard, save it and press `o` in
+  `./dryserver outside`.
 - After a false alarm (the coordinator was not reinstalled), `-lift` trusts
   the same machine again. Do that only when you are sure.
 - The coordinator's IPv6 addresses on the WiFi/router network are not
@@ -284,9 +284,15 @@ the dead copy and fails.
 
 `n` starts an app from a container image: a name (it starts with a letter),
 the image, the port it listens on, and, if it should be reachable from outside, a public host name.
-The screen shows what runs on which server; `d` removes an app. Under it is
-plain Kubernetes: on the coordinator, `k3s kubectl` works for you without
-sudo.
+The screen shows what runs on which server; `d` removes an app; `o` goes to
+the ways in from outside. Under it is plain Kubernetes: on the coordinator,
+`k3s kubectl` works for you without sudo.
+
+The screen never waits for the coordinator: every question and change runs
+in the background with a time limit (15 seconds for a look, a minute for a
+change), and the screen says when the coordinator does not answer. Both
+screens share one SSH connection, which ends by itself 20 seconds after the
+last call.
 
 What dryserver sets up around every app (namespace `apps`):
 
@@ -318,22 +324,43 @@ stick is built and checked against the checksum dryserver was built with.
 
 ### Reaching apps from outside
 
-No machine opens a port to the internet. The way in is a Cloudflare Tunnel
-that runs as two pods in the cluster and dials out to Cloudflare:
+No machine opens a port to the internet. What comes in arrives through an
+entrance, and the Outside screen shows them all, how each is doing and
+which host names come in through it:
+
+```sh
+./dryserver outside        # or "Outside" in the menu, or o on the apps screen
+```
+
+- **Cloudflare Tunnel**: two pods in the cluster dial out to Cloudflare,
+  which sends what arrives for your host names through them to the ingress.
+- **Your VPS**: not built yet. A server you rent will relay web and game
+  ports (TCP and UDP) to the cluster over WireGuard.
+
+Each public host name belongs to one app and comes in through one entrance.
+The choice is stored on the app's Ingress as the annotation
+`dryserver/entrance`; an Ingress without it comes in through Cloudflare, so
+apps started before there was a choice keep working. The apps form asks
+for it only when more than one entrance is set up. A host name that
+another app already has is refused; one that two apps claim anyway (made
+with kubectl) is served by neither, and the Outside screen says so.
+
+To open the Cloudflare Tunnel by hand:
 
 1. In the Cloudflare dashboard (Zero Trust, Networks, Tunnels) create a
    tunnel and copy its token. Save it on your computer as
    `secrets/cloudflare_tunnel_token` (the whole
    `cloudflared service install ...` line works too).
-2. In `./dryserver apps` press `t`. The line "From outside" shows how many
+2. In `./dryserver outside` press `o`. The tunnel's line shows how many
    copies hold a connection to Cloudflare.
 3. In the dashboard, add a public host name per app and point each at
    `http://traefik.kube-system.svc.cluster.local:80`. The ingress then
    routes by the host name you gave the app.
 
-`T` closes the tunnel; the apps keep running, reachable only inside the
-cluster. `t` again after you changed the file gives the tunnel the new
-token. The token is stored in the cluster as an encrypted secret. The tunnel
+`x` closes the tunnel (it names the apps that still come in through it);
+the apps keep running, reachable only inside the cluster. `o` again after
+you changed the file gives the tunnel the new token. The token is stored in
+the cluster as an encrypted secret. The tunnel
 pods run as a plain user with a read-only file system, no privileges and no
 cluster credentials, from one cloudflared image pinned by its digest.
 Nothing in the cluster may connect to them, and they may connect only to
@@ -482,12 +509,13 @@ On your desktop:
 
 | Command | What it does |
 |---|---|
-| `./dryserver` | menu: config, build, flash, machines |
+| `./dryserver` | menu: config, build, flash, machines, apps, outside |
 | `./dryserver build` | build the ISO, log to stdout |
 | `./dryserver disks` | list disks and which ones may be flashed |
 | `sudo ./dryserver flash --iso FILE` | flash any image to a USB drive |
 | `./dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed |
 | `./dryserver apps` | what runs on your cluster: start an app from a container image, remove one |
+| `./dryserver outside` | the ways in from the internet: open, sync or close the Cloudflare Tunnel, and which host names use it |
 | `./dryserver ssh-config` | SSH config for all servers |
 | `./dryserver quarantine-all` | kill switch: cut the coordinator off on every server |
 | `./dryserver backup-pull` | copy the coordinator's newest encrypted backups into `secrets/backups/` |
@@ -599,7 +627,7 @@ Layout: `src/main.rs` (CLI), `src/tui` (screens), `src/install`
 and `src/node.rs` (joining and sync), `src/mesh.rs` (WireGuard and SSH
 config), `src/quarantine.rs` (kill switch), `src/signed.rs` and
 `src/admin.rs` (signed member list and approval from the desktop),
-`src/apps.rs` (apps on the cluster), `assets/` (files embedded into the ISO and servers by `build.rs`).
+`src/apps.rs` (apps on the cluster), `src/entrance.rs` (the ways in from outside), `assets/` (files embedded into the ISO and servers by `build.rs`).
 Golden files for the generated system files are in `testdata/sysconf`;
 `UPDATE_GOLDEN=1 cargo test` rewrites them.
 

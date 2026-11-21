@@ -8,9 +8,17 @@ pub mod apps;
 pub mod build;
 pub mod flash;
 pub mod form;
+pub mod outside;
 pub mod setup;
 pub mod theme;
 pub mod worker;
+
+/// The cluster screens, for going from one to the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    Apps,
+    Outside,
+}
 
 use std::io::stdout;
 use std::sync::mpsc;
@@ -295,7 +303,51 @@ pub fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect::<String>() + "…"
 }
 
-/// The current frame of the busy spinner.
+/// s in at most n cells: cut with an ellipsis the console font has.
+pub fn fit(s: &str, n: usize) -> String {
+    if s.width() <= n {
+        return s.to_string();
+    }
+    let dots = theme::ellipsis();
+    let mut out = String::new();
+    for c in s.chars() {
+        if out.width() + c.to_string().width() + dots.width() > n {
+            break;
+        }
+        out.push(c);
+    }
+    out + dots
+}
+
+/// s broken into lines of at most width cells, at spaces where it can;
+/// its own line breaks stay. The screens do not wrap by themselves, and
+/// a long message would be cut at the edge.
+pub fn wrap(s: &str, width: usize) -> String {
+    let width = width.max(10);
+    let mut out = Vec::new();
+    for para in s.split('\n') {
+        let mut line = String::new();
+        for word in para.split(' ') {
+            let (lw, ww) = (line.width(), word.width());
+            if lw > 0 && lw + 1 + ww > width {
+                out.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+            // A word longer than a line is cut where the line ends.
+            while line.width() > width {
+                let cut: String = line.chars().take(width).collect();
+                line = line.chars().skip(cut.chars().count()).collect();
+                out.push(cut);
+            }
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
 /// The current frame of the busy spinner: an ember that glows and fades.
 /// Glyphs of code page 437 only, so it also shows on the Linux console
 /// (the braille spinner did not).
@@ -593,5 +645,17 @@ mod tests {
         t.handle(&Key::Ctrl('u'));
         assert_eq!(t.value, "b");
         assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn long_lines_wrap() {
+        assert_eq!(wrap("one two three four", 10), "one two\nthree four");
+        assert_eq!(wrap("keep\nbreaks", 80), "keep\nbreaks");
+        assert_eq!(wrap("abcdefghijklmnopqrstuvwxyz", 10), "abcdefghij\nklmnopqrst\nuvwxyz");
+        let long =
+            "Close Cloudflare Tunnel? blog, shop still come in through it: nothing from outside reaches them after that. y to confirm";
+        assert!(wrap(long, 76).lines().all(|l| l.width() <= 76), "{}", wrap(long, 76));
+        assert_eq!(fit("short", 10), "short");
+        assert!(fit("node-a,node-b,node-c", 12).width() <= 12 && fit("node-a,node-b,node-c", 12).starts_with("node-a,no"));
     }
 }
