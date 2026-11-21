@@ -6,6 +6,7 @@ mod apps;
 mod assets;
 mod cidr;
 mod config;
+mod coredns;
 mod ctx;
 mod disks;
 mod err;
@@ -82,6 +83,8 @@ on servers:
                       k3s, firewall, WireGuard); root shows everything
   tpm-enroll          let the TPM unlock the disk again (after a firmware change)
   registry            coordinator: SSH forced command for joining machines
+  cluster-dns         coordinator: keep the cluster's DNS on two machines
+                      (run by a timer)
 "#;
 
 /// Where the ISO build puts the config.
@@ -121,6 +124,7 @@ fn main() -> ExitCode {
         "report" => run_report(rest),
         "approve" => run_approve(rest),
         "tpm-enroll" => run_tpm_enroll(rest),
+        "cluster-dns" => run_cluster_dns(rest),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())
@@ -674,6 +678,23 @@ fn run_report(args: &[String]) -> Result<()> {
     let r = report::gather(&ctx, &ExecRunner::silent(), Path::new("/"), &subnet);
     println!("{}", serde_json::to_string_pretty(&r)?);
     Ok(())
+}
+
+fn run_cluster_dns(args: &[String]) -> Result<()> {
+    Flags::parse("cluster-dns", args, &[]);
+    if !fsx::is_root() {
+        bail!("run as root (sudo)");
+    }
+    if !is_coordinator() {
+        bail!("cluster-dns runs on the coordinator");
+    }
+    let ctx = Ctx::on_signals().with_timeout(coredns::RUN_TIMEOUT);
+    let run = ExecRunner::silent();
+    if run.ok(&ctx, &Cmd::new("systemctl", &["is-active", "--quiet", "k3s.service"])).is_err() {
+        println!("k3s is not running here; nothing to do");
+        return Ok(());
+    }
+    coredns::tend(&ctx, &run, Time::now(), &mut std::io::stdout()).map(|_| ())
 }
 
 /// kubectl on the coordinator over the admin's SSH login, with the host

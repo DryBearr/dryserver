@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 use crate::cidr::Cidr;
 use crate::config::{self, Config, Port};
 use crate::err::{Context, Result};
-use crate::{errf, fsx, packages, quarantine};
+use crate::{coredns, errf, fsx, packages, quarantine};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Role {
@@ -132,6 +132,9 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
         // No secret in it, and kubectl (run by the admin) reads it too.
         files.push(file(K3S_CONFIG, 0o644, k3s_server_config(&mesh1)));
         files.push(file(K3S_INGRESS_CONFIG, 0o600, K3S_INGRESS));
+        files.push(file(coredns::PDB_PATH, 0o600, coredns::PDB));
+        files.push(file(format!("/etc/systemd/system/{DNS_NAME}.service"), 0o644, DNS_UNIT));
+        files.push(file(format!("/etc/systemd/system/{DNS_TIMER}"), 0o644, DNS_TIMER_UNIT));
     }
     if !switch_addr.is_empty() && !p.switch_mac.is_empty() {
         files.push(file("/etc/systemd/network/10-switch.network", 0o644, switch_network(&p.switch_mac, &switch_addr)));
@@ -199,6 +202,31 @@ spec:
     deployment:
       kind: DaemonSet
 ";
+/// On the coordinator: keeps the cluster's DNS on two machines, and off
+/// the coordinator where it can (see coredns.rs). Every two minutes, so
+/// copies move apart soon after a server joins or comes back; a run is
+/// two short kubectl calls and changes nothing when all is well.
+const DNS_NAME: &str = "dryserver-dns";
+pub const DNS_TIMER: &str = "dryserver-dns.timer";
+const DNS_UNIT: &str = "[Unit]
+Description=Keep the cluster's DNS on two machines
+After=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dryserver cluster-dns
+";
+const DNS_TIMER_UNIT: &str = "[Unit]
+Description=Check where the cluster's DNS runs, every two minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+";
+
 /// While this file exists a server does not run k3s. It cut the
 /// coordinator off: what the coordinator's cluster started here is not
 /// trusted until the admin lifts the cut.
@@ -933,6 +961,19 @@ mod tests {
             ingress.content
         );
         assert!(!has(&node, K3S_INGRESS_CONFIG));
+        // The cluster's DNS: its disruption budget where k3s picks it up,
+        // next to (never in place of) k3s's own coredns.yaml, and the
+        // timer that keeps two copies apart. Coordinator only.
+        let pdb = find(&coord, coredns::PDB_PATH);
+        assert!(pdb.mode == 0o600 && pdb.content == coredns::PDB, "{pdb:?}");
+        assert!(!coord.iter().any(|f| f.path.ends_with("/manifests/coredns.yaml") || f.path.ends_with(".skip")));
+        let timer = &find(&coord, "/etc/systemd/system/dryserver-dns.timer").content;
+        assert!(timer.contains("OnUnitActiveSec=2min") && timer.contains("WantedBy=timers.target"), "{timer}");
+        let svc = &find(&coord, "/etc/systemd/system/dryserver-dns.service").content;
+        assert!(svc.contains("Type=oneshot\nExecStart=/usr/local/bin/dryserver cluster-dns\n"), "{svc}");
+        for f in [coredns::PDB_PATH, "/etc/systemd/system/dryserver-dns.timer", "/etc/systemd/system/dryserver-dns.service"] {
+            assert!(!has(&node, f), "{f} on a server");
+        }
         // A server that cut the coordinator off does not start k3s.
         let unit = &find(&node, "/etc/systemd/system/k3s.service").content;
         assert!(unit.contains("ConditionPathExists=!/etc/dryserver/k3s.hold\n"), "{unit}");
@@ -997,6 +1038,38 @@ mod tests {
 
         assert!(find(&node, "/etc/docker/daemon.json").content.contains(r#""ip": "127.0.0.1""#));
         assert!(!has(&coord, "/etc/docker/daemon.json"), "no docker bundle, no daemon.json");
+    }
+
+    /// A pod's DNS question may go to a CoreDNS copy on another machine,
+    /// and CoreDNS there asks the home router and the API server. Every
+    /// hop of that path is open on every machine, before the drops that
+    /// end each chain.
+    #[test]
+    fn pod_dns_crosses_machines() {
+        for (name, p) in cases() {
+            let nft = find(&render(&p).unwrap(), "/etc/nftables.conf").content.clone();
+            let chain = |c: &str| {
+                let start = nft.find(&format!("chain {c} {{")).unwrap_or_else(|| panic!("{name}: no chain {c}"));
+                nft[start..start + nft[start..].find("\n\t}").unwrap()].to_string()
+            };
+            let before = |c: &str, a: &str, b: &str| {
+                let text = chain(c);
+                let (i, j) = (text.find(a), text.find(b));
+                assert!(i.is_some() && j.is_some() && i < j, "{name}: in {c}, {a:?} must come before {b:?}:\n{text}");
+            };
+            // The asking pod: out through the pod network (VXLAN over the mesh).
+            before("pods", "oifname { \"cni0\", \"flannel.1\" } accept", "oifname \"wg0\" drop");
+            before("output", "oifname \"wg0\" accept", "reject with icmpx admin-prohibited");
+            // The machine with the copy: VXLAN in from the mesh, on to its pod.
+            before("mesh", "udp dport 8472 accept", "\t\tdrop");
+            let fwd = chain("forward");
+            assert!(fwd.contains("iifname \"flannel.1\" oifname != \"cni0\" drop"), "{name}: {fwd}");
+            assert!(fwd.contains("oifname \"cni0\" iifname != { \"cni0\", \"flannel.1\" } drop"), "{name}: {fwd}");
+            // CoreDNS there: the home router, and the API server it watches.
+            before("pods", "udp dport { 53, 123 } accept", "ip daddr { 10.0.0.0/8");
+            before("pods", "tcp dport 53 accept", "ip daddr { 10.0.0.0/8");
+            before("pods", "oifname \"wg0\" ip daddr 10.66.0.1 tcp dport 6443 accept", "oifname \"wg0\" drop");
+        }
     }
 
     #[test]

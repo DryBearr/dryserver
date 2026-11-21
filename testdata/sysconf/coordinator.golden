@@ -405,3 +405,33 @@ spec:
   valuesContent: |-
     deployment:
       kind: DaemonSet
+===== /var/lib/rancher/k3s/server/manifests/dryserver-coredns.yaml (0600)
+# dryserver: the cluster's DNS keeps at least one copy through a drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coredns
+  namespace: kube-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      k8s-app: kube-dns
+===== /etc/systemd/system/dryserver-dns.service (0644)
+[Unit]
+Description=Keep the cluster's DNS on two machines
+After=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dryserver cluster-dns
+===== /etc/systemd/system/dryserver-dns.timer (0644)
+[Unit]
+Description=Check where the cluster's DNS runs, every two minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

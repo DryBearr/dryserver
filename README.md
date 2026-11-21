@@ -294,6 +294,10 @@ What dryserver sets up around every app (namespace `apps`):
   not the cluster's own services, not the machines,
 - an app cannot send raw packets, so it cannot pose as another address on
   the pod network,
+- the cluster's DNS runs as two copies on different machines, on servers
+  rather than on the coordinator once there are two servers, so apps and
+  the tunnel keep finding each other when one machine is off, the
+  coordinator included,
 - a public host name makes the built-in ingress (Traefik) route that name to
   the app. The ingress has no port on any machine: what comes in from
   outside reaches it through a tunnel that runs inside the cluster. It runs
@@ -443,7 +447,7 @@ On servers:
 | `sudo dryserver tpm-enroll` | let the TPM unlock the disk again (after a firmware change) |
 | `sudo dryserver quarantine` | kill switch on this server (`-name`, `-status`, `-lift`) |
 | `dryserver report` | this machine's health as JSON, the same report it sends with every sync (`sudo` adds the firewall and WireGuard) |
-| `dryserver sync`, `join`, `scan`, `registry` | run automatically by systemd, cron and SSH |
+| `dryserver sync`, `join`, `scan`, `registry`, `cluster-dns` | run automatically by systemd, cron and SSH |
 
 ### Health reports
 

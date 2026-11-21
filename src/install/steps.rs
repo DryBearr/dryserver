@@ -334,6 +334,10 @@ impl Real {
         // coordinator at once, on a server after it was approved and got
         // its token (see the unit's condition).
         let mut enable = vec!["systemctl", "enable", "k3s.service"];
+        if ch.role() == Role::Coordinator {
+            // Keeps the cluster's DNS on two machines.
+            enable.push(sysconf::DNS_TIMER);
+        }
         enable.extend(plan.services.iter().map(String::as_str));
         self.chroot(ctx, &enable)?;
         for c in &plan.user_commands {
@@ -744,6 +748,8 @@ mod tests {
         assert_eq!(read("/usr/local/bin/k3s"), "k3s binary");
         assert_eq!(mode(r.target("/usr/local/bin/k3s")).0, 0o755);
         fr.index(&format!("arch-chroot {t} systemctl enable k3s.service"));
+        assert!(!fr.strings().iter().any(|c| c.contains("dryserver-dns")), "the DNS timer is the coordinator's");
+        assert!(!r.target(crate::coredns::PDB_PATH).exists());
         assert!(read("/etc/systemd/system/k3s.service").contains("ExecStart=/usr/local/bin/k3s agent"));
         assert!(!r.target("/etc/rancher/k3s/config.yaml").exists(), "a server gets its k3s config when it is approved");
         assert_eq!(read("/etc/wireguard/wg0.key"), "PRIVATEKEY=\n");
@@ -807,7 +813,17 @@ mod tests {
                 assert_eq!(mode & 0o777, 0o700, "{d} is open to read");
             }
             assert!(!get(&r.target, sysconf::K3S_INGRESS_CONFIG).is_empty());
+            // The cluster's DNS: the disruption budget beside k3s's own
+            // manifest, private like it; k3s's coredns.yaml is left to k3s.
+            assert_eq!(get(&r.target, crate::coredns::PDB_PATH), crate::coredns::PDB);
+            let mode = std::fs::metadata(fsx::under(&r.target, crate::coredns::PDB_PATH)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            for f in ["coredns.yaml", "coredns.yaml.skip"] {
+                assert!(!fsx::under(&r.target, "/var/lib/rancher/k3s/server/manifests").join(f).exists(), "{f} is k3s's");
+            }
         }
+        fr.index(&format!("arch-chroot {t} systemctl enable k3s.service dryserver-dns.timer"));
+        assert!(get(&r.target, "/etc/systemd/system/dryserver-dns.service").contains("dryserver cluster-dns"));
         let secret = get(&r.target, sysconf::K3S_AGENT_SECRET);
         assert!(secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit()), "agent secret: {secret:?}");
         {
