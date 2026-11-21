@@ -1,0 +1,1313 @@
+//! The rollout end to end in one process: a brain with the real registry
+//! and its copy of the releases, servers with their own stores, lane 5's
+//! update commands and kubectl as fakes, and a clock the tests move.
+
+use super::*;
+use crate::config::Config;
+use crate::gotime::Time;
+use crate::registry::{Heartbeat, Mesh};
+use crate::runner::Runner;
+use crate::signed::fake::Key;
+use crate::testutil::{TempDir, put};
+use chrono::TimeZone;
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+const ADMIN: Key = Key("admin");
+/// The k3s every machine runs.
+const K3S: &[u8] = b"k3s v1.37.2+k3s1, the binary";
+const OLD_BIN: &[u8] = b"\x7fELF dryserver 0.1.0, as installed";
+const K3S_VERSION: &str = "v1.37.2+k3s1";
+/// Minutes after midnight on the brain's clock.
+const IN_WINDOW: u32 = 4 * 60;
+const DAYTIME: u32 = 14 * 60;
+
+fn t0() -> i64 {
+    chrono::Utc.with_ymd_and_hms(2026, 11, 21, 4, 0, 0).unwrap().timestamp()
+}
+
+fn sha(b: &[u8]) -> String {
+    fsx::hex(&Sha256::digest(b))
+}
+
+fn time(t: i64) -> Time {
+    Time(chrono::DateTime::from_timestamp(t, 0).unwrap())
+}
+
+fn exe(root: &Path) -> PathBuf {
+    fsx::under(root, "/proc/self/exe")
+}
+
+/// lane 5's `dryserver update` on one machine, and kubectl on the brain.
+#[derive(Default)]
+struct Sim {
+    root: PathBuf,
+    installed: u64,
+    pending: u64,
+    /// The last action: serial, what, how it ended, why.
+    last: (u64, String, bool, String),
+    apply_fails: Option<String>,
+    /// The new binary does not come up: the old one keeps running.
+    broken: bool,
+    kubectl: Vec<String>,
+    drain_fails: Vec<String>,
+    applied: Vec<Vec<String>>,
+    confirmed: Vec<Vec<String>>,
+    /// What ran before the pending release, for a revert.
+    before: Vec<u8>,
+}
+
+struct Fake(Mutex<Sim>);
+
+impl Fake {
+    fn sim(&self) -> MutexGuard<'_, Sim> {
+        self.0.lock().unwrap()
+    }
+
+    /// The revert timer fires: back to what ran before.
+    fn revert(&self) {
+        let mut s = self.sim();
+        if s.pending != 0 {
+            s.last = (s.pending, "reverted".into(), true, "not confirmed before its deadline".into());
+            s.pending = 0;
+            let b = s.before.clone();
+            std::fs::write(exe(&s.root), b).unwrap();
+        }
+    }
+}
+
+impl Runner for Fake {
+    fn run(&self, _: &Ctx, c: &Cmd) -> (String, Result<()>) {
+        let mut s = self.sim();
+        let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
+        match (c.name.as_str(), a.as_slice()) {
+            ("k3s", ["kubectl", rest @ ..]) => {
+                s.kubectl.push(rest.join(" "));
+                if rest[0] == "drain" && s.drain_fails.iter().any(|n| n == rest[1]) {
+                    let e = "k3s failed: exit status 1: Cannot evict pod as it would violate the pod's disruption budget.";
+                    return (String::new(), Err(e.into()));
+                }
+                (String::new(), Ok(()))
+            }
+            (quarantine::SERVER_BIN, ["update", "apply", "--release", rel, "--binary", bin, "--brain-k3s", _]) => {
+                s.applied.push(c.args.clone());
+                let env: Envelope = serde_json::from_str(&std::fs::read_to_string(rel).unwrap()).unwrap();
+                let r: Release = serde_json::from_str(&env.doc).unwrap();
+                if let Some(e) = s.apply_fails.clone() {
+                    s.last = (r.serial, "applied".into(), false, e.clone());
+                    return (String::new(), Err(e.into()));
+                }
+                s.pending = r.serial;
+                s.last = (r.serial, "applied".into(), true, String::new());
+                s.before = std::fs::read(exe(&s.root)).unwrap();
+                if !s.broken {
+                    std::fs::copy(bin, exe(&s.root)).unwrap();
+                }
+                (String::new(), Ok(()))
+            }
+            (quarantine::SERVER_BIN, ["update", "confirm", "--serial", n]) => {
+                s.confirmed.push(c.args.clone());
+                if s.pending == 0 || n.parse::<u64>().unwrap() != s.pending {
+                    return (String::new(), Err("nothing to confirm".into()));
+                }
+                s.installed = s.pending;
+                s.last = (s.pending, "confirmed".into(), true, String::new());
+                s.pending = 0;
+                (String::new(), Ok(()))
+            }
+            (quarantine::SERVER_BIN, ["update", "status", "--json"]) => {
+                let pending = if s.pending == 0 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!({"serial": s.pending, "stage": "booted", "deadline": 0, "seconds_left": 300, "boots": 0, "files": []})
+                };
+                let st = serde_json::json!({
+                    "running": "0.1.0",
+                    "installed": {"serial": s.installed, "version": "0.1.0", "k3s": K3S_VERSION},
+                    "pending": pending,
+                    "last": {"at": 0, "serial": s.last.0, "action": s.last.1, "ok": s.last.2, "message": s.last.3},
+                    "problems": [],
+                });
+                (st.to_string(), Ok(()))
+            }
+            _ => (String::new(), Err(errf!("unexpected command {c}"))),
+        }
+    }
+}
+
+/// One machine: its own root, its fake commands.
+struct Box_ {
+    _dir: TempDir,
+    node: Node,
+    fake: Arc<Fake>,
+    host: u32,
+    name: String,
+}
+
+fn machine(host: u32, name: &str) -> Box_ {
+    let dir = TempDir::new();
+    put(dir.path(), "/proc/self/exe", OLD_BIN);
+    put(dir.path(), K3S_BIN, K3S);
+    let fake = Arc::new(Fake(Mutex::new(Sim { root: dir.path().to_path_buf(), ..Sim::default() })));
+    let node = Node {
+        cfg: Config { wg_subnet: "10.66.0.0/24".into(), ..Config::default() },
+        hostname: name.into(),
+        root: dir.path().to_path_buf(),
+        run: fake.clone(),
+        tmp_dir: None,
+        verifier: Arc::new(ADMIN),
+    };
+    Box_ { _dir: dir, node, fake, host, name: name.into() }
+}
+
+struct MeshNet;
+
+impl Mesh for MeshNet {
+    fn host_of(&self, ip: Ipv4Addr) -> u32 {
+        let o = ip.octets();
+        if o[..3] == [10, 66, 0] { u32::from(o[3]) } else { 0 }
+    }
+    fn fits(&self, host: u32) -> bool {
+        (1..=254).contains(&host)
+    }
+}
+
+/// What a server's link to the brain does wrong, once.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Fault {
+    /// Nothing goes wrong with this piece.
+    Fine,
+    /// The brain does not answer.
+    Down,
+    /// The piece is cut off half way.
+    Cut,
+    /// More comes than was asked for.
+    More,
+    /// The right length, one byte changed.
+    Flip,
+}
+
+fn plenty(_: &Path) -> Option<u64> {
+    None
+}
+
+fn full(_: &Path) -> Option<u64> {
+    Some(100 << 20)
+}
+
+struct Swarm {
+    now: i64,
+    minute: u32,
+    brain: Box_,
+    servers: Vec<Box_>,
+    store: Store,
+    served: Served,
+    /// Servers that do not sync.
+    offline: Vec<u32>,
+    /// Servers that send their heartbeat but never act on their turn.
+    ignore_turn: Vec<u32>,
+    /// Servers whose k3s does not run.
+    sick: Vec<u32>,
+    /// The k3s version the brain reports.
+    brain_k3s: String,
+    faults: Mutex<Vec<(u32, Fault)>>,
+    /// Pieces asked for: (host, name, offset).
+    pieces: Mutex<Vec<(u32, String, u64)>>,
+}
+
+impl Swarm {
+    fn new(servers: usize) -> Swarm {
+        let brain = machine(1, "coord");
+        let store = Store::new(brain.node.path(registry::DEFAULT_PATH));
+        let served = Served::beside(&store, brain.node.path(K3S_BIN));
+        let servers: Vec<Box_> = (0..servers).map(|i| machine(i as u32 + 2, &format!("node-{}", (b'a' + i as u8) as char))).collect();
+        let now = t0();
+        store
+            .update(|s| {
+                s.members = std::iter::once((1, "coord".to_string()))
+                    .chain(servers.iter().map(|m| (m.host, m.name.clone())))
+                    .map(|(host, name)| Member {
+                        host,
+                        name,
+                        wg_key: crate::admin::tests::key32(host as u8),
+                        last_seen: time(now),
+                        ..Member::default()
+                    })
+                    .collect();
+                Ok(())
+            })
+            .unwrap();
+        let sw = Swarm {
+            now,
+            minute: IN_WINDOW,
+            brain,
+            servers,
+            store,
+            served,
+            offline: vec![],
+            ignore_turn: vec![],
+            sick: vec![],
+            brain_k3s: K3S_VERSION.into(),
+            faults: Mutex::new(vec![]),
+            pieces: Mutex::new(vec![]),
+        };
+        sw.brain_sync();
+        for i in 0..sw.servers.len() {
+            sw.server_sync(i).unwrap();
+        }
+        sw
+    }
+
+    fn server(&self, host: u32) -> &Box_ {
+        self.servers.iter().find(|m| m.host == host).unwrap()
+    }
+
+    fn healthy(&self, host: u32) -> Report {
+        Report {
+            format: report::FORMAT,
+            time: self.now,
+            dryserver: "0.1.0".into(),
+            k3s: if host == 1 { self.brain_k3s.clone() } else { K3S_VERSION.into() },
+            k3s_active: Some(!self.sick.contains(&host)),
+            firewall: Some(true),
+            ..Report::default()
+        }
+    }
+
+    /// One registry command, as from host (0: the admin on the home
+    /// network).
+    fn call(&self, cmd: &str, host: u32, input: &[u8]) -> Result<Vec<u8>> {
+        let client = if host == 0 { "192.168.1.9 5000 22".to_string() } else { format!("10.66.0.{host} 5000 22") };
+        let mut out = Vec::new();
+        registry::serve(
+            &self.store,
+            &self.served,
+            &MeshNet,
+            &ADMIN,
+            "ssh-ed25519 AAAA",
+            cmd,
+            &client,
+            &mut &input[..],
+            &mut out,
+            time(self.now),
+        )?;
+        Ok(out)
+    }
+
+    fn brain_sync(&self) {
+        let m = Machine { n: &self.brain.node, brain: true, free: plenty };
+        let mut rep = self.healthy(1);
+        m.describe(&mut rep);
+        self.store.update(|s| s.heartbeat(1, Heartbeat { report: Some(rep.clone()), ..Heartbeat::default() }, time(self.now))).unwrap();
+        brain_tick_with(
+            &Ctx::new(),
+            &self.brain.node,
+            &self.store,
+            &self.served,
+            &rep,
+            Now { unix: self.now, minute: self.minute },
+            plenty,
+        );
+    }
+
+    fn server_sync(&self, i: usize) -> Result<()> {
+        let m = &self.servers[i];
+        if self.offline.contains(&m.host) {
+            return Ok(());
+        }
+        let mach = Machine { n: &m.node, brain: false, free: plenty };
+        let mut rep = self.healthy(m.host);
+        mach.describe(&mut rep);
+        let hb = Heartbeat { lan_ip: format!("192.168.1.{}", 20 + m.host), report: Some(rep.clone()), ..Heartbeat::default() };
+        self.store.update(|s| s.heartbeat(m.host, hb, time(self.now)))?;
+        if self.ignore_turn.contains(&m.host) {
+            return Ok(());
+        }
+        let o = offer(&self.store.read()?, m.host);
+        mach.step(&Ctx::new(), &Reg { sw: self, host: m.host }, &o, &rep, self.now)
+    }
+
+    /// A minute passes: the brain syncs, then every server.
+    fn tick(&mut self) {
+        self.now += 60;
+        self.brain_sync();
+        for i in 0..self.servers.len() {
+            let _ = self.server_sync(i);
+        }
+        self.one_at_a_time();
+    }
+
+    fn ticks(&mut self, n: usize) {
+        for _ in 0..n {
+            self.tick();
+        }
+    }
+
+    /// Ticks until f says yes, at most limit minutes.
+    fn until(&mut self, limit: usize, f: impl Fn(&Swarm) -> bool) {
+        for _ in 0..limit {
+            if f(self) {
+                return;
+            }
+            self.tick();
+        }
+        assert!(f(self), "not reached in {limit} minutes: {:#?}", self.rollout());
+    }
+
+    /// Minutes pass until f says yes right after the brain's sync, before
+    /// the servers sync in that minute.
+    fn brain_until(&mut self, limit: usize, f: impl Fn(&Swarm) -> bool) {
+        for _ in 0..limit {
+            self.now += 60;
+            self.brain_sync();
+            if f(self) {
+                return;
+            }
+            for i in 0..self.servers.len() {
+                let _ = self.server_sync(i);
+            }
+        }
+        panic!("not reached in {limit} minutes: {:#?}", self.rollout());
+    }
+
+    /// Never two members updating at once, and never more than one node
+    /// cordoned by the rollout.
+    fn one_at_a_time(&self) {
+        let members: Vec<u32> = self.store.read().unwrap().members.iter().map(|m| m.host).collect();
+        let pending: Vec<u32> = std::iter::once(&self.brain)
+            .chain(&self.servers)
+            .filter(|m| members.contains(&m.host) && m.fake.sim().pending != 0)
+            .map(|m| m.host)
+            .collect();
+        assert!(pending.len() <= 1, "updating at once: {pending:?}");
+        let mut cordoned: Vec<String> = Vec::new();
+        for line in &self.brain.fake.sim().kubectl {
+            let f: Vec<&str> = line.split(' ').collect();
+            match f[0] {
+                "cordon" if !cordoned.iter().any(|c| c == f[1]) => cordoned.push(f[1].into()),
+                "uncordon" => cordoned.retain(|c| c != f[1]),
+                _ => {}
+            }
+        }
+        // A machine that left is deleted from the cluster with its cordon.
+        let names: Vec<String> = self.store.read().unwrap().members.iter().map(|m| m.name.clone()).collect();
+        cordoned.retain(|c| names.contains(c));
+        assert!(cordoned.len() <= 1, "cordoned at once: {cordoned:?}");
+    }
+
+    fn rollout(&self) -> Rollout {
+        self.store.read().unwrap().rollout
+    }
+
+    fn installed(&self, host: u32) -> u64 {
+        let b = if host == 1 { &self.brain } else { self.server(host) };
+        Machine::new(&b.node, host == 1).installed_serial()
+    }
+
+    fn everyone_on(&self, serial: u64) -> bool {
+        self.installed(1) == serial && self.servers.iter().all(|m| self.installed(m.host) == serial)
+    }
+
+    fn kubectl(&self) -> Vec<String> {
+        self.brain.fake.sim().kubectl.clone()
+    }
+
+    fn release(&self, serial: u64, version: &str, urgent: bool) -> (Envelope, Vec<u8>) {
+        let bin = format!("\x7fELF dryserver {version}, release {serial}").into_bytes();
+        let r = Release {
+            serial,
+            created: self.now - 60,
+            expires: self.now + release::LIFETIME,
+            dryserver: release::Binary { version: version.into(), sha256: sha(&bin), size: bin.len() as u64 },
+            k3s: release::K3s { version: K3S_VERSION.into(), sha256: sha(K3S) },
+            arch_date: "2026/11/19".into(),
+            rollback: false,
+            urgent,
+            notes: format!("release {serial}"),
+        };
+        (release::seal(&ADMIN, &r).unwrap(), bin)
+    }
+
+    fn upload(&self, env: &Envelope, bin: &[u8], k3s: Option<&[u8]>) -> Result<u64> {
+        let head = PutHeader { release: env.clone(), k3s_size: k3s.map_or(0, |k| k.len() as u64) };
+        let mut input = (serde_json::to_string(&head).unwrap() + "\n").into_bytes();
+        input.extend_from_slice(bin);
+        if let Some(k) = k3s {
+            input.extend_from_slice(k);
+        }
+        let out = self.call("release-put", 0, &input)?;
+        Ok(serde_json::from_slice::<serde_json::Value>(&out).unwrap()["serial"].as_u64().unwrap())
+    }
+
+    fn publish(&self, serial: u64, urgent: bool) {
+        let (env, bin) = self.release(serial, "0.2.0", urgent);
+        assert_eq!(self.upload(&env, &bin, None).unwrap(), serial);
+    }
+
+    fn lines(&self) -> String {
+        let s = self.store.read().unwrap();
+        lines(&s.rollout, &s.members, self.now).into_iter().map(|(l, _)| l).collect::<Vec<_>>().join("\n")
+    }
+
+    fn fault(&self, host: u32, f: Fault) {
+        self.faults.lock().unwrap().push((host, f));
+    }
+}
+
+/// A server asking the brain's registry, in process, from its mesh address.
+struct Reg<'a> {
+    sw: &'a Swarm,
+    host: u32,
+}
+
+impl Source for Reg<'_> {
+    fn offered(&self, _: &Ctx, serial: u64) -> Result<Offered> {
+        let out = self.sw.call(&format!("release-get {serial} release"), self.host, b"")?;
+        Ok(serde_json::from_slice(&out)?)
+    }
+
+    fn chunk(&self, _: &Ctx, serial: u64, name: &str, offset: u64, _len: u64, dst: &Path) -> Result<()> {
+        self.sw.pieces.lock().unwrap().push((self.host, name.into(), offset));
+        let fault = {
+            let mut f = self.sw.faults.lock().unwrap();
+            f.iter().position(|(h, _)| *h == self.host).map(|i| f.remove(i).1)
+        };
+        if fault == Some(Fault::Down) {
+            bail!("ssh: connect to host 10.66.0.1 port 22: Connection timed out");
+        }
+        let mut out = self.sw.call(&format!("release-get {serial} {name} {offset}"), self.host, b"")?;
+        match fault {
+            Some(Fault::Cut) => out.truncate(out.len() / 2),
+            Some(Fault::More) => out.extend_from_slice(b"and more"),
+            Some(Fault::Flip) => out[0] ^= 1,
+            _ => {}
+        }
+        std::fs::write(dst, &out)?;
+        Ok(())
+    }
+}
+
+// ---- the window ----
+
+#[test]
+fn the_window_may_cross_midnight() {
+    let normal = (3 * 60, 5 * 60);
+    for (m, want) in [(179, false), (180, true), (299, true), (300, false), (0, false), (1439, false)] {
+        assert_eq!(in_window(m, normal), want, "{m}");
+    }
+    let night = (23 * 60, 60);
+    for (m, want) in [(22 * 60 + 59, false), (23 * 60, true), (23 * 60 + 59, true), (0, true), (59, true), (60, false), (12 * 60, false)] {
+        assert_eq!(in_window(m, night), want, "{m}");
+    }
+    assert!(!(0..1440).any(|m| in_window(m, (100, 100))), "an empty window is never open");
+    assert_eq!(window_text(WINDOW), "03:00-05:00");
+    assert_eq!(window_text(night), "23:00-01:00");
+}
+
+// ---- the whole way ----
+
+#[test]
+fn a_release_reaches_every_machine_brain_first_then_one_at_a_time() {
+    let mut sw = Swarm::new(3);
+    sw.publish(10, false);
+    // The brain first: no server is touched before it runs the release.
+    for _ in 0..60 {
+        let brain_before = sw.installed(1);
+        sw.tick();
+        let touched = sw.servers.iter().any(|m| !m.fake.sim().applied.is_empty()) || sw.kubectl().iter().any(|l| l.starts_with("cordon"));
+        assert!(!touched || sw.installed(1) == 10, "a server was touched before the brain ran the release");
+        if brain_before != 10 && touched {
+            // In the minute the brain confirmed, at most the canary began.
+            assert!(sw.servers[1..].iter().all(|m| m.fake.sim().applied.is_empty()));
+        }
+        if sw.everyone_on(10) {
+            break;
+        }
+    }
+    sw.ticks(2);
+    let r = sw.rollout();
+    assert_eq!((r.done.clone(), r.canary), (vec![2, 3, 4], 2));
+    assert!(r.cordoned.is_empty() && r.turn.is_none() && r.paused.is_empty(), "{r:#?}");
+    // Each server: cordoned, drained, updated, uncordoned, in host order.
+    let k = sw.kubectl();
+    let order: Vec<&String> = k.iter().filter(|l| !l.starts_with("drain") || l.contains("--ignore-daemonsets")).collect();
+    let want = [
+        "cordon node-a",
+        "drain node-a --ignore-daemonsets --delete-emptydir-data --timeout=25s",
+        "uncordon node-a",
+        "cordon node-b",
+        "drain node-b --ignore-daemonsets --delete-emptydir-data --timeout=25s",
+        "uncordon node-b",
+        "cordon node-c",
+        "drain node-c --ignore-daemonsets --delete-emptydir-data --timeout=25s",
+        "uncordon node-c",
+    ];
+    assert_eq!(order, want.iter().map(|s| s.to_string()).collect::<Vec<_>>().iter().collect::<Vec<_>>());
+    // Each machine: installed from its own store, with the brain's k3s
+    // version, and confirmed by serial. Nobody loaded k3s: every machine
+    // has the release's.
+    for m in std::iter::once(&sw.brain).chain(&sw.servers) {
+        let inc = m.node.path(STORE).join(INCOMING);
+        let path = |f: &str| inc.join(f).display().to_string();
+        let want = ["update", "apply", "--release", &path(RELEASE_FILE), "--binary", &path(DRYSERVER_FILE), "--brain-k3s", K3S_VERSION];
+        assert_eq!(m.fake.sim().applied, vec![want.map(String::from).to_vec()], "{}", m.name);
+        assert_eq!(m.fake.sim().confirmed, vec![vec!["update".to_string(), "confirm".into(), "--serial".into(), "10".into()]]);
+    }
+    assert!(!sw.pieces.lock().unwrap().iter().any(|p| p.1 == "k3s"));
+    assert!(sw.lines().contains("3 of 3 servers on this release."), "{}", sw.lines());
+    // The canary was watched before the next server got its turn.
+    let a_done = sw.servers[0].fake.sim().installed;
+    assert_eq!(a_done, 10);
+    // Reports say so.
+    let s = sw.store.read().unwrap();
+    for m in &s.members {
+        let rep = m.report.as_ref().unwrap();
+        assert_eq!((rep.release, rep.update.as_str()), (10, ""), "{}", m.name);
+    }
+}
+
+#[test]
+fn the_canary_is_watched_before_the_next_turn() {
+    let mut sw = Swarm::new(2);
+    sw.publish(10, false);
+    sw.until(30, |s| s.installed(2) == 10 && s.rollout().done == vec![2]);
+    let until = sw.rollout().canary_until;
+    assert!(until > sw.now, "the canary is watched");
+    assert!(sw.lines().contains("Watching the canary node-a"), "{}", sw.lines());
+    // Its k3s goes down while it is watched: the rollout stops.
+    sw.sick.push(2);
+    sw.ticks(2);
+    let r = sw.rollout();
+    assert_eq!(r.pause, Pause::Canary, "{r:#?}");
+    assert!(r.paused.contains("the canary node-a is not well") && r.paused.contains("k3s is not running"), "{}", r.paused);
+    assert!(!sw.kubectl().iter().any(|l| l == "cordon node-b"), "the next server got a turn");
+    // The admin looks and goes on.
+    sw.sick.clear();
+    sw.call(
+        "release-resume",
+        0,
+        serde_json::to_string(&crate::signed::seal_admin(&ADMIN, "release-resume", sw.now).unwrap()).unwrap().as_bytes(),
+    )
+    .unwrap();
+    sw.until(30, |s| s.everyone_on(10));
+}
+
+#[test]
+fn normal_releases_wait_for_the_window_urgent_ones_do_not() {
+    let mut sw = Swarm::new(2);
+    sw.minute = DAYTIME;
+    sw.publish(10, false);
+    sw.ticks(5);
+    assert_eq!(sw.rollout().phase, Phase::Waiting);
+    assert!(sw.brain.fake.sim().applied.is_empty(), "the brain updated outside the window");
+    assert!(sw.lines().contains("Waiting for the update window 03:00-05:00 on the coordinator's clock."), "{}", sw.lines());
+    // In the window it goes; when the window closes between two servers,
+    // the next one waits for the next night.
+    sw.minute = IN_WINDOW;
+    sw.until(30, |s| s.rollout().done == vec![2]);
+    sw.minute = DAYTIME;
+    sw.ticks(10);
+    assert!(sw.now > sw.rollout().canary_until);
+    assert_eq!(sw.installed(3), 0, "a server updated outside the window");
+    assert!(sw.lines().contains("Next server in the update window"), "{}", sw.lines());
+    sw.minute = IN_WINDOW;
+    sw.until(30, |s| s.everyone_on(10));
+
+    // Urgent: at once, in the middle of the day; still one at a time.
+    let mut sw = Swarm::new(2);
+    sw.minute = DAYTIME;
+    sw.publish(10, true);
+    sw.until(30, |s| s.everyone_on(10));
+    sw.ticks(2);
+    let r = sw.rollout();
+    assert!(r.urgent && r.done == vec![2, 3], "{r:#?}");
+}
+
+#[test]
+fn a_swarm_of_one_brain() {
+    let mut sw = Swarm::new(0);
+    sw.publish(10, true);
+    sw.until(5, |s| s.installed(1) == 10);
+    sw.tick();
+    let r = sw.rollout();
+    assert_eq!(r.phase, Phase::Servers);
+    assert!(sw.kubectl().is_empty(), "{:?}", sw.kubectl());
+    assert!(sw.lines().contains("0 of 0 servers on this release."), "{}", sw.lines());
+}
+
+// ---- the brain ----
+
+#[test]
+fn a_brain_whose_update_fails_touches_no_server() {
+    let mut sw = Swarm::new(2);
+    sw.brain.fake.sim().apply_fails = Some("dryserver failed: exit status 1: cannot install".into());
+    sw.publish(10, true);
+    sw.ticks(5);
+    let r = sw.rollout();
+    assert_eq!(r.phase, Phase::Failed, "{r:#?}");
+    assert!(r.paused.contains("own update to release 10 failed") && r.paused.contains("No server was touched"), "{}", r.paused);
+    assert!(sw.lines().contains("FAILED:"), "{}", sw.lines());
+    assert!(sw.kubectl().is_empty() && sw.servers.iter().all(|m| m.fake.sim().applied.is_empty()));
+    assert_eq!(sw.brain.fake.sim().applied.len(), 1, "a failed update is not tried again by itself");
+    // The admin fixed what was wrong and resumes: it tries again.
+    sw.brain.fake.sim().apply_fails = None;
+    let ask = serde_json::to_string(&crate::signed::seal_admin(&ADMIN, "release-resume", sw.now).unwrap()).unwrap();
+    sw.call("release-resume", 0, ask.as_bytes()).unwrap();
+    sw.until(30, |s| s.everyone_on(10));
+}
+
+#[test]
+fn a_brain_that_reverts_touches_no_server() {
+    let mut sw = Swarm::new(2);
+    // The new binary does not come up: it is never confirmed.
+    sw.brain.fake.sim().broken = true;
+    sw.publish(10, true);
+    sw.ticks(5);
+    assert_eq!(sw.brain.fake.sim().pending, 10);
+    assert_eq!(sw.rollout().phase, Phase::Brain);
+    let st = Machine::new(&sw.brain.node, true).load();
+    assert!(st.note.contains("the new dryserver does not run yet"), "{st:?}");
+    // The revert guard fires after its deadline.
+    sw.brain.fake.revert();
+    sw.tick();
+    let r = sw.rollout();
+    assert_eq!(r.phase, Phase::Failed);
+    assert!(r.paused.contains("release 10 reverted") && r.paused.contains("not confirmed"), "{}", r.paused);
+    sw.ticks(30);
+    assert!(sw.kubectl().is_empty() && sw.servers.iter().all(|m| m.fake.sim().applied.is_empty()));
+    assert_eq!(sw.installed(1), 0);
+    assert_eq!(sw.brain.fake.sim().applied.len(), 1, "a release that went back is not sent again by itself");
+    // The admin found the problem and resumes: only then it is tried again.
+    sw.brain.fake.sim().broken = false;
+    let ask = serde_json::to_string(&crate::signed::seal_admin(&ADMIN, "release-resume", sw.now).unwrap()).unwrap();
+    sw.call("release-resume", 0, ask.as_bytes()).unwrap();
+    sw.until(30, |s| s.everyone_on(10));
+    assert_eq!(sw.brain.fake.sim().applied.len(), 2);
+}
+
+#[test]
+fn a_brain_that_is_not_healthy_does_not_confirm() {
+    let mut sw = Swarm::new(1);
+    sw.sick.push(1);
+    sw.publish(10, true);
+    sw.ticks(5);
+    assert_eq!((sw.brain.fake.sim().pending, sw.installed(1)), (10, 0));
+    assert!(Machine::new(&sw.brain.node, true).load().note.contains("k3s is not running"));
+    sw.sick.clear();
+    sw.until(10, |s| s.everyone_on(10));
+}
+
+// ---- servers ----
+
+#[test]
+fn a_server_offline_at_its_turn_updates_when_it_is_back() {
+    let mut sw = Swarm::new(3);
+    sw.offline.push(2);
+    sw.store
+        .update(|s| {
+            s.members.iter_mut().find(|m| m.host == 2).unwrap().last_seen = time(t0() - 3600);
+            Ok(())
+        })
+        .unwrap();
+    sw.publish(10, true);
+    sw.until(60, |s| s.installed(3) == 10 && s.installed(4) == 10);
+    assert_eq!(sw.installed(2), 0);
+    assert!(!sw.kubectl().iter().any(|l| l == "cordon node-a"), "an offline server got a turn");
+    assert_eq!(sw.rollout().canary, 3, "the first server that updated is the canary");
+    assert!(sw.lines().contains("Silent, updates when back: node-a"), "{}", sw.lines());
+    // It comes back, and gets its turn.
+    sw.offline.clear();
+    sw.until(30, |s| s.everyone_on(10));
+}
+
+#[test]
+fn a_server_that_goes_silent_in_its_turn_is_passed_over_until_it_is_back() {
+    let mut sw = Swarm::new(2);
+    sw.publish(10, true);
+    sw.brain_until(10, |s| s.rollout().turn.is_some());
+    assert_eq!(sw.rollout().turn.unwrap().host, 2);
+    // node-a is switched off the moment its turn came.
+    sw.offline.push(2);
+    sw.ticks(TURN_TIMEOUT as usize / 60 + 2);
+    let r = sw.rollout();
+    assert!(r.paused.is_empty(), "silence is not a failure: {r:#?}");
+    assert!(r.deferred.contains(&2) && r.warnings.iter().any(|w| w.contains("node-a went silent when its turn came")), "{r:#?}");
+    assert!(sw.kubectl().contains(&"uncordon node-a".to_string()));
+    sw.until(20, |s| s.installed(3) == 10);
+    sw.offline.clear();
+    sw.until(30, |s| s.everyone_on(10));
+}
+
+#[test]
+fn a_server_with_its_kill_switch_on_is_held() {
+    let mut sw = Swarm::new(3);
+    // node-b cut node-c off: an incident, it changes nothing now.
+    put(&sw.server(3).node.root, quarantine::STATE_FILE, r#"{"cuts":[{"name":"node-c","hosts":[4]}]}"#);
+    sw.publish(10, true);
+    sw.until(60, |s| s.installed(2) == 10 && s.installed(4) == 10);
+    assert_eq!(sw.installed(3), 0);
+    assert!(!sw.kubectl().iter().any(|l| l == "cordon node-b"));
+    let rep = sw.store.read().unwrap().members.iter().find(|m| m.host == 3).unwrap().report.clone().unwrap();
+    assert_eq!(rep.update, "held");
+    assert!(rep.update_note.contains("kill switch is on (node-c cut off)"), "{}", rep.update_note);
+    assert!(sw.lines().contains("Held, kill switch on: node-b."), "{}", sw.lines());
+    // Even handed a turn, it does nothing.
+    let m = Machine { n: &sw.server(3).node, brain: false, free: plenty };
+    let o = Offer { serial: 10, turn: true, brain_k3s: K3S_VERSION.into() };
+    m.step(&Ctx::new(), &Reg { sw: &sw, host: 3 }, &o, &sw.healthy(3), sw.now).unwrap();
+    assert!(sw.server(3).fake.sim().applied.is_empty());
+    // Lifted: it updates.
+    std::fs::remove_file(sw.server(3).node.path(quarantine::STATE_FILE)).unwrap();
+    sw.until(30, |s| s.everyone_on(10));
+}
+
+#[test]
+fn a_server_removed_in_its_turn() {
+    let mut sw = Swarm::new(2);
+    sw.publish(10, true);
+    sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.ready));
+    sw.ignore_turn.push(2);
+    sw.store
+        .update(|s| {
+            s.members.retain(|m| m.host != 2);
+            Ok(())
+        })
+        .unwrap();
+    // It can no longer load anything.
+    assert!(sw.call("release-get 10 release", 2, b"").unwrap_err().to_string().contains("not a member"));
+    sw.offline.push(2);
+    sw.tick();
+    let r = sw.rollout();
+    assert!(r.warnings.iter().any(|w| w.contains("node-a left the swarm during its turn")), "{r:#?}");
+    assert!(!r.cordoned.contains(&"node-a".to_string()));
+    sw.until(30, |s| s.installed(3) == 10);
+    assert!(sw.rollout().paused.is_empty());
+}
+
+#[test]
+fn a_claim_of_success_without_the_new_release_is_not_success() {
+    let mut sw = Swarm::new(2);
+    // node-a says it is fine, and never updates.
+    sw.ignore_turn.push(2);
+    sw.publish(10, true);
+    sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.ready));
+    sw.ticks(TURN_TIMEOUT as usize / 60 + 2);
+    let r = sw.rollout();
+    assert_eq!(r.pause, Pause::Timeout, "{r:#?}");
+    assert!(r.paused.contains("node-a (the canary) did not finish its update in 20m: it runs release 0"), "{}", r.paused);
+    // It runs its old release well: uncordoned, and nobody else is touched.
+    sw.ticks(5);
+    assert!(!sw.rollout().cordoned.contains(&"node-a".to_string()), "{:#?}", sw.rollout());
+    assert!(!sw.kubectl().iter().any(|l| l == "cordon node-b"));
+    assert_eq!(sw.rollout().pause, Pause::Timeout, "it waits for the admin");
+    assert!(sw.lines().contains("PAUSED:") && sw.lines().contains("passes it over"), "{}", sw.lines());
+    // The admin resumes: node-a is passed over and uncordoned.
+    let ask = serde_json::to_string(&crate::signed::seal_admin(&ADMIN, "release-resume", sw.now).unwrap()).unwrap();
+    sw.call("release-resume", 0, ask.as_bytes()).unwrap();
+    sw.until(30, |s| s.installed(3) == 10);
+    let r = sw.rollout();
+    assert!(r.skipped.iter().any(|s| s.host == 2) && !r.cordoned.contains(&"node-a".to_string()), "{r:#?}");
+    assert!(sw.lines().contains("Passed over: node-a:"), "{}", sw.lines());
+}
+
+#[test]
+fn a_hacked_server_speaks_for_itself_only() {
+    let mut sw = Swarm::new(3);
+    sw.publish(10, true);
+    sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.ready && t.host == 2));
+    // node-c, hacked, wants the release out of turn, from the home network,
+    // for another serial, or files that are none.
+    for (host, cmd) in [
+        (4, "release-get 10 release"),
+        (4, "release-get 10 dryserver 0"),
+        (0, "release-get 10 release"),
+        (77, "release-get 10 release"),
+        (2, "release-get 9 release"),
+        (2, "release-get 10 ../../etc/shadow 0"),
+        (2, "release-get 10 dryserver -1"),
+        (2, "release-get x release"),
+    ] {
+        assert!(sw.call(cmd, host, b"").is_err(), "{host}: {cmd}");
+    }
+    // It claims to run the release: only its own entry says so, and only
+    // it is counted done without an update.
+    let lie = Report { release: 10, ..sw.healthy(4) };
+    sw.store.update(|s| s.heartbeat(4, Heartbeat { report: Some(lie), ..Heartbeat::default() }, time(sw.now))).unwrap();
+    sw.ignore_turn.push(4);
+    sw.until(60, |s| s.installed(2) == 10 && s.installed(3) == 10);
+    sw.ticks(2);
+    assert_eq!(sw.installed(4), 0);
+    assert!(!sw.kubectl().iter().any(|l| l == "cordon node-c"), "its word was taken for itself only");
+    // Its report cannot reach another member's entry either: the registry
+    // knows callers by their mesh address.
+    let s = sw.store.read().unwrap();
+    assert_eq!(s.members.iter().find(|m| m.host == 3).unwrap().report.as_ref().unwrap().release, 10);
+}
+
+#[test]
+fn a_server_that_holds_its_turn_does_not_stall_the_rollout_for_ever() {
+    let mut sw = Swarm::new(2);
+    sw.publish(10, true);
+    // node-a takes its turn, installs, and then never confirms (it reports
+    // pending for ever).
+    sw.server(2).fake.sim().broken = true;
+    sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+    sw.ticks(TURN_TIMEOUT as usize / 60 + 2);
+    let r = sw.rollout();
+    assert_eq!(r.pause, Pause::Timeout);
+    assert!(r.paused.contains("its update says pending"), "{}", r.paused);
+    // It is up and not well: cordoned. When it goes back to its old release
+    // and runs well, it is uncordoned, the rollout still waits for the admin.
+    assert!(r.cordoned.contains(&"node-a".to_string()));
+    sw.server(2).fake.revert();
+    sw.ticks(3);
+    let r = sw.rollout();
+    assert!(!r.cordoned.contains(&"node-a".to_string()) && r.pause == Pause::Timeout, "{r:#?}");
+    let rep = sw.store.read().unwrap().members.iter().find(|m| m.host == 2).unwrap().report.clone().unwrap();
+    assert_eq!((rep.update.as_str(), rep.update_serial), ("reverted", 10));
+    assert!(sw.lines().contains("node-a") && sw.lines().contains("PAUSED"), "{}", sw.lines());
+}
+
+#[test]
+fn a_canary_that_fails_stops_the_rollout() {
+    let mut sw = Swarm::new(3);
+    sw.server(2).fake.sim().apply_fails = Some("dryserver failed: exit status 1: no space left on device".into());
+    sw.publish(10, true);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert_eq!(r.pause, Pause::Failed);
+    assert!(r.paused.contains("node-a (the canary): update failed: dryserver failed: exit status 1: no space left"), "{}", r.paused);
+    sw.ticks(10);
+    assert!(sw.servers[1..].iter().all(|m| m.fake.sim().applied.is_empty()), "a server after a failed canary updated");
+    // It runs its old release well: not held cordoned.
+    assert!(!sw.rollout().cordoned.contains(&"node-a".to_string()), "{:#?}", sw.rollout());
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 1, "a failed update is not tried again by itself");
+}
+
+#[test]
+fn a_server_that_refuses_the_release_stops_the_rollout() {
+    let mut sw = Swarm::new(2);
+    // The brain reports an older k3s than the release's: a server never
+    // runs a newer k3s than the control plane, whatever the brain says.
+    sw.brain_k3s = "v1.36.1+k3s1".into();
+    sw.publish(10, true);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    let l = Machine::new(&sw.server(2).node, false).load();
+    assert_eq!((l.failed, l.outcome.as_str()), (10, "refused"));
+    assert!(l.why.contains("would be newer than the brain's"), "{l:?}");
+    let r = sw.rollout();
+    assert_eq!(r.pause, Pause::Failed, "{r:#?}");
+    assert!(r.paused.contains("node-a (the canary): update refused: k3s v1.37.2+k3s1 would be newer"), "{}", r.paused);
+    assert!(sw.server(2).fake.sim().applied.is_empty());
+    sw.ticks(3);
+    assert!(sw.server(3).fake.sim().applied.is_empty() && !sw.rollout().cordoned.contains(&"node-a".to_string()));
+}
+
+#[test]
+fn a_kill_switch_that_goes_on_in_its_turn_passes_the_turn_on() {
+    let mut sw = Swarm::new(2);
+    sw.ignore_turn.push(2);
+    sw.publish(10, true);
+    sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.ready && t.host == 2));
+    put(&sw.server(2).node.root, quarantine::STATE_FILE, r#"{"cuts":[{"name":"node-b","hosts":[3]}]}"#);
+    sw.ignore_turn.clear();
+    sw.ticks(2);
+    let r = sw.rollout();
+    assert!(r.paused.is_empty() && r.deferred.contains(&2), "{r:#?}");
+    assert!(r.warnings.iter().any(|w| w.contains("node-a's kill switch went on during its turn")), "{r:#?}");
+    assert!(sw.server(2).fake.sim().applied.is_empty());
+    sw.until(30, |s| s.installed(3) == 10);
+}
+
+// ---- transfers ----
+
+#[test]
+fn a_cut_off_or_oversized_piece_is_loaded_again() {
+    for fault in [Fault::Cut, Fault::More, Fault::Down] {
+        let mut sw = Swarm::new(1);
+        sw.fault(2, fault);
+        sw.publish(10, true);
+        sw.until(30, |s| s.everyone_on(10));
+        let pieces = sw.pieces.lock().unwrap().clone();
+        assert_eq!(pieces, vec![(2, "dryserver".to_string(), 0), (2, "dryserver".to_string(), 0)], "{fault:?}");
+    }
+}
+
+#[test]
+fn a_changed_file_is_refused() {
+    let mut sw = Swarm::new(2);
+    sw.fault(2, Fault::Flip);
+    sw.publish(10, true);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    let l = Machine::new(&sw.server(2).node, false).load();
+    assert_eq!((l.failed, l.outcome.as_str()), (10, "refused"));
+    assert!(l.why.contains("dryserver from the coordinator does not match the release"), "{}", l.why);
+    assert!(sw.server(2).fake.sim().applied.is_empty(), "a wrong binary was installed");
+    assert!(sw.rollout().paused.contains("update refused"), "{}", sw.rollout().paused);
+}
+
+#[test]
+fn a_large_release_comes_in_pieces_across_syncs() {
+    let mut sw = Swarm::new(1);
+    let big: Vec<u8> = (0..CHUNK + 1000).map(|i| (i * 31 % 251) as u8).collect();
+    let (env, _) = sw.release(10, "0.2.0", true);
+    let mut r: Release = serde_json::from_str(&env.doc).unwrap();
+    r.dryserver.sha256 = sha(&big);
+    r.dryserver.size = big.len() as u64;
+    let env = release::seal(&ADMIN, &r).unwrap();
+    // The second piece is cut off at first: the first one stays, and the
+    // next sync goes on from it.
+    sw.fault(2, Fault::Fine);
+    sw.fault(2, Fault::Cut);
+    sw.upload(&env, &big, None).unwrap();
+    sw.until(20, |s| s.everyone_on(10));
+    let mine: Vec<u64> = sw.pieces.lock().unwrap().iter().filter(|p| p.0 == 2).map(|p| p.2).collect();
+    assert_eq!(mine, vec![0, CHUNK, CHUNK], "each piece once, the cut one again");
+    assert_eq!(std::fs::read(exe(&sw.server(2).node.root)).unwrap(), big);
+}
+
+#[test]
+fn a_server_with_another_k3s_loads_the_releases() {
+    let mut sw = Swarm::new(1);
+    put(&sw.server(2).node.root, K3S_BIN, b"k3s v1.36.0+k3s1, older");
+    sw.publish(10, true);
+    sw.until(30, |s| s.everyone_on(10));
+    // Loaded, checked and kept with the installed release, for when the
+    // update commands install k3s too.
+    assert!(sw.pieces.lock().unwrap().iter().any(|p| p == &(2, "k3s".to_string(), 0)));
+    let kept = sw.server(2).node.path(STORE).join(INSTALLED).join(K3S_FILE);
+    assert_eq!(std::fs::read(kept).unwrap(), K3S);
+    // The others did not need it.
+    assert!(!sw.brain.node.path(STORE).join(INSTALLED).join(K3S_FILE).exists());
+}
+
+#[test]
+fn a_release_that_went_back_is_not_sent_again_by_itself() {
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().broken = true;
+    sw.publish(10, true);
+    sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+    sw.server(2).fake.revert();
+    sw.until(5, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert_eq!(r.pause, Pause::Failed, "{r:#?}");
+    assert!(r.paused.contains("node-a (the canary): update reverted: not confirmed before its deadline"), "{}", r.paused);
+    // Even with its own record lost and handed the turn again, it does not
+    // install the release that went back: the update commands would.
+    std::fs::remove_file(sw.server(2).node.path(STORE).join(STATE_FILE)).unwrap();
+    let m = Machine { n: &sw.server(2).node, brain: false, free: plenty };
+    let o = Offer { serial: 10, turn: true, brain_k3s: K3S_VERSION.into() };
+    let e = m.step(&Ctx::new(), &Reg { sw: &sw, host: 2 }, &o, &sw.healthy(2), sw.now).unwrap_err().to_string();
+    assert!(e.contains("release 10 reverted"), "{e}");
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 1);
+    assert_eq!((m.load().failed, m.load().outcome.as_str()), (10, "reverted"));
+}
+
+#[test]
+fn stream_to_file_caps_and_times_out() {
+    let dir = TempDir::new();
+    let dst = dir.join("out");
+    let sh = |script: &str| {
+        let mut c = Command::new("sh");
+        c.args(["-c", script]);
+        c
+    };
+    assert_eq!(stream_to_file(&Ctx::new(), &mut sh("printf abcdef"), &dst, 6).unwrap(), 6);
+    assert_eq!(std::fs::read(&dst).unwrap(), b"abcdef");
+    let e = stream_to_file(&Ctx::new(), &mut sh("head -c 1000000 /dev/zero"), &dst, 10).unwrap_err().to_string();
+    assert!(e.contains("more than 10 bytes"), "{e}");
+    let e = stream_to_file(&Ctx::new(), &mut sh("echo nope >&2; exit 3"), &dst, 10).unwrap_err().to_string();
+    assert!(e.contains("exit status 3") && e.contains("nope"), "{e}");
+    let start = Instant::now();
+    let ctx = Ctx::new().with_timeout(Duration::from_millis(200));
+    assert!(stream_to_file(&ctx, &mut sh("sleep 10"), &dst, 10).is_err());
+    assert!(start.elapsed() < Duration::from_secs(5), "a silent sender was not cut off");
+    // An endless sender stops at the cap without filling the disk.
+    let e = stream_to_file(&Ctx::new(), &mut sh("yes"), &dst, 1 << 20).unwrap_err().to_string();
+    assert!(e.contains("more than"), "{e}");
+    assert!(file_len(&dst) <= 1 << 20);
+}
+
+// ---- uploads ----
+
+#[test]
+fn uploads_that_do_not_check_out_leave_nothing_behind() {
+    let sw = Swarm::new(0);
+    let (env, bin) = sw.release(10, "0.2.0", false);
+    let head = |k3s_size: u64| serde_json::to_string(&PutHeader { release: env.clone(), k3s_size }).unwrap() + "\n";
+    let put = |input: Vec<u8>| sw.call("release-put", 0, &input).map(|_| ()).unwrap_err().to_string();
+    let cat = |parts: &[&[u8]]| parts.concat();
+    let cases: Vec<(Vec<u8>, &str)> = vec![
+        (cat(&[head(0).as_bytes(), &bin[..bin.len() / 2]]), "ended after"),
+        (cat(&[head(0).as_bytes(), &bin, b"x"]), "more than the release says"),
+        (cat(&[head(0).as_bytes(), &bin[1..], b"\0"]), "sha256"),
+        (cat(&[head(MAX_K3S + 1).as_bytes(), &bin]), "more than"),
+        (cat(&[head(5).as_bytes(), &bin, b"abc"]), "ended after"),
+        (cat(&[head(K3S.len() as u64).as_bytes(), &bin, b"not the k3s of the release.."]), "sha256"),
+        (head(0).trim_end().as_bytes().to_vec(), "header"),
+        (vec![b'{'; (MAX_HEADER + 10) as usize], "header"),
+        (b"{}\n".to_vec(), "header"),
+        (
+            cat(&[
+                (serde_json::to_string(&PutHeader {
+                    release: release::seal(&Key("thief"), &serde_json::from_str(&env.doc).unwrap()).unwrap(),
+                    k3s_size: 0,
+                })
+                .unwrap()
+                    + "\n")
+                    .as_bytes(),
+                &bin,
+            ]),
+            "bad signature",
+        ),
+    ];
+    for (input, want) in cases {
+        let e = put(input);
+        assert!(e.contains(want), "want {want:?}: {e}");
+    }
+    let left: Vec<String> = std::fs::read_dir(&sw.served.dir)
+        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n != ".lock").collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "left behind: {left:?}");
+    assert_eq!(sw.served.current(), None);
+    // What checks out is taken.
+    assert_eq!(sw.upload(&env, &bin, None).unwrap(), 10);
+    assert_eq!(sw.served.current(), Some(10));
+    assert_eq!(std::fs::read(sw.served.path(10, K3S_FILE)).unwrap(), K3S, "the brain's own k3s, copied");
+}
+
+#[test]
+fn a_full_disk_on_the_brain_refuses_the_upload() {
+    let mut sw = Swarm::new(0);
+    sw.served.free = full;
+    let (env, bin) = sw.release(10, "0.2.0", false);
+    let e = sw.upload(&env, &bin, None).unwrap_err().to_string();
+    assert!(e.contains("the coordinator has 100 MiB free") && e.contains("must stay free"), "{e}");
+    assert_eq!(sw.served.current(), None);
+    assert!(std::fs::read_dir(&sw.served.dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with("staging")));
+}
+
+#[test]
+fn the_brain_without_the_releases_k3s_asks_for_it() {
+    let sw = Swarm::new(0);
+    put(&sw.brain.node.root, K3S_BIN, b"another k3s");
+    let (env, bin) = sw.release(10, "0.2.0", false);
+    let e = sw.upload(&env, &bin, None).unwrap_err().to_string();
+    assert!(e.contains(SEND_K3S), "{e}");
+    assert_eq!(sw.upload(&env, &bin, Some(K3S)).unwrap(), 10);
+    assert_eq!(std::fs::read(sw.served.path(10, K3S_FILE)).unwrap(), K3S);
+}
+
+#[test]
+fn two_publishes_in_quick_succession() {
+    let mut sw = Swarm::new(1);
+    sw.publish(10, true);
+    sw.publish(11, true);
+    // An older one after them, or the same again, is refused.
+    let (env, bin) = sw.release(10, "0.2.0", true);
+    assert!(sw.upload(&env, &bin, None).unwrap_err().to_string().contains("older than"));
+    let (env, bin) = sw.release(11, "0.2.0", true);
+    assert!(sw.upload(&env, &bin, None).unwrap_err().to_string().contains("on the coordinator already"));
+    let mut twin: Release = serde_json::from_str(&env.doc).unwrap();
+    twin.notes = "another release under the same serial".into();
+    let e = sw.upload(&release::seal(&ADMIN, &twin).unwrap(), &bin, None).unwrap_err().to_string();
+    assert!(e.contains("signed twice"), "{e}");
+    sw.until(30, |s| s.everyone_on(11));
+    // Machines went straight to the newest.
+    assert!(std::iter::once(&sw.brain).chain(&sw.servers).all(|m| m.fake.sim().applied.len() == 1));
+    // The newest and the one before are kept, no more.
+    sw.publish(12, true);
+    let mut dirs: Vec<String> = std::fs::read_dir(&sw.served.dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.parse::<u64>().is_ok())
+        .collect();
+    dirs.sort();
+    assert_eq!(dirs, vec!["11", "12"]);
+}
+
+#[test]
+fn a_new_release_replaces_a_running_rollout() {
+    let mut sw = Swarm::new(3);
+    sw.publish(10, true);
+    sw.until(30, |s| s.installed(2) == 10 && s.rollout().turn.as_ref().is_some_and(|t| t.host == 3 && t.ready));
+    sw.publish(11, true);
+    sw.tick();
+    let r = sw.rollout();
+    assert_eq!(r.serial, 11);
+    assert!(r.warnings.iter().any(|w| w.contains("release 11 replaced release 10")), "{r:#?}");
+    assert!(sw.kubectl().contains(&"uncordon node-b".to_string()), "the old turn's node stays cordoned");
+    sw.until(60, |s| s.everyone_on(11));
+    sw.ticks(2);
+    assert_eq!(sw.rollout().done, vec![2, 3, 4]);
+}
+
+// ---- clocks ----
+
+#[test]
+fn the_brains_clock_is_checked() {
+    let mut sw = Swarm::new(1);
+    // The desktop's clock is right, the brain's two days behind: refused,
+    // and the message says to check the clock.
+    let (env, bin) = sw.release(10, "0.2.0", true);
+    sw.now -= 2 * release::DAY;
+    let e = sw.upload(&env, &bin, None).unwrap_err().to_string();
+    assert!(e.contains("check the clock"), "{e}");
+    // Far ahead: the release is past its expiry, still taken, with a
+    // warning.
+    sw.now += 2 * release::DAY + release::LIFETIME + release::DAY;
+    sw.upload(&env, &bin, None).unwrap();
+    sw.tick();
+    let r = sw.rollout();
+    assert!(r.warnings.iter().any(|w| w.contains("expired by the coordinator's clock")), "{r:#?}");
+    sw.until(30, |s| s.everyone_on(10));
+}
+
+#[test]
+fn a_clock_that_goes_back_does_not_freeze_a_turn() {
+    let mut sw = Swarm::new(1);
+    sw.ignore_turn.push(2);
+    sw.publish(10, true);
+    sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.ready));
+    sw.now -= 30 * 24 * 3600;
+    sw.ticks(TURN_TIMEOUT as usize / 60 + 2);
+    assert_eq!(sw.rollout().pause, Pause::Timeout, "{:#?}", sw.rollout());
+}
+
+// ---- drains ----
+
+#[test]
+fn a_drain_that_a_pdb_holds_back() {
+    let mut sw = Swarm::new(2);
+    sw.brain.fake.sim().drain_fails.push("node-a".into());
+    sw.publish(10, false);
+    sw.until(30, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert_eq!(r.pause, Pause::Drain);
+    assert!(r.paused.contains("draining node-a did not finish in 5m") && r.paused.contains("PodDisruptionBudget"), "{}", r.paused);
+    assert!(!r.cordoned.contains(&"node-a".to_string()), "a node that was not drained stays cordoned");
+    assert!(sw.server(2).fake.sim().applied.is_empty(), "updated without its turn");
+    assert!(sw.lines().contains("updates it without draining"), "{}", sw.lines());
+    // The admin resumes: it updates without the drain.
+    let ask = serde_json::to_string(&crate::signed::seal_admin(&ADMIN, "release-resume", sw.now).unwrap()).unwrap();
+    sw.call("release-resume", 0, ask.as_bytes()).unwrap();
+    sw.until(40, |s| s.everyone_on(10));
+    assert!(sw.rollout().warnings.iter().any(|w| w.contains("it updates anyway, as you resumed")));
+
+    // Urgent: it warns and goes on.
+    let mut sw = Swarm::new(2);
+    sw.brain.fake.sim().drain_fails.push("node-a".into());
+    sw.publish(10, true);
+    sw.until(40, |s| s.everyone_on(10));
+    let r = sw.rollout();
+    assert!(r.paused.is_empty() && r.warnings.iter().any(|w| w.contains("PodDisruptionBudget") && w.contains("urgent")), "{r:#?}");
+}
+
+// ---- reports and words ----
+
+#[test]
+fn reports_say_where_the_update_stands() {
+    let sw = Swarm::new(1);
+    let m = Machine::new(&sw.server(2).node, false);
+    let mut r = Report::default();
+    m.describe(&mut r);
+    assert_eq!((r.release, r.update.as_str()), (0, ""));
+    let save = |l: Local| m.save(&l).unwrap();
+    save(Local { pending: 7, note: "the new dryserver does not run yet".into(), ..Local::default() });
+    m.describe(&mut r);
+    assert_eq!((r.update.as_str(), r.update_serial, r.update_note.as_str()), ("pending", 7, "the new dryserver does not run yet"));
+    save(Local { failed: 7, outcome: "reverted".into(), why: "x\u{1b}[2J".into(), ..Local::default() });
+    m.describe(&mut r);
+    assert_eq!((r.update.as_str(), r.update_note.as_str()), ("reverted", "x?[2J"));
+    assert_eq!(member_release(&r, 7), Some(("update reverted".into(), true)));
+    // A hostile state word is dropped by the readers.
+    let bad =
+        Report { update: "rm -rf".into(), update_note: "\u{7}".repeat(500), release: u64::MAX, ..Report::default() }.sanitized(|_| true);
+    assert_eq!((bad.update.as_str(), bad.update_note.len(), bad.release), ("", report::MAX_NOTE, 0));
+    assert_eq!(member_release(&Report { release: 9, ..Report::default() }, 10), Some(("release 9 (old)".into(), false)));
+    assert_eq!(member_release(&Report { release: 10, ..Report::default() }, 10), Some(("release 10".into(), false)));
+    assert_eq!(member_release(&Report::default(), 0), None);
+}
+
+#[test]
+fn rollout_lines_are_plain_text() {
+    let members =
+        vec![Member { host: 1, name: "coord".into(), ..Member::default() }, Member { host: 2, name: "node-a".into(), ..Member::default() }];
+    let r = Rollout {
+        serial: 10,
+        phase: Phase::Servers,
+        paused: "node-a: update failed: \u{1b}]52;c;ZXZpbA==\u{7}".into(),
+        pause: Pause::Failed,
+        warnings: vec!["w\nx".into()],
+        ..Rollout::default()
+    };
+    for (l, _) in lines(&r, &members, 0) {
+        assert!(l.chars().all(|c| (' '..='~').contains(&c)), "{l:?}");
+    }
+    assert!(lines(&Rollout::default(), &members, 0)[0].0.contains("No release published yet"));
+}
+
+#[test]
+fn only_static_linux_programs_are_published() {
+    let dir = TempDir::new();
+    // An ELF header with one program header of the given type.
+    let elf = |kind: u32| {
+        let mut b = vec![0u8; 64 + 56];
+        b[..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2;
+        b[5] = 1;
+        b[16..18].copy_from_slice(&3u16.to_le_bytes());
+        b[18..20].copy_from_slice(&62u16.to_le_bytes());
+        b[32..40].copy_from_slice(&64u64.to_le_bytes());
+        b[54..56].copy_from_slice(&56u16.to_le_bytes());
+        b[56..58].copy_from_slice(&1u16.to_le_bytes());
+        b[64..68].copy_from_slice(&kind.to_le_bytes());
+        b
+    };
+    let at = |name: &str, data: &[u8]| {
+        let p = dir.join(name);
+        std::fs::write(&p, data).unwrap();
+        p
+    };
+    check_static(&at("static", &elf(1))).unwrap();
+    for (name, data, want) in [
+        ("dynamic", elf(3), "linked against this computer's libraries"),
+        ("script", b"#!/bin/sh\necho hi\n".to_vec(), "not a Linux program"),
+        (
+            "arm",
+            {
+                let mut b = elf(1);
+                b[18] = 183;
+                b
+            },
+            "64-bit x86",
+        ),
+        ("short", b"\x7fELF\x02\x01".to_vec(), "64-bit x86"),
+        ("cut", elf(1)[..50].to_vec(), "cut short"),
+        ("no headers", elf(1)[..60].to_vec(), "not where it says"),
+    ] {
+        let e = check_static(&at(name, &data)).unwrap_err().to_string();
+        assert!(e.contains(want), "{name}: {e}");
+    }
+    // Far-away program headers do not crash it.
+    let mut far = elf(1);
+    far[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(check_static(&at("far", &far)).is_err());
+}
+
+#[test]
+fn update_status_is_read_leniently() {
+    let s: UpdateStatus = serde_json::from_str(
+        r#"{"running":"0.2.0","installed":{"serial":9,"version":"0.2.0","stale":false},
+            "pending":{"serial":10,"stage":"booted","deadline":77,"seconds_left":5,"boots":1,"files":["x"]},
+            "last":{"at":1,"serial":8,"action":"reverted","ok":true,"message":"selfcheck failed"},"problems":["x"]}"#,
+    )
+    .unwrap();
+    assert_eq!((s.installed.serial, s.pending_serial(), s.pending.as_ref().unwrap().deadline), (9, 10, 77));
+    assert_eq!(s.reverted(8).as_deref(), Some("selfcheck failed"));
+    assert_eq!(s.reverted(9), None);
+    // Nothing pending; fields of the wrong kind read as empty.
+    let s: UpdateStatus = serde_json::from_str(r#"{"installed":{"serial":"x"},"pending":null,"last":5}"#).unwrap();
+    assert_eq!((s.installed.serial, s.pending_serial(), s.last), (0, 0, None));
+}

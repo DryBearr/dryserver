@@ -28,6 +28,7 @@ approval.
 - [Kill switch](#kill-switch)
 - [Apps](#apps)
 - [Backups](#backups)
+- [Updates](#updates)
 - [Security](#security)
 - [Commands](#commands)
 - [FAQ](#faq)
@@ -476,10 +477,67 @@ backup can be opened.
 
 ## Updates
 
-A machine changes only to a release you signed on your computer (namespace
-`dryserver-release`, so a signed member list can never pass as one). Each
-release has a serial that only goes up, so an old one cannot be sent again,
-and the checksum and size of every file in it.
+A fix reaches every machine from your desktop, without a reinstall and
+without anyone at the machines:
+
+```sh
+make                                   # the static binary you want to ship
+./dryserver release publish -notes "fixes the join timeout"
+./dryserver release publish -urgent -notes "security fix"   # at once
+./dryserver release status             # or watch it in ./dryserver approve
+```
+
+`publish` signs a release of the binary you run (with
+`secrets/signing_ed25519`, like the machine list: only what you signed is
+ever installed) and sends it with the binary to the coordinator. A
+release says which dryserver, which k3s (the one the USB stick pins) and
+which Arch snapshot the machines run. It is refused on your desktop
+already when the machines would refuse it: an older version (unless you
+give `-rollback`), notes that are not plain text, or a binary that is not
+the static one `make` builds.
+
+Then the coordinator rolls it out:
+
+1. **The coordinator updates itself first.** It keeps the new binary only
+   once it runs and is healthy (k3s up, firewall loaded); otherwise it
+   goes back to the old one by itself after 10 minutes. If its update
+   fails, no server is touched.
+2. **Then one server at a time.** The coordinator drains the server
+   (`kubectl drain`, keeping to PodDisruptionBudgets: its apps move first),
+   gives it its turn, and the server loads the release over the mesh,
+   checks the signature and the checksums itself, installs it, and keeps
+   it once the new binary runs, is healthy and reaches the coordinator.
+   Then the coordinator uncordons it and moves to the next one.
+3. **The first server is the canary**: it is watched for 5 minutes before
+   the next one gets its turn.
+
+Normal releases update machines only from 03:00 to 05:00 on the
+coordinator's clock; urgent ones start at once. Both go one machine at a
+time. A newer release replaces a rollout that runs: machines go straight
+to the newest.
+
+The rollout **stops** at a server whose update fails, goes back, is
+refused by its own checks, or does not finish in 20 minutes, and at a
+canary that is not well. `./dryserver approve` shows why, and the release
+on every machine. A stopped server stays cordoned while it is up and not
+well, and is uncordoned once it runs its old release well again. Look at
+it, then publish a fixed release, or `./dryserver release resume`: that
+passes the server over (or, when it could not be drained, updates it
+without draining; when the coordinator's own update failed, tries it
+again).
+
+Passed over without stopping, and shown: a server that is switched off
+(it updates when it is back, still one at a time), one whose kill switch
+is on (it updates nothing until it is lifted), and one with an older
+dryserver that cannot update itself.
+
+A hacked coordinator cannot change a release, make a server install an
+older one, or hand it a binary other than the signed one: each server
+checks for itself. It does decide when machines update (the window and
+the turns are its doing). A hacked server can fail or stall only its own
+turn, and a stalled turn ends after 20 minutes.
+
+### On each machine
 
 On each machine, `sudo dryserver update apply` checks the release, puts the
 new binary beside the old one and swaps it in one rename (a power cut leaves
@@ -492,8 +550,8 @@ itself. That needs no network and no coordinator, and a boot unit
 (`dryserver-update-guard.service`) carries it across a reboot. A machine
 whose kill switch has cut the coordinator off takes no update.
 
-Handing releases out and updating the machines one at a time (coordinator
-first) is the next step; so are Arch and k3s updates.
+Arch snapshot and k3s binary updates are built (`src/osupdate.rs`) but not
+wired into `update apply` yet.
 
 ## Security
 
@@ -579,6 +637,8 @@ On your desktop:
 | `./dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed |
 | `./dryserver apps` | what runs on your cluster: start an app from a container image, remove one |
 | `./dryserver outside` | the ways in from the internet: open, sync or close the Cloudflare Tunnel, and which host names use it |
+| `./dryserver release publish` | sign a release of this dryserver and roll it out (`-urgent`, `-notes`, `-rollback`) |
+| `./dryserver release status` / `resume` | where the rollout stands; let a stopped one go on |
 | `./dryserver ssh-config` | SSH config for all servers |
 | `./dryserver quarantine-all` | kill switch: cut the coordinator off on every server |
 | `./dryserver backup-pull` | copy the coordinator's newest encrypted backups into `secrets/backups/` |
@@ -602,8 +662,8 @@ With every sync, once a minute, each machine tells the coordinator how it
 is: its dryserver and k3s versions, the running kernel and whether a newer
 one waits for a reboot, when it was last fully upgraded (`pacman -Syu`),
 uptime, load, memory, root disk, its hottest temperature sensor, whether
-k3s runs and the firewall is loaded, and when it last shook hands with
-each WireGuard peer. `./dryserver approve` shows it under each member:
+k3s runs and the firewall is loaded, when it last shook hands with
+each WireGuard peer, and which release it runs and how its update stands. `./dryserver approve` shows it under each member:
 problems in red (a disk or memory 90% full, 85 °C, k3s or the firewall
 down, a reboot due, a clock more than two minutes off, no upgrade for 30
 days, a peer silent for five minutes). `i` shows everything about the
@@ -690,6 +750,7 @@ Layout: `src/main.rs` (CLI), `src/tui` (screens), `src/install`
 and `src/node.rs` (joining and sync), `src/mesh.rs` (WireGuard and SSH
 config), `src/quarantine.rs` (kill switch), `src/signed.rs` and
 `src/admin.rs` (signed member list and approval from the desktop),
+`src/release.rs` and `src/rollout.rs` (signed releases and their rollout),
 `src/apps.rs` (apps on the cluster), `src/entrance.rs` (the ways in from outside), `assets/` (files embedded into the ISO and servers by `build.rs`).
 Golden files for the generated system files are in `testdata/sysconf`;
 `UPDATE_GOLDEN=1 cargo test` rewrites them.
@@ -700,6 +761,7 @@ Golden files for the generated system files are in `testdata/sysconf`;
 | `secrets/registry_ed25519` | key machines use to ask to join; not committed |
 | `secrets/join_secret` | proves a join request comes from a machine installed from your stick; on the stick and here, never on an installed machine; not committed. **Back it up** |
 | `secrets/members.signed.json` | this computer's copy of the last machine list you signed: the backup of who is in your swarm |
+| `secrets/release.signed.json` | the last release you signed; serials go on from it |
 | `secrets/signing_ed25519` | key that signs the list of machines in your swarm; created by the first build, never leaves this computer, not committed. **Back it up.** Only `signing_ed25519.pub` goes onto the USB stick and the servers |
 | `secrets/backup_ed25519` | opens the coordinator's backups; created by the first build, never leaves this computer, not committed. **Back it up.** Only `backup_ed25519.pub` goes onto the USB stick and the coordinator |
 | `secrets/backups/` | the coordinator's backups, copied by `./dryserver backup-pull` (encrypted) |

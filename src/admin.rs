@@ -7,6 +7,9 @@
 //! What the coordinator sends is treated as a claim: entries are checked,
 //! pairing codes are computed here, and members that are on the
 //! coordinator but not in the list this desktop signed are shown as such.
+//!
+//! Releases go the same way (`./dryserver release publish`): signed here,
+//! uploaded with their binaries, and rolled out by the coordinator.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +17,8 @@ use std::process::{Command, Stdio};
 use crate::err::{Error, Result};
 use crate::gotime::Time;
 use crate::registry::{self, AdminState, Device, Member, Request};
+use crate::release::{self, Release};
+use crate::rollout::{self, Rollout};
 use crate::signed::{self, Entry, Envelope, List, Signer, Verifier, key_body};
 use crate::{bail, errf, fsx, sysconf};
 
@@ -21,6 +26,11 @@ use crate::{bail, errf, fsx, sysconf};
 /// continue from it even if the coordinator forgets or lies, and it is the
 /// backup of who is in the mesh.
 pub const SIGNED_COPY: &str = "members.signed.json";
+/// This desktop's copy of the last release it signed, in secrets/: serials
+/// continue from it.
+pub const RELEASE_COPY: &str = "release.signed.json";
+/// Further apart than this, the coordinator's clock is called off.
+const CLOCK_OFF: i64 = 120;
 /// The coordinator's SSH host key as first seen from this desktop.
 pub const KNOWN_HOSTS: &str = "coordinator_known_hosts";
 
@@ -29,6 +39,9 @@ pub trait Link {
     /// Runs one registry command. Fails with Kind::HostKey when the machine
     /// at the coordinator's address has another SSH key than the pinned one.
     fn call(&self, command: &str, stdin: &str) -> Result<String>;
+    /// Like call, with header and then the files, whole, as its input: a
+    /// release and its binaries.
+    fn upload(&self, command: &str, header: &str, files: &[&Path]) -> Result<String>;
     /// The coordinator's SSH host key ("type base64") that this desktop
     /// pinned on first contact.
     fn host_key(&self) -> Result<String>;
@@ -114,68 +127,31 @@ fn master_due() -> bool {
 impl Link for SshLink {
     fn call(&self, command: &str, stdin: &str) -> Result<String> {
         use std::io::Write;
-        let target = format!("{}@{}", sysconf::REGISTRY_USER, self.host);
-        let mut cmd = Command::new("ssh");
-        cmd.args(self.options());
-        // One connection for the whole session: the approval screen asks
-        // every few seconds, and the coordinator's firewall lets one
-        // address open only 10 SSH connections a minute. The connection is
-        // held by a master in the background, started with nothing
-        // attached: one that inherits our pipes would keep every call
-        // waiting until it exits. Without a master the call connects by
-        // itself and reports what is wrong.
-        if let Some(ctl) = self.control_path() {
-            let quiet =
-                |c: &mut Command| c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
-            // The check and the master get the same options. The socket's
-            // name (%C) is made from host, port and user: a check that
-            // looks under another name never finds the master, and every
-            // call would leave one more connection that never ends.
-            let mux = |extra: &[&str]| {
-                let mut c = Command::new("ssh");
-                c.args(self.options()).args(["-o", &ctl]).args(extra).arg(&target);
-                c
-            };
-            if !quiet(&mut mux(&["-O", "check"])) && master_due() {
-                quiet(&mut mux(&["-M", "-N", "-f", "-o", "ControlPersist=20"]));
-            }
-            cmd.args(["-o", "ControlMaster=no", "-o", &ctl]);
-        }
-        let mut child = cmd
-            .arg(&target)
-            .arg(command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::from(e).wrap("ssh"))?;
-        let mut pipe = child.stdin.take().ok_or_else(|| Error::new("ssh: no stdin"))?;
         let text = stdin.to_string();
-        let writer = std::thread::spawn(move || {
+        self.run(command, move |pipe| {
             let _ = pipe.write_all(text.as_bytes());
-        });
-        let out = child.wait_with_output().map_err(|e| Error::from(e).wrap("ssh"))?;
-        let _ = writer.join();
-        if out.status.success() {
-            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        })
+    }
+
+    fn upload(&self, command: &str, header: &str, files: &[&Path]) -> Result<String> {
+        use std::io::Write;
+        // Opened before connecting: a file that is not there is this
+        // computer's problem, said as such.
+        let mut opened = Vec::new();
+        for p in files {
+            opened.push(std::fs::File::open(p).map_err(|e| Error::from(e).wrap(format!("open {}", p.display())))?);
         }
-        // The coordinator's words: never raw onto the admin's terminal.
-        let msg = clean(String::from_utf8_lossy(&out.stderr).trim(), 300);
-        if msg.contains("Host key verification failed") || msg.contains("HOST IDENTIFICATION HAS CHANGED") {
-            return Err(Error::with_kind(
-                crate::err::Kind::HostKey,
-                format!(
-                    "the machine at {} does not have the SSH key this computer saw before. Either the coordinator was \
-                     reinstalled, or something else answers at its address. Nothing was sent.",
-                    self.host
-                ),
-            ));
-        }
-        if out.status.code() == Some(255) {
-            bail!("cannot reach the coordinator at {}: {}", self.host, msg.lines().last().unwrap_or("no answer"));
-        }
-        // The registry's own error, e.g. "dryserver: this list is not newer".
-        Err(errf!("the coordinator refused: {}", msg.trim_start_matches("dryserver: ")))
+        let head = header.to_string();
+        self.run(command, move |pipe| {
+            if pipe.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            for mut f in opened {
+                if std::io::copy(&mut f, pipe).is_err() {
+                    return;
+                }
+            }
+        })
     }
 
     fn host_key(&self) -> Result<String> {
@@ -222,6 +198,74 @@ impl Link for SshLink {
     }
 }
 
+impl SshLink {
+    /// Runs one registry command; feed writes its input from a thread of
+    /// its own, so a large input never waits on the output.
+    fn run(&self, command: &str, feed: impl FnOnce(&mut std::process::ChildStdin) + Send + 'static) -> Result<String> {
+        let target = format!("{}@{}", sysconf::REGISTRY_USER, self.host);
+        let mut cmd = Command::new("ssh");
+        cmd.args(self.options());
+        // One connection for the whole session: the approval screen asks
+        // every few seconds, and the coordinator's firewall lets one
+        // address open only 10 SSH connections a minute. The connection is
+        // held by a master in the background, started with nothing
+        // attached: one that inherits our pipes would keep every call
+        // waiting until it exits. Without a master the call connects by
+        // itself and reports what is wrong.
+        if let Some(ctl) = self.control_path() {
+            let quiet =
+                |c: &mut Command| c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+            // The check and the master get the same options. The socket's
+            // name (%C) is made from host, port and user: a check that
+            // looks under another name never finds the master, and every
+            // call would leave one more connection that never ends.
+            let mux = |extra: &[&str]| {
+                let mut c = Command::new("ssh");
+                c.args(self.options()).args(["-o", &ctl]).args(extra).arg(&target);
+                c
+            };
+            if !quiet(&mut mux(&["-O", "check"])) && master_due() {
+                quiet(&mut mux(&["-M", "-N", "-f", "-o", "ControlPersist=20"]));
+            }
+            cmd.args(["-o", "ControlMaster=no", "-o", &ctl]);
+        }
+        let mut child = cmd
+            .arg(&target)
+            .arg(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::from(e).wrap("ssh"))?;
+        let mut pipe = child.stdin.take().ok_or_else(|| Error::new("ssh: no stdin"))?;
+        // The pipe closes when the thread ends: the coordinator sees the
+        // end of the input.
+        let writer = std::thread::spawn(move || feed(&mut pipe));
+        let out = child.wait_with_output().map_err(|e| Error::from(e).wrap("ssh"))?;
+        let _ = writer.join();
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        // The coordinator's words: never raw onto the admin's terminal.
+        let msg = clean(String::from_utf8_lossy(&out.stderr).trim(), 300);
+        if msg.contains("Host key verification failed") || msg.contains("HOST IDENTIFICATION HAS CHANGED") {
+            return Err(Error::with_kind(
+                crate::err::Kind::HostKey,
+                format!(
+                    "the machine at {} does not have the SSH key this computer saw before. Either the coordinator was \
+                     reinstalled, or something else answers at its address. Nothing was sent.",
+                    self.host
+                ),
+            ));
+        }
+        if out.status.code() == Some(255) {
+            bail!("cannot reach the coordinator at {}: {}", self.host, msg.lines().last().unwrap_or("no answer"));
+        }
+        // The registry's own error, e.g. "dryserver: this list is not newer".
+        Err(errf!("the coordinator refused: {}", msg.trim_start_matches("dryserver: ")))
+    }
+}
+
 /// Text from the coordinator made safe to print: no control characters
 /// (a terminal would obey them), and not longer than max.
 fn clean(s: &str, max: usize) -> String {
@@ -257,6 +301,12 @@ pub struct View {
     pub warnings: Vec<String>,
     /// Cuts the members reported: who cut whom off.
     pub reports: Vec<String>,
+    /// The newest release on the coordinator, its signature checked here.
+    pub release: Option<Release>,
+    /// Its rollout, as the coordinator tells it.
+    pub rollout: Rollout,
+    /// The coordinator's clock, unix seconds (0: an older one).
+    pub coordinator_now: i64,
 }
 
 /// A machine at the coordinator's address with other keys than the ones
@@ -294,6 +344,8 @@ pub struct Admin {
     /// The coordinator showed the proof that it was installed from the
     /// admin's stick, for the keys it has now.
     coordinator_proved: bool,
+    /// The newest release on the coordinator, verified, as last loaded.
+    release: Option<Release>,
 }
 
 impl Admin {
@@ -310,6 +362,7 @@ impl Admin {
             pending: Vec::new(),
             unproved: Vec::new(),
             coordinator_proved: false,
+            release: None,
         }
     }
 
@@ -346,6 +399,26 @@ impl Admin {
         let st: AdminState = serde_json::from_str(&out).map_err(|e| Error::from(e).wrap("the coordinator's answer"))?;
         let mut v = View { unknown: st.unknown.into_iter().filter_map(clean_device).collect(), scanned: st.scanned, ..View::default() };
         let coord_key = self.link.host_key()?;
+        let now = (self.now)().0.timestamp();
+
+        // The release: only what the admin's signature covers is shown.
+        self.release = None;
+        if !st.release.is_empty() {
+            match release::open(self.verifier.as_ref(), &st.release, now) {
+                Ok(r) => self.release = Some(r),
+                Err(e) => v.warnings.push(format!("The coordinator's newest release was refused: {e}")),
+            }
+        }
+        v.release = self.release.clone();
+        v.rollout = st.rollout;
+        v.coordinator_now = st.now;
+        if st.now > 0 && (st.now - now).abs() > CLOCK_OFF {
+            let off = crate::report::short_age((st.now - now).unsigned_abs());
+            v.warnings.push(format!(
+                "The coordinator's clock is {off} {} this computer's: the update window and the expiry of releases go by it.",
+                if st.now > now { "ahead of" } else { "behind" }
+            ));
+        }
 
         let (mut members, problems) = registry::check_members(st.members, |h| self.fits(h));
         v.warnings.extend(problems.into_iter().map(|p| format!("The coordinator lists a bad entry, ignored: {p}")));
@@ -691,6 +764,82 @@ impl Admin {
     pub fn would_drop(&self, keep: &[String]) -> Vec<String> {
         self.members.iter().filter(|m| m.host != 1 && !self.base.has(m) && !keep.contains(&m.name)).map(|m| m.name.clone()).collect()
     }
+
+    /// The newest release this desktop knows was signed: its own copy or
+    /// the coordinator's (as last loaded), whichever is newer. Neither
+    /// counts without its signature.
+    pub fn last_release(&self) -> Option<Release> {
+        let now = (self.now)().0.timestamp();
+        let local = std::fs::read(self.secrets.join(RELEASE_COPY))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Envelope>(&b).ok())
+            .and_then(|e| release::open(self.verifier.as_ref(), &e, now).ok());
+        match (local, self.release.clone()) {
+            (Some(a), Some(b)) => Some(if b.serial > a.serial { b } else { a }),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Builds the release that d describes, without signing or sending
+    /// it: what publish_release would sign, or why the coordinator would
+    /// refuse it.
+    pub fn draft_release(&self, d: &release::Draft) -> Result<Release> {
+        rollout::check_static(d.binary)?;
+        release::build(d, self.last_release().as_ref(), (self.now)().0.timestamp())
+    }
+
+    /// Signs the release that d describes and uploads it with its
+    /// binaries to the coordinator, which then rolls it out. k3s is the
+    /// pinned k3s binary, sent only when the coordinator does not have it.
+    ///
+    /// Refused here, before anything is signed, when the coordinator would
+    /// refuse it (an older version without rollback, a malformed field) or
+    /// when the binary would not run on the servers.
+    pub fn publish_release(&mut self, d: &release::Draft, k3s: &Path) -> Result<Release> {
+        let now = (self.now)().0.timestamp();
+        let r = self.draft_release(d)?;
+        let env = release::seal(self.signer.as_ref(), &r)?;
+        // Our own signature must pass our own check, or no machine would
+        // accept it.
+        release::open(self.verifier.as_ref(), &env, now)
+            .map_err(|e| e.wrap("the new signature does not verify with secrets/signing_ed25519.pub"))?;
+        // Saved before sending: a serial is never used for two releases.
+        let path = self.secrets.join(RELEASE_COPY);
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        fsx::write_file(&tmp, serde_json::to_string(&env)? + "\n", 0o600)?;
+        fsx::rename(&tmp, &path)?;
+        let mut head = rollout::PutHeader { release: env, k3s_size: 0 };
+        match self.link.upload("release-put", &(serde_json::to_string(&head)? + "\n"), &[d.binary]) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains(rollout::SEND_K3S) => {
+                // The coordinator runs another k3s: it gets the pinned one.
+                let (sha, size) = release::hash_file(k3s, rollout::MAX_K3S).map_err(|e| {
+                    e.wrap(format!(
+                        "the coordinator needs k3s {}, and this computer has none at {} (build the USB stick once to download it)",
+                        r.k3s.version,
+                        k3s.display()
+                    ))
+                })?;
+                if sha != r.k3s.sha256 {
+                    bail!("{} is not k3s {}: its sha256 is {sha}, the release says {}", k3s.display(), r.k3s.version, r.k3s.sha256);
+                }
+                head.k3s_size = size;
+                self.link.upload("release-put", &(serde_json::to_string(&head)? + "\n"), &[d.binary, k3s])?;
+            }
+            Err(e) => return Err(e),
+        }
+        self.release = Some(r.clone());
+        Ok(r)
+    }
+
+    /// Lets a stopped rollout go on (what that means depends on why it
+    /// stopped; see rollout::Pause). Returns how many resumes were asked.
+    pub fn resume_release(&mut self) -> Result<u64> {
+        let ask = signed::seal_admin(self.signer.as_ref(), "release-resume", (self.now)().0.timestamp())?;
+        let out = self.link.call("release-resume", &serde_json::to_string(&ask)?)?;
+        let v: serde_json::Value = serde_json::from_str(&out).map_err(|e| Error::from(e).wrap("the coordinator's answer"))?;
+        Ok(v["resume"].as_u64().unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
@@ -732,8 +881,14 @@ pub mod tests {
         pub pinned: Arc<Mutex<String>>,
     }
 
-    impl Link for Direct {
-        fn call(&self, command: &str, stdin: &str) -> Result<String> {
+    impl Direct {
+        /// Where the coordinator keeps uploaded releases, beside its
+        /// registry; its own k3s is the file "k3s" there.
+        pub fn served(&self) -> crate::rollout::Served {
+            crate::rollout::Served::beside(&self.store, fsx::dir(&self.store.path).join("k3s"))
+        }
+
+        fn serve(&self, command: &str, input: &[u8]) -> Result<String> {
             if *self.pinned.lock().unwrap() != self.host_key {
                 return Err(Error::with_kind(crate::err::Kind::HostKey, "does not have the SSH key this computer saw before"));
             }
@@ -745,16 +900,30 @@ pub mod tests {
             let v: &dyn Verifier = self.verifier.as_deref().unwrap_or(&fake);
             registry::serve(
                 &self.store,
+                &self.served(),
                 &Subnet,
                 v,
                 COORD_KEY,
                 command,
                 "192.168.1.9 5000 22",
-                &mut stdin.as_bytes(),
+                &mut &input[..],
                 &mut out,
                 Time::now(),
             )?;
             Ok(String::from_utf8(out).unwrap())
+        }
+    }
+
+    impl Link for Direct {
+        fn call(&self, command: &str, stdin: &str) -> Result<String> {
+            self.serve(command, stdin.as_bytes())
+        }
+        fn upload(&self, command: &str, header: &str, files: &[&Path]) -> Result<String> {
+            let mut input = header.as_bytes().to_vec();
+            for f in files {
+                input.extend(std::fs::read(f)?);
+            }
+            self.serve(command, &input)
         }
         fn host_key(&self) -> Result<String> {
             let k = self.pinned.lock().unwrap().clone();
@@ -1337,6 +1506,209 @@ pub mod tests {
         assert!(a.link.call("publish", &serde_json::to_string(&forged).unwrap()).unwrap_err().to_string().contains("bad signature"));
         assert_eq!(store.read().unwrap().members.len(), 2);
         assert!(node.signed_members(2, &s.members, &forged).unwrap_err().to_string().contains("bad signature"));
+    }
+
+    /// A program as `make` builds it, as far as check_static looks: a
+    /// static x86-64 ELF header.
+    pub fn static_binary(dir: &TempDir, name: &str, body: &str) -> PathBuf {
+        let mut b = vec![0u8; 64 + 56];
+        b[..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2;
+        b[5] = 1;
+        b[16..18].copy_from_slice(&3u16.to_le_bytes());
+        b[18..20].copy_from_slice(&62u16.to_le_bytes());
+        b[32..40].copy_from_slice(&64u64.to_le_bytes());
+        b[54..56].copy_from_slice(&56u16.to_le_bytes());
+        b[56..58].copy_from_slice(&1u16.to_le_bytes());
+        b[64..68].copy_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(body.as_bytes());
+        let p = dir.join(name);
+        std::fs::write(&p, b).unwrap();
+        p
+    }
+
+    /// Uploads as sent: command, header, files.
+    type Uploads = Arc<Mutex<Vec<(String, String, Vec<PathBuf>)>>>;
+
+    /// The registry for everything but uploads, which it records and takes.
+    struct Recorder {
+        inner: Direct,
+        uploads: Uploads,
+    }
+
+    impl Link for Recorder {
+        fn call(&self, command: &str, stdin: &str) -> Result<String> {
+            self.inner.call(command, stdin)
+        }
+        fn upload(&self, command: &str, header: &str, files: &[&Path]) -> Result<String> {
+            self.uploads.lock().unwrap().push((command.into(), header.into(), files.iter().map(|p| p.to_path_buf()).collect()));
+            Ok(r#"{"serial":1}"#.into())
+        }
+        fn host_key(&self) -> Result<String> {
+            self.inner.host_key()
+        }
+        fn scan_host_key(&self) -> Result<String> {
+            self.inner.scan_host_key()
+        }
+        fn repin(&self, key: &str) -> Result<()> {
+            self.inner.repin(key)
+        }
+    }
+
+    fn recording(a: &mut Admin, store: &Store) -> Uploads {
+        let uploads: Uploads = Arc::default();
+        a.link = Box::new(Recorder {
+            inner: Direct {
+                store: Store::new(&store.path),
+                host_key: COORD_KEY.into(),
+                publish_fails: Arc::default(),
+                verifier: None,
+                pinned: Arc::new(Mutex::new(COORD_KEY.into())),
+            },
+            uploads: uploads.clone(),
+        });
+        uploads
+    }
+
+    #[test]
+    fn a_release_is_signed_kept_and_sent() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        let uploads = recording(&mut a, &store);
+        a.load().unwrap();
+        let bin = static_binary(&dir, "dryserver", "0.2.0");
+        let d = release::Draft { binary: &bin, version: "0.2.0", arch_date: "2026/11/19", notes: "fixes X", ..release::Draft::default() };
+        let r = a.publish_release(&d, &dir.join("no-k3s")).unwrap();
+        assert!(r.serial as i64 >= Time::now().0.timestamp() - 5 && r.notes == "fixes X" && !r.urgent);
+        // Sent: the signed release, then the binary; no k3s unless asked.
+        let up = uploads.lock().unwrap().clone();
+        assert_eq!(up.len(), 1);
+        assert_eq!((up[0].0.as_str(), up[0].2.clone()), ("release-put", vec![bin.clone()]));
+        let head: rollout::PutHeader = serde_json::from_str(up[0].1.trim_end()).unwrap();
+        assert!(up[0].1.ends_with('\n') && head.k3s_size == 0);
+        assert_eq!(release::open(&Key("admin"), &head.release, Time::now().0.timestamp()).unwrap(), r);
+        // Kept here before it was sent.
+        let copy: Envelope = serde_json::from_slice(&std::fs::read(dir.join("secrets").join(RELEASE_COPY)).unwrap()).unwrap();
+        assert_eq!(copy, head.release);
+
+        // The next one goes up from it, also published at once after it.
+        let urgent = a.publish_release(&release::Draft { urgent: true, ..d.clone() }, &dir.join("no-k3s")).unwrap();
+        assert!(urgent.serial > r.serial && urgent.urgent);
+        // An older dryserver needs rollback; refused before anything is
+        // signed or sent.
+        let old = release::Draft { version: "0.1.9", ..d.clone() };
+        let e = a.publish_release(&old, &dir.join("no-k3s")).unwrap_err().to_string();
+        assert!(e.contains("rollback"), "{e}");
+        assert_eq!(uploads.lock().unwrap().len(), 2);
+        assert!(a.publish_release(&release::Draft { rollback: true, ..old }, &dir.join("no-k3s")).unwrap().rollback);
+        // Notes that are not printable ASCII are refused here too.
+        let e = a.publish_release(&release::Draft { notes: "line\nbreak", ..d.clone() }, &dir.join("no-k3s")).unwrap_err().to_string();
+        assert!(e.contains("notes"), "{e}");
+    }
+
+    #[test]
+    fn only_a_static_binary_is_published() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        let uploads = recording(&mut a, &store);
+        a.load().unwrap();
+        let bin = static_binary(&dir, "dryserver", "x");
+        // The same with a program header that asks for a dynamic loader.
+        let mut b = std::fs::read(&bin).unwrap();
+        b[64..68].copy_from_slice(&3u32.to_le_bytes());
+        std::fs::write(&bin, b).unwrap();
+        let d = release::Draft { binary: &bin, version: "0.2.0", arch_date: "2026/11/19", ..release::Draft::default() };
+        let e = a.publish_release(&d, &dir.join("no-k3s")).unwrap_err().to_string();
+        assert!(e.contains("linked against this computer's libraries") && e.contains("make"), "{e}");
+        assert!(uploads.lock().unwrap().is_empty() && !dir.join("secrets").join(RELEASE_COPY).exists());
+    }
+
+    #[test]
+    fn the_coordinator_asks_for_k3s_when_it_has_another() {
+        let dir = TempDir::new();
+        let (mut a, _) = setup(&dir);
+        a.load().unwrap();
+        let bin = static_binary(&dir, "dryserver", "0.2.0");
+        let d = release::Draft { binary: &bin, version: "0.2.0", arch_date: "2026/11/19", ..release::Draft::default() };
+        // The real registry: it has no k3s of the release's.
+        let e = a.publish_release(&d, &dir.join("no-k3s")).unwrap_err().to_string();
+        assert!(e.contains("the coordinator needs k3s") && e.contains("build the USB stick once"), "{e}");
+        std::fs::write(dir.join("desktop-k3s"), "not the pinned k3s").unwrap();
+        let e = a.publish_release(&d, &dir.join("desktop-k3s")).unwrap_err().to_string();
+        assert!(e.contains("is not k3s") && e.contains(crate::iso::K3S_SHA256), "{e}");
+        // Nothing reached the coordinator, and each try used a serial of its
+        // own.
+        let served = Direct {
+            store: Store::new(dir.join("registry.json")),
+            host_key: String::new(),
+            publish_fails: Arc::default(),
+            verifier: None,
+            pinned: Arc::default(),
+        }
+        .served();
+        assert_eq!(served.current(), None);
+        assert!(a.last_release().is_some());
+    }
+
+    #[test]
+    fn the_view_shows_the_release_and_the_coordinators_clock() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        let now = Time::now().0.timestamp();
+        let r = release::Release {
+            serial: 77,
+            created: now - 60,
+            expires: now + release::LIFETIME,
+            dryserver: release::Binary { version: "0.2.0".into(), sha256: "a".repeat(64), size: 10 },
+            k3s: release::K3s { version: crate::iso::K3S_VERSION.into(), sha256: crate::iso::K3S_SHA256.into() },
+            arch_date: "2026/11/19".into(),
+            rollback: false,
+            urgent: true,
+            notes: "fixes X".into(),
+        };
+        let served = fsx::dir(&store.path).join(rollout::SERVED_DIR);
+        let put_release = |key: &Key| {
+            std::fs::create_dir_all(served.join("77")).unwrap();
+            std::fs::write(served.join("77").join(rollout::RELEASE_FILE), serde_json::to_string(&release::seal(key, &r).unwrap()).unwrap())
+                .unwrap();
+            std::fs::write(served.join("current"), "77\n").unwrap();
+        };
+        put_release(&Key("admin"));
+        store
+            .update(|s| {
+                s.rollout = Rollout { serial: 77, urgent: true, phase: rollout::Phase::Brain, ..Rollout::default() };
+                Ok(())
+            })
+            .unwrap();
+        let v = a.load().unwrap();
+        assert_eq!(v.release.as_ref().map(|x| x.serial), Some(77));
+        assert_eq!(v.rollout.phase, rollout::Phase::Brain);
+        assert!((v.coordinator_now - now).abs() < 5 && v.warnings.is_empty(), "{:?}", v.warnings);
+        assert_eq!(a.last_release().map(|x| x.serial), Some(77), "the coordinator's release counts for the next serial");
+        // Signed by someone else: not shown, said so.
+        put_release(&Key("thief"));
+        let v = a.load().unwrap();
+        assert!(v.release.is_none() && v.warnings.iter().any(|w| w.contains("newest release was refused")), "{:?}", v.warnings);
+        // This computer's clock is ten minutes ahead of the coordinator's.
+        a.now = || Time::now().add(chrono::TimeDelta::minutes(10));
+        let v = a.load().unwrap();
+        assert!(v.warnings.iter().any(|w| w.contains("The coordinator's clock is 10m behind this computer's")), "{:?}", v.warnings);
+    }
+
+    #[test]
+    fn resume_needs_a_rollout() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        a.load().unwrap();
+        assert!(a.resume_release().unwrap_err().to_string().contains("no rollout to resume"));
+        store
+            .update(|s| {
+                s.rollout = Rollout { serial: 5, phase: rollout::Phase::Servers, paused: "x".into(), ..Rollout::default() };
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(a.resume_release().unwrap(), 1);
+        assert_eq!(store.read().unwrap().rollout.resume_asked, 1);
     }
 
     #[test]

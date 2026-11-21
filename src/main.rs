@@ -34,6 +34,7 @@ mod relay;
 #[allow(dead_code)]
 mod release;
 mod report;
+mod rollout;
 mod runner;
 mod signed;
 mod sysconf;
@@ -83,6 +84,11 @@ commands:
                       secrets/backups (encrypted; signed by the coordinator)
   outside             the ways in from the internet: open, sync or close
                       the Cloudflare Tunnel, see which names use it
+  release publish     sign a release of this dryserver and send it to the
+                      coordinator: it updates itself, then one server at a
+                      time (-urgent: at once, -notes TEXT, -rollback)
+  release status      where the rollout stands
+  release resume      let a stopped rollout go on
 
 on servers:
   join                ask the coordinator to join (runs at boot until approved)
@@ -144,6 +150,7 @@ fn main() -> ExitCode {
         "scan" => run_scan(rest),
         "report" => run_report(rest),
         "approve" => run_approve(rest),
+        "release" => run_release(rest),
         "tpm-enroll" => run_tpm_enroll(rest),
         "cluster-dns" => run_cluster_dns(rest),
         "backup" => run_backup(rest),
@@ -501,17 +508,21 @@ fn run_registry(args: &[String]) -> Result<()> {
     // from the caller: what the caller asks for is SSH_ORIGINAL_COMMAND.
     let f = Flags::parse("registry", args, &[("subnet", "", "mesh subnet"), ("root", "/", "directory holding this server's files")]);
     let root = Path::new(f.get("root"));
-    // Every command here is a read or a small write. A caller that sends
-    // nothing, or never finishes, does not get to keep a session.
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(30));
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    // Every command here is a read or a small write, but for moving a
+    // release, which takes as long as the network needs. A caller that
+    // sends nothing, or never finishes, does not get to keep a session.
+    let deadline = registry::deadline(&env("SSH_ORIGINAL_COMMAND"));
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline);
         eprintln!("dryserver: registry command took too long");
         std::process::exit(1);
     });
     let host_key = fsx::read_string(fsx::under(root, "/etc/ssh/ssh_host_ed25519_key.pub"))?;
-    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    let store = registry::Store::new(fsx::under(root, registry::DEFAULT_PATH));
     registry::serve(
-        &registry::Store::new(fsx::under(root, registry::DEFAULT_PATH)),
+        &store,
+        &rollout::Served::beside(&store, fsx::under(root, rollout::K3S_BIN)),
         &mesh::Subnet(f.get("subnet").to_string()),
         &signed::SshVerifier::installed(root, std::env::temp_dir()),
         &host_key,
@@ -699,7 +710,14 @@ fn run_report(args: &[String]) -> Result<()> {
     // mesh subnet names WireGuard peers, which only root sees anyway.
     let subnet = Config::load(LIVE_CONFIG).map(|c| c.wg_subnet).unwrap_or_default();
     let ctx = Ctx::on_signals();
-    let r = report::gather(&ctx, &ExecRunner::silent(), Path::new("/"), &subnet);
+    let mut r = report::gather(&ctx, &ExecRunner::silent(), Path::new("/"), &subnet);
+    // Where its update stands: root only reads that.
+    if fsx::is_root()
+        && let Ok(cfg) = Config::load(LIVE_CONFIG)
+    {
+        let n = Node::new(cfg, "", Path::new("/"), Arc::new(ExecRunner::silent()));
+        rollout::Machine::new(&n, is_coordinator()).describe(&mut r);
+    }
     println!("{}", serde_json::to_string_pretty(&r)?);
     Ok(())
 }
@@ -844,6 +862,130 @@ fn run_approve(args: &[String]) -> Result<()> {
     }
     let (a, _) = desktop_admin(&f, "approve")?;
     tui::run(&mut tui::admin::Screen::new(a))
+}
+
+const RELEASE_USAGE: &str = "usage: dryserver release publish|status|resume [flags]
+
+  publish   sign a release of this dryserver binary and send it to the
+            coordinator. The coordinator updates itself first, then one
+            server at a time: normal releases in the update window on its
+            clock, urgent ones at once. -notes TEXT, -urgent, -rollback,
+            -arch-date YYYY/MM/DD, -k3s FILE, -yes (do not ask)
+  status    where the rollout stands
+  resume    let a stopped rollout go on
+";
+
+fn run_release(args: &[String]) -> Result<()> {
+    let Some(sub) = args.first() else {
+        eprint!("{RELEASE_USAGE}");
+        std::process::exit(2);
+    };
+    let rest = &args[1..];
+    if matches!(sub.as_str(), "-h" | "--help" | "help") {
+        print!("{RELEASE_USAGE}");
+        return Ok(());
+    }
+    if Path::new(LIVE_CONFIG).exists() {
+        // Only the computer with the signing key makes releases.
+        bail!("release runs on your own computer, where the signing key is:\n  ./dryserver release {sub}");
+    }
+    match sub.as_str() {
+        "publish" => release_publish(rest),
+        "status" => {
+            let f = Flags::parse("release status", rest, DESKTOP_FLAGS);
+            let (mut a, _) = desktop_admin(&f, "release status")?;
+            print_rollout(&mut a)
+        }
+        "resume" => {
+            let f = Flags::parse("release resume", rest, DESKTOP_FLAGS);
+            let (mut a, _) = desktop_admin(&f, "release resume")?;
+            a.load()?;
+            a.resume_release()?;
+            println!("The coordinator goes on at its next sync, within a minute.\n");
+            print_rollout(&mut a)
+        }
+        other => {
+            eprint!("unknown release command {other:?}\n\n{RELEASE_USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// The newest release and where its rollout stands.
+fn print_rollout(a: &mut admin::Admin) -> Result<()> {
+    let v = a.load()?;
+    for w in &v.warnings {
+        eprintln!("warning: {w}");
+    }
+    if let Some(r) = &v.release {
+        println!("{}", rollout::release_line(r));
+    }
+    for (line, _) in rollout::lines(&v.rollout, &v.members.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(), v.coordinator_now) {
+        println!("  {line}");
+    }
+    Ok(())
+}
+
+fn release_publish(args: &[String]) -> Result<()> {
+    let mut spec = DESKTOP_FLAGS.to_vec();
+    spec.extend([
+        ("notes", "", "what the release is for, shown with it (printable ASCII, at most 200 bytes)"),
+        ("urgent", "false", "roll out at once, not in the nightly update window (a security fix)"),
+        ("rollback", "false", "allow older versions than the machines run: the way back from a bad release"),
+        ("arch-date", "", "the Arch snapshot day YYYY/MM/DD (default: today, UTC)"),
+        ("k3s", "", "the pinned k3s binary (default: the one the USB stick build downloaded)"),
+        ("yes", "false", "sign and send without asking"),
+    ]);
+    let f = Flags::parse("release publish", args, &spec);
+    let (mut a, host) = desktop_admin(&f, "release publish")?;
+    for w in a.load()?.warnings {
+        eprintln!("warning: {w}");
+    }
+    // The release is this binary: the one the admin runs now.
+    let me = std::env::current_exe().map_err(|e| err::Error::from(e).wrap("find this program"))?;
+    let arch = match f.get("arch-date") {
+        "" => chrono::Utc::now().format("%Y/%m/%d").to_string(),
+        d => d.to_string(),
+    };
+    let d = release::Draft {
+        binary: &me,
+        version: env!("CARGO_PKG_VERSION"),
+        arch_date: &arch,
+        rollback: f.on("rollback"),
+        urgent: f.on("urgent"),
+        notes: f.get("notes"),
+    };
+    let r = a.draft_release(&d).map_err(|e| e.wrap("not published"))?;
+    println!("{}", rollout::release_line(&r));
+    println!("  dryserver {} ({}, sha256 {})", r.dryserver.version, report::size(r.dryserver.size), r.dryserver.sha256);
+    println!("  k3s {}, Arch snapshot {}", r.k3s.version, r.arch_date);
+    if r.urgent {
+        println!("  urgent: the coordinator updates itself at once, then one server at a time");
+    } else {
+        println!("  rolls out in the update window {} on the coordinator's clock", rollout::window_text(rollout::WINDOW));
+    }
+    if r.rollback {
+        println!("  rollback: older versions than the machines run are allowed");
+    }
+    if !f.on("yes") {
+        print!("Sign it and send it to the coordinator at {host}? [y/N] ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("Nothing signed.");
+            return Ok(());
+        }
+    }
+    let k3s = match f.get("k3s") {
+        "" => paths().out_dir.join("pkgcache").join(format!("k3s-{}", iso::K3S_VERSION)),
+        p => PathBuf::from(p),
+    };
+    let r = a.publish_release(&d, &k3s)?;
+    println!("Release {} is on the coordinator. It updates itself first, then one server at a time.", r.serial);
+    println!("Watch it: ./dryserver approve, or ./dryserver release status");
+    Ok(())
 }
 
 /// The LUKS container of the root filesystem, from /etc/crypttab.

@@ -131,6 +131,42 @@ pub struct Report {
     /// newest handshake.
     #[serde(deserialize_with = "lenient_list", skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<Peer>,
+    /// The signed release this machine runs, by serial; 0 before its
+    /// first update.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "is_zero")]
+    pub release: u64,
+    /// Where its update stands: "" nothing going on, or one of
+    /// UPDATE_STATES.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "String::is_empty")]
+    pub update: String,
+    /// The release that update is about.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "is_zero")]
+    pub update_serial: u64,
+    /// Why, in a few words: printable ASCII, at most MAX_NOTE characters.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "String::is_empty")]
+    pub update_note: String,
+}
+
+/// What a machine says about its update:
+/// - fetching: it has its turn and loads the release from the brain,
+/// - pending: installed, not confirmed yet (it goes back by itself if it
+///   is not confirmed in time),
+/// - failed: installing it did not work,
+/// - reverted: it went back to the release it ran before,
+/// - refused: the release did not pass this machine's own checks,
+/// - held: its kill switch is on; it updates nothing until it is lifted.
+pub const UPDATE_STATES: [&str; 6] = ["fetching", "pending", "failed", "reverted", "refused", "held"];
+/// The longest update note kept.
+pub const MAX_NOTE: usize = 160;
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// A note from a machine made safe to show: printable ASCII only, so no
+/// escape sequence reaches a terminal, and at most MAX_NOTE characters.
+pub fn note(s: &str) -> String {
+    s.chars().map(|c| if (' '..='~').contains(&c) { c } else { '?' }).take(MAX_NOTE).collect()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -219,7 +255,16 @@ impl Report {
             k3s_active: self.k3s_active,
             firewall: self.firewall,
             peers: peers.into_iter().map(|(host, age)| Peer { host, age }).collect(),
+            release: if self.release <= crate::release::MAX_SERIAL { self.release } else { 0 },
+            update: if UPDATE_STATES.contains(&self.update.as_str()) { self.update } else { String::new() },
+            update_serial: if self.update_serial <= crate::release::MAX_SERIAL { self.update_serial } else { 0 },
+            update_note: note(&self.update_note),
         }
+    }
+
+    /// Whether its last update did not work.
+    pub fn update_failed(&self) -> bool {
+        matches!(self.update.as_str(), "failed" | "reverted" | "refused")
     }
 
     /// How far the machine's clock was from the coordinator's when the
@@ -265,6 +310,9 @@ impl Report {
         if self.upgraded > 0 && self.time > 0 && self.time - self.upgraded > UPGRADE_DUE {
             out.push((Concern::Upgrade, format!("not upgraded for {}", short_age((self.time - self.upgraded) as u64))));
         }
+        if self.update_failed() {
+            out.push((Concern::Update, format!("update {}", self.update)));
+        }
         let silent = self.silent_peers().len();
         if silent > 0 {
             out.push((Concern::Peers, format!("{silent} silent peer{}", if silent == 1 { "" } else { "s" })));
@@ -285,6 +333,7 @@ pub enum Concern {
     Firewall,
     Clock,
     Upgrade,
+    Update,
     Peers,
 }
 
@@ -349,6 +398,12 @@ pub fn gather(ctx: &Ctx, run: &dyn Runner, root: &Path, wg_subnet: &str) -> Repo
         k3s_active: k3s_installed.then(|| run.ok(&ctx, &Cmd::new("systemctl", &["is-active", "--quiet", "k3s.service"])).is_ok()),
         firewall: firewall(&ctx, run),
         peers: handshakes(&ctx, run, wg_subnet, now),
+        // Its update: added by the caller (rollout::Machine::describe),
+        // which keeps that state.
+        release: 0,
+        update: String::new(),
+        update_serial: 0,
+        update_note: String::new(),
     };
     // What this machine sends is what every reader accepts, so nothing of
     // it is dropped on the way and it stays within the heartbeat's size.

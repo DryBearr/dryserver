@@ -248,6 +248,68 @@ check "servers can read the signed list from it" grep -q "BEGIN SSH SIGNATURE" <
 out=$(screen "$S/desk" "node-c" "" 2>&1)
 check_not "the screen is clean afterwards" grep -q "NOT SIGNED\|Cannot talk" <<<"$out"
 
+echo "== releases"
+desk() { (cd "$S/desk" && "$BIN" "$@" --config config.env --host 127.0.0.1 --port $PORT 2>&1); }
+REL=$S/root2/var/lib/dryserver/release
+out=$(desk release status)
+check "release status: nothing published yet" grep -q "No release published yet" <<<"$out"
+if ldd "$BIN" >/dev/null 2>&1; then
+    out=$(desk release publish -yes -notes "dev build")
+    check "publish refuses a binary that is not static" grep -q "linked against this computer's libraries" <<<"$out"
+    check_not "nothing reached the coordinator" test -e "$REL/current"
+    check_not "nothing was signed" test -e "$S/desk/secrets/release.signed.json"
+fi
+# A release signed with real OpenSSH, sent over ssh as the desktop sends
+# it: the header line, then the binaries. A 3 MiB binary, a 1 MiB k3s.
+head -c 3145728 /dev/urandom > "$S/bin.new"
+head -c 1048576 /dev/urandom > "$S/k3s.new"
+mkrel() { # serial offset -> $S/rel.doc, $S/rel.sig
+    python3 -I - "$S" "$1" <<'PY'
+import hashlib, json, sys, time
+s, off = sys.argv[1], int(sys.argv[2])
+b, k = open(s + "/bin.new", "rb").read(), open(s + "/k3s.new", "rb").read()
+now = int(time.time())
+doc = {"serial": now + off, "created": now - 60, "expires": now + 30 * 86400,
+       "dryserver": {"version": "0.2.0", "sha256": hashlib.sha256(b).hexdigest(), "size": len(b)},
+       "k3s": {"version": "v1.37.2+k3s1", "sha256": hashlib.sha256(k).hexdigest()},
+       "arch_date": time.strftime("%Y/%m/%d", time.gmtime(now - 86400)),
+       "rollback": False, "urgent": True, "notes": "live test"}
+open(s + "/rel.doc", "w").write(json.dumps(doc, separators=(",", ":")))
+PY
+    ssh-keygen -Y sign -f "$S/desk/secrets/signing_ed25519" -n dryserver-release < "$S/rel.doc" > "$S/rel.sig" 2>/dev/null
+}
+upload() { # k3s size
+    python3 -I -c "import json; print(json.dumps({'release': {'doc': open('$S/rel.doc').read(), 'sig': open('$S/rel.sig').read()}, 'k3s_size': $1}))"
+    cat "$S/bin.new"
+    if [ "$1" != 0 ]; then cat "$S/k3s.new"; fi
+}
+K3S_SIZE=$(stat -c %s "$S/k3s.new")
+mkrel 0
+out=$(upload 0 | reg release-put 2>&1)
+check "a coordinator without the release's k3s asks for it" grep -q "send k3s" <<<"$out"
+out=$(upload "$K3S_SIZE" | reg release-put 2>&1)
+check "a release with its binaries arrives over ssh ($out)" grep -q '"serial"' <<<"$out"
+SER=$(cat "$REL/current" 2>/dev/null)
+check "the binary arrived whole" cmp "$S/bin.new" "$REL/$SER/dryserver"
+check "and k3s" cmp "$S/k3s.new" "$REL/$SER/k3s"
+out=$(upload "$K3S_SIZE" | reg release-put 2>&1)
+check "the same release again is refused" grep -q "on the coordinator already" <<<"$out"
+mkrel 10
+out=$(upload "$K3S_SIZE" | head -c 2000000 | reg release-put 2>&1)
+check "a cut-off upload is refused ($out)" grep -q "ended after" <<<"$out"
+check "the newest stays" test "$(cat "$REL/current")" = "$SER"
+check_not "nothing of it is left" bash -c "ls -d $REL/staging-* 2>/dev/null | grep -q ."
+# Signed by someone else.
+ssh-keygen -Y sign -f "$S/thief/secrets/signing_ed25519" -n dryserver-release < "$S/rel.doc" > "$S/rel.sig" 2>/dev/null
+out=$(upload "$K3S_SIZE" | reg release-put 2>&1)
+check "a release signed with another key is refused" grep -q "bad signature" <<<"$out"
+out=$(desk release status)
+check "release status shows the release and its notes" grep -q "Release $SER (urgent), made .*: live test" <<<"$out"
+out=$(desk release resume)
+check "resume without a rollout is refused" grep -q "no rollout to resume" <<<"$out"
+out=$(reg "release-get $SER release" 2>&1)
+check "release-get is not answered outside the mesh" grep -q "only answered over the mesh" <<<"$out"
+
 echo "== connections"
 # The screen asks the coordinator every few seconds over one shared
 # connection. Open for 20 seconds (four rounds), it must not leave a

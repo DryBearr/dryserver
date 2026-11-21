@@ -10,6 +10,7 @@ use crate::gotime::{Time, duration_string, round_ms};
 use crate::mesh;
 use crate::registry::Member;
 use crate::report::{self, Concern, percent, short_age};
+use crate::rollout;
 
 const REFRESH: Duration = Duration::from_secs(5);
 /// After a failed load: do not freeze the screen on every tick.
@@ -20,10 +21,31 @@ const STALE: i64 = 180;
 /// The most WireGuard peers named in the details; the rest are counted.
 const SHOWN_PEERS: usize = 24;
 
+/// Text cut into lines of at most width columns, each starting with
+/// indent.
+fn wrap(text: &str, width: usize, indent: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::from(indent);
+    for word in text.split(' ') {
+        let fits = line.chars().count() + 1 + word.chars().count() <= width;
+        if line.len() > indent.len() && !fits {
+            out.push(std::mem::replace(&mut line, format!("{indent}  ")));
+        }
+        if line.len() > indent.len() && !line.ends_with(' ') {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.trim().is_empty() {
+        out.push(line);
+    }
+    out
+}
+
 /// The second line under a member: what it says about itself. Values that
 /// need a look are in the alarm colour; the rest of what needs a look
-/// follows them.
-fn health(m: &Member, now: Time) -> Doc {
+/// follows them. target is the release the swarm moves to.
+fn health(m: &Member, now: Time, target: u64) -> Doc {
     let mut d = Doc::new();
     let Some(r) = &m.report else {
         d.s("    ").add(dim("no report: its dryserver, or the coordinator's, is older than this one"));
@@ -37,6 +59,9 @@ fn health(m: &Member, now: Time) -> Doc {
         items.push((format!("silent for {}:", short_age(quiet as u64)), true));
     }
     items.push((if r.dryserver.is_empty() { "?".into() } else { r.dryserver.clone() }, false));
+    if let Some(item) = rollout::member_release(r, target) {
+        items.push(item);
+    }
     if let Some(p) = percent(r.disk_used, r.disk_total) {
         items.push((format!("disk {p}%"), bad(Concern::Disk)));
     }
@@ -101,6 +126,26 @@ fn details(m: &Member, names: &dyn Fn(u32) -> String, now: Time) -> Doc {
         None => "firewall unknown",
     };
     d.s(format!("  dryserver {}   {k3s}   {fw}", or(&r.dryserver))).nl();
+    if r.release != 0 || !r.update.is_empty() {
+        let mut line = if r.release == 0 { "  no release installed yet".to_string() } else { format!("  release {}", r.release) };
+        if !r.update.is_empty() {
+            line += &format!("; update {}", r.update);
+            if r.update_serial != 0 {
+                line += &format!(" (release {})", r.update_serial);
+            }
+            if !r.update_note.is_empty() {
+                line += &format!(": {}", r.update_note);
+            }
+        }
+        for l in wrap(&line, 80, "") {
+            if r.update_failed() || r.update == "held" {
+                d.add(err(l));
+            } else {
+                d.s(l);
+            }
+            d.nl();
+        }
+    }
     if r.reboot {
         d.s(format!("  kernel {} running, {} installed: ", or(&r.kernel), or(&r.kernel_installed))).add(err("reboot needed")).nl();
     } else {
@@ -434,7 +479,7 @@ impl Model for Screen {
             } else {
                 b.s(" ").add(err("NOT SIGNED")).nl();
             }
-            b.append(health(m, now)).nl();
+            b.append(health(m, now, self.view.rollout.serial)).nl();
         }
         if self.view.version == 0 && !self.view.members.is_empty() {
             b.add(dim("  Nothing is signed yet. Press S to sign the coordinator; then machines can join.")).nl();
@@ -459,6 +504,26 @@ impl Model for Screen {
                 None => {
                     b.add(dim("Select a member to see what it reports.")).nl();
                 }
+            }
+        }
+
+        // The newest release and its rollout, on the coordinator's clock.
+        b.s("\nUpdates:\n");
+        if let Some(r) = &self.view.release {
+            for l in wrap(&rollout::release_line(r), 80, "  ") {
+                b.s(l).nl();
+            }
+        }
+        let members: Vec<Member> = self.view.members.iter().map(|(m, _)| m.clone()).collect();
+        let at = if self.view.coordinator_now > 0 { self.view.coordinator_now } else { now.0.timestamp() };
+        for (text, alarm) in rollout::lines(&self.view.rollout, &members, at) {
+            for l in wrap(&text, 80, "  ") {
+                if alarm {
+                    b.add(err(l));
+                } else {
+                    b.add(dim(l));
+                }
+                b.nl();
             }
         }
 
@@ -844,6 +909,96 @@ mod tests {
         s.load();
         let doc = s.view();
         assert_eq!(styled(&doc, "silent for 10m:"), vec![crate::tui::err_style()], "{}", doc.plain());
+    }
+
+    #[test]
+    fn the_release_and_its_rollout_are_shown() {
+        use crate::rollout::{Pause, Phase, Rollout};
+        let dir = TempDir::new();
+        let (admin, store) = setup(&dir);
+        store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
+        let mut s = Screen::new(admin);
+        s.load();
+        s.key(Key::Char('a'));
+        assert!(s.view().plain().contains("No release published yet: ./dryserver release publish"), "{}", s.view().plain());
+
+        // A release on the coordinator, its rollout stopped at node-a.
+        let now = Time::now().0.timestamp();
+        let r = crate::release::Release {
+            serial: 1_795_000_000,
+            created: now - 3600,
+            expires: now + crate::release::LIFETIME,
+            dryserver: crate::release::Binary { version: "0.2.0".into(), sha256: "a".repeat(64), size: 10 },
+            k3s: crate::release::K3s { version: crate::iso::K3S_VERSION.into(), sha256: crate::iso::K3S_SHA256.into() },
+            arch_date: "2026/11/19".into(),
+            rollback: false,
+            urgent: true,
+            notes: "fixes the relay timeout that drops long uploads on slow links".into(),
+        };
+        let served = crate::fsx::dir(&store.path).join(crate::rollout::SERVED_DIR);
+        let at = served.join(r.serial.to_string());
+        std::fs::create_dir_all(&at).unwrap();
+        let env = crate::release::seal(&crate::signed::fake::Key("admin"), &r).unwrap();
+        std::fs::write(at.join(crate::rollout::RELEASE_FILE), serde_json::to_string(&env).unwrap()).unwrap();
+        std::fs::write(served.join("current"), format!("{}\n", r.serial)).unwrap();
+        let failed = Report {
+            update: "failed".into(),
+            update_serial: r.serial,
+            update_note: "dryserver failed: exit status 1: no space left on device".into(),
+            ..healthy(now)
+        };
+        store
+            .update(|st| {
+                st.heartbeat(2, Heartbeat { lan_ip: "192.168.1.23".into(), report: Some(failed), ..Heartbeat::default() }, Time::now())?;
+                st.rollout = Rollout {
+                    serial: r.serial,
+                    urgent: true,
+                    phase: Phase::Servers,
+                    paused: "node-a (the canary): update failed: dryserver failed: exit status 1: no space left on device".into(),
+                    pause: Pause::Failed,
+                    pause_host: 2,
+                    pause_name: "node-a".into(),
+                    cordoned: vec!["node-a".into()],
+                    ..Rollout::default()
+                };
+                Ok(())
+            })
+            .unwrap();
+        s.load();
+        let doc = s.view();
+        let v = doc.plain();
+        for want in [
+            "Updates:",
+            "Release 1795000000 (urgent), made",
+            ": fixes the relay\n    timeout that drops",
+            "PAUSED: node-a (the canary): update failed",
+            "./dryserver release resume (passes it over)",
+            "0 of 1 servers on this release.",
+        ] {
+            assert!(v.contains(want), "{want}: {v}");
+        }
+        assert_eq!(styled(&doc, "update failed"), vec![crate::tui::err_style()], "{v}");
+        for line in v.lines() {
+            assert!(line.chars().count() <= 80, "wider than 80 columns: {line:?}");
+        }
+        // The details of node-a say why.
+        s.key(Key::Down);
+        s.key(Key::Char('i'));
+        let v = s.view().plain();
+        assert!(v.contains("no release installed yet; update failed (release 1795000000): dryserver failed"), "{v}");
+        for line in v.lines() {
+            assert!(line.chars().count() <= 80, "wider than 80 columns: {line:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_keeps_lines_short() {
+        assert_eq!(wrap("a b c", 80, "  "), vec!["  a b c"]);
+        let long = "word ".repeat(40);
+        let lines = wrap(long.trim(), 30, "  ");
+        assert!(lines.len() > 1 && lines.iter().all(|l| l.chars().count() <= 30), "{lines:?}");
+        assert!(lines[1].starts_with("    word"), "{lines:?}");
+        assert!(wrap("", 80, "  ").is_empty());
     }
 
     #[test]

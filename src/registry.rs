@@ -20,6 +20,7 @@ use crate::cidr::parse_ip4;
 use crate::err::{Error, Result};
 use crate::gotime::{Time, null_default};
 use crate::report::{self, Report};
+use crate::rollout::{self, Rollout, Served};
 use crate::signed::{self, Envelope, List, Verifier};
 use crate::{errf, fsx};
 
@@ -155,6 +156,11 @@ pub struct State {
     /// sync copies it here; only members get it, with the member list.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub k3s_token: String,
+    /// The rollout of the newest release (rollout.rs). The brain's sync
+    /// moves it on; a form this version does not know reads as none
+    /// instead of making the registry unreadable.
+    #[serde(deserialize_with = "report::lenient", skip_serializing_if = "Rollout::is_none")]
+    pub rollout: Rollout,
 }
 
 /// The 6-digit code both sides show. It covers the new node's keys and the
@@ -625,6 +631,15 @@ pub struct AdminState {
     pub signed: Envelope,
     /// See State::coordinator_proof.
     pub coordinator_proof: String,
+    /// The newest release the admin uploaded, exactly as it arrived: the
+    /// desktop checks its signature before it shows anything of it.
+    #[serde(skip_serializing_if = "Envelope::is_empty")]
+    pub release: Envelope,
+    #[serde(deserialize_with = "report::lenient", skip_serializing_if = "Rollout::is_none")]
+    pub rollout: Rollout,
+    /// The coordinator's clock, unix seconds: the update window and the
+    /// expiry of releases go by it.
+    pub now: i64,
 }
 
 /// Answers "status". When approved it carries what the node needs to bring
@@ -686,22 +701,59 @@ fn valid_id(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// How long one registry command may take. Most are a read or a small
+/// write; moving a release takes as long as the network needs.
+pub fn deadline(cmdline: &str) -> std::time::Duration {
+    let secs = match cmdline.split_whitespace().next() {
+        Some("release-put") => 600,
+        Some("release-get") => 120,
+        _ => 30,
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+/// The mesh member calling from client, if it is one.
+fn member_host(st: &Store, mesh: &dyn Mesh, client: &str) -> Result<u32> {
+    let first = client.split_whitespace().next().unwrap_or("");
+    let host = parse_ip4(first).map(|ip| mesh.host_of(ip)).unwrap_or(0);
+    if host == 0 {
+        return Err("only answered over the mesh".into());
+    }
+    if !st.read()?.members.iter().any(|m| m.host == host) {
+        return Err("not a member".into());
+    }
+    Ok(host)
+}
+
+/// A release serial as a caller writes it.
+fn parse_serial(s: &str) -> Result<u64> {
+    if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("bad release serial".into());
+    }
+    s.parse().map_err(|_| Error::new("bad release serial"))
+}
+
 /// Handles one call from the SSH forced command. cmdline is
 /// SSH_ORIGINAL_COMMAND, client is SSH_CLIENT ("ip port port").
 ///
 ///   request      stdin: Request JSON        -> {"id": ...}         (any source)
 ///   status ID                               -> StatusReply         (any source)
-///   peers        stdin: Heartbeat           -> {"members": [...], "signed": ...}  (mesh members only)
+///   peers        stdin: Heartbeat           -> {"members": [...], "signed": ..., "release": Offer}  (mesh members only)
 ///   signed                                  -> {"signed": ...}     (any source; it proves itself)
 ///   admin        stdin: signed admin request -> AdminState          (holder of the signing key)
 ///   publish      stdin: signed member list   -> {"version": N}      (holder of the signing key)
+///   release-put  stdin: PutHeader line, then the binaries -> {"serial": N}  (holder of the signing key)
+///   release-get SERIAL release              -> Offered             (the server whose turn it is)
+///   release-get SERIAL FILE OFFSET          -> up to CHUNK bytes   (the server whose turn it is)
+///   release-resume stdin: signed admin request -> {"resume": N}    (holder of the signing key)
 ///
 /// The key that reaches this command is on every server and on the USB
-/// stick, so it proves nothing. admin and publish are allowed by the
-/// signature on their input alone.
+/// stick, so it proves nothing. admin, publish, release-put and
+/// release-resume are allowed by the signature on their input alone.
 #[allow(clippy::too_many_arguments)]
 pub fn serve(
     st: &Store,
+    served: &Served,
     mesh: &dyn Mesh,
     verifier: &dyn Verifier,
     coord_host_key: &str,
@@ -741,11 +793,16 @@ pub fn serve(
             }
             // Longer than MAX_INPUT reads as cut off, and is refused.
             let hb: Heartbeat = decode_first(input).ok_or_else(|| Error::new("bad heartbeat JSON"))?;
-            let (members, signed, token) = st.update(|s| {
+            let (members, signed, token, offer) = st.update(|s| {
                 s.heartbeat(host, hb, now)?;
-                Ok((s.members.iter().map(without_report).collect::<Vec<_>>(), s.signed.clone(), s.k3s_token.clone()))
+                Ok((
+                    s.members.iter().map(without_report).collect::<Vec<_>>(),
+                    s.signed.clone(),
+                    s.k3s_token.clone(),
+                    rollout::offer(s, host),
+                ))
             })?;
-            send(out, &serde_json::json!({ "members": members, "signed": signed, "k3s_token": token }))
+            send(out, &serde_json::json!({ "members": members, "signed": signed, "k3s_token": token, "release": offer }))
         }
         ("signed", 1) => {
             // Not secret, and nobody can change it without the admin's key.
@@ -757,6 +814,7 @@ pub fn serve(
         ("admin", 1) => {
             let req: Envelope = decode_first(input).ok_or_else(|| Error::new("bad admin request"))?;
             signed::open_admin(verifier, &req, "state", now.0.timestamp())?;
+            let release = served.current().and_then(|n| served.envelope(n).ok()).unwrap_or_default();
             let reply = st.update(|s| {
                 s.prune(now);
                 Ok(AdminState {
@@ -766,6 +824,9 @@ pub fn serve(
                     scanned: s.scanned,
                     signed: s.signed.clone(),
                     coordinator_proof: s.coordinator_proof.clone(),
+                    release,
+                    rollout: s.rollout.clone(),
+                    now: now.0.timestamp(),
                 })
             })?;
             send(out, &reply)
@@ -775,6 +836,41 @@ pub fn serve(
             let list = env.list(verifier, |h| mesh.fits(h))?;
             st.update(|s| s.publish(&list, &env, now))?;
             send(out, &serde_json::json!({ "version": list.version }))
+        }
+        ("release-put", 1) => {
+            let serial = served.receive(verifier, input, now.0.timestamp())?;
+            send(out, &serde_json::json!({ "serial": serial }))
+        }
+        ("release-resume", 1) => {
+            let req: Envelope = decode_first(input).ok_or_else(|| Error::new("bad admin request"))?;
+            signed::open_admin(verifier, &req, "release-resume", now.0.timestamp())?;
+            let asked = st.update(|s| {
+                if s.rollout.serial == 0 {
+                    return Err("there is no rollout to resume".into());
+                }
+                s.rollout.resume_asked += 1;
+                Ok(s.rollout.resume_asked)
+            })?;
+            send(out, &serde_json::json!({ "resume": asked }))
+        }
+        ("release-get", 3 | 4) => {
+            // Only the server whose turn it is, and only the release of
+            // the rollout: nobody else makes the coordinator send its
+            // binaries over and over.
+            let host = member_host(st, mesh, client).map_err(|e| e.wrap("release-get"))?;
+            let serial = parse_serial(f[1])?;
+            let s = st.read()?;
+            if !rollout::offer(&s, host).turn || s.rollout.serial != serial {
+                return Err(errf!("it is not this machine's turn to update to release {serial}"));
+            }
+            if f.len() == 3 && f[2] == "release" {
+                return send(out, &served.offered(serial)?);
+            }
+            if f.len() != 4 {
+                return Err("bad release-get".into());
+            }
+            let offset: u64 = parse_serial(f[3]).map_err(|_| Error::new("bad offset"))?;
+            served.send(serial, f[2], offset, out)
         }
         _ => Err(errf!("unknown command {:?}", f[0])),
     }
@@ -1096,6 +1192,11 @@ mod tests {
             k3s_active: Some(false),
             firewall: Some(false),
             peers: (1..=1000).map(|host| report::Peer { host, age: Some(3_000_000_000) }).collect(),
+            release: crate::release::MAX_SERIAL,
+            update: "reverted".into(),
+            update_serial: crate::release::MAX_SERIAL,
+            // Quotes take two bytes each in JSON.
+            update_note: "\"".repeat(report::MAX_NOTE),
             ..report(&[])
         }
         .sanitized(|_| true);
@@ -1199,8 +1300,9 @@ mod tests {
 
     fn call(st: &Store, cmd: &str, client: &str, stdin: &str) -> Result<String> {
         let mesh = FakeMesh(HashMap::from([("10.66.0.2".to_string(), 2)]));
+        let served = Served::beside(st, fsx::dir(&st.path).join("k3s"));
         let mut out = Vec::new();
-        serve(st, &mesh, &ADMIN, COORD_KEY, cmd, client, &mut stdin.as_bytes(), &mut out, t0())?;
+        serve(st, &served, &mesh, &ADMIN, COORD_KEY, cmd, client, &mut stdin.as_bytes(), &mut out, t0())?;
         Ok(String::from_utf8(out).unwrap())
     }
 
@@ -1437,6 +1539,86 @@ mod tests {
         assert!(call(&st, "peers", "10.66.0.9 5000 22", "{}").is_err(), "peers answered to a non-member");
         let out = call(&st, "peers", "10.66.0.2 5000 22", r#"{"lan_ip":"192.168.1.99","switch":true}"#).unwrap();
         assert!(out.contains("node-a") && out.contains("192.168.1.99"), "peers {out:?}");
+    }
+
+    #[test]
+    fn members_get_their_turn_and_the_admin_the_rollout() {
+        let dir = TempDir::new();
+        let st = coordinator(&dir);
+        let turn = |ready: bool| rollout::Turn { host: 2, name: "node-a".into(), since: 1, ready };
+        let set = |r: Rollout| {
+            st.update(|s| {
+                s.rollout = r;
+                Ok(())
+            })
+            .unwrap()
+        };
+        st.update(|s| {
+            s.members.push(Member { host: 2, name: "node-a".into(), wg_key: key32(2), ..Member::default() });
+            s.members[0].report = Some(Report { k3s: "v1.37.2+k3s1".into(), ..Report::default() });
+            Ok(())
+        })
+        .unwrap();
+        let running = Rollout { serial: 9, phase: rollout::Phase::Servers, turn: Some(turn(true)), ..Rollout::default() };
+        let hb = r#"{"lan_ip":"192.168.1.23"}"#;
+        let offer = |st: &Store| {
+            let out: serde_json::Value = serde_json::from_str(&call(st, "peers", "10.66.0.2 5000 22", hb).unwrap()).unwrap();
+            out["release"].clone()
+        };
+        // Before any release: nothing offered.
+        assert_eq!(offer(&st), serde_json::json!({"serial": 0, "turn": false, "brain_k3s": "v1.37.2+k3s1"}));
+        set(running.clone());
+        assert_eq!(offer(&st), serde_json::json!({"serial": 9, "turn": true, "brain_k3s": "v1.37.2+k3s1"}));
+        // Not drained yet, stopped, or the brain's own phase: no turn.
+        for r in [
+            Rollout { turn: Some(turn(false)), ..running.clone() },
+            Rollout { paused: "node-x: update failed".into(), ..running.clone() },
+            Rollout { phase: rollout::Phase::Brain, ..running.clone() },
+            Rollout { turn: Some(rollout::Turn { host: 3, ..turn(true) }), ..running.clone() },
+        ] {
+            set(r.clone());
+            assert_eq!(offer(&st)["turn"], false, "{r:?}");
+        }
+        set(running.clone());
+
+        // The admin sees the rollout and the coordinator's clock.
+        let ask =
+            |key: &signed::fake::Key, op: &str| serde_json::to_string(&signed::seal_admin(key, op, t0().0.timestamp()).unwrap()).unwrap();
+        let adm: AdminState = serde_json::from_str(&call(&st, "admin", "192.168.1.9 5000 22", &ask(&ADMIN, "state")).unwrap()).unwrap();
+        assert_eq!((adm.rollout.serial, adm.now), (9, t0().0.timestamp()));
+        // Only the admin resumes, with a request made for it.
+        assert!(call(&st, "release-resume", "192.168.1.9 5000 22", &ask(&signed::fake::Key("thief"), "release-resume")).is_err());
+        assert!(call(&st, "release-resume", "192.168.1.9 5000 22", &ask(&ADMIN, "state")).is_err());
+        let out = call(&st, "release-resume", "192.168.1.9 5000 22", &ask(&ADMIN, "release-resume")).unwrap();
+        assert!(out.contains(r#""resume":1"#), "{out}");
+        assert_eq!(st.read().unwrap().rollout.resume_asked, 1);
+        set(Rollout::default());
+        let e = call(&st, "release-resume", "192.168.1.9 5000 22", &ask(&ADMIN, "release-resume")).unwrap_err().to_string();
+        assert!(e.contains("no rollout to resume"), "{e}");
+    }
+
+    #[test]
+    fn a_rollout_in_an_unknown_form_does_not_break_the_registry() {
+        let dir = TempDir::new();
+        let path = dir.join("registry.json");
+        for rollout in [r#""from the future""#, r#"{"serial":5,"turn":"x"}"#, r#"{"serial":5,"phase":"teleport","pause":"why"}"#] {
+            std::fs::write(&path, format!(r#"{{"members":[{{"host":1,"name":"coord","wg_key":"K"}}],"rollout":{rollout}}}"#)).unwrap();
+            let s = Store::new(&path).read().unwrap();
+            assert_eq!(s.members.len(), 1, "{rollout}");
+            if rollout.contains("teleport") {
+                assert_eq!((s.rollout.serial, s.rollout.phase, s.rollout.pause), (5, rollout::Phase::None, rollout::Pause::None));
+            } else {
+                assert!(s.rollout.is_none(), "{rollout}: {:?}", s.rollout);
+            }
+        }
+    }
+
+    #[test]
+    fn moving_a_release_may_take_longer() {
+        assert_eq!(deadline("peers").as_secs(), 30);
+        assert_eq!(deadline("").as_secs(), 30);
+        assert_eq!(deadline("release-get 5 dryserver 0").as_secs(), 120);
+        assert_eq!(deadline("release-put").as_secs(), 600);
     }
 
     #[test]

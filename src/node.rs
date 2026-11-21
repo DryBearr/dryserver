@@ -19,7 +19,7 @@ use crate::report::{self, Report};
 use crate::runner::{Cmd, Runner};
 use crate::signed::{self, Envelope, Verifier};
 use crate::sysconf::{self, Params};
-use crate::{errf, fsx, quarantine};
+use crate::{errf, fsx, quarantine, rollout};
 
 // Files inside the server's root.
 pub const REGISTRY_KEY: &str = "/etc/dryserver/registry_ed25519";
@@ -47,6 +47,8 @@ pub const SIGNED_STATUS: &str = "/run/dryserver-signed.status";
 /// What a machine that is no member found left of k3s at the last sync;
 /// a change is logged.
 pub const K3S_LEFT_STATUS: &str = "/run/dryserver-k3s-left.status";
+/// What held up this server's update at the last sync; a change is logged.
+pub const UPDATE_STATUS: &str = "/run/dryserver-update.status";
 /// How often a machine waiting for approval asks the coordinator. The
 /// coordinator's firewall lets one address open 10 SSH connections a
 /// minute; asking every 3 or 5 seconds ran into that after a few minutes.
@@ -116,6 +118,9 @@ pub struct Fetched {
     pub signed: Envelope,
     /// The token for joining the k3s cluster; "" before k3s is up.
     pub k3s_token: String,
+    /// The release the swarm moves to, and whether this machine may
+    /// update now.
+    pub release: rollout::Offer,
 }
 
 impl Node {
@@ -175,10 +180,16 @@ impl Node {
     /// The coordinator's host key is pinned in KNOWN_HOSTS on first contact;
     /// the pairing code shows the admin which key the node saw.
     fn ssh(&self, ctx: &Ctx, addr: &str, command: &str, stdin: &str) -> (String, Result<()>) {
+        self.run.run(ctx, &Cmd::new("ssh", &self.ssh_args(addr, command)).stdin(stdin).stdout_only())
+    }
+
+    /// The ssh arguments for one registry command at addr, with the pinned
+    /// host key.
+    pub fn ssh_args(&self, addr: &str, command: &str) -> Vec<String> {
         let key = self.path(REGISTRY_KEY).display().to_string();
         let kh = format!("UserKnownHostsFile={}", self.path(KNOWN_HOSTS).display());
         let target = format!("{}@{addr}", sysconf::REGISTRY_USER);
-        let args = [
+        [
             "-i",
             &key,
             "-o",
@@ -201,8 +212,10 @@ impl Node {
             "LogLevel=ERROR",
             &target,
             command,
-        ];
-        self.run.run(ctx, &Cmd::new("ssh", &args).stdin(stdin).stdout_only())
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
     /// Asks the coordinator at its LAN address for the signed member list
@@ -397,6 +410,13 @@ impl Node {
         report::gather(ctx, self.run.as_ref(), &self.root, &self.cfg.wg_subnet)
     }
 
+    /// The report with where this machine's update stands.
+    pub fn full_report(&self, ctx: &Ctx, coordinator: bool) -> Report {
+        let mut r = self.report(ctx);
+        rollout::Machine::new(self, coordinator).describe(&mut r);
+        r
+    }
+
     /// Asks the coordinator for the member list over the mesh, reporting
     /// this node's current LAN IP, cable link and health. Also returns the
     /// signed list as the coordinator sent it (empty when it has none).
@@ -415,9 +435,13 @@ impl Node {
             signed: Envelope,
             #[serde(default, deserialize_with = "crate::gotime::null_default")]
             k3s_token: String,
+            // An older coordinator sends none; one this version cannot
+            // read offers nothing.
+            #[serde(default, deserialize_with = "report::lenient")]
+            release: rollout::Offer,
         }
-        let (members, signed, k3s_token) = match serde_json::from_str::<Reply>(&out) {
-            Ok(r) if !r.members.is_empty() => (r.members, r.signed, r.k3s_token),
+        let (members, signed, k3s_token, release) = match serde_json::from_str::<Reply>(&out) {
+            Ok(r) if !r.members.is_empty() => (r.members, r.signed, r.k3s_token, r.release),
             _ => return Err("bad member list from coordinator".into()),
         };
         // Nothing from the coordinator is used unchecked.
@@ -425,7 +449,7 @@ impl Node {
         for p in &problems {
             eprintln!("dryserver: sync: ignoring {p}");
         }
-        Ok(Fetched { members, signed, k3s_token })
+        Ok(Fetched { members, signed, k3s_token, release })
     }
 
     /// On a server: joins the k3s cluster once the coordinator handed out
@@ -943,9 +967,14 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     let sw = port_link(&n.switch_mac());
     let mut me = SelfInfo { host: 0, switch: sw };
     let mut token = String::new();
+    let mut offer = rollout::Offer::default();
+    // What this machine says about itself, its update included. Kept for
+    // the update step after the mesh: it is this sync's health.
+    let rep;
     let members = if coordinator {
         me.host = 1;
-        let hb = Heartbeat { lan_ip: n.cfg.coord_lan_ip.clone(), switch: sw, cuts, report: Some(n.report(ctx)) };
+        rep = n.full_report(ctx, true);
+        let hb = Heartbeat { lan_ip: n.cfg.coord_lan_ip.clone(), switch: sw, cuts, report: Some(rep.clone()) };
         let (members, signed) = store.update(|s| {
             s.heartbeat(1, hb, Time::now())?;
             Ok((s.members.clone(), s.signed_version > 0))
@@ -962,7 +991,8 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
             return Err("not a member of the swarm: not joined yet, or removed by the admin (sudo dryserver join asks to join)".into());
         }
         let lan = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).unwrap_or_default();
-        let hb = Heartbeat { lan_ip: lan, switch: sw, cuts, report: Some(n.report(ctx)) };
+        rep = n.full_report(ctx, false);
+        let hb = Heartbeat { lan_ip: lan, switch: sw, cuts, report: Some(rep.clone()) };
         let fetched = match n.fetch_members(ctx, &hb) {
             Ok(f) => f,
             Err(e) => {
@@ -980,8 +1010,9 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
                 return Err(e);
             }
         };
-        let Fetched { members: sent, signed: env, k3s_token } = fetched;
+        let Fetched { members: sent, signed: env, k3s_token, release } = fetched;
         token = k3s_token;
+        offer = release;
         match n.signed_members(me.host, &sent, &env) {
             Ok((members, status)) => {
                 n.note_signed(&status);
@@ -1015,8 +1046,25 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     // drops machines that left; a server joins once it has the token.
     if coordinator {
         n.k3s_share(ctx, store, &all);
-    } else if let Err(e) = n.k3s_join(ctx, me.host, &token) {
-        eprintln!("dryserver: k3s: {e}");
+        // The rollout of the newest release: the coordinator first, then
+        // one server at a time.
+        let served = rollout::Served::beside(store, n.path(rollout::K3S_BIN));
+        rollout::brain_tick(ctx, n, store, &served, &rep, rollout::Now::current());
+    } else {
+        if let Err(e) = n.k3s_join(ctx, me.host, &token) {
+            eprintln!("dryserver: k3s: {e}");
+        }
+        // This sync reached the coordinator: confirm an installed update,
+        // or load and install the offered one when it is this machine's
+        // turn.
+        match rollout::server_tick(ctx, n, &offer, &rep, Time::now().0.timestamp()) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(n.path(UPDATE_STATUS));
+            }
+            Err(e) => {
+                n.note(UPDATE_STATUS, &format!("update: {e}"), &e.to_string());
+            }
+        }
     }
     Ok(true)
 }
@@ -1577,6 +1625,36 @@ mod tests {
         }
         // node-c stays a member (it is signed), without the bad address.
         assert!(hosts.contains("10.66.0.3 node-c\n") && wg.contains(OTHER_WG) && kh.contains("node-c,10.66.0.3 ssh-ed25519"));
+    }
+
+    #[test]
+    fn a_server_takes_its_turn_after_the_mesh() {
+        let (_dir, _tmp, n, fc) = joined();
+        let store = Store::new("/nonexistent");
+        let ctx = Ctx::new();
+        let env = sign(&ADMIN, 5, vec![coord_entry(), node_entry(2)]);
+        let with = |release: serde_json::Value| {
+            let mut reply: serde_json::Value = serde_json::from_str(&peers(&[coord_member(), node_member(2)], &env)).unwrap();
+            reply["release"] = release;
+            *fc.peers.lock().unwrap() = Some(reply.to_string());
+        };
+        // An offer this version cannot read is no offer.
+        with(serde_json::json!("junk"));
+        assert!(sync(&ctx, &n, false, &store).unwrap());
+        assert!(!fc.calls.lock().unwrap().iter().any(|c| c.contains("status")), "{:?}", fc.calls.lock().unwrap());
+        // Its turn: the update commands are asked (and here they are not
+        // there). The mesh is synced all the same.
+        with(serde_json::json!({"serial": 9, "turn": true, "brain_k3s": "v1.37.2+k3s1"}));
+        assert!(sync(&ctx, &n, false, &store).unwrap(), "an update problem must not fail the sync");
+        assert!(get(&n.root, WG_CONF).contains(COORD_WG));
+        let status = get(&n.root, UPDATE_STATUS);
+        assert!(status.contains("release 9 failed: cannot ask how its updates stand"), "{status}");
+        // The next heartbeat says so, and it is not tried again by itself.
+        let asked = fc.calls.lock().unwrap().len();
+        assert!(sync(&ctx, &n, false, &store).unwrap());
+        let hb = fc.heartbeat.lock().unwrap().clone();
+        assert!(hb.contains(r#""update":"failed""#) && hb.contains(r#""update_serial":9"#), "{hb}");
+        assert_eq!(fc.calls.lock().unwrap().len(), asked + 1, "only the sync itself: {:?}", fc.calls.lock().unwrap());
     }
 
     #[test]
