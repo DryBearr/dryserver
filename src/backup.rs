@@ -68,6 +68,8 @@ pub const FORMAT: u32 = 1;
 const HOST_KEY: &str = "etc/ssh/ssh_host_ed25519_key";
 const ROLE_FILE: &str = "etc/dryserver/role";
 const LOCK_FILE: &str = ".lock";
+/// How long a second backup waits for the first before it gives up.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const STAGING: &str = ".staging";
 /// The registry's directory: the backups live inside it.
 const PARENT: &str = "var/lib/dryserver";
@@ -293,7 +295,7 @@ impl<'a> Job<'a> {
             bail!("backups are made on the coordinator; this machine is not it");
         }
         self.prepare_dir()?;
-        let Some(_lock) = fsx::try_lock(self.dir().join(LOCK_FILE))? else {
+        let Some(_lock) = fsx::try_lock_for(self.dir().join(LOCK_FILE), LOCK_WAIT)? else {
             bail!("another backup is running");
         };
         let res = self.make(ctx, now, out);

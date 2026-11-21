@@ -106,6 +106,22 @@ pub fn try_lock(path: impl AsRef<Path>) -> Result<Option<fs::File>> {
     Ok(Some(f))
 }
 
+/// try_lock, waiting up to max for a holder to let go. A child that another
+/// thread forked a moment ago keeps a copy of a just-closed lock open until
+/// its exec, so a lock can look taken for an instant after it was released.
+pub fn try_lock_for(path: impl AsRef<Path>, max: std::time::Duration) -> Result<Option<fs::File>> {
+    let end = std::time::Instant::now() + max;
+    loop {
+        if let Some(f) = try_lock(path.as_ref())? {
+            return Ok(Some(f));
+        }
+        if std::time::Instant::now() >= end {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// The size of the filesystem holding path and the space on it that is
 /// free for anyone (root's reserve not counted), in bytes.
 pub fn space(path: impl AsRef<Path>) -> Result<(u64, u64)> {
