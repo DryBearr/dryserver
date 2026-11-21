@@ -14,7 +14,8 @@ use crate::ctx::Ctx;
 use crate::err::{Error, Kind, Result};
 use crate::gotime::Time;
 use crate::mesh::{self, SelfInfo};
-use crate::registry::{self, Member, Status, StatusReply, Store};
+use crate::registry::{self, Heartbeat, Member, Status, StatusReply, Store};
+use crate::report::{self, Report};
 use crate::runner::{Cmd, Runner};
 use crate::signed::{self, Envelope, Verifier};
 use crate::sysconf::{self, Params};
@@ -115,15 +116,6 @@ pub struct Fetched {
     pub signed: Envelope,
     /// The token for joining the k3s cluster; "" before k3s is up.
     pub k3s_token: String,
-}
-
-/// What a node reports on each sync.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Heartbeat {
-    pub lan_ip: String,
-    pub switch: bool,
-    /// Members this node has cut off, for the admin's screen.
-    pub cuts: Vec<registry::CutReport>,
 }
 
 impl Node {
@@ -400,9 +392,14 @@ impl Node {
         self.write("/etc/ssh/ssh_config.d/20-dryserver.conf", 0o644, &mesh::ssh_config(&self.cfg, members))
     }
 
+    /// What this machine reports about itself with the heartbeat.
+    pub fn report(&self, ctx: &Ctx) -> Report {
+        report::gather(ctx, self.run.as_ref(), &self.root, &self.cfg.wg_subnet)
+    }
+
     /// Asks the coordinator for the member list over the mesh, reporting
-    /// this node's current LAN IP and cable link. Also returns the signed
-    /// list as the coordinator sent it (empty when it has none).
+    /// this node's current LAN IP, cable link and health. Also returns the
+    /// signed list as the coordinator sent it (empty when it has none).
     pub fn fetch_members(&self, ctx: &Ctx, hb: &Heartbeat) -> Result<Fetched> {
         let body = serde_json::to_string(hb)?;
         let out = {
@@ -940,14 +937,17 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     if !coordinator && q.coordinator_cut() {
         return Ok(false);
     }
-    let cuts = q.reports();
+    let mut cuts = q.reports();
+    // No more than the coordinator keeps: the heartbeat stays small.
+    cuts.truncate(registry::MAX_CUT_REPORTS);
     let sw = port_link(&n.switch_mac());
     let mut me = SelfInfo { host: 0, switch: sw };
     let mut token = String::new();
     let members = if coordinator {
         me.host = 1;
+        let hb = Heartbeat { lan_ip: n.cfg.coord_lan_ip.clone(), switch: sw, cuts, report: Some(n.report(ctx)) };
         let (members, signed) = store.update(|s| {
-            s.heartbeat(1, &n.cfg.coord_lan_ip, sw, &cuts, Time::now())?;
+            s.heartbeat(1, hb, Time::now())?;
             Ok((s.members.clone(), s.signed_version > 0))
         })?;
         // Signed by the admin: the code on the console has done its job.
@@ -962,7 +962,8 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
             return Err("not a member of the swarm: not joined yet, or removed by the admin (sudo dryserver join asks to join)".into());
         }
         let lan = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).unwrap_or_default();
-        let fetched = match n.fetch_members(ctx, &Heartbeat { lan_ip: lan, switch: sw, cuts }) {
+        let hb = Heartbeat { lan_ip: lan, switch: sw, cuts, report: Some(n.report(ctx)) };
+        let fetched = match n.fetch_members(ctx, &hb) {
             Ok(f) => f,
             Err(e) => {
                 // A removed machine is cut from the mesh before it hears
@@ -1176,6 +1177,8 @@ mod tests {
         k3s_up: Mutex<bool>,
         /// systemctl stop k3s.service fails, like one that timed out.
         stop_fails: Mutex<bool>,
+        /// The last heartbeat a "peers" call sent.
+        heartbeat: Mutex<String>,
     }
 
     impl FakeCoord {
@@ -1193,6 +1196,7 @@ mod tests {
                 signed: Mutex::new(None),
                 k3s_up: Mutex::new(false),
                 stop_fails: Mutex::new(false),
+                heartbeat: Mutex::new(String::new()),
             })
         }
     }
@@ -1240,10 +1244,13 @@ mod tests {
                     return (out.into(), Ok(()));
                 }
                 "wg-quick" => return ("[Interface]\nListenPort = 51820\n".into(), Ok(())),
-                "wg" => {
+                "wg" if c.args[0] == "syncconf" => {
                     *self.applied.lock().unwrap() = std::fs::read_to_string(&c.args[2]).unwrap_or_default();
                     return (String::new(), Ok(()));
                 }
+                // The report's look at the links: the coordinator only.
+                "wg" if c.args[2] == "allowed-ips" => return (format!("{COORD_WG}\t10.66.0.1/32\n"), Ok(())),
+                "wg" => return (format!("{COORD_WG}\t{}\n", Time::now().0.timestamp() - 7), Ok(())),
                 _ => {}
             }
             let cmd = c.args[c.args.len() - 1].clone();
@@ -1277,6 +1284,7 @@ mod tests {
                 return (String::new(), Err("ssh: connect to host 10.66.0.1 port 22: Connection timed out".into()));
             }
             if cmd == "peers" {
+                *self.heartbeat.lock().unwrap() = c.stdin.clone();
                 let fixed = self.peers.lock().unwrap().clone();
                 let reply =
                     fixed.unwrap_or_else(|| peers(&[coord_member(), node_member(2)], &sign(&ADMIN, 5, vec![coord_entry(), node_entry(2)])));
@@ -1344,7 +1352,7 @@ mod tests {
         assert!(get(&n.root, "/etc/hosts").contains("10.66.0.1 coord") && n.load_state().host == 4, "hosts/state not updated");
         assert!(get(&n.root, SIGNED_FILE).contains(&env.sig), "the list that let this machine in must be remembered");
 
-        let f = n.fetch_members(&ctx, &Heartbeat { lan_ip: "192.168.1.23".into(), switch: false, cuts: vec![] }).unwrap();
+        let f = n.fetch_members(&ctx, &Heartbeat { lan_ip: "192.168.1.23".into(), ..Heartbeat::default() }).unwrap();
         assert_eq!(f.members.len(), 2);
         assert!(!f.signed.is_empty() && f.k3s_token.is_empty());
         assert_eq!(fc.calls.lock().unwrap().last().unwrap(), "dryreg@10.66.0.1 peers", "sync must go over the mesh");
@@ -2008,5 +2016,35 @@ mod tests {
         assert!(applied.contains("PrivateKey = PRIVKEY="), "syncconf input lost the private key:\n{applied}");
         assert!(!get(&n.root, WG_CONF).contains("PRIVKEY"), "wg0.conf must not hold the private key");
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "temporary key file left behind");
+    }
+
+    #[test]
+    fn every_heartbeat_carries_the_report() {
+        // A server: with the member list request.
+        let (_dir, _tmp, n, fc) = joined();
+        put(&n.root, "/proc/sys/kernel/osrelease", "6.12.1-arch1-1\n");
+        let many: Vec<String> = (0..100).map(|i| format!(r#"{{"name":"n{i}","hosts":[{}]}}"#, i + 10)).collect();
+        put(&n.root, quarantine::STATE_FILE, format!(r#"{{"cuts":[{}]}}"#, many.join(",")));
+        assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
+        let hb: Heartbeat = serde_json::from_str(&fc.heartbeat.lock().unwrap()).unwrap();
+        let r = hb.report.expect("no report in the heartbeat");
+        assert_eq!((r.dryserver.as_str(), r.kernel.as_str()), (env!("CARGO_PKG_VERSION"), "6.12.1-arch1-1"));
+        assert_eq!(r.peers, vec![report::Peer { host: 1, age: Some(7) }], "the coordinator's link, by number");
+        assert_eq!(hb.cuts.len(), registry::MAX_CUT_REPORTS, "no more cuts than the coordinator keeps");
+
+        // The coordinator: its own entry, in its own registry.
+        let (_dir, _tmp, n, _) = joined();
+        let dir = TempDir::new();
+        let store = Store::new(dir.join("registry.json"));
+        store
+            .update(|s| {
+                s.members = vec![coord_member(), node_member(2)];
+                Ok(())
+            })
+            .unwrap();
+        sync(&Ctx::new(), &Node { hostname: "coord".into(), ..n }, true, &store).unwrap();
+        let st = store.read().unwrap();
+        assert!(st.members[0].report.as_ref().is_some_and(|r| r.dryserver == env!("CARGO_PKG_VERSION")));
+        assert_eq!(st.members[1].report, None, "the coordinator wrote a report for another machine");
     }
 }

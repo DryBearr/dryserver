@@ -442,7 +442,27 @@ On servers:
 |---|---|
 | `sudo dryserver tpm-enroll` | let the TPM unlock the disk again (after a firmware change) |
 | `sudo dryserver quarantine` | kill switch on this server (`-name`, `-status`, `-lift`) |
+| `dryserver report` | this machine's health as JSON, the same report it sends with every sync (`sudo` adds the firewall and WireGuard) |
 | `dryserver sync`, `join`, `scan`, `registry` | run automatically by systemd, cron and SSH |
+
+### Health reports
+
+With every sync, once a minute, each machine tells the coordinator how it
+is: its dryserver and k3s versions, the running kernel and whether a newer
+one waits for a reboot, when it was last fully upgraded (`pacman -Syu`),
+uptime, load, memory, root disk, its hottest temperature sensor, whether
+k3s runs and the firewall is loaded, and when it last shook hands with
+each WireGuard peer. `./dryserver approve` shows it under each member:
+problems in red (a disk or memory 90% full, 85 °C, k3s or the firewall
+down, a reboot due, a clock more than two minutes off, no upgrade for 30
+days, a peer silent for five minutes). `i` shows everything about the
+selected machine.
+
+It is each machine's own word, relayed by the coordinator. A machine that
+lies, or was broken into, can only change its own line: the coordinator
+and the desktop both check every field, and nothing in a report names
+another machine. Reports go to your desktop only; no server sees another
+one's report. A machine with an older dryserver sends none.
 
 ## FAQ
 

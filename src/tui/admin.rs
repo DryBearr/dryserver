@@ -8,10 +8,156 @@ use crate::admin::{Admin, NewCoordinator, View};
 use crate::err::{Error, Kind, Result};
 use crate::gotime::{Time, duration_string, round_ms};
 use crate::mesh;
+use crate::registry::Member;
+use crate::report::{self, Concern, percent, short_age};
 
 const REFRESH: Duration = Duration::from_secs(5);
 /// After a failed load: do not freeze the screen on every tick.
 const RETRY: Duration = Duration::from_secs(15);
+/// A member syncs every minute: three without a word and its report is
+/// old news.
+const STALE: i64 = 180;
+/// The most WireGuard peers named in the details; the rest are counted.
+const SHOWN_PEERS: usize = 24;
+
+/// The second line under a member: what it says about itself. Values that
+/// need a look are in the alarm colour; the rest of what needs a look
+/// follows them.
+fn health(m: &Member, now: Time) -> Doc {
+    let mut d = Doc::new();
+    let Some(r) = &m.report else {
+        d.s("    ").add(dim("no report: its dryserver, or the coordinator's, is older than this one"));
+        return d;
+    };
+    let problems = r.problems(m.last_seen);
+    let bad = |c: Concern| problems.iter().any(|(k, _)| *k == c);
+    let mut items: Vec<(String, bool)> = Vec::new();
+    let quiet = now.since(m.last_seen).num_seconds();
+    if !m.last_seen.is_zero() && quiet > STALE {
+        items.push((format!("silent for {}:", short_age(quiet as u64)), true));
+    }
+    items.push((if r.dryserver.is_empty() { "?".into() } else { r.dryserver.clone() }, false));
+    if let Some(p) = percent(r.disk_used, r.disk_total) {
+        items.push((format!("disk {p}%"), bad(Concern::Disk)));
+    }
+    if let Some(p) = percent(r.mem_used, r.mem_total) {
+        items.push((format!("mem {p}%"), bad(Concern::Memory)));
+    }
+    if let Some(t) = r.temp {
+        items.push((format!("{t}°C"), bad(Concern::Heat)));
+    }
+    items.push(match r.k3s_active {
+        Some(true) => ("k3s on".into(), false),
+        Some(false) => ("k3s off".into(), true),
+        None => ("no k3s".into(), false),
+    });
+    items.push(match r.firewall {
+        Some(true) => ("firewall on".into(), false),
+        Some(false) => ("firewall OFF".into(), true),
+        None => ("firewall ?".into(), false),
+    });
+    for (c, text) in &problems {
+        if matches!(c, Concern::Reboot | Concern::Clock | Concern::Upgrade | Concern::Peers) {
+            items.push((text.clone(), true));
+        }
+    }
+    // As many to a line as fit 80 columns.
+    let mut width = 0;
+    for (text, alarm) in items {
+        let w = text.chars().count();
+        if width > 4 && width + 2 + w > 80 {
+            d.nl();
+            width = 0;
+        }
+        d.s(if width == 0 { "    " } else { "  " });
+        width += if width == 0 { 4 } else { 2 } + w;
+        if alarm {
+            d.add(err(text));
+        } else {
+            d.s(text);
+        }
+    }
+    d
+}
+
+/// Everything a member says about itself, for the details under the list.
+/// names gives the member names by host number, for its WireGuard peers.
+fn details(m: &Member, names: &dyn Fn(u32) -> String, now: Time) -> Doc {
+    let mut d = Doc::new();
+    let Some(r) = &m.report else {
+        d.s(format!("{} sends no report: its dryserver, or the coordinator's, is older than this one.", m.name)).nl();
+        return d;
+    };
+    d.s(format!("{}, as it reports itself", m.name)).add(dim(format!(" (relayed by the coordinator, {}):", ago(m.last_seen, now)))).nl();
+    let or = |s: &str| if s.is_empty() { "?".to_string() } else { s.to_string() };
+    let k3s = match (r.k3s.as_str(), r.k3s_active) {
+        ("", _) => "no k3s".to_string(),
+        (v, Some(true)) => format!("k3s {v}, running"),
+        (v, _) => format!("k3s {v}, STOPPED"),
+    };
+    let fw = match r.firewall {
+        Some(true) => "firewall loaded",
+        Some(false) => "FIREWALL NOT LOADED",
+        None => "firewall unknown",
+    };
+    d.s(format!("  dryserver {}   {k3s}   {fw}", or(&r.dryserver))).nl();
+    if r.reboot {
+        d.s(format!("  kernel {} running, {} installed: ", or(&r.kernel), or(&r.kernel_installed))).add(err("reboot needed")).nl();
+    } else {
+        d.s(format!("  kernel {}", or(&r.kernel))).nl();
+    }
+    let upgraded = if r.upgraded > 0 && r.time >= r.upgraded {
+        format!("upgraded {} ago", short_age((r.time - r.upgraded) as u64))
+    } else {
+        "last upgrade unknown".into()
+    };
+    let [l1, l5, l15] = r.load;
+    d.s(format!("  up {}   {upgraded}   load {l1:.2} {l5:.2} {l15:.2} on {} CPUs", short_age(r.uptime), r.cpus)).nl();
+    let share = |used: u64, total: u64| match percent(used, total) {
+        Some(p) => format!("{} of {} ({p}%)", report::size(used), report::size(total)),
+        None => "?".into(),
+    };
+    let temp = r.temp.map(|t| format!("   {t}°C")).unwrap_or_default();
+    d.s(format!("  memory {}   disk {}{temp}", share(r.mem_used, r.mem_total), share(r.disk_used, r.disk_total))).nl();
+    match r.clock_offset(m.last_seen) {
+        Some(0) => {
+            d.s("  clock in step with the coordinator's").nl();
+        }
+        Some(off) => {
+            d.s(format!("  clock {} {} the coordinator's", short_age(off.unsigned_abs()), if off > 0 { "ahead of" } else { "behind" }))
+                .nl();
+        }
+        None => {}
+    }
+    if r.peers.is_empty() {
+        d.s("  WireGuard: nothing reported").nl();
+        return d;
+    }
+    // The silent ones first: they are what to look at.
+    let silent = r.silent_peers();
+    let mut peers: Vec<&report::Peer> = r.peers.iter().collect();
+    peers.sort_by_key(|p| !silent.contains(&p.host));
+    d.s("  WireGuard, last handshake:");
+    let mut width = 30;
+    for p in peers.iter().take(SHOWN_PEERS) {
+        let text = format!(" {} {}", names(p.host), p.age.map(short_age).unwrap_or_else(|| "never".into()));
+        if width + text.len() > 78 {
+            d.nl().s("   ");
+            width = 3;
+        }
+        width += text.len();
+        if silent.contains(&p.host) {
+            d.add(err(text));
+        } else {
+            d.s(text);
+        }
+    }
+    if peers.len() > SHOWN_PEERS {
+        d.add(dim(format!(" and {} more", peers.len() - SHOWN_PEERS)));
+    }
+    d.nl();
+    d
+}
 
 pub enum Msg {}
 
@@ -57,6 +203,8 @@ pub struct Screen {
     confirm: Option<(String, Action)>,
     pub notice: String,
     last_load: Option<Instant>,
+    /// Everything the selected member reports, under the list.
+    details: bool,
 }
 
 impl Screen {
@@ -72,6 +220,7 @@ impl Screen {
             confirm: None,
             notice: String::new(),
             last_load: None,
+            details: false,
         }
     }
 
@@ -137,7 +286,9 @@ impl Screen {
         let n = pending.len() + members.len();
         let member = self.cursor.checked_sub(pending.len()).and_then(|i| members.get(i)).cloned();
         match k {
+            Key::Esc if self.details => self.details = false,
             Key::Char('q') | Key::Esc | Key::Ctrl('c') => return Flow::Quit,
+            Key::Char('i') => self.details = !self.details,
             Key::Up | Key::Char('k') => self.cursor = self.cursor.saturating_sub(1),
             Key::Down | Key::Char('j') => self.cursor = (self.cursor + 1).min(n.saturating_sub(1)),
             Key::Char(c @ ('a' | 'r')) => {
@@ -265,17 +416,14 @@ impl Model for Screen {
             b.add(dim("  Approve only if the code matches the one on the new machine's screen.")).nl();
         }
 
-        b.s("\nMembers:\n");
+        b.s("\nMembers, each with what it reports about itself:\n");
+        if !self.view.members.is_empty() {
+            b.add(dim(format!("  {:<14} {:<11} {:<15} {:<6} seen", "name", "mesh", "LAN", "link"))).nl();
+        }
         for (i, (m, signed)) in self.view.members.iter().enumerate() {
-            let link = if m.switch { "switch" } else { "WiFi/router" };
-            let text = format!(
-                "{:<14} {:<12} LAN {:<15} {:<11} seen {:<10}",
-                m.name,
-                mesh::ip(&self.subnet, m.host),
-                m.lan_ip,
-                link,
-                ago(m.last_seen, now)
-            );
+            let link = if m.switch { "switch" } else { "router" };
+            let text =
+                format!("{:<14} {:<11} {:<15} {:<6} {:<10}", m.name, mesh::ip(&self.subnet, m.host), m.lan_ip, link, ago(m.last_seen, now));
             if i + pending.len() == self.cursor {
                 b.add(sel(format!("> {text}")));
             } else {
@@ -286,11 +434,32 @@ impl Model for Screen {
             } else {
                 b.s(" ").add(err("NOT SIGNED")).nl();
             }
+            b.append(health(m, now)).nl();
         }
         if self.view.version == 0 && !self.view.members.is_empty() {
             b.add(dim("  Nothing is signed yet. Press S to sign the coordinator; then machines can join.")).nl();
         } else if !self.view.unsigned().is_empty() {
             b.add(err("  NOT SIGNED: put on the coordinator without you. Servers ignore it. Press p to drop it.")).nl();
+        }
+        if self.details {
+            let selected = self.cursor.checked_sub(pending.len()).and_then(|i| self.view.members.get(i));
+            b.nl();
+            match selected {
+                Some((m, _)) => {
+                    let names = |host: u32| {
+                        self.view
+                            .members
+                            .iter()
+                            .find(|(o, _)| o.host == host)
+                            .map(|(o, _)| o.name.clone())
+                            .unwrap_or_else(|| host.to_string())
+                    };
+                    b.append(details(m, &names, now));
+                }
+                None => {
+                    b.add(dim("Select a member to see what it reports.")).nl();
+                }
+            }
         }
 
         if !self.view.unknown.is_empty() {
@@ -324,12 +493,13 @@ impl Model for Screen {
         } else if !self.notice.is_empty() {
             b.nl().s(&self.notice).nl();
         }
+        // Two lines, so each fits 80 columns.
         let mut keys = vec![("↑↓", "select"), ("a", "approve"), ("r", "reject"), ("d", "remove")];
         if self.view.version == 0 {
             keys.push(("S", "sign coordinator"));
         }
-        keys.extend([("p", "send list again"), ("q", "quit")]);
-        b.nl().append(theme::keys(&keys)).nl();
+        let more = [("i", if self.details { "hide details" } else { "details" }), ("p", "send list again"), ("q", "quit")];
+        b.nl().append(theme::keys(&keys)).nl().append(theme::keys(&more)).nl();
         b
     }
 }
@@ -338,7 +508,8 @@ impl Model for Screen {
 mod tests {
     use super::*;
     use crate::admin::tests::{COORD_KEY, SECRET, key32, move_to, reinstalled, request, setup};
-    use crate::registry::Member;
+    use crate::registry::{Heartbeat, Member};
+    use crate::report::Report;
     use crate::testutil::TempDir;
 
     #[test]
@@ -519,6 +690,160 @@ mod tests {
         // With a coordinator that answers, N does nothing.
         s.key(Key::Char('N'));
         assert!(s.notice.contains("answers fine"), "{:?}", s.notice);
+    }
+
+    /// A healthy machine's report, as gather makes it.
+    fn healthy(now: i64) -> Report {
+        Report {
+            format: report::FORMAT,
+            time: now,
+            dryserver: "0.1.0".into(),
+            k3s: "v1.31.4+k3s1".into(),
+            kernel: "6.12.1-arch1-1".into(),
+            kernel_installed: "6.12.1-arch1-1".into(),
+            upgraded: now - 2 * 86_400,
+            uptime: 3 * 86_400,
+            load: [0.5, 0.4, 0.3],
+            cpus: 4,
+            mem_used: 1 << 30,
+            mem_total: 4 << 30,
+            disk_used: 20 << 30,
+            disk_total: 50 << 30,
+            temp: Some(48),
+            k3s_active: Some(true),
+            firewall: Some(true),
+            peers: vec![report::Peer { host: 2, age: Some(12) }],
+            ..Report::default()
+        }
+    }
+
+    /// The styled pieces of a doc whose text is exactly text.
+    fn styled(d: &Doc, text: &str) -> Vec<ratatui::style::Style> {
+        d.lines.iter().flatten().filter(|s| s.0 == text).map(|s| s.1).collect()
+    }
+
+    #[test]
+    fn members_show_what_they_report() {
+        let dir = TempDir::new();
+        let (admin, store) = setup(&dir);
+        store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
+        let mut s = Screen::new(admin);
+        s.load();
+        s.key(Key::Char('a'));
+        // Nobody has sent a report yet (an older dryserver sends none).
+        assert!(s.view().plain().contains("no report: its dryserver"), "{}", s.view().plain());
+
+        let now = Time::now().0.timestamp();
+        let sick = Report {
+            time: now - 600,
+            reboot: true,
+            kernel_installed: "6.12.4-arch1-1".into(),
+            disk_used: 95,
+            disk_total: 100,
+            k3s_active: Some(false),
+            firewall: Some(false),
+            peers: vec![report::Peer { host: 1, age: None }],
+            ..healthy(now)
+        };
+        store
+            .update(|st| {
+                let hb = |lan: &str, r: Report| Heartbeat { lan_ip: lan.into(), report: Some(r), ..Heartbeat::default() };
+                st.heartbeat(1, hb("192.168.1.50", healthy(now)), Time::now())?;
+                st.heartbeat(2, hb("192.168.1.23", sick), Time::now())
+            })
+            .unwrap();
+        s.load();
+        let doc = s.view();
+        let v = doc.plain();
+        assert!(v.contains("Members, each with what it reports about itself"), "{v}");
+        assert!(v.contains("    0.1.0  disk 40%  mem 25%  48°C  k3s on  firewall on\n"), "{v}");
+        for want in ["disk 95%", "k3s off", "firewall OFF", "reboot needed", "clock 10m behind", "1 silent peer"] {
+            assert!(v.contains(want), "{want}: {v}");
+            assert_eq!(styled(&doc, want), vec![crate::tui::err_style()], "{want} must be an alarm");
+        }
+        assert_eq!(styled(&doc, "k3s on"), vec![ratatui::style::Style::new()], "a healthy value is plain");
+        for line in v.lines() {
+            assert!(line.chars().count() <= 80, "wider than 80 columns: {line:?}");
+        }
+
+        // The details of the coordinator, then of node-a.
+        s.key(Key::Char('i'));
+        let v = s.view().plain();
+        for want in [
+            "coord, as it reports itself (relayed by the coordinator",
+            "dryserver 0.1.0   k3s v1.31.4+k3s1, running   firewall loaded",
+            "kernel 6.12.1-arch1-1\n",
+            "up 3d   upgraded 2d ago   load 0.50 0.40 0.30 on 4 CPUs",
+            "memory 1.0 GiB of 4.0 GiB (25%)   disk 20.0 GiB of 50.0 GiB (40%)   48°C",
+            "WireGuard, last handshake: node-a 12s",
+            "i hide details",
+        ] {
+            assert!(v.contains(want), "{want}: {v}");
+        }
+        s.key(Key::Down);
+        let v = s.view().plain();
+        for want in [
+            "node-a, as it reports itself",
+            "k3s v1.31.4+k3s1, STOPPED   FIREWALL NOT LOADED",
+            "kernel 6.12.1-arch1-1 running, 6.12.4-arch1-1 installed: reboot needed",
+            "clock 10m behind the coordinator's",
+            "WireGuard, last handshake: coord never",
+        ] {
+            assert!(v.contains(want), "{want}: {v}");
+        }
+        for line in v.lines() {
+            assert!(line.chars().count() <= 80, "wider than 80 columns: {line:?}");
+        }
+        // Esc closes the details first; it quits only after that.
+        assert_eq!(s.key(Key::Esc), Flow::Continue);
+        assert!(!s.view().plain().contains("as it reports itself"));
+        assert_eq!(s.key(Key::Esc), Flow::Quit);
+    }
+
+    #[test]
+    fn a_report_is_the_machines_word_and_only_about_itself() {
+        let dir = TempDir::new();
+        let (admin, store) = setup(&dir);
+        store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
+        let mut s = Screen::new(admin);
+        s.load();
+        s.key(Key::Char('a'));
+        // A hacked coordinator writes what it likes into a report, past
+        // the checks on its own heartbeat path.
+        let now = Time::now().0.timestamp();
+        store
+            .update(|st| {
+                let m = st.members.iter_mut().find(|m| m.host == 2).unwrap();
+                m.last_seen = Time::now();
+                m.report = Some(Report {
+                    dryserver: "0.1.0\u{1b}]52;c;ZXZpbA==\u{7}".into(),
+                    kernel: "x".repeat(300),
+                    temp: Some(9999),
+                    peers: (0..2000).map(|h| report::Peer { host: h, age: Some(5) }).collect(),
+                    ..healthy(now)
+                });
+                Ok(())
+            })
+            .unwrap();
+        s.load();
+        s.key(Key::Down);
+        s.key(Key::Char('i'));
+        let v = s.view().plain();
+        assert!(!v.contains('\u{1b}') && !v.contains("xxxx") && !v.contains("9999"), "{v}");
+        assert!(v.contains("WireGuard, last handshake: coord 5s\n"), "only members are peers, never itself: {v}");
+        // The coordinator's own row is untouched by it.
+        s.key(Key::Up);
+        assert!(s.view().plain().contains("coord sends no report"), "{}", s.view().plain());
+        // A machine that went quiet: its report is old news.
+        store
+            .update(|st| {
+                st.members.iter_mut().find(|m| m.host == 2).unwrap().last_seen = Time::now().add(chrono::TimeDelta::minutes(-10));
+                Ok(())
+            })
+            .unwrap();
+        s.load();
+        let doc = s.view();
+        assert_eq!(styled(&doc, "silent for 10m:"), vec![crate::tui::err_style()], "{}", doc.plain());
     }
 
     #[test]

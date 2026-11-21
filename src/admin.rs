@@ -347,8 +347,16 @@ impl Admin {
         let mut v = View { unknown: st.unknown.into_iter().filter_map(clean_device).collect(), scanned: st.scanned, ..View::default() };
         let coord_key = self.link.host_key()?;
 
-        let (members, problems) = registry::check_members(st.members, |h| self.fits(h));
+        let (mut members, problems) = registry::check_members(st.members, |h| self.fits(h));
         v.warnings.extend(problems.into_iter().map(|p| format!("The coordinator lists a bad entry, ignored: {p}")));
+        // What each machine says about itself, as relayed by the
+        // coordinator: checked again here, as either could lie. Its peers
+        // can only be other members.
+        let hosts: Vec<u32> = members.iter().map(|m| m.host).collect();
+        for m in members.iter_mut() {
+            let me = m.host;
+            m.report = m.report.take().map(|r| r.sanitized(|h| h != me && hosts.contains(&h)));
+        }
         self.coordinator_proved = false;
         if let Some(c) = members.iter().find(|m| m.host == 1) {
             v.coordinator_code = registry::coordinator_code(&c.wg_key, &coord_key);
@@ -1116,7 +1124,11 @@ pub mod tests {
                 s.members.push(Member { host: 2, name: "node-a".into(), wg_key: key32(2), ..Member::default() });
                 let cuts =
                     [registry::CutReport { name: "node-c".into(), auto: true }, registry::CutReport { name: "coord".into(), auto: false }];
-                s.heartbeat(2, "192.168.1.23", false, &cuts, Time::now())
+                s.heartbeat(
+                    2,
+                    registry::Heartbeat { lan_ip: "192.168.1.23".into(), cuts: cuts.to_vec(), ..registry::Heartbeat::default() },
+                    Time::now(),
+                )
             })
             .unwrap();
         let v = a.load().unwrap();

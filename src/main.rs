@@ -26,6 +26,7 @@ mod registry;
 mod relay;
 #[allow(dead_code)]
 mod release;
+mod report;
 mod runner;
 mod signed;
 mod sysconf;
@@ -77,6 +78,8 @@ on servers:
   quarantine          cut the coordinator (or -name a,b) off this server;
                       -lift undoes it, -status shows it
   scan                coordinator: report unknown devices on the network
+  report              this machine's health as JSON (versions, reboot, disk,
+                      k3s, firewall, WireGuard); root shows everything
   tpm-enroll          let the TPM unlock the disk again (after a firmware change)
   registry            coordinator: SSH forced command for joining machines
 "#;
@@ -115,6 +118,7 @@ fn main() -> ExitCode {
         "join" => run_join(rest),
         "sync" => run_sync(rest),
         "scan" => run_scan(rest),
+        "report" => run_report(rest),
         "approve" => run_approve(rest),
         "tpm-enroll" => run_tpm_enroll(rest),
         "help" | "-h" | "--help" => {
@@ -657,6 +661,19 @@ fn run_scan(args: &[String]) -> Result<()> {
         s.scanned = Time::now();
         Ok(())
     })
+}
+
+/// What this machine reports about itself with every sync, as JSON. Needs
+/// no root; without it the firewall and WireGuard stay unknown.
+fn run_report(args: &[String]) -> Result<()> {
+    Flags::parse("report", args, &[]);
+    // The config holds the WiFi password and only root reads it; the
+    // mesh subnet names WireGuard peers, which only root sees anyway.
+    let subnet = Config::load(LIVE_CONFIG).map(|c| c.wg_subnet).unwrap_or_default();
+    let ctx = Ctx::on_signals();
+    let r = report::gather(&ctx, &ExecRunner::silent(), Path::new("/"), &subnet);
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
 }
 
 /// kubectl on the coordinator over the admin's SSH login, with the host

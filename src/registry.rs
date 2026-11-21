@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::cidr::parse_ip4;
 use crate::err::{Error, Result};
 use crate::gotime::{Time, null_default};
+use crate::report::{self, Report};
 use crate::signed::{self, Envelope, List, Verifier};
 use crate::{errf, fsx};
 
@@ -48,7 +49,7 @@ pub struct CutReport {
 }
 
 /// At most this many cuts are kept per member.
-const MAX_CUT_REPORTS: usize = 32;
+pub const MAX_CUT_REPORTS: usize = 32;
 
 /// An approved mesh node. The coordinator is member 1.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -67,6 +68,11 @@ pub struct Member {
     /// What this member has cut off, as it reported last.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cuts: Vec<CutReport>,
+    /// What the member said about itself in its newest heartbeat, checked
+    /// (Report::sanitized). For the admin only: other members never get
+    /// it.
+    #[serde(deserialize_with = "report::lenient_report", skip_serializing_if = "Option::is_none")]
+    pub report: Option<Report>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +439,7 @@ impl State {
                         approved: now,
                         last_seen: now,
                         cuts: Vec::new(),
+                        report: None,
                     }
                 }
             };
@@ -455,19 +462,27 @@ impl State {
         Ok(())
     }
 
-    /// Records a member's current LAN IP and switch link. host identifies
-    /// the member by its mesh address, which WireGuard ties to its key.
-    pub fn heartbeat(&mut self, host: u32, lan_ip: &str, sw: bool, cuts: &[CutReport], now: Time) -> Result<()> {
+    /// Records a member's current LAN IP, switch link, cuts and report.
+    /// host identifies the member by its mesh address, which WireGuard ties
+    /// to its key. Nothing in what it sends names another member, so a
+    /// member that lies changes only its own entry.
+    pub fn heartbeat(&mut self, host: u32, hb: Heartbeat, now: Time) -> Result<()> {
+        let Heartbeat { lan_ip, switch: sw, cuts, report } = hb;
+        let others: Vec<u32> = self.members.iter().map(|m| m.host).filter(|h| *h != host).collect();
         let Some(m) = self.members.iter_mut().find(|m| m.host == host) else {
             return Err("not a member".into());
         };
-        if parse_ip4(lan_ip).is_some() {
-            m.lan_ip = lan_ip.to_string();
+        if parse_ip4(&lan_ip).is_some() {
+            m.lan_ip = lan_ip;
         }
         m.switch = sw;
         m.last_seen = now;
         // A member's word, shown to the admin: names only, and not many.
-        m.cuts = cuts.iter().filter(|c| valid_name(&c.name)).take(MAX_CUT_REPORTS).cloned().collect();
+        m.cuts = cuts.into_iter().filter(|c| valid_name(&c.name)).take(MAX_CUT_REPORTS).collect();
+        // The newest report replaces the last one, and none (an older
+        // dryserver) leaves none rather than a stale one. Its peers can
+        // only be other members.
+        m.report = report.map(|r| r.sanitized(|h| others.contains(&h)));
         Ok(())
     }
 
@@ -628,13 +643,19 @@ pub struct StatusReply {
     pub signed: Envelope,
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// What a member sends with every sync ("peers"). One of an older version
+/// sends no report; one of a newer version may send fields this one does
+/// not know, which are left out.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-struct HeartbeatIn {
-    lan_ip: String,
-    switch: bool,
+pub struct Heartbeat {
+    pub lan_ip: String,
+    pub switch: bool,
+    /// Members this one has cut off, for the admin's screen.
     #[serde(deserialize_with = "null_default")]
-    cuts: Vec<CutReport>,
+    pub cuts: Vec<CutReport>,
+    #[serde(deserialize_with = "report::lenient_report", skip_serializing_if = "Option::is_none")]
+    pub report: Option<Report>,
 }
 
 fn decode_first<T: serde::de::DeserializeOwned>(input: &mut dyn Read) -> Option<T> {
@@ -654,6 +675,13 @@ fn send<T: Serialize>(out: &mut dyn Write, v: &T) -> Result<()> {
     Ok(())
 }
 
+/// A member as other machines get it. What a machine reports about itself
+/// (versions, a reboot it waits for) is for the admin: it would tell a
+/// member that was broken into where to go next.
+fn without_report(m: &Member) -> Member {
+    Member { report: None, ..m.clone() }
+}
+
 fn valid_id(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -663,7 +691,7 @@ fn valid_id(s: &str) -> bool {
 ///
 ///   request      stdin: Request JSON        -> {"id": ...}         (any source)
 ///   status ID                               -> StatusReply         (any source)
-///   peers        stdin: {"lan_ip","switch"} -> {"members": [...], "signed": ...}  (mesh members only)
+///   peers        stdin: Heartbeat           -> {"members": [...], "signed": ...}  (mesh members only)
 ///   signed                                  -> {"signed": ...}     (any source; it proves itself)
 ///   admin        stdin: signed admin request -> AdminState          (holder of the signing key)
 ///   publish      stdin: signed member list   -> {"version": N}      (holder of the signing key)
@@ -698,7 +726,7 @@ pub fn serve(
                 let r = s.request_status(f[1], now)?;
                 let mut reply = StatusReply { status: r.status, host: r.host, ..StatusReply::default() };
                 if r.status == Status::Approved {
-                    reply.coordinator = s.members.iter().find(|m| m.host == 1).cloned();
+                    reply.coordinator = s.members.iter().find(|m| m.host == 1).map(without_report);
                     reply.signed = s.signed.clone();
                 }
                 Ok(reply)
@@ -711,10 +739,11 @@ pub fn serve(
             if host == 0 {
                 return Err("peers is only answered over the mesh".into());
             }
-            let hb: HeartbeatIn = decode_first(input).ok_or_else(|| Error::new("bad heartbeat JSON"))?;
+            // Longer than MAX_INPUT reads as cut off, and is refused.
+            let hb: Heartbeat = decode_first(input).ok_or_else(|| Error::new("bad heartbeat JSON"))?;
             let (members, signed, token) = st.update(|s| {
-                s.heartbeat(host, &hb.lan_ip, hb.switch, &hb.cuts, now)?;
-                Ok((s.members.clone(), s.signed.clone(), s.k3s_token.clone()))
+                s.heartbeat(host, hb, now)?;
+                Ok((s.members.iter().map(without_report).collect::<Vec<_>>(), s.signed.clone(), s.k3s_token.clone()))
             })?;
             send(out, &serde_json::json!({ "members": members, "signed": signed, "k3s_token": token }))
         }
@@ -942,20 +971,155 @@ mod tests {
     fn heartbeat_updates_member() {
         let mut s =
             State { members: vec![member(1, "coord"), Member { lan_ip: "192.168.1.5".into(), ..member(2, "a") }], ..State::default() };
+        let hb = |cuts: Vec<CutReport>| Heartbeat { lan_ip: "192.168.1.77".into(), switch: true, cuts, report: None };
         let cuts = vec![CutReport { name: "node-c".into(), auto: true }, CutReport { name: "x\u{1b}[2J evil".into(), auto: false }];
-        s.heartbeat(2, "192.168.1.77", true, &cuts, t0()).unwrap();
+        s.heartbeat(2, hb(cuts), t0()).unwrap();
         let m = s.members.iter().find(|m| m.host == 2).unwrap();
         assert_eq!(m.cuts, vec![CutReport { name: "node-c".into(), auto: true }], "only real names are kept");
         let many: Vec<CutReport> = (0..100).map(|i| CutReport { name: format!("n{i}"), auto: false }).collect();
-        s.heartbeat(2, "192.168.1.77", true, &many, t0()).unwrap();
+        s.heartbeat(2, hb(many), t0()).unwrap();
         assert_eq!(s.members.iter().find(|m| m.host == 2).unwrap().cuts.len(), MAX_CUT_REPORTS);
-        s.heartbeat(2, "192.168.1.77", true, &[], t0()).unwrap();
+        s.heartbeat(2, hb(vec![]), t0()).unwrap();
         assert!(s.members.iter().find(|m| m.host == 2).unwrap().cuts.is_empty(), "a lifted cut must disappear");
         let m = &s.members[1];
         assert_eq!(m.lan_ip, "192.168.1.77");
         assert!(m.switch);
         assert_eq!(m.last_seen, t0());
-        assert!(s.heartbeat(9, "1.2.3.4", false, &[], t0()).is_err(), "unknown host accepted");
+        assert!(s.heartbeat(9, hb(vec![]), t0()).is_err(), "unknown host accepted");
+    }
+
+    /// A report as a server sends it, with peers.
+    fn report(peers: &[u32]) -> Report {
+        Report {
+            format: report::FORMAT,
+            time: t0().0.timestamp(),
+            dryserver: "0.1.0".into(),
+            kernel: "6.12.1-arch1-1".into(),
+            disk_used: 10,
+            disk_total: 100,
+            peers: peers.iter().map(|h| report::Peer { host: *h, age: Some(12) }).collect(),
+            ..Report::default()
+        }
+    }
+
+    #[test]
+    fn each_member_reports_for_itself_only() {
+        let dir = TempDir::new();
+        let st = coordinator(&dir);
+        st.update(|s| {
+            for (host, seed) in [(2, 2), (3, 3)] {
+                s.members.push(Member { host, name: format!("n{host}"), wg_key: key32(seed), ..Member::default() });
+            }
+            Ok(())
+        })
+        .unwrap();
+        let get = |host: u32| st.read().unwrap().members.into_iter().find(|m| m.host == host).unwrap();
+        let send = |client: &str, body: &str| call(&st, "peers", client, body);
+
+        // Its peers can only be other members; the rest of the report is
+        // checked too, and fields it should not have are ignored.
+        let body = serde_json::json!({
+            "lan_ip": "192.168.1.23",
+            "report": {"dryserver": "0.1.0", "kernel": "6.1\u{1b}[2J", "temp": 55,
+                       "peers": [{"host": 1, "age": 3}, {"host": 2, "age": 3}, {"host": 3}, {"host": 77, "age": 1}],
+                       "host": 3, "name": "n3", "members": []},
+        });
+        let out = send("10.66.0.2 5000 22", &body.to_string()).unwrap();
+        let r = get(2).report.unwrap();
+        assert_eq!((r.dryserver.as_str(), r.kernel.as_str(), r.temp), ("0.1.0", "", Some(55)));
+        assert_eq!(r.peers.iter().map(|p| p.host).collect::<Vec<_>>(), vec![1, 3], "not itself, not a stranger");
+        assert_eq!(get(3).report, None, "one member's report reached another's entry");
+        assert!(!out.contains("report") && !out.contains("6.1"), "members get each other's reports: {out}");
+
+        // A report that is not one, or a field of the wrong kind, costs
+        // that much and not the heartbeat.
+        for (lan, junk, want) in
+            [("192.168.1.24", r#""report":"x""#, None), ("192.168.1.25", r#""report":{"uptime":"long","cpus":4}"#, Some(4))]
+        {
+            send("10.66.0.2 5000 22", &format!(r#"{{"lan_ip":"{lan}",{junk}}}"#)).unwrap();
+            assert_eq!(get(2).lan_ip, lan, "{junk}");
+            assert_eq!(get(2).report.map(|r| r.cpus), want, "{junk}");
+        }
+
+        // An older server sends none: no stale report stays behind.
+        send("10.66.0.2 5000 22", &serde_json::to_string(&Heartbeat { report: Some(report(&[1])), ..Heartbeat::default() }).unwrap())
+            .unwrap();
+        assert!(get(2).report.is_some());
+        send("10.66.0.2 5000 22", r#"{"lan_ip":"192.168.1.23","switch":false}"#).unwrap();
+        assert_eq!(get(2).report, None);
+
+        // Too big a heartbeat is refused, and changes nothing.
+        let seen = get(2).last_seen;
+        let huge = format!(r#"{{"lan_ip":"192.168.1.99","report":{{"k3s":"{}"}}}}"#, "v".repeat(MAX_INPUT as usize));
+        assert!(send("10.66.0.2 5000 22", &huge).is_err());
+        assert!(get(2).lan_ip != "192.168.1.99" && get(2).last_seen == seen);
+
+        // The admin gets every report; a server waiting for approval gets
+        // the coordinator without its report.
+        st.update(|s| s.heartbeat(1, Heartbeat { report: Some(report(&[2, 3])), ..Heartbeat::default() }, t0())).unwrap();
+        let ask = serde_json::to_string(&signed::seal_admin(&ADMIN, "state", t0().0.timestamp()).unwrap()).unwrap();
+        let adm: AdminState = serde_json::from_str(&call(&st, "admin", "192.168.1.9 5000 22", &ask).unwrap()).unwrap();
+        assert!(adm.members.iter().find(|m| m.host == 1).unwrap().report.as_ref().is_some_and(|r| r.peers.len() == 2));
+        let id = st.read().unwrap().requests[0].id.clone();
+        st.update(|s| {
+            s.requests[0].status = Status::Approved;
+            Ok(())
+        })
+        .unwrap();
+        let out = call(&st, &format!("status {id}"), "192.168.1.23 5000 22", "").unwrap();
+        assert!(out.contains("coord") && !out.contains("report"), "{out}");
+    }
+
+    #[test]
+    fn the_largest_heartbeat_fits() {
+        // What a server can send at most: every cut the coordinator keeps
+        // with the longest names, and a report with every peer and the
+        // longest versions. It must fit what this and older coordinators
+        // read (MAX_INPUT), or the server could not sync.
+        let long = |c: char| c.to_string().repeat(64);
+        let r = Report {
+            time: i64::from(u32::MAX),
+            dryserver: long('d'),
+            k3s: long('k'),
+            kernel: long('r'),
+            kernel_installed: long('i'),
+            reboot: true,
+            upgraded: i64::from(u32::MAX),
+            uptime: u64::from(u32::MAX),
+            load: [99999.99; 3],
+            cpus: 4096,
+            mem_used: 1 << 49,
+            mem_total: 1 << 49,
+            disk_used: 1 << 49,
+            disk_total: 1 << 49,
+            temp: Some(-49),
+            k3s_active: Some(false),
+            firewall: Some(false),
+            peers: (1..=1000).map(|host| report::Peer { host, age: Some(3_000_000_000) }).collect(),
+            ..report(&[])
+        }
+        .sanitized(|_| true);
+        let cuts = (0..MAX_CUT_REPORTS).map(|i| CutReport { name: format!("{i:02}{}", "n".repeat(61)), auto: true }).collect();
+        let hb = Heartbeat { lan_ip: "255.255.255.255".into(), switch: true, cuts, report: Some(r) };
+        let len = serde_json::to_string(&hb).unwrap().len() as u64;
+        assert!(len < MAX_INPUT * 3 / 4, "the largest heartbeat is {len} bytes");
+    }
+
+    #[test]
+    fn a_registry_file_with_reports_of_any_age_loads() {
+        let dir = TempDir::new();
+        let path = dir.join("registry.json");
+        // A report in a form this version does not know (a newer one wrote
+        // it): the registry still loads, without it.
+        std::fs::write(
+            &path,
+            r#"{"members":[{"host":1,"name":"coord","wg_key":"K","report":"from the future"},
+                          {"host":2,"name":"a","wg_key":"L","report":{"format":9,"cpus":2,"gpu":{"x":1}}}]}"#,
+        )
+        .unwrap();
+        let s = Store::new(path).read().unwrap();
+        assert_eq!(s.members[0].report, None);
+        assert_eq!(s.members[1].report.as_ref().map(|r| (r.format, r.cpus)), Some((9, 2)));
     }
 
     #[test]

@@ -444,6 +444,7 @@ impl Real {
             approved: now,
             last_seen: now,
             cuts: Vec::new(),
+            report: None,
         };
         let store = Store::new(self.target(registry::DEFAULT_PATH));
         let m = me.clone();
