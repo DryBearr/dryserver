@@ -974,7 +974,7 @@ pub fn serve(
                 if s.rollout.serial == 0 {
                     return Err("there is no rollout to resume".into());
                 }
-                s.rollout.resume_asked += 1;
+                s.rollout.resume_asked = s.rollout.resume_asked.wrapping_add(1);
                 Ok(s.rollout.resume_asked)
             })?;
             send(out, &serde_json::json!({ "resume": asked }))

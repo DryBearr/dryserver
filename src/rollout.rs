@@ -46,7 +46,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ctx::Ctx;
-use crate::err::{Error, Result};
+use crate::err::{Error, Kind, Result};
+use crate::mesh;
 use crate::node::Node;
 use crate::registry::{self, Member, Store};
 use crate::release::{self, Place, Release};
@@ -65,6 +66,9 @@ use crate::{bail, errf, fsx, quarantine};
 /// own in its place while root reads it.
 pub const STORE: &str = "/var/lib/dryserver-releases";
 const STATE_FILE: &str = "state.json";
+/// On the brain: the rollout as root keeps it. The registry gets a copy to
+/// answer servers from, which root never reads back.
+const ROLLOUT_FILE: &str = "rollout.json";
 const INCOMING: &str = "incoming";
 const INSTALLED: &str = "installed";
 const PREVIOUS: &str = "previous";
@@ -97,6 +101,8 @@ const MAX_HEADER: u64 = 32 << 10;
 const MAX_ENVELOPE: u64 = 32 << 10;
 /// This machine's update state.
 const MAX_STATE: u64 = 16 << 10;
+/// The brain's rollout state: a list or two of host numbers, a few lines.
+const MAX_ROLLOUT: u64 = 256 << 10;
 
 // ---- timing ----
 
@@ -830,6 +836,16 @@ impl<'a> Machine<'a> {
         write_atomic(&self.dir().join(STATE_FILE), &(serde_json::to_string_pretty(l)? + "\n"))
     }
 
+    /// On the brain: the rollout as root keeps it; none before the first.
+    fn own_rollout(&self) -> Rollout {
+        read_small(&self.dir().join(ROLLOUT_FILE), MAX_ROLLOUT).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    }
+
+    fn save_rollout(&self, r: &Rollout) -> Result<()> {
+        self.ensure_dir()?;
+        write_atomic(&self.dir().join(ROLLOUT_FILE), &(serde_json::to_string_pretty(r)? + "\n"))
+    }
+
     /// A release in one of the store's directories. It was checked before
     /// it was stored, and only root writes there.
     fn release_in(&self, sub: &str) -> Option<(Envelope, Release)> {
@@ -1247,9 +1263,12 @@ pub struct Skip {
     pub why: String,
 }
 
-/// The rollout of the newest release, kept in the registry. The brain's
-/// sync (root) moves it on; the registry account reads it to answer its
-/// callers, and adds only resume_asked.
+/// The rollout of the newest release. The brain's sync (root) keeps it in
+/// its own store and moves it on; the registry gets a copy, which the
+/// registry account reads to answer its callers. Of that copy root takes
+/// back only resume_asked, the admin's resumes the registry counts: the
+/// registry account could write anything else in it, and node names from
+/// it would end up on kubectl's command line.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Rollout {
@@ -1349,6 +1368,8 @@ struct Brain<'a> {
     members: &'a [Member],
     r: Rollout,
     free: fn(&Path) -> Option<u64>,
+    /// The cluster's node names, asked once per tick when needed.
+    nodes: Option<Vec<String>>,
 }
 
 /// One step of the rollout, at every sync of the brain (as root): takes up
@@ -1361,23 +1382,34 @@ pub fn brain_tick(ctx: &Ctx, n: &Node, store: &Store, served: &Served, rep: &Rep
 
 fn brain_tick_with(ctx: &Ctx, n: &Node, store: &Store, served: &Served, rep: &Report, now: Now, free: fn(&Path) -> Option<u64>) {
     let Ok(s) = store.read() else { return };
-    let before = s.rollout.clone();
-    let mut b = Brain { ctx, n, served, rep, now, members: &s.members, r: s.rollout.clone(), free };
+    let m = Machine { n, brain: true, free };
+    let before = m.own_rollout();
+    // The registry account writes the member list too: only members that
+    // pass the checks a server makes take part (the sync logged the rest).
+    let (members, _) = registry::check_members(s.members.clone(), |h| !mesh::ip(&n.cfg.wg_subnet, h).is_empty());
+    let mut b = Brain { ctx, n, served, rep, now, members: &members, r: before.clone(), free, nodes: None };
+    b.r.resume_asked = s.rollout.resume_asked;
     b.take_upload();
     if b.r.serial != 0 {
         b.resume();
         b.advance();
     }
-    if b.r != before {
-        let r = b.r;
+    let r = b.r;
+    if r != before
+        && let Err(e) = m.save_rollout(&r)
+    {
+        // Not handed out either: the registry tells what root keeps.
+        eprintln!("dryserver: rollout: cannot save its state: {e}");
+        return;
+    }
+    if (Rollout { resume_asked: s.rollout.resume_asked, ..r.clone() }) != s.rollout {
         let res = store.update(|s| {
             // A resume asked while this tick ran stays asked.
-            let asked = s.rollout.resume_asked.max(r.resume_asked);
-            s.rollout = Rollout { resume_asked: asked, ..r.clone() };
+            s.rollout = Rollout { resume_asked: s.rollout.resume_asked, ..r.clone() };
             Ok(())
         });
         if let Err(e) = res {
-            eprintln!("dryserver: rollout: cannot save its state: {e}");
+            eprintln!("dryserver: rollout: cannot hand its state to the registry: {e}");
         }
     }
 }
@@ -1387,10 +1419,34 @@ impl Brain<'_> {
         Machine { n: self.n, brain: true, free: self.free }
     }
 
-    fn kubectl(&self, args: &[&str]) -> Result<()> {
+    /// kubectl on one node of the cluster. The name goes last, after `--`,
+    /// so it is never read as an option (`-l...` would select every node),
+    /// and only when it is a plain hostname, not the brain's own node, and
+    /// a node the cluster lists; one it does not list is NotFound.
+    fn kubectl(&mut self, args: &[&str], node: &str) -> Result<()> {
+        if !registry::valid_name(node) {
+            bail!("{:?} is not a node name", shown(node, 40));
+        }
+        if node == self.n.hostname || self.members.iter().any(|m| m.host == 1 && m.name == node) {
+            bail!("{node} is the coordinator, which the rollout never cordons or drains");
+        }
+        if !self.nodes()?.iter().any(|n| n == node) {
+            return Err(Error::with_kind(Kind::NotFound, format!("{node} is not a node of the cluster")));
+        }
         let mut all = vec!["kubectl"];
         all.extend_from_slice(args);
+        all.extend(["--", node]);
         self.n.run.ok(&self.ctx.with_timeout(Duration::from_secs(40)), &Cmd::new("k3s", &all))
+    }
+
+    /// The names of the cluster's nodes.
+    fn nodes(&mut self) -> Result<&[String]> {
+        if self.nodes.is_none() {
+            let cmd = Cmd::new("k3s", &["kubectl", "get", "nodes", "-o", "name"]).quiet().stdout_only();
+            let out = self.n.run.output(&self.ctx.with_timeout(Duration::from_secs(40)), &cmd)?;
+            self.nodes = Some(out.lines().filter_map(|l| l.trim().strip_prefix("node/")).map(String::from).collect());
+        }
+        Ok(self.nodes.as_deref().unwrap_or_default())
     }
 
     fn member(&self, host: u32) -> Option<&Member> {
@@ -1444,8 +1500,12 @@ impl Brain<'_> {
     }
 
     fn uncordon(&mut self, name: &str) {
-        match self.kubectl(&["uncordon", name]) {
+        match self.kubectl(&["uncordon"], name) {
             Ok(()) => self.r.cordoned.retain(|c| c != name),
+            // Not a node (any more), or not one it may touch: nothing to undo.
+            Err(e) if e.is_not_found() || !registry::valid_name(name) || name == self.n.hostname => {
+                self.r.cordoned.retain(|c| c != name);
+            }
             Err(e) => {
                 if self.members.iter().any(|m| m.name == name) {
                     if !self.r.cordoned.iter().any(|c| c == name) {
@@ -1460,8 +1520,12 @@ impl Brain<'_> {
         }
     }
 
+    /// resume_asked is the registry's count, which anyone who can write
+    /// the registry can change: a count that grew is one resume (what the
+    /// admin's resume does anyway), one that went back is none.
     fn resume(&mut self) {
         if self.r.resume_asked <= self.r.resume_done {
+            self.r.resume_done = self.r.resume_asked;
             return;
         }
         self.r.resume_done = self.r.resume_asked;
@@ -1579,7 +1643,8 @@ impl Brain<'_> {
         let mut servers: Vec<&Member> = self
             .members
             .iter()
-            .filter(|m| m.host != 1 && !self.r.done.contains(&m.host) && !self.r.skipped.iter().any(|s| s.host == m.host))
+            .filter(|m| m.host != 1 && m.name != self.n.hostname)
+            .filter(|m| !self.r.done.contains(&m.host) && !self.r.skipped.iter().any(|s| s.host == m.host))
             .collect();
         let deferred = |h: u32| self.r.deferred.iter().position(|d| *d == h).map_or(0, |i| i + 1);
         servers.sort_by_key(|m| (deferred(m.host), m.host));
@@ -1599,7 +1664,7 @@ impl Brain<'_> {
         }
         self.r.done.extend(already);
         let Some((host, name)) = pick else { return };
-        if let Err(e) = self.kubectl(&["cordon", &name]) {
+        if let Err(e) = self.kubectl(&["cordon"], &name) {
             self.r.warn(format!("cannot cordon {name} ({e}); trying again"));
             return;
         }
@@ -1613,6 +1678,10 @@ impl Brain<'_> {
 
     fn turn(&mut self) {
         let Some(mut t) = self.r.turn.take() else { return };
+        if t.host == 1 || t.name == self.n.hostname {
+            self.r.warn("the coordinator held a server's turn; it was taken back".into());
+            return;
+        }
         let target = self.r.serial;
         let now = self.now.unix;
         let Some(m) = self.member(t.host).filter(|m| m.name == t.name).cloned() else {
@@ -1625,7 +1694,7 @@ impl Brain<'_> {
             t.since = now;
         }
         if !t.ready {
-            match self.kubectl(&["drain", &t.name, "--ignore-daemonsets", "--delete-emptydir-data", DRAIN_TIMEOUT]) {
+            match self.kubectl(&["drain", "--ignore-daemonsets", "--delete-emptydir-data", DRAIN_TIMEOUT], &t.name.clone()) {
                 Ok(()) => t.ready = true,
                 Err(e) if self.r.force.contains(&t.host) => {
                     self.r.warn(format!("draining {} failed ({e}); it updates anyway, as you resumed", t.name));

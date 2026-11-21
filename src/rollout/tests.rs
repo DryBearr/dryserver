@@ -51,6 +51,8 @@ struct Sim {
     broken: bool,
     kubectl: Vec<String>,
     drain_fails: Vec<String>,
+    /// The cluster's nodes; None: coord and node-a to node-h.
+    nodes: Option<Vec<String>>,
     applied: Vec<Vec<String>>,
     confirmed: Vec<Vec<String>>,
     /// What ran before the pending release, for a revert.
@@ -81,9 +83,15 @@ impl Runner for Fake {
         let mut s = self.sim();
         let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
         match (c.name.as_str(), a.as_slice()) {
+            ("k3s", ["kubectl", "get", "nodes", "-o", "name"]) => {
+                let names = s.nodes.clone().unwrap_or_else(|| {
+                    std::iter::once("coord".to_string()).chain((b'a'..=b'h').map(|c| format!("node-{}", c as char))).collect()
+                });
+                (names.iter().map(|n| format!("node/{n}\n")).collect(), Ok(()))
+            }
             ("k3s", ["kubectl", rest @ ..]) => {
                 s.kubectl.push(rest.join(" "));
-                if rest[0] == "drain" && s.drain_fails.iter().any(|n| n == rest[1]) {
+                if rest[0] == "drain" && s.drain_fails.iter().any(|n| Some(n.as_str()) == rest.last().copied()) {
                     let e = "k3s failed: exit status 1: Cannot evict pod as it would violate the pod's disruption budget.";
                     return (String::new(), Err(e.into()));
                 }
@@ -383,9 +391,10 @@ impl Swarm {
         let mut cordoned: Vec<String> = Vec::new();
         for line in &self.brain.fake.sim().kubectl {
             let f: Vec<&str> = line.split(' ').collect();
+            let node = f[f.len() - 1];
             match f[0] {
-                "cordon" if !cordoned.iter().any(|c| c == f[1]) => cordoned.push(f[1].into()),
-                "uncordon" => cordoned.retain(|c| c != f[1]),
+                "cordon" if !cordoned.iter().any(|c| c == node) => cordoned.push(node.into()),
+                "uncordon" => cordoned.retain(|c| c != node),
                 _ => {}
             }
         }
@@ -532,15 +541,15 @@ fn a_release_reaches_every_machine_brain_first_then_one_at_a_time() {
     let k = sw.kubectl();
     let order: Vec<&String> = k.iter().filter(|l| !l.starts_with("drain") || l.contains("--ignore-daemonsets")).collect();
     let want = [
-        "cordon node-a",
-        "drain node-a --ignore-daemonsets --delete-emptydir-data --timeout=25s",
-        "uncordon node-a",
-        "cordon node-b",
-        "drain node-b --ignore-daemonsets --delete-emptydir-data --timeout=25s",
-        "uncordon node-b",
-        "cordon node-c",
-        "drain node-c --ignore-daemonsets --delete-emptydir-data --timeout=25s",
-        "uncordon node-c",
+        "cordon -- node-a",
+        "drain --ignore-daemonsets --delete-emptydir-data --timeout=25s -- node-a",
+        "uncordon -- node-a",
+        "cordon -- node-b",
+        "drain --ignore-daemonsets --delete-emptydir-data --timeout=25s -- node-b",
+        "uncordon -- node-b",
+        "cordon -- node-c",
+        "drain --ignore-daemonsets --delete-emptydir-data --timeout=25s -- node-c",
+        "uncordon -- node-c",
     ];
     assert_eq!(order, want.iter().map(|s| s.to_string()).collect::<Vec<_>>().iter().collect::<Vec<_>>());
     // Each machine: installed from its own store, with the brain's k3s
@@ -580,7 +589,7 @@ fn the_canary_is_watched_before_the_next_turn() {
     let r = sw.rollout();
     assert_eq!(r.pause, Pause::Canary, "{r:#?}");
     assert!(r.paused.contains("the canary node-a is not well") && r.paused.contains("k3s is not running"), "{}", r.paused);
-    assert!(!sw.kubectl().iter().any(|l| l == "cordon node-b"), "the next server got a turn");
+    assert!(!sw.kubectl().iter().any(|l| l == "cordon -- node-b"), "the next server got a turn");
     // The admin looks and goes on.
     sw.sick.clear();
     sw.call(
@@ -712,7 +721,7 @@ fn a_server_offline_at_its_turn_updates_when_it_is_back() {
     sw.publish(10, true);
     sw.until(60, |s| s.installed(3) == 10 && s.installed(4) == 10);
     assert_eq!(sw.installed(2), 0);
-    assert!(!sw.kubectl().iter().any(|l| l == "cordon node-a"), "an offline server got a turn");
+    assert!(!sw.kubectl().iter().any(|l| l == "cordon -- node-a"), "an offline server got a turn");
     assert_eq!(sw.rollout().canary, 3, "the first server that updated is the canary");
     assert!(sw.lines().contains("Silent, updates when back: node-a"), "{}", sw.lines());
     // It comes back, and gets its turn.
@@ -732,7 +741,7 @@ fn a_server_that_goes_silent_in_its_turn_is_passed_over_until_it_is_back() {
     let r = sw.rollout();
     assert!(r.paused.is_empty(), "silence is not a failure: {r:#?}");
     assert!(r.deferred.contains(&2) && r.warnings.iter().any(|w| w.contains("node-a went silent when its turn came")), "{r:#?}");
-    assert!(sw.kubectl().contains(&"uncordon node-a".to_string()));
+    assert!(sw.kubectl().contains(&"uncordon -- node-a".to_string()));
     sw.until(20, |s| s.installed(3) == 10);
     sw.offline.clear();
     sw.until(30, |s| s.everyone_on(10));
@@ -746,7 +755,7 @@ fn a_server_with_its_kill_switch_on_is_held() {
     sw.publish(10, true);
     sw.until(60, |s| s.installed(2) == 10 && s.installed(4) == 10);
     assert_eq!(sw.installed(3), 0);
-    assert!(!sw.kubectl().iter().any(|l| l == "cordon node-b"));
+    assert!(!sw.kubectl().iter().any(|l| l == "cordon -- node-b"));
     let rep = sw.store.read().unwrap().members.iter().find(|m| m.host == 3).unwrap().report.clone().unwrap();
     assert_eq!(rep.update, "held");
     assert!(rep.update_note.contains("kill switch is on (node-c cut off)"), "{}", rep.update_note);
@@ -798,7 +807,7 @@ fn a_claim_of_success_without_the_new_release_is_not_success() {
     // It runs its old release well: uncordoned, and nobody else is touched.
     sw.ticks(5);
     assert!(!sw.rollout().cordoned.contains(&"node-a".to_string()), "{:#?}", sw.rollout());
-    assert!(!sw.kubectl().iter().any(|l| l == "cordon node-b"));
+    assert!(!sw.kubectl().iter().any(|l| l == "cordon -- node-b"));
     assert_eq!(sw.rollout().pause, Pause::Timeout, "it waits for the admin");
     assert!(sw.lines().contains("PAUSED:") && sw.lines().contains("passes it over"), "{}", sw.lines());
     // The admin resumes: node-a is passed over and uncordoned.
@@ -808,6 +817,81 @@ fn a_claim_of_success_without_the_new_release_is_not_success() {
     let r = sw.rollout();
     assert!(r.skipped.iter().any(|s| s.host == 2) && !r.cordoned.contains(&"node-a".to_string()), "{r:#?}");
     assert!(sw.lines().contains("Passed over: node-a:"), "{}", sw.lines());
+}
+
+/// What a hacked registry account wrote into the registry's rollout made
+/// root run `kubectl uncordon -lkubernetes.io/hostname`, `drain coord` and
+/// `drain -lkubernetes.io/hostname` (every node). Root keeps its own
+/// rollout, takes only the resume count from the registry, and names a
+/// node to kubectl only after `--`, when the cluster lists it and it is
+/// not the brain.
+#[test]
+fn the_registry_account_cannot_steer_kubectl() {
+    let mut sw = Swarm::new(2);
+    let evil = "-lkubernetes.io/hostname";
+    let plant = |sw: &Swarm| {
+        let now = sw.now;
+        sw.store
+            .update(|s| {
+                if !s.members.iter().any(|m| m.host == 9) {
+                    let report = Some(Report { format: report::FORMAT, time: now, ..Report::default() });
+                    let wg_key = crate::admin::tests::key32(9);
+                    s.members.push(Member { host: 9, name: evil.into(), wg_key, last_seen: time(now), report, ..Member::default() });
+                }
+                s.rollout.cordoned = vec![evil.into(), "coord".into()];
+                s.rollout.turn = Some(Turn { host: 1, name: "coord".into(), since: now, ready: false });
+                s.rollout.phase = Phase::Servers;
+                s.rollout.done.clear();
+                Ok(())
+            })
+            .unwrap();
+    };
+    plant(&sw);
+    sw.tick();
+    sw.publish(10, true);
+    for _ in 0..60 {
+        plant(&sw);
+        sw.tick();
+        if sw.everyone_on(10) {
+            break;
+        }
+    }
+    assert!(sw.everyone_on(10), "{:#?}", sw.rollout());
+    let k = sw.kubectl();
+    assert!(!k.is_empty());
+    for line in &k {
+        assert!(!line.contains("-l") && !line.contains("coord"), "{k:?}");
+        assert!(line.ends_with(" -- node-a") || line.ends_with(" -- node-b"), "{k:?}");
+    }
+
+    // Even root's own state cannot name such a node, the brain, or one
+    // the cluster does not have.
+    let n = &sw.brain.node;
+    let members = sw.store.read().unwrap().members;
+    let served = Served::beside(&sw.store, n.path(K3S_BIN));
+    let rep = sw.healthy(1);
+    let mut b = Brain {
+        ctx: &Ctx::new(),
+        n,
+        served: &served,
+        rep: &rep,
+        now: Now { unix: sw.now, minute: IN_WINDOW },
+        members: &members,
+        r: Rollout::default(),
+        free: plenty,
+        nodes: None,
+    };
+    for name in [evil, "coord", "node-z", "a\nb"] {
+        let e = b.kubectl(&["drain"], name).unwrap_err();
+        assert!(name != "node-z" || e.is_not_found(), "{e}");
+        b.r.cordoned = vec![name.into()];
+        b.uncordon(name);
+        assert!(b.r.cordoned.is_empty(), "{name}: {:?}", b.r.cordoned);
+    }
+    b.r.turn = Some(Turn { host: 1, name: "coord".into(), since: sw.now, ready: false });
+    b.turn();
+    assert!(b.r.turn.is_none());
+    assert_eq!(sw.kubectl(), k, "kubectl ran for a refused name");
 }
 
 #[test]
@@ -837,7 +921,7 @@ fn a_hacked_server_speaks_for_itself_only() {
     sw.until(60, |s| s.installed(2) == 10 && s.installed(3) == 10);
     sw.ticks(2);
     assert_eq!(sw.installed(4), 0);
-    assert!(!sw.kubectl().iter().any(|l| l == "cordon node-c"), "its word was taken for itself only");
+    assert!(!sw.kubectl().iter().any(|l| l == "cordon -- node-c"), "its word was taken for itself only");
     // Its report cannot reach another member's entry either: the registry
     // knows callers by their mesh address.
     let s = sw.store.read().unwrap();
@@ -1137,7 +1221,7 @@ fn a_new_release_replaces_a_running_rollout() {
     let r = sw.rollout();
     assert_eq!(r.serial, 11);
     assert!(r.warnings.iter().any(|w| w.contains("release 11 replaced release 10")), "{r:#?}");
-    assert!(sw.kubectl().contains(&"uncordon node-b".to_string()), "the old turn's node stays cordoned");
+    assert!(sw.kubectl().contains(&"uncordon -- node-b".to_string()), "the old turn's node stays cordoned");
     sw.until(60, |s| s.everyone_on(11));
     sw.ticks(2);
     assert_eq!(sw.rollout().done, vec![2, 3, 4]);
