@@ -20,6 +20,9 @@ mod owner;
 mod packages;
 mod quarantine;
 mod registry;
+// Not called yet: a later step wires releases into the machines.
+#[allow(dead_code)]
+mod release;
 mod runner;
 mod signed;
 mod sysconf;
