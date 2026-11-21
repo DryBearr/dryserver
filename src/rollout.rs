@@ -1664,15 +1664,27 @@ impl Brain<'_> {
         }
         self.r.done.extend(already);
         let Some((host, name)) = pick else { return };
-        if let Err(e) = self.kubectl(&["cordon"], &name) {
-            self.r.warn(format!("cannot cordon {name} ({e}); trying again"));
-            return;
+        // The turn begins whatever the cordon does: a server that is no node
+        // (its agent never joined, or the cluster dropped it) has nothing to
+        // drain, and any other failure counts against DRAIN_LIMIT like a
+        // drain that does not finish. Trying the same server again at every
+        // sync without a turn would stall the rollout for ever.
+        let mut ready = false;
+        match self.kubectl(&["cordon"], &name) {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => {
+                eprintln!("dryserver: rollout: {e}: {name} updates without being drained");
+                self.r.warn(format!("{name} is not a node of the cluster: it updates without being drained"));
+                ready = true;
+            }
+            Err(e) => self.r.warn(format!("cannot cordon {name} ({e}); trying again")),
         }
-        if !self.r.cordoned.contains(&name) {
+        if !ready && !self.r.cordoned.contains(&name) {
+            // Draining cordons it too, so it is uncordoned in any case.
             self.r.cordoned.push(name.clone());
         }
         self.r.deferred.retain(|d| *d != host);
-        self.r.turn = Some(Turn { host, name, since: self.now.unix, ready: false });
+        self.r.turn = Some(Turn { host, name, since: self.now.unix, ready });
         self.turn();
     }
 
@@ -1696,6 +1708,12 @@ impl Brain<'_> {
         if !t.ready {
             match self.kubectl(&["drain", "--ignore-daemonsets", "--delete-emptydir-data", DRAIN_TIMEOUT], &t.name.clone()) {
                 Ok(()) => t.ready = true,
+                Err(e) if e.is_not_found() => {
+                    eprintln!("dryserver: rollout: {e}: {} updates without being drained", t.name);
+                    self.r.warn(format!("{} is not a node of the cluster any more: it updates without being drained", t.name));
+                    self.r.cordoned.retain(|c| *c != t.name);
+                    t.ready = true;
+                }
                 Err(e) if self.r.force.contains(&t.host) => {
                     self.r.warn(format!("draining {} failed ({e}); it updates anyway, as you resumed", t.name));
                     t.ready = true;

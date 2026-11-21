@@ -51,6 +51,7 @@ struct Sim {
     broken: bool,
     kubectl: Vec<String>,
     drain_fails: Vec<String>,
+    cordon_fails: Vec<String>,
     /// The cluster's nodes; None: coord and node-a to node-h.
     nodes: Option<Vec<String>>,
     applied: Vec<Vec<String>>,
@@ -91,6 +92,9 @@ impl Runner for Fake {
             }
             ("k3s", ["kubectl", rest @ ..]) => {
                 s.kubectl.push(rest.join(" "));
+                if rest[0] == "cordon" && s.cordon_fails.iter().any(|n| Some(n.as_str()) == rest.last().copied()) {
+                    return (String::new(), Err("k3s failed: exit status 1: the server is currently unable to handle the request".into()));
+                }
                 if rest[0] == "drain" && s.drain_fails.iter().any(|n| Some(n.as_str()) == rest.last().copied()) {
                     let e = "k3s failed: exit status 1: Cannot evict pod as it would violate the pod's disruption budget.";
                     return (String::new(), Err(e.into()));
@@ -401,6 +405,10 @@ impl Swarm {
         // A machine that left is deleted from the cluster with its cordon.
         let names: Vec<String> = self.store.read().unwrap().members.iter().map(|m| m.name.clone()).collect();
         cordoned.retain(|c| names.contains(c));
+        // So is one the cluster dropped.
+        if let Some(nodes) = &self.brain.fake.sim().nodes {
+            cordoned.retain(|c| nodes.contains(c));
+        }
         assert!(cordoned.len() <= 1, "cordoned at once: {cordoned:?}");
     }
 
@@ -1286,6 +1294,49 @@ fn a_drain_that_a_pdb_holds_back() {
     sw.until(40, |s| s.everyone_on(10));
     let r = sw.rollout();
     assert!(r.paused.is_empty() && r.warnings.iter().any(|w| w.contains("PodDisruptionBudget") && w.contains("urgent")), "{r:#?}");
+}
+
+/// A server that is not a node of the cluster (its agent never joined, or
+/// k3s_share removed it) blocked the rollout for ever: its cordon failed
+/// at every sync and it never got its turn, so no timeout began.
+#[test]
+fn a_server_that_is_no_node_does_not_block_the_rollout() {
+    let mut sw = Swarm::new(2);
+    sw.brain.fake.sim().nodes = Some(vec!["coord".into(), "node-b".into()]);
+    sw.publish(10, false);
+    sw.until(40, |s| s.everyone_on(10));
+    sw.ticks(3);
+    let r = sw.rollout();
+    assert!(r.paused.is_empty() && r.cordoned.is_empty() && r.done == vec![2, 3], "{r:#?}");
+    assert!(r.warnings.iter().any(|w| w.contains("node-a is not a node of the cluster")), "{r:#?}");
+    assert!(!sw.kubectl().iter().any(|l| l.ends_with("node-a")), "{:?}", sw.kubectl());
+    assert!(sw.kubectl().contains(&"drain --ignore-daemonsets --delete-emptydir-data --timeout=25s -- node-b".to_string()));
+
+    // One that leaves the cluster while it is drained.
+    let mut sw = Swarm::new(2);
+    sw.brain.fake.sim().drain_fails.push("node-a".into());
+    sw.publish(10, false);
+    sw.until(10, |s| s.kubectl().iter().any(|l| l.starts_with("drain") && l.ends_with("node-a")));
+    sw.brain.fake.sim().nodes = Some(vec!["coord".into(), "node-b".into()]);
+    sw.until(40, |s| s.everyone_on(10));
+    assert!(sw.rollout().paused.is_empty(), "{:#?}", sw.rollout());
+}
+
+/// A cordon that fails for another reason counts against the drain limit,
+/// and the rollout then stops as for a drain that does not finish.
+#[test]
+fn a_cordon_that_keeps_failing_stops_the_rollout() {
+    let mut sw = Swarm::new(2);
+    sw.brain.fake.sim().cordon_fails.push("node-a".into());
+    sw.brain.fake.sim().drain_fails.push("node-a".into());
+    sw.publish(10, false);
+    sw.until(30, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert_eq!((r.pause, r.pause_name.as_str()), (Pause::Drain, "node-a"), "{r:#?}");
+    assert!(r.paused.contains("did not finish in 5m"), "{}", r.paused);
+    assert!(sw.server(2).fake.sim().applied.is_empty() && sw.server(3).fake.sim().applied.is_empty());
+    let cordons = sw.kubectl().iter().filter(|l| l.starts_with("cordon")).count();
+    assert_eq!(cordons, 1, "the turn began at the first try: {:?}", sw.kubectl());
 }
 
 // ---- reports and words ----
