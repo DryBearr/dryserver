@@ -463,11 +463,17 @@ for a moment; the apps keep running.
 It copies them over your own SSH login, checks each one's size and the
 coordinator's signature, and never replaces a file you already have. Both
 sides keep the newest backup of each of the last 7 days and of each of the
-last 4 weeks that have one. Pull now and then: if the coordinator's disk
-dies, the backups on it die with it.
+last 4 weeks that have one. Your copies are thinned only by backups that
+are on your computer or checked out in this pull, never by names the
+coordinator lists: a hacked coordinator listing backups it cannot deliver
+removes nothing. Names dated more than a day after your computer's clock,
+and files listed above 4 GiB, are not copied. Pull now and then: if the
+coordinator's disk dies, the backups on it die with it.
 
-On the coordinator, `sudo dryserver backup` makes one now,
-`/var/lib/dryserver/backups/last.json` says how the last one went, and
+On the coordinator, the backups are in `/var/lib/dryserver-backup` (root's,
+readable by your login; not inside `/var/lib/dryserver`, which belongs to
+the account every server reaches), `sudo dryserver backup` makes one now,
+`/var/lib/dryserver-backup/last.json` says how the last one went, and
 `journalctl -u dryserver-backup` has the details. Restoring is not built
 yet; to look inside one:
 `age -d -i secrets/backup_ed25519 FILE | tar -tv`.

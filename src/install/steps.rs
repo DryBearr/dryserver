@@ -329,6 +329,13 @@ impl Real {
                 return Err(errf!("{} is not one ed25519 public key (the backup key); build the USB stick again", backup.display()));
             }
             self.write(crate::backup::RECIPIENT, 0o644, line)?;
+            // Where the backups go: root's own, beside the registry's
+            // directory and not in it (see backup.rs), readable by the
+            // admin's login (wheel) for backup-pull.
+            let bdir = self.target(crate::backup::BACKUP_DIR);
+            fsx::mkdir_all(&bdir, 0o750)?;
+            fsx::chmod(&bdir, 0o750)?;
+            self.chroot(ctx, &["chgrp", "-h", "wheel", crate::backup::BACKUP_DIR])?;
             // The cluster's secret for agents, made here and never shown.
             self.write(sysconf::K3S_AGENT_SECRET, 0o600, fsx::hex(&fsx::random_bytes(32)))?;
             self.setup_registry_user(ctx)?;
@@ -761,6 +768,7 @@ mod tests {
         assert!(!fr.strings().iter().any(|c| c.contains("dryserver-dns")), "the DNS timer is the coordinator's");
         assert!(!fr.strings().iter().any(|c| c.contains("dryserver-backup")), "the backup timer is the coordinator's");
         assert!(!r.target(crate::backup::RECIPIENT).exists(), "only the coordinator makes backups");
+        assert!(!r.target(crate::backup::BACKUP_DIR).exists(), "only the coordinator keeps backups");
         assert!(!r.target(crate::coredns::PDB_PATH).exists());
         assert!(read("/etc/systemd/system/k3s.service").contains("ExecStart=/usr/local/bin/k3s agent"));
         assert!(!r.target("/etc/rancher/k3s/config.yaml").exists(), "a server gets its k3s config when it is approved");
@@ -841,6 +849,13 @@ mod tests {
         assert_eq!(get(&r.target, crate::backup::RECIPIENT), "ssh-ed25519 AAAAbackup dryserver-backup\n");
         assert_eq!(std::fs::metadata(r.target(crate::backup::RECIPIENT)).unwrap().permissions().mode() & 0o777, 0o644);
         assert!(get(&r.target, "/etc/systemd/system/dryserver-backup.service").contains("ExecStart=/usr/local/bin/dryserver backup"));
+        // The backups' own directory: root's, wheel may read; the
+        // registry's directory gets nothing for them.
+        let bdir = r.target(crate::backup::BACKUP_DIR);
+        assert_eq!(std::fs::symlink_metadata(&bdir).unwrap().permissions().mode() & 0o7777, 0o750);
+        fr.index(&format!("arch-chroot {t} chgrp -h wheel /var/lib/dryserver-backup"));
+        assert!(!r.target("/var/lib/dryserver/backups").exists());
+        assert!(!fr.strings().iter().any(|c| c.contains("setfacl")), "{:?}", fr.strings());
         assert!(get(&r.target, "/etc/systemd/system/dryserver-dns.service").contains("dryserver cluster-dns"));
         let secret = get(&r.target, sysconf::K3S_AGENT_SECRET);
         assert!(secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit()), "agent secret: {secret:?}");

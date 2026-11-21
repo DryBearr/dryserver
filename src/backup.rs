@@ -24,13 +24,20 @@
 //!   changes /etc or /var/lib themselves.
 //! - The .sig file is an SSH signature by the coordinator's host key
 //!   (namespace NAMESPACE) over receipt(): the file's name, size and
-//!   SHA-256. Anyone can encrypt to a public key, and the directory sits in
-//!   the registry account's, so encryption alone does not say who made a
-//!   file. The desktop takes only backups signed by the coordinator it
-//!   pinned.
+//!   SHA-256. Anyone can encrypt to a public key, so encryption alone does
+//!   not say who made a file. The desktop takes only backups signed by the
+//!   coordinator it pinned.
+//!
+//! BACKUP_DIR is root's own (root:wheel 0750, files 0640), beside the
+//! registry's directory and not in it: /var/lib/dryserver belongs to the
+//! registry account every server reaches over SSH, which could rename a
+//! directory in it and put its own there while root works in it. Then root
+//! would follow its links, and the host key would sign its files.
 
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -47,8 +54,12 @@ use crate::signed::Verifier;
 use crate::sysconf::Role;
 use crate::{bail, errf, fsx, iso};
 
-/// Where the coordinator keeps its backups.
-pub const BACKUP_DIR: &str = "/var/lib/dryserver/backups";
+/// Where the coordinator keeps its backups: root's, see above. Made by the
+/// installer; a backup makes it on a machine installed before.
+pub const BACKUP_DIR: &str = "/var/lib/dryserver-backup";
+/// The directories above BACKUP_DIR. Root's and nobody else may write
+/// them, so nobody else can swap BACKUP_DIR once it is checked.
+const ABOVE: &[&str] = &["/var", "/var/lib"];
 /// The public half of secrets/backup_ed25519, from the USB stick.
 pub const RECIPIENT: &str = "/usr/local/share/dryserver/backup_ed25519.pub";
 /// The result of the last run, for the admin and a future monitor.
@@ -71,8 +82,6 @@ const LOCK_FILE: &str = ".lock";
 /// How long a second backup waits for the first before it gives up.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const STAGING: &str = ".staging";
-/// The registry's directory: the backups live inside it.
-const PARENT: &str = "var/lib/dryserver";
 /// There while the backup has k3s stopped. Whatever ends the backup
 /// service (a crash, a kill, its timeout), the unit's ExecStopPost starts
 /// k3s again when it finds this.
@@ -326,46 +335,75 @@ impl<'a> Job<'a> {
     fn write_status(&self, st: &Status) -> Result<()> {
         let path = self.dir().join(STATUS_FILE);
         let tmp = self.dir().join(format!("{STATUS_FILE}.tmp"));
-        fsx::write_file(&tmp, serde_json::to_vec_pretty(st)?, 0o640)?;
+        remove_stale(&tmp)?;
+        let mut f = create_new(&tmp, 0o640)?;
+        f.write_all(&serde_json::to_vec_pretty(st)?)
+            .and_then(|_| f.sync_all())
+            .map_err(|e| Error::from(e).wrap(format!("write {}", tmp.display())))?;
+        drop(f);
         self.wheel(&tmp)?;
+        // rename replaces a link standing at path, never what it points to.
         fsx::rename(&tmp, &path)
     }
 
     /// Group wheel may read: the admin's login copies backups without
-    /// sudo. They are encrypted; the status says nothing secret.
+    /// sudo. They are encrypted; the status says nothing secret. -h: a
+    /// link would get the group itself, never the file it points to.
     fn wheel(&self, p: &Path) -> Result<()> {
-        fsx::chmod(p, if p.is_dir() { 0o750 } else { 0o640 })?;
-        self.run.ok(&Ctx::new(), &Cmd::new("chgrp", &["wheel", &p.display().to_string()]))
+        self.run.ok(&Ctx::new(), &Cmd::new("chgrp", &["-h", "wheel", &p.display().to_string()]))
     }
 
-    /// The backup directory: made by root, readable by wheel. It sits in
-    /// the registry account's directory, which wheel may pass through but
-    /// not list. Whatever stands there that root did not make is not used.
+    /// The backup directory: root's, 0750, group wheel. Made when it is
+    /// missing (a machine installed before it moved here). A wrong mode or
+    /// group is put right; what nobody but root could have made is
+    /// refused and left alone: a link, a file, a directory of another
+    /// owner or one others may write (they could have put links in it).
+    /// The directories above must be root's alone too: then nobody else
+    /// can swap this one after the check.
     fn prepare_dir(&self) -> Result<()> {
-        use std::os::unix::fs::MetadataExt;
-        let dir = self.dir();
-        match std::fs::symlink_metadata(&dir) {
-            Ok(m) if !m.is_dir() || (fsx::is_root() && m.uid() != 0) => {
+        let me = fsx::geteuid();
+        for d in ABOVE {
+            let p = self.at(d);
+            let m = std::fs::symlink_metadata(&p).map_err(|e| Error::from(e).wrap(format!("stat {}", p.display())))?;
+            if !m.is_dir() || (m.uid() != 0 && m.uid() != me) || m.mode() & 0o022 != 0 {
                 bail!(
-                    "{} is not a directory made by root; it was not touched. Look at it, remove it, and run the backup again",
-                    dir.display()
-                )
+                    "{} is not a directory only root may change (owner {}, mode {:04o}); no backup is made under it",
+                    p.display(),
+                    m.uid(),
+                    m.mode() & 0o7777
+                );
             }
-            Ok(_) => {}
-            Err(_) => fsx::mkdir_all(&dir, 0o750)?,
         }
+        let dir = self.dir();
+        if std::fs::symlink_metadata(&dir).is_err() {
+            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(Error::from(e).wrap(format!("mkdir {}", dir.display()))),
+            }
+        }
+        // Opened without following a link, and checked on what was opened.
+        let refuse = |why: String| errf!("{} {why}; it was not touched. Look at it, remove it, and run the backup again", dir.display());
+        let f = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY).open(&dir).map_err(|e| {
+            if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
+                refuse("is not a directory made by root".into())
+            } else {
+                Error::from(e).wrap(format!("open {}", dir.display()))
+            }
+        })?;
+        let m = f.metadata().map_err(|e| Error::from(e).wrap(format!("stat {}", dir.display())))?;
+        if m.uid() != me {
+            return Err(refuse(format!("is not a directory made by root (it belongs to user {})", m.uid())));
+        }
+        if m.mode() & 0o022 != 0 {
+            return Err(refuse(format!("may be written by others than root (mode {:04o})", m.mode() & 0o7777)));
+        }
+        f.set_permissions(std::fs::Permissions::from_mode(0o750)).map_err(|e| Error::from(e).wrap(format!("chmod {}", dir.display())))?;
         self.wheel(&dir)
     }
 
     fn make(&self, ctx: &Ctx, now: Time, out: &mut dyn Write) -> Result<Done> {
         let mut done = Done::default();
-        // The admin's login (wheel) may pass through the registry's
-        // directory to the backups, nothing more. Set every time: a chmod
-        // of that directory takes it away.
-        let parent = self.at(PARENT).display().to_string();
-        if let Err(e) = self.run.ok(ctx, &Cmd::new("setfacl", &["-m", "g:wheel:x", &parent])) {
-            done.warnings.push(format!("backup-pull will need sudo here: {e}"));
-        }
         // Everything that can be checked before k3s is stopped.
         if let Err(e) = self.run.ok(ctx, &Cmd::new(&self.age, &["--version"]).quiet()) {
             bail!("the age tool is missing or broken ({e}); install it: pacman -S age");
@@ -379,7 +417,7 @@ impl<'a> Job<'a> {
         let name = name_of(now.0);
         let final_path = self.dir().join(&name);
         let sig_path = self.dir().join(format!("{name}.sig"));
-        if fsx::exists(&final_path) || fsx::exists(&sig_path) {
+        if std::fs::symlink_metadata(&final_path).is_ok() || std::fs::symlink_metadata(&sig_path).is_ok() {
             bail!("a backup named {name} exists already; is the clock right?");
         }
         let mut newest: Vec<DateTime<Utc>> = self.backups()?.into_iter().filter(|t| *t > now.0).collect();
@@ -394,8 +432,9 @@ impl<'a> Job<'a> {
         room(total, free, need.saturating_mul(2) + (16 << 20))?;
 
         // Left by a run that was killed: the plain copy and half archives.
+        // remove_dir_all removes a link itself, never what it points to.
         let staging = self.dir().join(STAGING);
-        if fsx::exists(&staging) {
+        if std::fs::symlink_metadata(&staging).is_ok() {
             std::fs::remove_dir_all(&staging).map_err(|e| Error::from(e).wrap(format!("remove {}", staging.display())))?;
         }
         for e in std::fs::read_dir(self.dir()).map(|rd| rd.flatten().collect::<Vec<_>>()).unwrap_or_default() {
@@ -407,8 +446,8 @@ impl<'a> Job<'a> {
         let tmp = self.dir().join(format!(".{name}.tmp"));
         let sig_tmp = self.dir().join(format!(".{name}.sig.tmp"));
         let _clean = Cleanup(vec![staging.clone(), tmp.clone(), sig_tmp.clone()]);
-        fsx::mkdir_all(&staging, 0o700)?;
-        fsx::chmod(&staging, 0o700)?;
+        // A new directory, never one that stands there.
+        std::fs::DirBuilder::new().mode(0o700).create(&staging).map_err(|e| Error::from(e).wrap(format!("mkdir {}", staging.display())))?;
         self.copy(ctx, &live, &staging)?;
 
         // The datastore: k3s stopped, so SQLite is not written during the
@@ -460,10 +499,13 @@ impl<'a> Job<'a> {
         })?;
 
         let manifest = manifest(&staging, &live, &k3s, &missing, &self.hostname, &done.k3s, &self.k3s_version(ctx), now)?;
-        fsx::write_file(staging.join("MANIFEST"), manifest, 0o600)?;
+        let mpath = staging.join("MANIFEST");
+        create_new(&mpath, 0o600)?.write_all(manifest.as_bytes()).map_err(|e| Error::from(e).wrap(format!("write {}", mpath.display())))?;
         let mut entries = vec!["MANIFEST".to_string()];
         entries.extend(k3s.iter().chain(&live).cloned());
-        fsx::write_file(&tmp, b"", 0o600)?;
+        // Made here, new; the shell below writes into it. Only root
+        // writes the directory (checked), so it is still this file then.
+        drop(create_new(&tmp, 0o600)?);
         let (dir_s, tmp_s, rcpt_s) = (staging.display().to_string(), tmp.display().to_string(), rcpt.display().to_string());
         let mut args = vec![
             "-c".to_string(),
@@ -493,9 +535,12 @@ tar --create --file=- --directory="$dir" --sort=name -- "$@" | "$age" --encrypt 
         if !sig.contains("BEGIN SSH SIGNATURE") {
             bail!("ssh-keygen gave no signature for the backup");
         }
-        fsx::write_file(&sig_tmp, &sig, 0o600)?;
+        create_new(&sig_tmp, 0o600)?.write_all(sig.as_bytes()).map_err(|e| Error::from(e).wrap(format!("write {}", sig_tmp.display())))?;
         for p in [&tmp, &sig_tmp] {
-            std::fs::File::open(p).and_then(|f| f.sync_all()).map_err(|e| Error::from(e).wrap(format!("sync {}", p.display())))?;
+            let f = open_regular(p)?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o640))
+                .and_then(|_| f.sync_all())
+                .map_err(|e| Error::from(e).wrap(format!("sync {}", p.display())))?;
             self.wheel(p)?;
         }
         // Never over an existing file (checked above; hard links fail
@@ -650,9 +695,49 @@ fn tree_size(p: &Path) -> u64 {
     }
 }
 
+/// A new file to write, with exactly this mode whatever the umask. Never
+/// an existing file and never through a link (O_EXCL): a name taken by
+/// anything is an error, not something to write into.
+fn create_new(p: &Path, mode: u32) -> Result<File> {
+    let f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(p)
+        .map_err(|e| Error::from(e).wrap(format!("create {}", p.display())))?;
+    f.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(|e| Error::from(e).wrap(format!("chmod {}", p.display())))?;
+    Ok(f)
+}
+
+/// Opens a regular file to read, without following a link and without
+/// waiting on a FIFO.
+fn open_regular(p: &Path) -> Result<File> {
+    let f = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(p).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            errf!("{} is a symbolic link, not the file itself", p.display())
+        } else {
+            Error::from(e).wrap(format!("open {}", p.display()))
+        }
+    })?;
+    if !f.metadata().map_err(|e| Error::from(e).wrap(format!("stat {}", p.display())))?.is_file() {
+        bail!("{} is not a regular file", p.display());
+    }
+    Ok(f)
+}
+
+/// Removes what a killed run left at p (the name itself, a link too),
+/// if anything.
+fn remove_stale(p: &Path) -> Result<()> {
+    match std::fs::remove_file(p) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Error::from(e).wrap(format!("remove {}", p.display()))),
+        _ => Ok(()),
+    }
+}
+
 /// Size and SHA-256 (hex) of a file, read in pieces.
 fn file_sum(p: &Path) -> Result<(u64, String)> {
-    let mut f = std::fs::File::open(p).map_err(|e| Error::from(e).wrap(format!("open {}", p.display())))?;
+    let mut f = open_regular(p)?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];
     let mut n = 0u64;
@@ -679,7 +764,6 @@ fn manifest(
     k3s_version: &str,
     now: Time,
 ) -> Result<String> {
-    use std::os::unix::fs::PermissionsExt;
     let mut m = format!(
         "dryserver backup\nformat: {FORMAT}\ndryserver: {}\nk3s: {k3s_version}\nhost: {host}\ntime: {}\nk3s during the copy: {}\n",
         env!("CARGO_PKG_VERSION"),
@@ -739,6 +823,14 @@ pub trait Brain {
 /// The most a listing may hold.
 const MAX_LISTING: usize = 1 << 20;
 const MAX_SIG: u64 = 16 << 10;
+/// The most one backup may be. A coordinator's backup is its datastore
+/// and a few keys, far below this; a listed size above it (a huge sparse
+/// file, say) is refused before a byte of it lands on the desktop's disk.
+pub const MAX_FILE: u64 = 4 << 30;
+/// How far ahead of the desktop's clock a backup's name may be. More is a
+/// wrong clock or a lie, and a name from the future would count as the
+/// newest backup for as long as it is kept.
+const MAX_AHEAD: chrono::TimeDelta = chrono::TimeDelta::days(1);
 
 /// What backup-pull did.
 #[derive(Debug, Default, PartialEq)]
@@ -772,13 +864,33 @@ pub fn parse_listing(text: &str) -> Vec<(String, u64)> {
 /// Copies the coordinator's newest backups into dir, checks each one's
 /// size and the coordinator's signature, and keeps the same plan there as
 /// the coordinator does. A file already in dir is never replaced.
-pub fn pull(brain: &dyn Brain, verifier: &dyn Verifier, dir: &Path, out: &mut dyn Write) -> Result<Pulled> {
+///
+/// The listing comes from the coordinator and is believed only to choose
+/// what to fetch. Which copies here are thinned out is planned from the
+/// files here and the ones that checked out in this run: a hacked
+/// coordinator that lists names it cannot deliver removes nothing here.
+/// Names dated more than MAX_AHEAD after now (this computer's clock) and
+/// sizes above MAX_FILE are refused before anything is fetched.
+pub fn pull(brain: &dyn Brain, verifier: &dyn Verifier, dir: &Path, now: DateTime<Utc>, out: &mut dyn Write) -> Result<Pulled> {
     fsx::mkdir_all(dir, 0o700)?;
     let listing = brain.list()?;
     if listing.len() > MAX_LISTING {
         bail!("the coordinator's list of backups is too long");
     }
-    let remote = parse_listing(&listing);
+    let mut res = Pulled::default();
+    let mut remote: Vec<(DateTime<Utc>, String, u64)> = Vec::new();
+    for (name, size) in parse_listing(&listing) {
+        let Some(t) = parse_name(&name) else { continue };
+        if t > now + MAX_AHEAD {
+            res.problems.push(format!(
+                "{name}: dated more than a day after this computer's clock; not copied. Is the coordinator's clock (or this one) wrong?"
+            ));
+        } else if size > MAX_FILE {
+            res.problems.push(format!("{name}: listed with {size} bytes, more than a backup may be ({} GiB); not copied", MAX_FILE >> 30));
+        } else {
+            remote.push((t, name, size));
+        }
+    }
     let local: Vec<(DateTime<Utc>, String)> = std::fs::read_dir(dir)
         .map_err(|e| Error::from(e).wrap(format!("read {}", dir.display())))?
         .flatten()
@@ -787,15 +899,17 @@ pub fn pull(brain: &dyn Brain, verifier: &dyn Verifier, dir: &Path, out: &mut dy
             parse_name(&n).map(|t| (t, n))
         })
         .collect();
+    // What to fetch: the coordinator's that the plan over ours and theirs
+    // keeps.
     let mut stamps: Vec<DateTime<Utc>> = local.iter().map(|(t, _)| *t).collect();
-    stamps.extend(remote.iter().filter_map(|(n, _)| parse_name(n)));
-    let kept = keep(&stamps, KEEP_DAILY, KEEP_WEEKLY);
-    let mut res = Pulled::default();
-    let mut wanted: Vec<&(String, u64)> = remote.iter().filter(|(n, _)| parse_name(n).is_some_and(|t| kept.contains(&t))).collect();
-    wanted.sort_by(|a, b| b.0.cmp(&a.0));
-    for (name, size) in wanted {
+    stamps.extend(remote.iter().map(|(t, _, _)| *t));
+    let plan = keep(&stamps, KEEP_DAILY, KEEP_WEEKLY);
+    let mut wanted: Vec<&(DateTime<Utc>, String, u64)> = remote.iter().filter(|(t, _, _)| plan.contains(t)).collect();
+    wanted.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut checked: Vec<DateTime<Utc>> = Vec::new();
+    for (t, name, size) in wanted {
         let path = dir.join(name);
-        if let Ok(m) = std::fs::metadata(&path) {
+        if let Ok(m) = std::fs::symlink_metadata(&path) {
             if m.len() != *size {
                 res.problems.push(format!("{name}: yours has {} bytes, the coordinator's {size}; yours is kept", m.len()));
             }
@@ -805,10 +919,15 @@ pub fn pull(brain: &dyn Brain, verifier: &dyn Verifier, dir: &Path, out: &mut dy
             Ok(()) => {
                 let _ = writeln!(out, "pulled {name} ({})", human(*size));
                 res.fetched.push(name.clone());
+                checked.push(*t);
             }
             Err(e) => res.problems.push(format!("{name}: {e}")),
         }
     }
+    // What to keep here: planned from the files here, never from a name.
+    let mut stamps: Vec<DateTime<Utc>> = local.iter().map(|(t, _)| *t).collect();
+    stamps.extend(&checked);
+    let kept = keep(&stamps, KEEP_DAILY, KEEP_WEEKLY);
     for (t, name) in &local {
         if !kept.contains(t) {
             for f in [name.clone(), format!("{name}.sig")] {
@@ -835,7 +954,8 @@ fn fetch_one(brain: &dyn Brain, verifier: &dyn Verifier, dir: &Path, name: &str,
         .mode_600()
         .open(&part)
         .map_err(|e| Error::from(e).wrap(format!("open {}", part.display())))?;
-    let mut hw = HashWriter { inner: &mut f, hash: Sha256::new(), n: 0 };
+    // At most the listed size reaches the disk, whatever the brain sends.
+    let mut hw = HashWriter { inner: &mut f, hash: Sha256::new(), n: 0, limit: size.min(MAX_FILE) };
     let got = brain.fetch(name, size, &mut hw)?;
     let (n, sum) = (hw.n, fsx::hex(&hw.hash.finalize()));
     if got != size || n != size {
@@ -861,15 +981,20 @@ impl Mode600 for std::fs::OpenOptions {
     }
 }
 
-/// Counts and hashes what passes through.
+/// Counts and hashes what passes through, and refuses more than limit
+/// bytes.
 struct HashWriter<'a> {
     inner: &'a mut dyn Write,
     hash: Sha256,
     n: u64,
+    limit: u64,
 }
 
 impl Write for HashWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.n.saturating_add(buf.len() as u64) > self.limit {
+            return Err(std::io::Error::other(format!("the coordinator sent more than the {} bytes it listed", self.limit)));
+        }
         let k = self.inner.write(buf)?;
         self.hash.update(&buf[..k]);
         self.n += k as u64;
@@ -1123,7 +1248,7 @@ mod tests {
         assert!(fsx::space("/no/such/dir").is_err());
     }
 
-    /// systemctl, ssh-keygen, chgrp, setfacl and k3s are played; bash
+    /// systemctl, ssh-keygen, chgrp and k3s are played; bash
     /// (the tar pipelines) and the age stand-in run for real.
     struct Fake {
         calls: Mutex<Vec<String>>,
@@ -1203,7 +1328,7 @@ mod tests {
                     self.signed.lock().unwrap().push(c.stdin.clone());
                     ok(&fake::Key("coord").sign(NAMESPACE, &c.stdin).unwrap())
                 }
-                ("chgrp", ["wheel", _]) | ("setfacl", ["-m", "g:wheel:x", _]) => ok(""),
+                ("chgrp", ["-h", "wheel", _]) => ok(""),
                 ("k3s", ["--version"]) => ok("k3s version v1.37.2+k3s1 (abcdef12)\ngo version go1.25\n"),
                 _ => (String::new(), Err(format!("unexpected command {line}").into())),
             }
@@ -1312,7 +1437,16 @@ mod tests {
         assert_eq!(*f.k3s.lock().unwrap(), "active");
         assert!(f.pos("systemctl stop k3s.service") < f.pos("systemctl start --no-block k3s.service"));
         assert!(!fsx::under(&root, K3S_MARK).exists(), "k3s runs: no mark left for the unit's ExecStopPost");
-        assert!(f.calls().iter().any(|c| c.starts_with("setfacl -m g:wheel:x ") && c.ends_with("/var/lib/dryserver")), "{:?}", f.calls());
+        // Group wheel on the directory and the files, never through a
+        // link; the registry's directory is not touched for it.
+        let chgrps: Vec<String> = f.calls().into_iter().filter(|c| c.starts_with("chgrp")).collect();
+        assert!(chgrps.iter().all(|c| c.starts_with("chgrp -h wheel ")), "{chgrps:?}");
+        for p in [bdir.clone(), bdir.join(format!(".{name}.tmp")), bdir.join(format!(".{name}.sig.tmp")), bdir.join("last.json.tmp")] {
+            assert!(chgrps.iter().any(|c| c.ends_with(&format!(" {}", p.display()))), "{} {chgrps:?}", p.display());
+        }
+        assert!(!f.calls().iter().any(|c| c.starts_with("setfacl") || c.contains("var/lib/dryserver ")), "{:?}", f.calls());
+        assert_eq!(bdir, root.join("var/lib/dryserver-backup"));
+        assert!(!root.join("var/lib/dryserver/backups").exists());
 
         // The layout: MANIFEST first, then only the chosen paths, never
         // their parent directories.
@@ -1514,16 +1648,110 @@ mod tests {
 
     #[test]
     fn a_planted_backup_directory_is_not_used() {
+        // A link, or a file, where the directory belongs: refused, and
+        // what it points to stays empty.
+        for link in [true, false] {
+            let dir = TempDir::new();
+            let root = coordinator(&dir, AGE);
+            let elsewhere = dir.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            let bdir = root.join("var/lib/dryserver-backup");
+            if link {
+                std::os::unix::fs::symlink(&elsewhere, &bdir).unwrap();
+            } else {
+                std::fs::write(&bdir, "not a directory").unwrap();
+            }
+            let f = Fake::new(&dir.join("age"), "active");
+            let j = job(&root, &dir.join("age"), &f);
+            let e = j.run(&Ctx::new(), now(), &mut Vec::new()).unwrap_err().to_string();
+            assert!(e.contains("not a directory made by root") && e.contains("not touched"), "{e}");
+            assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+            assert!(f.calls().is_empty(), "nothing stopped, nothing chgrp'd: {:?}", f.calls());
+        }
+
+        // One that others may write: they could have put links in it.
         let dir = TempDir::new();
         let root = coordinator(&dir, AGE);
-        let elsewhere = dir.join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, root.join("var/lib/dryserver/backups")).unwrap();
+        let bdir = root.join("var/lib/dryserver-backup");
+        std::fs::create_dir(&bdir).unwrap();
+        std::fs::set_permissions(&bdir, std::fs::Permissions::from_mode(0o770)).unwrap();
         let f = Fake::new(&dir.join("age"), "active");
         let j = job(&root, &dir.join("age"), &f);
         let e = j.run(&Ctx::new(), now(), &mut Vec::new()).unwrap_err().to_string();
-        assert!(e.contains("not a directory made by root"), "{e}");
-        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        assert!(e.contains("may be written by others than root (mode 0770)"), "{e}");
+        assert_eq!(std::fs::metadata(&bdir).unwrap().permissions().mode() & 0o7777, 0o770, "refused, not repaired");
+        assert!(f.calls().is_empty(), "{:?}", f.calls());
+
+        // A directory above it that others may write: they could swap
+        // the backup directory after the check.
+        let dir = TempDir::new();
+        let root = coordinator(&dir, AGE);
+        std::fs::set_permissions(root.join("var/lib"), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let f = Fake::new(&dir.join("age"), "active");
+        let j = job(&root, &dir.join("age"), &f);
+        let e = j.run(&Ctx::new(), now(), &mut Vec::new()).unwrap_err().to_string();
+        std::fs::set_permissions(root.join("var/lib"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(e.contains("var/lib is not a directory only root may change") && e.contains("mode 0777"), "{e}");
+        assert!(!root.join("var/lib/dryserver-backup").exists() && f.calls().is_empty());
+
+        // A machine installed before the directory moved: made here.
+        // One with a mode that is only wrong, not open: put right.
+        for before in [None, Some(0o700), Some(0o755)] {
+            let dir = TempDir::new();
+            let root = coordinator(&dir, AGE);
+            let bdir = root.join("var/lib/dryserver-backup");
+            if let Some(m) = before {
+                std::fs::create_dir(&bdir).unwrap();
+                std::fs::set_permissions(&bdir, std::fs::Permissions::from_mode(m)).unwrap();
+            }
+            let f = Fake::new(&dir.join("age"), "active");
+            let j = job(&root, &dir.join("age"), &f);
+            j.run(&Ctx::new(), now(), &mut Vec::new()).unwrap();
+            assert_eq!(std::fs::symlink_metadata(&bdir).unwrap().permissions().mode() & 0o7777, 0o750, "{before:?}");
+            assert!(f.calls().iter().any(|c| *c == format!("chgrp -h wheel {}", bdir.display())), "{:?}", f.calls());
+        }
+    }
+
+    /// Links standing in the backup directory where the backup writes
+    /// (left there by whoever could write it once) are replaced or
+    /// refused, never followed: the files they point to keep their
+    /// content and mode.
+    #[test]
+    fn links_in_the_backup_directory_are_not_followed() {
+        let dir = TempDir::new();
+        let root = coordinator(&dir, AGE);
+        let bdir = root.join("var/lib/dryserver-backup");
+        std::fs::create_dir(&bdir).unwrap();
+        std::fs::set_permissions(&bdir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let victim_dir = dir.join("victim-dir");
+        put(&victim_dir, "keep", "mine");
+        let name = name_of(now().0);
+        for n in [format!("{STATUS_FILE}.tmp"), STATUS_FILE.to_string(), format!(".{name}.tmp"), format!(".{name}.sig.tmp")] {
+            std::os::unix::fs::symlink(&victim, bdir.join(n)).unwrap();
+        }
+        std::os::unix::fs::symlink(&victim_dir, bdir.join(STAGING)).unwrap();
+        let f = Fake::new(&dir.join("age"), "active");
+        let j = job(&root, &dir.join("age"), &f);
+        let d = j.run(&Ctx::new(), now(), &mut Vec::new()).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(std::fs::metadata(&victim).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert_eq!(get(&victim_dir, "keep"), "mine");
+        assert_eq!(std::fs::read_dir(&victim_dir).unwrap().count(), 1, "nothing staged through the link");
+        // The status and the backup are real files of their own.
+        for p in [bdir.join(STATUS_FILE), bdir.join(&d.file), bdir.join(format!("{}.sig", d.file))] {
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            assert!(m.is_file() && m.permissions().mode() & 0o7777 == 0o640, "{}", p.display());
+        }
+        assert_eq!(status(&bdir).result, "ok");
+        assert!(leftovers(&bdir).is_empty(), "{:?}", leftovers(&bdir));
+        // file_sum, and so the receipt the host key signs, never reads
+        // through a link.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(file_sum(&link).unwrap_err().to_string().contains("symbolic link"));
     }
 
     #[test]
@@ -1576,6 +1804,9 @@ mod tests {
         /// Listed sizes that differ from what is sent.
         listed: BTreeMap<String, u64>,
         fetched: Mutex<Vec<String>>,
+        /// Sends the whole file whatever the limit (a hacked brain that
+        /// does not stop).
+        ignores_limit: bool,
     }
 
     impl FakeBrain {
@@ -1590,7 +1821,7 @@ mod tests {
                 files.insert(format!("{n}.sig"), sig.into_bytes());
                 files.insert(n, data);
             }
-            FakeBrain { files, listed: BTreeMap::new(), fetched: Mutex::default() }
+            FakeBrain { files, listed: BTreeMap::new(), fetched: Mutex::default(), ignores_limit: false }
         }
     }
 
@@ -1602,6 +1833,10 @@ mod tests {
         fn fetch(&self, name: &str, limit: u64, w: &mut dyn Write) -> Result<u64> {
             self.fetched.lock().unwrap().push(name.to_string());
             let d = self.files.get(name).ok_or_else(|| errf!("no such file"))?;
+            if self.ignores_limit {
+                w.write_all(d)?;
+                return Ok(d.len() as u64);
+            }
             if d.len() as u64 > limit {
                 w.write_all(&d[..limit as usize]).unwrap();
                 bail!("the coordinator sent more than the {limit} bytes it listed");
@@ -1615,12 +1850,134 @@ mod tests {
         (0..n).map(|i| t(2026, 11, 20, 2) - chrono::TimeDelta::days(i)).collect()
     }
 
+    /// The desktop's clock in these tests: after every backup in them.
+    fn desk() -> DateTime<Utc> {
+        t(2026, 11, 28, 12)
+    }
+
+    fn local_names(d: &Path) -> BTreeSet<String> {
+        std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+    }
+
+    /// The review's attack: a hacked coordinator lists names dated after
+    /// every genuine backup (signature files too) that it cannot or will
+    /// not deliver. Before, they pushed every copy here out of the plan
+    /// and all nine were removed. Now nothing here goes, whether the
+    /// names are years ahead or just ahead of the copies here.
+    #[test]
+    fn listed_names_alone_remove_nothing_here() {
+        let dir = TempDir::new();
+        let local = dir.join("backups");
+        let genuine = nights(9);
+        pull(&FakeBrain::new(&genuine), &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        let before = local_names(&local);
+        assert_eq!(before.iter().filter(|n| parse_name(n).is_some()).count(), keep(&genuine, KEEP_DAILY, KEEP_WEEKLY).len());
+
+        // Nine names years ahead, and nine just ahead of every copy here
+        // (one a day, later in the day than the genuine one): either set
+        // filled the plan before.
+        let future: Vec<DateTime<Utc>> = (0..9).map(|i| t(2030, 1, 1, 2) + chrono::TimeDelta::days(i)).collect();
+        let recent: Vec<DateTime<Utc>> = (0..9).map(|i| t(2026, 11, 28, 11) - chrono::TimeDelta::days(i)).collect();
+        for (fake_times, fetches) in [(future, false), (recent, true)] {
+            let listing: String = fake_times.iter().map(|t| format!("{0} 4096\n{0}.sig 300\n", name_of(*t))).collect();
+            struct Liar(String, Mutex<u32>);
+            impl Brain for Liar {
+                fn list(&self) -> Result<String> {
+                    Ok(self.0.clone())
+                }
+                fn fetch(&self, _: &str, _: u64, _: &mut dyn Write) -> Result<u64> {
+                    *self.1.lock().unwrap() += 1;
+                    bail!("cat: No such file or directory")
+                }
+            }
+            let liar = Liar(listing, Mutex::new(0));
+            let r = pull(&liar, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+            assert!(r.removed.is_empty() && r.fetched.is_empty(), "{r:?}");
+            assert_eq!(local_names(&local), before, "every genuine copy stays");
+            // Each one the plan wanted is a problem; nothing else comes of it.
+            assert_eq!(r.problems.len(), if fetches { 7 } else { 9 }, "{:?}", r.problems);
+            assert_eq!(*liar.1.lock().unwrap() > 0, fetches, "names from the future are not even fetched");
+        }
+
+        // Names more than a day ahead of this computer's clock are not
+        // even fetched, signed or not; a day ahead is a clock that runs a
+        // little fast and is taken.
+        let dir = TempDir::new();
+        let local = dir.join("backups");
+        let ahead = t(2026, 11, 29, 13);
+        let close = t(2026, 11, 29, 11);
+        let brain = FakeBrain::new(&[ahead, close]);
+        let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        assert_eq!(r.fetched, vec![name_of(close)]);
+        assert!(r.problems.len() == 1 && r.problems[0].contains("more than a day after this computer's clock"), "{:?}", r.problems);
+        assert!(!brain.fetched.lock().unwrap().iter().any(|n| n.starts_with(&name_of(ahead))), "{:?}", brain.fetched.lock().unwrap());
+        assert!(!local.join(name_of(ahead)).exists());
+    }
+
+    /// Copies here go only when backups that checked out in this run (or
+    /// were here) push them out of the plan.
+    #[test]
+    fn thinned_only_by_what_checked_out() {
+        let dir = TempDir::new();
+        let local = dir.join("backups");
+        pull(&FakeBrain::new(&nights(9)), &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        let before = local_names(&local);
+        // Seven newer nights: three forged, four genuine. Only the four
+        // count, so fewer of the old ones go than seven would remove.
+        let newer: Vec<DateTime<Utc>> = (0..7).map(|i| t(2026, 11, 27, 2) - chrono::TimeDelta::days(i)).collect();
+        let mut brain = FakeBrain::new(&newer);
+        for t in &newer[..3] {
+            brain.files.insert(format!("{}.sig", name_of(*t)), fake::Key("someone").sign(NAMESPACE, "x").unwrap().into_bytes());
+        }
+        let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        assert_eq!(r.fetched.len(), 4, "{r:?}");
+        assert_eq!(r.problems.len(), 3, "{:?}", r.problems);
+        let mut stamps: Vec<DateTime<Utc>> = before.iter().filter_map(|n| parse_name(n)).collect();
+        stamps.extend(&newer[3..]);
+        let want: BTreeSet<String> = keep(&stamps, KEEP_DAILY, KEEP_WEEKLY).into_iter().map(name_of).collect();
+        let have: BTreeSet<String> = local_names(&local).into_iter().filter(|n| parse_name(n).is_some()).collect();
+        assert_eq!(have, want);
+        for t in &newer[..3] {
+            assert!(!local.join(name_of(*t)).exists());
+        }
+    }
+
+    /// A size above MAX_FILE in the listing is refused before anything
+    /// is fetched; a brain that sends more than it listed is cut off at
+    /// the listed size, before the signature is even looked at.
+    #[test]
+    fn pull_caps_what_lands_on_disk() {
+        let dir = TempDir::new();
+        let local = dir.join("backups");
+        let times = nights(2);
+        let mut brain = FakeBrain::new(&times);
+        let big = name_of(times[0]);
+        brain.listed.insert(big.clone(), MAX_FILE + 1);
+        let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        assert!(r.problems.iter().any(|p| p.starts_with(&big) && p.contains("more than a backup may be (4 GiB)")), "{:?}", r.problems);
+        assert!(!brain.fetched.lock().unwrap().iter().any(|n| n.starts_with(&big)), "not even its signature is fetched");
+        assert_eq!(r.fetched, vec![name_of(times[1])], "the others still come");
+        assert_eq!(MAX_FILE, 4 << 30);
+
+        let dir = TempDir::new();
+        let local = dir.join("backups");
+        let mut brain = FakeBrain::new(&times);
+        brain.ignores_limit = true;
+        let short = name_of(times[0]);
+        let listed = brain.files[&short].len() as u64 - 5;
+        brain.listed.insert(short.clone(), listed);
+        let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        assert!(r.problems.iter().any(|p| p.starts_with(&short) && p.contains("more than the")), "{:?}", r.problems);
+        assert!(!local.join(&short).exists() && no_parts(&local));
+        assert_eq!(r.fetched, vec![name_of(times[1])]);
+    }
+
     #[test]
     fn pull_takes_the_newest_signed_backups() {
         let dir = TempDir::new();
         let local = dir.join("backups");
         let brain = FakeBrain::new(&nights(30));
-        let r = pull(&brain, &fake::Key("coord"), &local, &mut Vec::new()).unwrap();
+        let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
         let kept = keep(&nights(30), KEEP_DAILY, KEEP_WEEKLY);
         assert_eq!(r.fetched.len(), kept.len());
         assert!(r.problems.is_empty(), "{:?}", r.problems);
@@ -1632,12 +1989,12 @@ mod tests {
         }
         assert_eq!(std::fs::metadata(&local).unwrap().permissions().mode() & 0o777, 0o700);
         // Again: nothing new to fetch.
-        let r = pull(&brain, &fake::Key("coord"), &local, &mut Vec::new()).unwrap();
+        let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
         assert!(r.fetched.is_empty() && r.removed.is_empty() && r.problems.is_empty(), "{r:?}");
         // A week later the brain has newer ones: the local copies follow
         // the same plan.
         let newer: Vec<DateTime<Utc>> = (0..7).map(|i| t(2026, 11, 27, 2) - chrono::TimeDelta::days(i)).collect();
-        let r = pull(&FakeBrain::new(&newer), &fake::Key("coord"), &local, &mut Vec::new()).unwrap();
+        let r = pull(&FakeBrain::new(&newer), &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
         assert_eq!(r.fetched.len(), 7);
         assert!(!r.removed.is_empty());
         for n in &r.removed {
@@ -1664,7 +2021,7 @@ mod tests {
         brain.listed.insert(names[1].clone(), l1);
         let l2 = brain.files[&names[2]].len() as u64 - 3;
         brain.listed.insert(names[2].clone(), l2);
-        let r = pull(&brain, &fake::Key("coord"), &local, &mut Vec::new()).unwrap();
+        let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
         assert!(r.fetched.is_empty(), "{r:?}");
         assert_eq!(r.problems.len(), 3, "{:?}", r.problems);
         assert!(r.problems[0].contains("not signed by the coordinator"), "{:?}", r.problems);
@@ -1684,7 +2041,7 @@ mod tests {
         let brain = FakeBrain::new(&times);
         let n = name_of(times[0]);
         put(&local, &n, "my own copy, different");
-        let r = pull(&brain, &fake::Key("coord"), &local, &mut Vec::new()).unwrap();
+        let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
         assert_eq!(get(&local, &n), "my own copy, different");
         assert!(r.problems.iter().any(|p| p.contains("yours is kept")), "{:?}", r.problems);
         assert_eq!(r.fetched, vec![name_of(times[1])]);

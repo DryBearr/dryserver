@@ -243,6 +243,9 @@ After=k3s.service time-sync.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/dryserver backup
+# What the backup and its tools make is root's alone unless the backup
+# says otherwise (the backups themselves: 0640, group wheel).
+UMask=0077
 # However the backup ends (a crash, a kill, the timeout) while it has k3s
 # stopped for the copy, k3s starts again.
 ExecStopPost=/usr/bin/sh -c 'if [ -e {mark} ]; then rm -f {mark}; systemctl start --no-block k3s.service; fi'
@@ -1014,6 +1017,7 @@ mod tests {
         }
         let svc = &find(&coord, "/etc/systemd/system/dryserver-backup.service").content;
         assert!(svc.contains("Type=oneshot\nExecStart=/usr/local/bin/dryserver backup\n"), "{svc}");
+        assert!(svc.contains("\nUMask=0077\n"), "{svc}");
         assert!(
             svc.contains("ExecStopPost=/usr/bin/sh -c 'if [ -e /run/dryserver-backup.k3s-stopped ]; then rm -f /run/dryserver-backup.k3s-stopped; systemctl start --no-block k3s.service; fi'\n"),
             "k3s must start again when the backup dies: {svc}"

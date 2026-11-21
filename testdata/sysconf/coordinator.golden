@@ -462,6 +462,9 @@ After=k3s.service time-sync.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/dryserver backup
+# What the backup and its tools make is root's alone unless the backup
+# says otherwise (the backups themselves: 0640, group wheel).
+UMask=0077
 # However the backup ends (a crash, a kill, the timeout) while it has k3s
 # stopped for the copy, k3s starts again.
 ExecStopPost=/usr/bin/sh -c 'if [ -e /run/dryserver-backup.k3s-stopped ]; then rm -f /run/dryserver-backup.k3s-stopped; systemctl start --no-block k3s.service; fi'

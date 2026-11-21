@@ -102,7 +102,7 @@ on servers:
   registry            coordinator: SSH forced command for joining machines
   cluster-dns         coordinator: keep the cluster's DNS on two machines
                       (run by a timer)
-  backup              coordinator: encrypted backup into /var/lib/dryserver/backups
+  backup              coordinator: encrypted backup into /var/lib/dryserver-backup
                       (run by a timer every night)
   update apply --release FILE --binary FILE [--brain-k3s V] [--window SECS]
                       install a dryserver release the admin signed; it
@@ -786,7 +786,7 @@ fn run_backup_pull(args: &[String]) -> Result<()> {
     fsx::write_file(&signer, format!("{host_key}\n"), 0o600)?;
     let verifier = signed::SshVerifier { pubkey: signer.clone(), tmp_dir: std::env::temp_dir() };
     let brain = backup::SshBrain::new(&host, f.get("port"), &cfg.username, known_hosts);
-    let res = backup::pull(&brain, &verifier, &dir, &mut std::io::stdout());
+    let res = backup::pull(&brain, &verifier, &dir, chrono::Utc::now(), &mut std::io::stdout());
     let _ = fsx::remove(&signer);
     let r = res?;
     for n in &r.removed {
