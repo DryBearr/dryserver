@@ -560,7 +560,10 @@ older one, or hand it a binary other than the signed one: each server
 checks for itself (one that never took an update counts the dryserver
 and k3s it was installed with as its own). It does decide when machines update (the window and
 the turns are its doing). A hacked server can fail or stall only its own
-turn, and a stalled turn ends after 20 minutes.
+turn, and a stalled turn ends after 20 minutes. But a failed or stalled
+turn stops the whole rollout there until you resume: a hacked server can
+hold every release up once, until you look and resume (each hacked
+server, once per release).
 
 ### On each machine
 

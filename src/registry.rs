@@ -827,15 +827,44 @@ fn valid_id(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// How long one registry command may take. Most are a read or a small
-/// write; moving a release takes as long as the network needs.
+/// How long one registry command may take at first. Most are a read or a
+/// small write. An upload gets no more by its name, which anyone with the
+/// USB stick's key can send: only once its header holds a release the
+/// admin signed (extend_deadline).
 pub fn deadline(cmdline: &str) -> std::time::Duration {
     let secs = match cmdline.split_whitespace().next() {
-        Some("release-put") => 600,
         Some("release-get") => 120,
         _ => 30,
     };
     std::time::Duration::from_secs(secs)
+}
+
+/// What an upload may take once its signature checked out: as long as the
+/// network needs for the binaries.
+pub const UPLOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// When this registry command must be done, unix seconds; 0: no limit.
+/// main's watchdog ends the process after it.
+static DEADLINE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Starts the limit for this command: d from now.
+pub fn set_deadline(d: std::time::Duration) {
+    DEADLINE.store(unix_now() + d.as_secs() as i64, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Gives the running command until d from now, if that is later.
+pub fn extend_deadline(d: std::time::Duration) {
+    DEADLINE.fetch_max(unix_now() + d.as_secs() as i64, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the running command is past its limit.
+pub fn past_deadline() -> bool {
+    let d = DEADLINE.load(std::sync::atomic::Ordering::SeqCst);
+    d != 0 && unix_now() > d
 }
 
 /// The mesh member calling from client, if it is one.
@@ -1828,7 +1857,14 @@ mod tests {
         assert_eq!(deadline("peers").as_secs(), 30);
         assert_eq!(deadline("").as_secs(), 30);
         assert_eq!(deadline("release-get 5 dryserver 0").as_secs(), 120);
-        assert_eq!(deadline("release-put").as_secs(), 600);
+        // An upload gets more only once its signature checked out.
+        assert_eq!(deadline("release-put").as_secs(), 30);
+        set_deadline(std::time::Duration::from_secs(30));
+        assert!(!past_deadline());
+        extend_deadline(UPLOAD_DEADLINE);
+        assert!(DEADLINE.load(std::sync::atomic::Ordering::SeqCst) >= unix_now() + 590);
+        extend_deadline(std::time::Duration::from_secs(1));
+        assert!(DEADLINE.load(std::sync::atomic::Ordering::SeqCst) >= unix_now() + 590, "an extension never shortens it");
     }
 
     #[test]

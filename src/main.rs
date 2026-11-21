@@ -512,11 +512,17 @@ fn run_registry(args: &[String]) -> Result<()> {
     // Every command here is a read or a small write, but for moving a
     // release, which takes as long as the network needs. A caller that
     // sends nothing, or never finishes, does not get to keep a session.
-    let deadline = registry::deadline(&env("SSH_ORIGINAL_COMMAND"));
+    // An upload gets longer only once its header's signature checked out
+    // (registry::extend_deadline).
+    registry::set_deadline(registry::deadline(&env("SSH_ORIGINAL_COMMAND")));
     std::thread::spawn(move || {
-        std::thread::sleep(deadline);
-        eprintln!("dryserver: registry command took too long");
-        std::process::exit(1);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if registry::past_deadline() {
+                eprintln!("dryserver: registry command took too long");
+                std::process::exit(1);
+            }
+        }
     });
     let host_key = fsx::read_string(fsx::under(root, "/etc/ssh/ssh_host_ed25519_key.pub"))?;
     let store = registry::Store::new(fsx::under(root, registry::DEFAULT_PATH));

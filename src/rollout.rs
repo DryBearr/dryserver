@@ -32,7 +32,8 @@
 //! came from an attacker: sizes are capped before anything is read, the
 //! signature and the checksums decide, and a server can only speak for
 //! itself. A hacked server can fail or stall only its own turn, and a
-//! stalled turn ends after TURN_TIMEOUT.
+//! stalled turn ends after TURN_TIMEOUT; but the rollout then stops there
+//! until the admin resumes, once per release per hacked server.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -502,6 +503,9 @@ impl Served {
         }
         let head: PutHeader = serde_json::from_slice(&line).map_err(|e| Error::from(e).wrap("release header"))?;
         let r = release::open(v, &head.release, now)?;
+        // Signed by the admin: moving the binaries may take as long as
+        // the network needs.
+        registry::extend_deadline(registry::UPLOAD_DEADLINE);
         if head.k3s_size > MAX_K3S {
             bail!("the upload's k3s is {} bytes, more than {MAX_K3S}", head.k3s_size);
         }
@@ -635,11 +639,16 @@ impl Source for SshSource<'_> {
     fn offered(&self, ctx: &Ctx, serial: u64) -> Result<Offered> {
         let n = self.0;
         let addr = crate::mesh::ip(&n.cfg.wg_subnet, 1);
-        let args = n.ssh_args(&addr, &format!("release-get {serial} release"));
-        let out = n.run.output(ctx, &Cmd::new("ssh", &args).stdout_only())?;
-        if out.len() as u64 > MAX_ENVELOPE {
-            bail!("the coordinator's answer is larger than {MAX_ENVELOPE} bytes");
-        }
+        // Read capped, as it comes: whoever answers cannot make this
+        // machine hold more than MAX_ENVELOPE of it.
+        let dir = n.path(STORE);
+        fsx::mkdir_all(&dir, 0o700)?;
+        let tmp = dir.join("offered.part");
+        let mut cmd = Command::new("ssh");
+        cmd.args(n.ssh_args(&addr, &format!("release-get {serial} release")));
+        let got = stream_to_file(ctx, &mut cmd, &tmp, MAX_ENVELOPE).and_then(|_| read_small(&tmp, MAX_ENVELOPE));
+        let _ = std::fs::remove_file(&tmp);
+        let out = got.map_err(|e| e.wrap("the coordinator's answer"))?;
         serde_json::from_str(&out).map_err(|e| Error::from(e).wrap("the coordinator's answer"))
     }
 
