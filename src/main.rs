@@ -20,7 +20,10 @@ mod owner;
 mod packages;
 mod quarantine;
 mod registry;
-// Not called yet: a later step wires releases into the machines.
+// Not called yet: later steps run the relay on the VPS entrance and wire
+// releases into the machines.
+#[allow(dead_code)]
+mod relay;
 #[allow(dead_code)]
 mod release;
 mod runner;
