@@ -1322,6 +1322,30 @@ fn a_server_that_is_no_node_does_not_block_the_rollout() {
     assert!(sw.rollout().paused.is_empty(), "{:#?}", sw.rollout());
 }
 
+/// Problems that pass (the brain's k3s not known yet) are tried again at
+/// the next sync, not recorded as a failure of the release; after
+/// MAX_TRIES syncs in a row they are.
+#[test]
+fn a_problem_that_passes_is_tried_again() {
+    let mut sw = Swarm::new(1);
+    sw.brain_k3s = String::new();
+    sw.publish(10, true);
+    sw.until(20, |s| s.rollout().turn.as_ref().is_some_and(|t| t.ready));
+    sw.ticks(3);
+    let l = Machine::new(&sw.server(2).node, false).load();
+    assert!(l.failed == 0 && l.note.contains("does not say yet which k3s"), "{l:?}");
+    sw.brain_k3s = K3S_VERSION.into();
+    sw.until(20, |s| s.everyone_on(10));
+
+    let mut sw = Swarm::new(1);
+    sw.brain_k3s = String::new();
+    sw.publish(10, true);
+    sw.until(40, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert_eq!(r.pause, Pause::Failed, "{r:#?}");
+    assert!(r.paused.contains(&format!("{MAX_TRIES} syncs in a row")), "{}", r.paused);
+}
+
 /// A cordon that fails for another reason counts against the drain limit,
 /// and the rollout then stops as for a drain that does not finish.
 #[test]

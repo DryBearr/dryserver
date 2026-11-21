@@ -136,6 +136,11 @@ const CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Installing and confirming are not cut off by the sync's deadline: a
 /// half-run installer is worse than a late sync.
 const APPLY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How many syncs in a row a problem that may pass (the update commands
+/// do not answer, the disk is full for now, the brain's k3s is not known
+/// yet) is tried again before the release counts as failed here: well
+/// within TURN_TIMEOUT, a sync a minute.
+pub const MAX_TRIES: u32 = 10;
 /// The most warnings a rollout keeps (the newest).
 const MAX_WARNINGS: usize = 8;
 /// What the registry says when an upload needs the k3s binary too; the
@@ -779,6 +784,9 @@ pub struct Local {
     pub installed: u64,
     /// A release the admin said to try again although it went back before.
     pub retry: u64,
+    /// The release a problem that may pass held up, and at how many syncs.
+    pub tries_serial: u64,
+    pub tries: u32,
 }
 
 /// What is known about the release being loaded, in STORE/incoming.
@@ -795,6 +803,9 @@ struct Meta {
 enum Stop {
     /// Not done yet, or a problem that may pass: again at the next sync.
     Again(Error),
+    /// A problem that may pass but may also stay: again at the next sync,
+    /// MAX_TRIES times, then the update failed.
+    Later(String),
     /// The release did not pass this machine's checks.
     Refused(String),
     /// Installing it did not work.
@@ -944,6 +955,18 @@ impl<'a> Machine<'a> {
                 }
                 return Err(e);
             }
+            Err(Stop::Later(why)) => {
+                if l.tries_serial != offer.serial {
+                    (l.tries_serial, l.tries) = (offer.serial, 0);
+                }
+                l.tries += 1;
+                if l.tries < MAX_TRIES {
+                    l.note = report::note(&why);
+                    self.save(&l)?;
+                    return Err(errf!("release {}: {why} (tried {} of {MAX_TRIES} times, again at the next sync)", offer.serial, l.tries));
+                }
+                ("failed", format!("{why} ({MAX_TRIES} syncs in a row)"))
+            }
             Err(Stop::Refused(why)) => ("refused", why),
             Err(Stop::Failed(why)) => ("failed", why),
             Err(Stop::Reverted(why)) => ("reverted", why),
@@ -961,7 +984,8 @@ impl<'a> Machine<'a> {
     /// commands do not refuse it themselves); one that is already
     /// installed or pending is taken over.
     fn ready(&self, ctx: &Ctx, offer: &Offer, now: i64, l: &mut Local) -> std::result::Result<bool, Stop> {
-        let st = self.update().status(ctx).map_err(|e| Stop::Failed(format!("cannot ask how its updates stand: {e}")))?;
+        // The sync's own time running out ends up here too.
+        let st = self.update().status(ctx).map_err(|e| Stop::Later(format!("cannot ask how its updates stand: {e}")))?;
         if st.installed.serial >= offer.serial {
             l.installed = st.installed.serial;
             self.save(l).map_err(Stop::Again)?;
@@ -992,6 +1016,10 @@ impl<'a> Machine<'a> {
         self.ensure_dir().map_err(again)?;
         let inc = self.dir().join(INCOMING);
         let place = if self.brain { Place::Brain } else { Place::Worker { brain_k3s: &offer.brain_k3s } };
+        if !self.brain && offer.brain_k3s.trim().is_empty() {
+            // Its report may not have come in yet (the brain just booted).
+            return Err(Stop::Later("the coordinator does not say yet which k3s it runs".into()));
+        }
         let installed = self.installed();
 
         // The signed release: loaded once, checked at every step.
@@ -1024,7 +1052,8 @@ impl<'a> Machine<'a> {
             // Its k3s is loaded only when this machine's is another one.
             meta.need_k3s = sha_of(&self.n.path(K3S_BIN), MAX_K3S).as_deref() != Some(r.k3s.sha256.as_str());
             let need = r.dryserver.size + if meta.need_k3s { meta.k3s_size } else { 0 };
-            room(self.free, &self.dir(), need, "this machine").map_err(|e| Stop::Refused(e.to_string()))?;
+            // Room may be made (logs rotate, an old image goes).
+            room(self.free, &self.dir(), need, "this machine").map_err(|e| Stop::Later(e.to_string()))?;
             fsx::write_file(inc.join(META_FILE), serde_json::to_string(&meta).map_err(|e| again(e.into()))?, 0o600).map_err(again)?;
             write_atomic(&inc.join(RELEASE_FILE), &(serde_json::to_string(&env).map_err(|e| again(e.into()))? + "\n")).map_err(again)?;
         }

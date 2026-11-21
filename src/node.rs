@@ -1748,6 +1748,15 @@ mod tests {
         assert!(sync(&ctx, &n, false, &store).unwrap(), "an update problem must not fail the sync");
         assert!(get(&n.root, WG_CONF).contains(COORD_WG));
         let status = get(&n.root, UPDATE_STATUS);
+        assert!(status.contains("release 9: cannot ask how its updates stand") && status.contains("tried 1 of"), "{status}");
+        // That may pass: it is tried again at the next syncs, then it
+        // counts as failed.
+        for _ in 1..rollout::MAX_TRIES {
+            let asked = fc.calls.lock().unwrap().len();
+            assert!(sync(&ctx, &n, false, &store).unwrap());
+            assert!(fc.calls.lock().unwrap()[asked..].iter().any(|c| c.contains("status")), "not tried again");
+        }
+        let status = get(&n.root, UPDATE_STATUS);
         assert!(status.contains("release 9 failed: cannot ask how its updates stand"), "{status}");
         // The next heartbeat says so, and it is not tried again by itself.
         let asked = fc.calls.lock().unwrap().len();
