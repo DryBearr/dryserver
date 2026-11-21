@@ -339,7 +339,11 @@ Remove a server in `./dryserver approve` and the cluster follows: the
 coordinator deletes it from the cluster, and its apps start on the servers
 that are left. The removed server stops k3s and every container as soon as
 it sees the signed list without itself (it asks the coordinator on the home
-network when the mesh no longer answers). A server that only lost contact
+network when the mesh no longer answers). From then on every sync checks
+that nothing of k3s is left on it (its token, k3s.service, processes in its
+cgroups, pods' mounts) and stops it again if something is, until nothing
+is: a stop that timed out or a k3s started again by hand does not stay.
+A server that only lost contact
 keeps its apps running. To bring a removed server back, run
 `sudo dryserver join` on it and approve it like a new machine. A machine
 installed again under a name the cluster knows takes that name over: the

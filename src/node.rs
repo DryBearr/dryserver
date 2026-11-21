@@ -43,6 +43,9 @@ pub const JOIN_PROOF: &str = "/etc/dryserver/join.proof";
 pub const SIGNED_FILE: &str = "/etc/dryserver/members.signed.json";
 /// What the last sync thought of the coordinator's list; a change is logged.
 pub const SIGNED_STATUS: &str = "/run/dryserver-signed.status";
+/// What a machine that is no member found left of k3s at the last sync;
+/// a change is logged.
+pub const K3S_LEFT_STATUS: &str = "/run/dryserver-k3s-left.status";
 /// How often a machine waiting for approval asks the coordinator. The
 /// coordinator's firewall lets one address open 10 SSH connections a
 /// minute; asking every 3 or 5 seconds ran into that after a few minutes.
@@ -89,6 +92,8 @@ pub struct Node {
     pub verifier: Arc<dyn Verifier>,
 }
 
+/// What k3s keeps for the control plane; only the coordinator has it.
+const K3S_SERVER_DIR: &str = "/var/lib/rancher/k3s/server";
 /// Where k3s on the coordinator keeps the token agents join with.
 pub const K3S_AGENT_TOKEN: &str = "/var/lib/rancher/k3s/server/agent-token";
 /// The cgroups of what k3s runs: its own helpers (containerd and the
@@ -617,13 +622,95 @@ impl Node {
     /// swarm's apps, forgets its way into the cluster and no longer counts
     /// itself a member. To come back it asks again (sudo dryserver join)
     /// and waits for approval like a new machine.
+    ///
+    /// The decision is recorded first and the work done after it: from then
+    /// on every sync finishes what is left (finish_leave), so a stop that
+    /// did not take, or a reboot half way, is caught there.
     pub(crate) fn leave(&self, ctx: &Ctx, env: &Envelope, why: &Error) {
-        self.k3s_leave(ctx);
+        let _ = self.save_state(&State::default());
         if let Ok(text) = serde_json::to_string(env) {
             let _ = self.write(SIGNED_FILE, 0o600, &(text + "\n"));
         }
-        let _ = self.save_state(&State::default());
-        self.note_signed(&format!("REMOVED: {why}. k3s and its containers are stopped. To bring this machine back: sudo dryserver join"));
+        self.k3s_leave(ctx);
+        self.note_signed(&format!(
+            "REMOVED: {why}. k3s and its containers are stopped, and every sync checks they stay stopped. \
+             To bring this machine back: sudo dryserver join"
+        ));
+    }
+
+    /// Finishes what leave started, on every sync of a server that is no
+    /// member: whatever of k3s is still there is stopped again, until
+    /// nothing is. A stop can fail (systemctl timed out, a process escaped
+    /// the kill), and k3s can be started again by hand; leave runs once
+    /// and would not notice.
+    ///
+    /// A machine waiting for its first approval has nothing there, and
+    /// pays a few file reads for this: no command.
+    pub(crate) fn finish_leave(&self, ctx: &Ctx) {
+        // The control plane is never stopped here, also on a coordinator
+        // whose role file was lost: only the coordinator has its directory.
+        if self.path(K3S_SERVER_DIR).exists() {
+            return;
+        }
+        let left = self.k3s_remains(ctx);
+        if left.is_empty() {
+            self.note(K3S_LEFT_STATUS, "k3s: nothing of k3s is left on this machine", "");
+            return;
+        }
+        // Under the mesh lock, and only while this machine still is no
+        // member. An approval sets the host number under the same lock, and
+        // the token comes after it: a machine that joins again is never
+        // stopped here.
+        let _lock = match fsx::lock(self.path(quarantine::MESH_LOCK)) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("dryserver: k3s is still there although this machine is no member, not stopped: {e}");
+                return;
+            }
+        };
+        if self.load_state().host != 0 {
+            return;
+        }
+        let status = format!("still there although this machine is no member ({}): stopping it again", left.join(", "));
+        self.note(K3S_LEFT_STATUS, &format!("k3s: {status}"), &status);
+        self.k3s_leave(ctx);
+    }
+
+    /// What of k3s is on this machine: its token, processes in its cgroups,
+    /// an active k3s.service, pods' mounts. Empty when none of it is.
+    ///
+    /// systemctl is asked only while k3s.service has a cgroup. systemd
+    /// removes that cgroup once the unit has stopped and its last process
+    /// is gone, so where k3s never ran no command runs.
+    pub fn k3s_remains(&self, ctx: &Ctx) -> Vec<String> {
+        let mut left = Vec::new();
+        if fsx::exists(self.path(sysconf::K3S_TOKEN)) {
+            left.push("its token".to_string());
+        }
+        for cgroup in K3S_CGROUPS {
+            if populated(&self.path(cgroup)) {
+                left.push(format!("processes in {}", cgroup.rsplit('/').next().unwrap_or(cgroup)));
+            }
+        }
+        if self.path(K3S_CGROUPS[0]).is_dir() && self.cmd(ctx, "systemctl", &["is-active", "--quiet", "k3s.service"]).is_ok() {
+            left.push("k3s.service is active".into());
+        }
+        let mounts = self.pod_mounts().len();
+        if mounts > 0 {
+            left.push(format!("{mounts} pod mounts"));
+        }
+        left
+    }
+
+    /// Where pods have something mounted, from /proc/self/mounts.
+    fn pod_mounts(&self) -> Vec<String> {
+        let mounts = fsx::read_or_empty(self.path("/proc/self/mounts"));
+        mounts
+            .lines()
+            .filter_map(|l| l.split(' ').nth(1))
+            .filter(|p| POD_MOUNTS.iter().any(|pre| p.starts_with(pre)))
+            .map(str::to_string)
+            .collect()
     }
 
     /// Deletes this machine's way into the cluster and stops k3s with
@@ -661,27 +748,33 @@ impl Node {
                 let _ = std::fs::OpenOptions::new().write(true).open(&kill).and_then(|mut f| f.write_all(b"1"));
             }
         }
-        let mounts = fsx::read_or_empty(self.path("/proc/self/mounts"));
-        let mut points: Vec<&str> =
-            mounts.lines().filter_map(|l| l.split(' ').nth(1)).filter(|p| POD_MOUNTS.iter().any(|pre| p.starts_with(pre))).collect();
+        let mut points = self.pod_mounts();
         // A mount inside another sorts after it: backwards is inside first.
         points.sort_unstable();
         for point in points.into_iter().rev() {
             // Lazy: the killed processes may need a moment to let go.
-            let _ = self.run.output(ctx, &Cmd::new("umount", &["-l", point]).quiet());
+            let _ = self.run.output(ctx, &Cmd::new("umount", &["-l", &point]).quiet());
         }
     }
 
-    /// Logs the status when it changed since the last sync, so the journal
-    /// gets one line per change and not one per minute.
+    /// Logs the status of the member list when it changed since the last
+    /// sync.
     fn note_signed(&self, status: &str) {
-        let path = self.path(SIGNED_STATUS);
+        self.note(SIGNED_STATUS, &format!("member list: {status}"), status);
+    }
+
+    /// Keeps status in the file at path and logs line when the status
+    /// changed since the last sync, so the journal gets one line per change
+    /// and not one per minute. Returns whether it changed.
+    fn note(&self, path: &str, line: &str, status: &str) -> bool {
+        let path = self.path(path);
         if fsx::read_or_empty(&path).trim() == status {
-            return;
+            return false;
         }
-        eprintln!("dryserver: member list: {status}");
+        eprintln!("dryserver: {line}");
         let _ = fsx::mkdir_all(fsx::dir(&path), 0o755);
         let _ = fsx::write_file(&path, format!("{status}\n"), 0o644);
+        true
     }
 
     // ---- commands run at boot and by the timer ----
@@ -747,6 +840,17 @@ impl Node {
 /// itself never holds the key.
 pub fn with_private_key(conf: &str, key: &str) -> String {
     conf.replacen("[Interface]\n", &format!("[Interface]\nPrivateKey = {}\n", key.trim()), 1)
+}
+
+/// Whether a cgroup, or one below it, holds a process. cgroup.procs alone
+/// does not tell: kubepods.slice keeps every pod in cgroups below itself,
+/// and its own list stays empty. A missing cgroup holds nothing.
+fn populated(dir: &Path) -> bool {
+    let events = fsx::read_or_empty(dir.join("cgroup.events"));
+    if !events.is_empty() {
+        return events.lines().any(|l| l.trim() == "populated 1");
+    }
+    !fsx::read_or_empty(dir.join("cgroup.procs")).trim().is_empty()
 }
 
 /// Runs at boot on a server that is not approved yet: sends (or resumes) a
@@ -825,6 +929,13 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     if let Err(e) = quarantine::auto_cut(ctx, n, coordinator) {
         eprintln!("dryserver: automatic cut: {e}");
     }
+    // A server that is no member runs nothing of the cluster: what its
+    // leave did not stop is stopped now. Also while it is quarantined, and
+    // whatever the quarantine file says.
+    let host = if coordinator { 1 } else { n.load_state().host };
+    if host == 0 {
+        n.finish_leave(ctx);
+    }
     let q = quarantine::load(n)?;
     if !coordinator && q.coordinator_cut() {
         return Ok(false);
@@ -846,7 +957,7 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
         }
         members
     } else {
-        me.host = n.load_state().host;
+        me.host = host;
         if me.host == 0 {
             return Err("not a member of the swarm: not joined yet, or removed by the admin (sudo dryserver join asks to join)".into());
         }
@@ -1061,6 +1172,10 @@ mod tests {
         mesh_down: Mutex<bool>,
         /// The "signed" reply on the home network; None: nobody answers.
         signed: Mutex<Option<Envelope>>,
+        /// k3s.service runs: systemctl start and stop change it.
+        k3s_up: Mutex<bool>,
+        /// systemctl stop k3s.service fails, like one that timed out.
+        stop_fails: Mutex<bool>,
     }
 
     impl FakeCoord {
@@ -1076,6 +1191,8 @@ mod tests {
                 ran: Mutex::new(Vec::new()),
                 mesh_down: Mutex::new(false),
                 signed: Mutex::new(None),
+                k3s_up: Mutex::new(false),
+                stop_fails: Mutex::new(false),
             })
         }
     }
@@ -1087,6 +1204,29 @@ mod tests {
             match c.name.as_str() {
                 "systemctl" | "umount" => {
                     self.ran.lock().unwrap().push(format!("{} {}", c.name, c.args.join(" ")));
+                    if c.name == "umount" {
+                        // Gone from the mount table, like a lazy umount.
+                        let mounts = fsx::under(&self.root, "/proc/self/mounts");
+                        let left: String = fsx::read_or_empty(&mounts)
+                            .lines()
+                            .filter(|l| l.split(' ').nth(1) != c.args.last().map(String::as_str))
+                            .map(|l| format!("{l}\n"))
+                            .collect();
+                        if mounts.exists() {
+                            std::fs::write(&mounts, left).unwrap();
+                        }
+                    } else if c.args.last().is_some_and(|a| a == "k3s.service") {
+                        let mut up = self.k3s_up.lock().unwrap();
+                        match c.args[0].as_str() {
+                            "is-active" if !*up => return (String::new(), Err("inactive".into())),
+                            "stop" if *self.stop_fails.lock().unwrap() => {
+                                return (String::new(), Err("systemctl failed: Job for k3s.service canceled".into()));
+                            }
+                            "stop" => *up = false,
+                            "start" | "restart" => *up = true,
+                            _ => {}
+                        }
+                    }
                     return (String::new(), Ok(()));
                 }
                 "ping" | "ip" | "agetty" | "networkctl" => return (String::new(), Ok(())),
@@ -1480,6 +1620,7 @@ mod tests {
              /dev/vda2 /var/lib/rancher ext4 rw 0 0\n",
         );
         fc.ran.lock().unwrap().clear();
+        *fc.k3s_up.lock().unwrap() = true;
         let wg = get(&n.root, WG_CONF);
         (dir, tmp, n, fc, wg)
     }
@@ -1509,9 +1650,182 @@ mod tests {
         assert!(status.starts_with("REMOVED") && status.contains("sudo dryserver join"), "{status}");
         assert!(get(&n.root, SIGNED_FILE).contains(&list.sig), "the list that removed it is the newest it has seen");
         assert_eq!(get(&n.root, WG_CONF), wg);
-        // From here on it is like a machine that never joined.
+        // From here on it is like a machine that never joined, and with
+        // nothing of k3s left there is nothing to stop again.
+        fc.ran.lock().unwrap().clear();
         let e = sync(&Ctx::new(), n, false, &Store::new("/nonexistent")).unwrap_err().to_string();
         assert!(e.contains("not a member of the swarm"), "{e}");
+        assert_eq!(*fc.ran.lock().unwrap(), vec!["systemctl is-active --quiet k3s.service"], "stopped again with nothing left");
+        assert!(get(&n.root, K3S_LEFT_STATUS).trim().is_empty());
+    }
+
+    /// The kernel's word on k3s's cgroups.
+    fn cgroups(n: &Node, populated: bool) {
+        for cgroup in K3S_CGROUPS {
+            put(&n.root, &format!("{cgroup}/cgroup.events"), format!("populated {}\nfrozen 0\n", u8::from(populated)));
+            put(&n.root, &format!("{cgroup}/cgroup.kill"), "");
+        }
+    }
+
+    fn stopped(fc: &FakeCoord) -> bool {
+        fc.ran.lock().unwrap().iter().any(|c| c == "systemctl stop k3s.service")
+    }
+
+    #[test]
+    fn a_removed_server_stops_k3s_until_it_is_gone() {
+        let (_dir, _tmp, n, fc, _) = running_apps();
+        let (store, ctx) = (Store::new("/nonexistent"), Ctx::new());
+        // systemctl gives up on the stop, and the kill misses something.
+        cgroups(&n, true);
+        *fc.stop_fails.lock().unwrap() = true;
+        *fc.peers.lock().unwrap() = Some(peers(&[coord_member()], &sign(&ADMIN, 7, vec![coord_entry(), other_entry()])));
+        assert!(sync(&ctx, &n, false, &store).unwrap_err().is(Kind::Removed));
+        assert!(n.load_state().host == 0 && get(&n.root, sysconf::K3S_TOKEN).is_empty());
+
+        // Every later sync stops it again, and says so in one line: the
+        // status stays the same from one sync to the next.
+        for round in 0..3 {
+            fc.ran.lock().unwrap().clear();
+            cgroups(&n, true);
+            let e = sync(&ctx, &n, false, &store).unwrap_err().to_string();
+            assert!(e.contains("not a member of the swarm"), "{e}");
+            assert!(stopped(&fc), "round {round}: {:?}", fc.ran.lock().unwrap());
+            for cgroup in K3S_CGROUPS {
+                assert_eq!(get(&n.root, &format!("{cgroup}/cgroup.kill")), "1", "round {round}: {cgroup} not killed again");
+            }
+            let status = get(&n.root, K3S_LEFT_STATUS);
+            for want in ["processes in k3s.service", "processes in kubepods.slice", "k3s.service is active"] {
+                assert!(status.contains(want), "round {round}: {status}");
+            }
+            assert!(!n.note(K3S_LEFT_STATUS, "", status.trim()), "the same status is not logged again");
+        }
+
+        // The stop works at last, and the kernel lets go of the last
+        // process: systemd removes the unit's cgroup.
+        *fc.stop_fails.lock().unwrap() = false;
+        sync(&ctx, &n, false, &store).unwrap_err();
+        assert!(!*fc.k3s_up.lock().unwrap());
+        cgroups(&n, false);
+        std::fs::remove_dir_all(n.path(K3S_CGROUPS[0])).unwrap();
+        fc.ran.lock().unwrap().clear();
+        sync(&ctx, &n, false, &store).unwrap_err();
+        assert!(fc.ran.lock().unwrap().is_empty(), "nothing left, nothing to run: {:?}", fc.ran.lock().unwrap());
+        assert!(get(&n.root, K3S_LEFT_STATUS).trim().is_empty(), "the end is logged once too");
+    }
+
+    #[test]
+    fn a_machine_waiting_to_join_pays_nothing() {
+        let (_dir, n, fc) = setup(vec![]);
+        let ctx = Ctx::new();
+        for round in 0..2 {
+            let e = sync(&ctx, &n, false, &Store::new("/nonexistent")).unwrap_err().to_string();
+            assert!(e.contains("not a member of the swarm"), "{e}");
+            assert!(fc.ran.lock().unwrap().is_empty(), "round {round}: {:?}", fc.ran.lock().unwrap());
+            assert!(!n.path(K3S_LEFT_STATUS).exists());
+            // An empty slice from long ago changes nothing.
+            put(&n.root, &format!("{}/cgroup.events", K3S_CGROUPS[1]), "populated 0\nfrozen 0\n");
+        }
+    }
+
+    #[test]
+    fn a_machine_that_joins_again_is_never_stopped() {
+        let (_dir, _tmp, n, fc, _) = running_apps();
+        let (store, ctx) = (Store::new("/nonexistent"), Ctx::new());
+        *fc.peers.lock().unwrap() = Some(peers(&[coord_member()], &sign(&ADMIN, 7, vec![coord_entry(), other_entry()])));
+        assert!(sync(&ctx, &n, false, &store).unwrap_err().is(Kind::Removed));
+
+        // sudo dryserver join, approved again as host 4: the approval sets
+        // the host number, then sync writes the token and starts k3s.
+        n.save_state(&State { host: 4, ..State::default() }).unwrap();
+        let env = sign(&ADMIN, 8, vec![coord_entry(), node_entry(4)]);
+        *fc.peers.lock().unwrap() = Some(
+            serde_json::json!({ "members": [coord_member(), node_member(4)], "signed": env, "k3s_token": "K10abc::node:again" })
+                .to_string(),
+        );
+        cgroups(&n, true);
+        for _ in 0..2 {
+            fc.ran.lock().unwrap().clear();
+            assert!(sync(&ctx, &n, false, &store).unwrap());
+            assert!(!stopped(&fc), "{:?}", fc.ran.lock().unwrap());
+            assert_eq!(get(&n.root, sysconf::K3S_TOKEN), "K10abc::node:again\n");
+        }
+        assert!(*fc.k3s_up.lock().unwrap());
+        // The approval lands between the look and the stop: the second look,
+        // under the mesh lock, sees the member.
+        n.finish_leave(&ctx);
+        assert!(!stopped(&fc) && n.path(sysconf::K3S_TOKEN).exists());
+    }
+
+    #[test]
+    fn a_reboot_half_way_through_leave_is_caught() {
+        let (_dir, _tmp, n, fc, _) = running_apps();
+        // leave recorded the decision, then the machine went down. At boot
+        // k3s found its token and started again.
+        n.save_state(&State::default()).unwrap();
+        cgroups(&n, true);
+        fc.calls.lock().unwrap().clear();
+        let e = sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap_err().to_string();
+        assert!(e.contains("not a member of the swarm"), "{e}");
+        assert!(stopped(&fc) && get(&n.root, sysconf::K3S_TOKEN).is_empty() && get(&n.root, sysconf::K3S_CONFIG).is_empty());
+        assert!(get(&n.root, K3S_LEFT_STATUS).contains("its token"));
+        assert!(fc.calls.lock().unwrap().is_empty(), "no need to ask the coordinator again");
+    }
+
+    #[test]
+    fn leave_under_the_kill_switch_and_again_and_again() {
+        let (_dir, _tmp, n, fc, _) = running_apps();
+        let ctx = Ctx::new();
+        // The coordinator is cut off and k3s is held. Lifting finds that
+        // the admin removed this server meanwhile; the cut stays.
+        put(&n.root, quarantine::STATE_FILE, format!(r#"{{"cuts":[{{"name":"coord","hosts":[1],"wg_keys":["{COORD_WG}"]}}]}}"#));
+        put(&n.root, sysconf::K3S_HOLD, "x\n");
+        cgroups(&n, true);
+        *fc.stop_fails.lock().unwrap() = true;
+        let gone = sign(&ADMIN, 7, vec![coord_entry(), other_entry()]);
+        let why = Error::with_kind(Kind::Removed, "the admin removed this server from the swarm (signed list version 7)");
+        for _ in 0..3 {
+            n.leave(&ctx, &gone, &why);
+        }
+        let status = get(&n.root, SIGNED_STATUS);
+        assert!(status.starts_with("REMOVED") && !n.note(SIGNED_STATUS, "", status.trim()), "{status}");
+        assert!(n.load_state().host == 0 && get(&n.root, SIGNED_FILE).contains(&gone.sig));
+
+        // Sync stays away from the cut coordinator but still stops k3s,
+        // also when the quarantine file is damaged.
+        fc.calls.lock().unwrap().clear();
+        for (state, want_paused) in [(None, true), (Some("{oops"), false)] {
+            if let Some(text) = state {
+                put(&n.root, quarantine::STATE_FILE, text);
+            }
+            fc.ran.lock().unwrap().clear();
+            let res = sync(&ctx, &n, false, &Store::new("/nonexistent"));
+            assert_eq!(res.as_ref().is_ok_and(|ok| !ok), want_paused, "{res:?}");
+            assert!(stopped(&fc), "{:?}", fc.ran.lock().unwrap());
+            assert!(fc.calls.lock().unwrap().is_empty(), "sync talked to a cut coordinator");
+            assert!(n.path(sysconf::K3S_HOLD).exists(), "the hold belongs to the cut and goes with it");
+        }
+    }
+
+    #[test]
+    fn only_what_is_there_is_stopped() {
+        let (_dir, n, fc) = setup(vec![]);
+        // A token, no cgroups (k3s never started), no pod mounts.
+        put(&n.root, sysconf::K3S_TOKEN, "K10abc::node:secret\n");
+        n.finish_leave(&Ctx::new());
+        assert!(!n.path(sysconf::K3S_TOKEN).exists());
+        assert_eq!(*fc.ran.lock().unwrap(), vec!["systemctl stop k3s.service"], "no is-active without a cgroup, no umount");
+        for cgroup in K3S_CGROUPS {
+            assert!(!n.path(cgroup).exists(), "{cgroup} was made up");
+        }
+        // The coordinator's control plane is never stopped here, even if
+        // it looks like a server that is no member (its role file lost).
+        put(&n.root, K3S_AGENT_TOKEN, "K10abc::node:secret\n");
+        put(&n.root, sysconf::K3S_TOKEN, "K10abc::node:secret\n");
+        cgroups(&n, true);
+        *fc.k3s_up.lock().unwrap() = true;
+        fc.ran.lock().unwrap().clear();
+        n.finish_leave(&Ctx::new());
+        assert!(fc.ran.lock().unwrap().is_empty() && n.path(sysconf::K3S_TOKEN).exists());
     }
 
     #[test]
