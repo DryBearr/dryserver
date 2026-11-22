@@ -95,8 +95,18 @@ pub const K3S_MARK: &str = "/run/dryserver-backup.k3s-stopped";
 /// the admin's login. A coordinator installed then still has both; every
 /// backup run puts them away (Job::retire_old), and finds nothing once
 /// that is done.
-const OLD_PARENT: &str = "var/lib/dryserver";
+const OLD_PARENT: &str = REGISTRY_DIR;
 const OLD_NAME: &CStr = c"backups";
+/// The registry's directory and file. The registry account writes them,
+/// and may put anything at that name (a link, a FIFO, a huge file, or
+/// nothing): the file is copied on its own, read once through its
+/// directory without following a link, a regular file of at most
+/// MAX_REGISTRY. Anything else is left out with a warning; it never stops
+/// the backup of the rest (the admin's desktop keeps the signed list).
+const REGISTRY_DIR: &str = "var/lib/dryserver";
+const REGISTRY_NAME: &CStr = c"registry.json";
+const REGISTRY: &str = "var/lib/dryserver/registry.json";
+const MAX_REGISTRY: u64 = 16 << 20;
 
 /// One thing that goes into the backup, a path relative to "/".
 struct Source {
@@ -128,7 +138,7 @@ const SOURCES: &[Source] = &[
     Source { path: "var/lib/rancher/k3s/server/manifests", needed: false, k3s: true, prefix: Some("dryserver-") },
     src("etc/rancher/k3s/agent-token", true, false),
     src("etc/rancher/k3s/config.yaml", false, false),
-    src("var/lib/dryserver/registry.json", true, false),
+    // And REGISTRY, copied on its own (copy_registry).
     src("etc/dryserver", true, false),
     src("etc/wireguard", true, false),
     Source { path: "etc/ssh", needed: true, k3s: false, prefix: Some("ssh_host_") },
@@ -565,8 +575,9 @@ impl<'a> Job<'a> {
         if let Some(t) = newest.last() {
             done.warnings.push(format!("the clock is behind the newest backup ({}); this one is kept anyway", name_of(*t)));
         }
-        let (live, k3s, missing) = self.pick()?;
-        let need = live.iter().chain(&k3s).map(|p| tree_size(&self.at(p))).sum::<u64>();
+        let (mut live, k3s, mut missing) = self.pick()?;
+        // The registry's file counts at its most.
+        let need = live.iter().chain(&k3s).map(|p| tree_size(&self.at(p))).sum::<u64>() + MAX_REGISTRY;
         // The plain copy and the archive are on the disk at the same time.
         let (total, free) = (self.space)(&self.dir())?;
         room(total, free, need.saturating_mul(2) + (16 << 20))?;
@@ -589,6 +600,13 @@ impl<'a> Job<'a> {
         // A new directory, never one that stands there.
         std::fs::DirBuilder::new().mode(0o700).create(&staging).map_err(|e| Error::from(e).wrap(format!("mkdir {}", staging.display())))?;
         self.copy(ctx, &live, &staging)?;
+        match self.copy_registry(&staging) {
+            Ok(()) => live.push(REGISTRY.to_string()),
+            Err(why) => {
+                done.warnings.push(format!("/{REGISTRY} is not in this backup: {why}"));
+                missing.push(format!("/{REGISTRY} ({why})"));
+            }
+        }
 
         // The datastore: k3s stopped, so SQLite is not written during the
         // copy. KillMode=process: the containers keep running, only the
@@ -786,6 +804,44 @@ tar --create --file=- --directory="$src" --numeric-owner -- "$@" | tar --extract
         self.run.ok(ctx, &Cmd::new("bash", &args)).map_err(|e| e.wrap("copy for the backup"))
     }
 
+    /// Copies the registry's file (REGISTRY) into the staging copy with
+    /// its owner and mode. Err says why it is left out.
+    fn copy_registry(&self, staging: &Path) -> std::result::Result<(), String> {
+        let dir = DirFd::open(&self.at(REGISTRY_DIR)).map_err(|e| e.to_string())?;
+        let src = dir.open_file_at(REGISTRY_NAME).map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => "it is a symbolic link".to_string(),
+            Some(libc::ENOENT) => "it is not there".to_string(),
+            _ => e.to_string(),
+        })?;
+        let m = src.metadata().map_err(|e| e.to_string())?;
+        if !m.is_file() {
+            return Err("it is not a regular file".into());
+        }
+        if m.len() > MAX_REGISTRY {
+            return Err(format!("it has {} bytes, more than the registry ever needs ({} MiB)", m.len(), MAX_REGISTRY >> 20));
+        }
+        let mut data = Vec::new();
+        (&src).take(MAX_REGISTRY + 1).read_to_end(&mut data).map_err(|e| e.to_string())?;
+        if data.len() as u64 > MAX_REGISTRY {
+            return Err(format!("it grew past {} MiB while it was read", MAX_REGISTRY >> 20));
+        }
+        let dst = staging.join(REGISTRY);
+        fsx::mkdir_all(fsx::dir(&dst), 0o700).map_err(|e| e.to_string())?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&dst)
+            .map_err(|e| format!("create {}: {e}", dst.display()))?;
+        f.write_all(&data).map_err(|e| format!("write {}: {e}", dst.display()))?;
+        if fsx::is_root() {
+            // SAFETY: fchown on a valid descriptor this function opened.
+            unsafe { libc::fchown(f.as_raw_fd(), m.uid(), m.gid()) };
+        }
+        f.set_permissions(std::fs::Permissions::from_mode(m.mode() & 0o777)).map_err(|e| format!("chmod {}: {e}", dst.display()))
+    }
+
     /// Starts k3s and waits until it is up, a few times. Says loudly when
     /// it does not come back.
     fn start_k3s(&self, out: &mut dyn Write) -> bool {
@@ -898,6 +954,19 @@ impl DirFd {
         }
         // SAFETY: fd was just opened and nothing else owns it.
         Ok(DirFd(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// A file in the directory, to read: never a link, and without
+    /// waiting on a FIFO.
+    fn open_file_at(&self, name: &CStr) -> std::io::Result<File> {
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: a valid directory descriptor and C string.
+        let fd = unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(last_err());
+        }
+        // SAFETY: fd was just opened and nothing else owns it.
+        Ok(unsafe { File::from_raw_fd(fd) })
     }
 
     fn stat(&self) -> std::io::Result<libc::stat> {
@@ -2096,6 +2165,54 @@ mod tests {
         let link = dir.join("link");
         std::os::unix::fs::symlink(&victim, &link).unwrap();
         assert!(file_sum(&link).unwrap_err().to_string().contains("symbolic link"));
+    }
+
+    /// The registry account may put anything at the registry's name: it
+    /// never stops the backup, never makes root read through a link or
+    /// wait on a FIFO, and never fills the disk.
+    #[test]
+    fn the_registry_file_is_taken_only_as_a_plain_file() {
+        let secret = "precious root-only text";
+        /// Puts something at the registry's name (the path, a scratch
+        /// directory).
+        type Plant = Box<dyn Fn(&Path, &Path)>;
+        let cases: Vec<(&str, Plant)> = vec![
+            (
+                "is a symbolic link",
+                Box::new(move |reg: &Path, dir: &Path| {
+                    std::fs::write(dir.join("secret"), secret).unwrap();
+                    std::os::unix::fs::symlink(dir.join("secret"), reg).unwrap();
+                }),
+            ),
+            (
+                "is not a regular file",
+                Box::new(|reg: &Path, _: &Path| assert!(std::process::Command::new("mkfifo").arg(reg).status().unwrap().success())),
+            ),
+            (
+                "more than the registry ever needs",
+                Box::new(|reg: &Path, _: &Path| std::fs::File::create(reg).unwrap().set_len(64 << 30).unwrap()),
+            ),
+            ("is not there", Box::new(|_: &Path, _: &Path| {})),
+        ];
+        for (why, plant) in cases {
+            let dir = TempDir::new();
+            let root = coordinator(&dir, AGE);
+            let reg = root.join(REGISTRY);
+            std::fs::remove_file(&reg).unwrap();
+            plant(&reg, dir.path());
+            let f = Fake::new(&dir.join("age"), "active");
+            let j = job(&root, &dir.join("age"), &f);
+            let d = j.run(&Ctx::new(), now(), &mut Vec::new()).unwrap();
+            assert!(
+                d.warnings.iter().any(|w| w.contains("registry.json is not in this backup") && w.contains(why)),
+                "{why}: {:?}",
+                d.warnings
+            );
+            let file = j.dir().join(&d.file);
+            assert!(!tar_list(&file).iter().any(|e| e.contains("registry.json")), "{why}");
+            assert!(!tar_cat(&file, "MANIFEST").contains(secret) && tar_cat(&file, "MANIFEST").contains(why), "{why}");
+            assert!(!String::from_utf8_lossy(&std::fs::read(&file).unwrap()).contains(secret), "{why}: the link was followed");
+        }
     }
 
     /// The raw xattr of an access ACL: (tag, perm, id) entries.
