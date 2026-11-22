@@ -1702,12 +1702,12 @@ mod tests {
     use super::*;
     use crate::release::{Binary, K3s};
     use crate::signed::fake;
-    use crate::testutil::{TempDir, put};
+    use crate::testutil::{PowerCut, TempDir, put, quiet_power_cuts};
     use chrono::{TimeZone, Utc};
     use sha2::{Digest, Sha256};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, Once, OnceLock, Weak};
+    use std::sync::{Mutex, OnceLock, Weak};
 
     const OLD: &[u8] = b"\x7fELF dryserver 0.1.0";
     const NEW: &[u8] = b"\x7fELF dryserver 0.2.0, with the fix";
@@ -2109,21 +2109,6 @@ mod tests {
         confirm(&lab.m(), &Ctx::new(), Some(7), now(), &mut Vec::new()).unwrap();
         let e = confirm(&lab.m(), &Ctx::new(), None, now(), &mut Vec::new()).unwrap_err().to_string();
         assert!(e.contains("no update waits for confirm"), "{e}");
-    }
-
-    struct PowerCut;
-
-    /// The simulated power cuts are panics; only they are kept quiet.
-    fn quiet_power_cuts() {
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            let default = std::panic::take_hook();
-            std::panic::set_hook(Box::new(move |info| {
-                if !info.payload().is::<PowerCut>() {
-                    default(info)
-                }
-            }));
-        });
     }
 
     /// Cuts the power at the n-th step.

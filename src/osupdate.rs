@@ -37,6 +37,7 @@ use crate::err::{Error, Result};
 use crate::release::{self, K3sVersion};
 use crate::runner::{Cmd, LogFn, Runner};
 use crate::sysconf::{self, Role};
+use crate::update::Hook;
 use crate::{bail, errf, fsx};
 
 /// pacman's list of servers; [core] and [extra] include it.
@@ -135,20 +136,22 @@ pub struct Host<'a> {
     /// Who must own a staged binary and every directory above it: root.
     pub owner: u32,
     pub limits: Limits,
+    /// Called where a power cut could stop an update (update.rs's hook);
+    /// tests crash or fail there.
+    pub hook: Hook,
 }
 
 impl<'a> Host<'a> {
-    /// This machine.
-    pub fn new(run: &'a dyn Runner, log: LogFn) -> Host<'a> {
-        Host { root: PathBuf::from("/"), run, log, owner: 0, limits: Limits::default() }
-    }
-
     fn path(&self, p: &str) -> PathBuf {
         fsx::under(&self.root, p)
     }
 
     fn say(&self, msg: &str) {
         (self.log)(msg)
+    }
+
+    fn at(&self, point: &str) -> Result<()> {
+        (self.hook)(point).map_err(|e| Error::from(e).wrap(point))
     }
 }
 
@@ -1013,9 +1016,20 @@ fn took(d: Duration) -> String {
 
 // ---- the k3s binary ----
 
-/// How a k3s update ended, when it got as far as changing the binary.
+/// While this file exists, the k3s binary in place was swapped in by an
+/// update and has not been through its health check yet: a run that finds
+/// it (the power went between the swap and the check) checks it. Without
+/// it, a binary with the release's checksum is simply the one to keep, and
+/// nothing is restarted. It holds the checksum of that binary, and lives
+/// in update.rs's directory, which only root can change.
+pub const K3S_CHECK: &str = "/var/lib/dryserver-update/k3s-check";
+
+/// How a k3s update ended, when it did not refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum K3sOutcome {
+    /// The binary in place is the release's and was checked before:
+    /// nothing was done, k3s was not restarted.
+    Unchanged,
     /// The new binary runs and k3s answers healthy.
     Running,
     /// The new binary is in place, k3s was not started: the kill switch
@@ -1056,54 +1070,105 @@ impl Host<'_> {
     /// wrong place, too large or with another checksum, or a binary that
     /// says it is another version than the release does (the version skew
     /// rules go by the release's word). Otherwise the K3sOutcome says how
-    /// it ended.
+    /// it ended. staged may be None only when the release's binary is in
+    /// place already.
     ///
     /// The swap, each step safe to cut the power after:
     /// 1. copy to a temporary name next to the binary, flushed to disk,
     ///    and checked again there: what is renamed into place is exactly
     ///    what was checked;
-    /// 2. hard link the current binary to k3s.prev (one rename replaces
+    /// 2. note in K3S_CHECK that the binary with this checksum still needs
+    ///    its health check;
+    /// 3. hard link the current binary to k3s.prev (one rename replaces
     ///    the older k3s.prev);
-    /// 3. rename the copy over the binary.
+    /// 4. rename the copy over the binary.
     ///
-    /// A run that finds the new binary already in place (the power went
-    /// after step 3) keeps k3s.prev as it is and goes on with the restart.
-    pub fn k3s_install(&self, ctx: &Ctx, staged: &Path, sha256: &str, version: &str, role: Role) -> Result<K3sOutcome> {
+    /// A run that finds the new binary already in place with K3S_CHECK
+    /// (the power went after step 4) keeps k3s.prev as it is and goes on
+    /// with the restart and the check. Without K3S_CHECK the binary in
+    /// place passed its check before: nothing to do. Restarting it anyway
+    /// would stop the control plane on the brain for nothing, and a check
+    /// that fails then (the brain down) would put k3s.prev back: a
+    /// downgrade.
+    pub fn k3s_install(&self, ctx: &Ctx, staged: Option<&Path>, sha256: &str, version: &str, role: Role) -> Result<K3sOutcome> {
         if !release::is_sha256(sha256) {
             bail!("{} is not a sha256 of 64 lowercase hex digits", show(sha256));
         }
         K3sVersion::parse(version)?;
-        let size = self.check_staged(staged)?;
-        release::verify_file(staged, sha256, size).map_err(|e| e.wrap("staged k3s"))?;
         let bin = self.path(K3S_BIN);
         self.clean_k3s_temps();
         if release::hash_file(&bin, MAX_K3S).is_ok_and(|(h, _)| h == sha256) {
-            self.say(&format!("k3s {version} is in place already (an earlier run stopped before its health check)"));
+            if !self.k3s_unchecked(sha256) {
+                self.say(&format!("k3s {version} is in place already: nothing to do"));
+                return Ok(K3sOutcome::Unchanged);
+            }
+            self.say(&format!("k3s {version} is in place but was not checked yet (an earlier run stopped before its health check)"));
             self.check_version(ctx, &bin, version)?;
         } else {
+            let staged = staged.ok_or_else(|| errf!("k3s {version} is not in place, and its binary was not given"))?;
+            let size = self.check_staged(staged)?;
+            release::verify_file(staged, sha256, size).map_err(|e| e.wrap("staged k3s"))?;
             self.stage_k3s(ctx, staged, sha256, size, version)?;
-            self.keep_prev()?;
-            fsx::rename(self.path(K3S_NEW), &bin)?;
-            sync_dir(&bin)?;
+            let swapped = (|| {
+                self.at("k3s copied")?;
+                self.mark_unchecked(sha256)?;
+                self.at("k3s marked")?;
+                self.keep_prev()?;
+                self.at("k3s kept")?;
+                fsx::rename(self.path(K3S_NEW), &bin)
+            })();
+            if let Err(e) = swapped {
+                let _ = fs::remove_file(self.path(K3S_NEW));
+                self.unmark();
+                return Err(e);
+            }
+            // The new binary is in place from here on: whatever happens
+            // next, this is no refusal.
+            if let Err(e) = sync_dir(&bin).and_then(|_| self.at("k3s swapped")) {
+                self.say(&format!(
+                    "warning: k3s {version} is in place but its directory could not be flushed ({e}): a power cut now may bring the previous binary back"
+                ));
+            }
             self.say(&format!("k3s {version} is in place, the previous binary kept as {K3S_PREV}"));
         }
         if let Some(why) = self.k3s_blocked(role) {
+            // Never started, so never checked: K3S_CHECK stays for the run
+            // that may start it.
             self.say(&format!("k3s {version}: not started: {why}"));
             return Ok(K3sOutcome::Placed { why });
         }
+        // Whether the binary in place still needs its check afterwards.
+        let mut unchecked = false;
         let outcome = match self.k3s_restart(ctx, role) {
             Ok(()) => K3sOutcome::Running,
             // Stopped (the update service was stopped): a revert could not
             // finish its own check either. The new binary stays; the next
             // run finds it in place and checks it, as after a power cut.
-            Err(why) if ctx.done() => K3sOutcome::Broken {
-                why: why.to_string(),
-                revert: "the update was stopped before k3s was checked; the next run checks it again".into(),
-                left: Left::New,
+            Err(why) if ctx.done() => {
+                unchecked = true;
+                K3sOutcome::Broken {
+                    why: why.to_string(),
+                    revert: "the update was stopped before k3s was checked; the next run checks it again".into(),
+                    left: Left::New,
+                }
+            }
+            Err(why) => match self.k3s_blocked(role) {
+                // The kill switch held k3s while it started: not the new
+                // binary's fault, and the previous one could not start
+                // either.
+                Some(held) => {
+                    unchecked = true;
+                    self.say(&format!("k3s {version}: stopped while it started: {held}"));
+                    K3sOutcome::Placed { why: held }
+                }
+                None => self.k3s_revert(ctx, role, sha256, why),
             },
-            Err(why) => self.k3s_revert(ctx, role, sha256, why),
         };
+        if !unchecked {
+            self.unmark();
+        }
         match &outcome {
+            K3sOutcome::Unchanged => {}
             K3sOutcome::Running => self.say(&format!("k3s {version} runs and is healthy")),
             K3sOutcome::Reverted { why } => {
                 self.say(&format!("k3s {version} was not healthy ({why}); the previous binary is back and healthy"))
@@ -1165,6 +1230,44 @@ impl Host<'_> {
             bail!("the staged k3s {} is {} bytes, not between 1 and {MAX_K3S}", staged.display(), m.len());
         }
         Ok(m.len())
+    }
+
+    /// Whether the binary with sha256 was swapped in and not checked yet.
+    pub fn k3s_unchecked(&self, sha256: &str) -> bool {
+        read_capped(&self.path(K3S_CHECK), 256).is_ok_and(|s| s.trim() == sha256)
+    }
+
+    fn mark_unchecked(&self, sha256: &str) -> Result<()> {
+        let p = self.path(K3S_CHECK);
+        fsx::mkdir_all(fsx::dir(&p), 0o700)?;
+        write_atomic(&p, format!("{sha256}\n").as_bytes(), 0o600)
+    }
+
+    fn unmark(&self) {
+        let p = self.path(K3S_CHECK);
+        if fs::remove_file(&p).is_ok() {
+            let _ = sync_dir(&p);
+        }
+    }
+
+    /// Puts back the k3s that ran before an update (update.rs's revert):
+    /// k3s.prev, when its checksum is prev. Ok(false) when that binary is
+    /// in place already. Restarting k3s is the caller's business.
+    pub fn k3s_put_back(&self, prev: &str) -> Result<bool> {
+        let bin = self.path(K3S_BIN);
+        self.clean_k3s_temps();
+        if release::hash_file(&bin, MAX_K3S).is_ok_and(|(h, _)| h == prev) {
+            self.unmark();
+            return Ok(false);
+        }
+        match release::hash_file(&self.path(K3S_PREV), MAX_K3S) {
+            Ok((h, _)) if h == prev => {}
+            Ok(_) => bail!("{K3S_PREV} is not the k3s that ran before the update, so {K3S_BIN} stays the new one"),
+            Err(e) => bail!("{K3S_PREV} cannot be used ({e}), so {K3S_BIN} stays the new one"),
+        }
+        replace_with(&self.path(K3S_PREV), &self.path(K3S_BACK), &bin)?;
+        self.unmark();
+        Ok(true)
     }
 
     fn clean_k3s_temps(&self) {
@@ -1254,6 +1357,7 @@ impl Host<'_> {
         // a time limit, so a blocking restart could hang for ever. Readiness
         // is waited for below, with one.
         self.run.ok(&ctx.with_timeout(Duration::from_secs(60)), &Cmd::new("systemctl", &["restart", "--no-block", K3S_UNIT]))?;
+        self.at("k3s restarted")?;
         self.wait_healthy(ctx, role, &before)
     }
 
@@ -1278,18 +1382,29 @@ impl Host<'_> {
     /// cluster; and it needs no credentials, nothing from k3s's data
     /// directory, and no answer from another machine. Whether the brain
     /// counts the node Ready is for the rollout on the brain to see.
+    ///
+    /// The limit is for getting healthy; the settling after it is not cut
+    /// short by it (only by ctx): a k3s that answered just before the limit
+    /// is as good as one that answered early.
+    ///
+    /// A kill switch that holds k3s meanwhile ends the wait at once: k3s
+    /// cannot start, whatever its binary.
     fn wait_healthy(&self, ctx: &Ctx, role: Role, before: &str) -> Result<()> {
         let limit = if role == Role::Coordinator { self.limits.k3s_ready_brain } else { self.limits.k3s_ready_agent };
         let wctx = ctx.with_timeout(limit);
         let mut last = String::from("it did not start");
         loop {
+            if let Some(why) = self.k3s_blocked(role) {
+                bail!("k3s may not run here now: {why}");
+            }
             let (state, id) = self.k3s_unit(&wctx);
             if state == "active" && !id.is_empty() && id != before {
                 match self.k3s_probe(&wctx, role) {
                     Ok(()) => {
-                        if wctx.sleep(self.limits.k3s_settle).is_ok() {
-                            let (state2, id2) = self.k3s_unit(&wctx);
-                            if state2 == "active" && id2 == id && self.k3s_probe(&wctx, role).is_ok() {
+                        let sctx = ctx.with_timeout(self.limits.k3s_settle + Duration::from_secs(60));
+                        if sctx.sleep(self.limits.k3s_settle).is_ok() {
+                            let (state2, id2) = self.k3s_unit(&sctx);
+                            if state2 == "active" && id2 == id && self.k3s_probe(&sctx, role).is_ok() {
                                 return Ok(());
                             }
                             last = "it came up, then stopped or was restarted (crashing?)".into();
@@ -1461,7 +1576,7 @@ fn printable(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::install::{Encryption, crypttab};
-    use crate::testutil::{TempDir, get, put};
+    use crate::testutil::{PowerCut, TempDir, get, put, quiet_power_cuts};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1473,7 +1588,8 @@ mod tests {
     /// runs whatever binary is in place when it is restarted. The binary's
     /// text says how it behaves: "version=V" is what --version prints;
     /// "good" answers healthy, "sick" runs but never answers, "dead" never
-    /// gets active, "flaky" is restarted by systemd all the time.
+    /// gets active, "flaky" is restarted by systemd all the time, "slow"
+    /// answers healthy SLOW after its start.
     struct Fake {
         root: PathBuf,
         ran: Mutex<Vec<Cmd>>,
@@ -1482,7 +1598,17 @@ mod tests {
         keyring_newer: bool,
         running: Mutex<Option<String>>,
         invocation: Mutex<u32>,
+        started: Mutex<Option<std::time::Instant>>,
+        /// The kill switch lands as k3s restarts: the hold file appears and
+        /// k3s.service's condition keeps it from starting.
+        hold_on_restart: bool,
+        /// Nothing answers healthy, whatever binary runs.
+        brain_down: Mutex<bool>,
+        /// sshd -t fails.
+        sshd_fails: bool,
     }
+
+    const SLOW: Duration = Duration::from_millis(200);
 
     impl Fake {
         fn new(root: &Path) -> Fake {
@@ -1497,7 +1623,19 @@ mod tests {
                 keyring_newer: true,
                 running: Mutex::default(),
                 invocation: Mutex::new(0),
+                started: Mutex::default(),
+                hold_on_restart: false,
+                brain_down: Mutex::new(false),
+                sshd_fails: false,
             }
+        }
+
+        fn healthy(&self) -> bool {
+            if *self.brain_down.lock().unwrap() {
+                return false;
+            }
+            let since = self.started.lock().unwrap().map(|t| t.elapsed()).unwrap_or_default();
+            self.behaves("good") || self.behaves("flaky") || (self.behaves("slow") && since >= SLOW)
         }
 
         fn lines(&self) -> Vec<String> {
@@ -1527,8 +1665,13 @@ mod tests {
                 ("pacman", ["-Qu", _]) => (String::new(), Err("pacman failed: exit status 1".into())),
                 ("pacman", _) => (self.pacman)(ctx, &self.root, c),
                 ("systemctl", ["restart", "--no-block", "k3s.service"]) => {
-                    *self.running.lock().unwrap() = Some(get(&self.root, K3S_BIN));
+                    if self.hold_on_restart {
+                        put(&self.root, sysconf::K3S_HOLD, "the coordinator is cut off\n");
+                    }
+                    let held = fsx::under(&self.root, sysconf::K3S_HOLD).exists();
+                    *self.running.lock().unwrap() = if held { None } else { Some(get(&self.root, K3S_BIN)) };
                     *self.invocation.lock().unwrap() += 1;
+                    *self.started.lock().unwrap() = Some(std::time::Instant::now());
                     ok("")
                 }
                 ("systemctl", ["show", "k3s.service", _]) => {
@@ -1547,7 +1690,7 @@ mod tests {
                     ok(&format!("ActiveState={state}\nInvocationID={inv}\n"))
                 }
                 ("curl", _) | (_, ["kubectl", "get", "--raw", "/readyz"]) => {
-                    if self.behaves("good") || self.behaves("flaky") {
+                    if self.healthy() {
                         ok("ok")
                     } else {
                         (String::new(), Err(errf!("{} failed: exit status 7: connection refused", c.name)))
@@ -1579,7 +1722,7 @@ mod tests {
             ..Limits::default()
         };
         let log: LogFn = Arc::new(move |s: &str| l.lock().unwrap().push(s.to_string()));
-        (Host { root: root.into(), run, log, owner: fsx::geteuid(), limits }, logs)
+        (Host { root: root.into(), run, log, owner: fsx::geteuid(), limits, hook: Arc::new(|_| Ok(())) }, logs)
     }
 
     fn append(root: &Path, path: &str, text: &str) {
@@ -2270,7 +2413,7 @@ mod tests {
         let fake = Fake::new(r);
         let (h, _) = host(r, &fake);
         let (staged, sha) = stage(r, &binary(NEW, "good"));
-        assert_eq!(h.k3s_install(&Ctx::new(), &staged, &sha, NEW, Role::Node).unwrap(), K3sOutcome::Running);
+        assert_eq!(h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap(), K3sOutcome::Running);
         assert_eq!(get(r, K3S_BIN), binary(NEW, "good"));
         assert_eq!(get(r, K3S_PREV), binary(OLD, "good"));
         assert_eq!(fs::metadata(h.path(K3S_BIN)).unwrap().permissions().mode() & 0o777, 0o755);
@@ -2287,7 +2430,7 @@ mod tests {
         let fake = Fake::new(r);
         let (h, _) = host(r, &fake);
         let (staged, sha) = stage(r, &binary(NEW, "good"));
-        assert_eq!(h.k3s_install(&Ctx::new(), &staged, &sha, NEW, Role::Coordinator).unwrap(), K3sOutcome::Running);
+        assert_eq!(h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Coordinator).unwrap(), K3sOutcome::Running);
         assert!(fake.count(&format!("{} kubectl get --raw /readyz", h.path(K3S_BIN).display())) >= 2);
         untouched(r, &fake);
     }
@@ -2305,14 +2448,14 @@ mod tests {
             (sha.clone(), "1.37.2", "not a k3s version"),
             (sha.clone(), "v1.37.3+k3s1", "says it is \"v1.37.2+k3s1\", the release says v1.37.3+k3s1"),
         ] {
-            let err = h.k3s_install(&Ctx::new(), &staged, &sha, version, Role::Node).unwrap_err().to_string();
+            let err = h.k3s_install(&Ctx::new(), Some(&staged), &sha, version, Role::Node).unwrap_err().to_string();
             assert!(err.contains(want), "{err}");
             assert_eq!(get(r, K3S_BIN), binary(OLD, "good"));
             assert!(!h.path(K3S_PREV).exists());
         }
         // A binary that does not run at all.
         let (staged, sha) = stage(r, "not a program");
-        let err = h.k3s_install(&Ctx::new(), &staged, &sha, NEW, Role::Node).unwrap_err().to_string();
+        let err = h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap_err().to_string();
         assert!(err.contains("does not run"), "{err}");
         assert_eq!(fake.count("systemctl"), 0);
         untouched(r, &fake);
@@ -2327,11 +2470,11 @@ mod tests {
         let fake = Fake::new(r);
         let (h, _) = host(r, &fake);
         let start = std::time::Instant::now();
-        let err = h.k3s_install(&Ctx::new(), &staged, &"a".repeat(64), NEW, Role::Node).unwrap_err().to_string();
+        let err = h.k3s_install(&Ctx::new(), Some(&staged), &"a".repeat(64), NEW, Role::Node).unwrap_err().to_string();
         assert!(err.contains("not between 1 and"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(2), "it was read");
         let (staged, _) = stage(r, "");
-        let err = h.k3s_install(&Ctx::new(), &staged, &"a".repeat(64), NEW, Role::Node).unwrap_err().to_string();
+        let err = h.k3s_install(&Ctx::new(), Some(&staged), &"a".repeat(64), NEW, Role::Node).unwrap_err().to_string();
         assert!(err.contains("is 0 bytes"), "{err}");
         assert_eq!(get(r, K3S_BIN), binary(OLD, "good"));
     }
@@ -2387,7 +2530,7 @@ mod tests {
             spoil(r, &staged);
             let fake = Fake::new(r);
             let (h, _) = host(r, &fake);
-            let err = h.k3s_install(&Ctx::new(), &staged, &sha, NEW, Role::Node).unwrap_err().to_string();
+            let err = h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap_err().to_string();
             assert!(err.contains(want), "{name}: {err}");
             assert_eq!(get(r, K3S_BIN), binary(OLD, "good"), "{name}");
         }
@@ -2398,9 +2541,9 @@ mod tests {
         let fake = Fake::new(r);
         let (mut h, _) = host(r, &fake);
         h.owner = fsx::geteuid() + 1;
-        assert!(h.k3s_install(&Ctx::new(), &staged, &sha, NEW, Role::Node).unwrap_err().to_string().contains("belongs to uid"));
+        assert!(h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap_err().to_string().contains("belongs to uid"));
         h.owner = fsx::geteuid();
-        let err = h.k3s_install(&Ctx::new(), Path::new("staging/k3s"), &sha, NEW, Role::Node).unwrap_err().to_string();
+        let err = h.k3s_install(&Ctx::new(), Some(Path::new("staging/k3s")), &sha, NEW, Role::Node).unwrap_err().to_string();
         assert!(err.contains("not an absolute path"), "{err}");
     }
 
@@ -2423,7 +2566,7 @@ mod tests {
             let fake = Fake::new(r);
             let (h, _) = host(r, &fake);
             let (staged, sha) = stage(r, &binary(NEW, "good"));
-            match h.k3s_install(&Ctx::new(), &staged, &sha, NEW, role).unwrap() {
+            match h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, role).unwrap() {
                 K3sOutcome::Placed { why } => assert!(why.contains(want), "{why}"),
                 other => panic!("{spoil}: {other:?}"),
             }
@@ -2443,7 +2586,7 @@ mod tests {
             let fake = Fake::new(r);
             let (h, _) = host(r, &fake);
             let (staged, sha) = stage(r, &binary(NEW, how));
-            match h.k3s_install(&Ctx::new(), &staged, &sha, NEW, Role::Node).unwrap() {
+            match h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap() {
                 K3sOutcome::Reverted { why } => assert!(why.contains(want) && why.contains("not healthy within"), "{how}: {why}"),
                 other => panic!("{how}: {other:?}"),
             }
@@ -2463,7 +2606,7 @@ mod tests {
         let fake = Fake::new(r);
         let (h, logs) = host(r, &fake);
         let (staged, sha) = stage(r, &binary(NEW, "sick"));
-        match h.k3s_install(&Ctx::new(), &staged, &sha, NEW, Role::Node).unwrap() {
+        match h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap() {
             K3sOutcome::Broken { why, revert, left } => {
                 assert!(why.contains("not healthy") && revert.contains("not healthy either"), "{why} / {revert}");
                 assert_eq!(left, Left::Previous);
@@ -2488,14 +2631,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             c.cancel();
         });
-        match h.k3s_install(&ctx, &staged, &sha, NEW, Role::Node).unwrap() {
+        match h.k3s_install(&ctx, Some(&staged), &sha, NEW, Role::Node).unwrap() {
             K3sOutcome::Broken { revert, left, .. } => assert!(left == Left::New && revert.contains("stopped"), "{revert}"),
             other => panic!("{other:?}"),
         }
         assert_eq!(get(r, K3S_BIN), binary(NEW, "sick"));
         assert_eq!(fake.count("systemctl restart"), 1, "no revert once stopped");
         // The next run finds it in place, checks it, and goes back.
-        match h.k3s_install(&Ctx::new(), &staged, &sha, NEW, Role::Node).unwrap() {
+        match h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap() {
             K3sOutcome::Reverted { .. } => {}
             other => panic!("{other:?}"),
         }
@@ -2510,7 +2653,7 @@ mod tests {
         let fake = Fake::new(r);
         let (h, _) = host(r, &fake);
         let (staged, sha) = stage(r, &binary(NEW, "sick"));
-        match h.k3s_install(&Ctx::new(), &staged, &sha, NEW, Role::Node).unwrap() {
+        match h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap() {
             K3sOutcome::Broken { revert, left, .. } => {
                 assert!(revert.contains("no /usr/local/bin/k3s.prev"), "{revert}");
                 assert_eq!(left, Left::New);
@@ -2523,46 +2666,161 @@ mod tests {
 
     #[test]
     fn a_power_cut_at_any_step_of_the_swap_leaves_a_whole_binary() {
+        quiet_power_cuts();
         let (old, new) = (binary(OLD, "good"), binary(NEW, "good"));
-        for cut in 0..=5 {
+        for cut in ["leftovers", "half a copy", "k3s copied", "k3s marked", "k3s kept", "k3s swapped", "k3s restarted"] {
             let dir = k3s_machine(Role::Node);
             let r = dir.path();
             let fake = Fake::new(r);
-            let (h, _) = host(r, &fake);
+            let (mut h, _) = host(r, &fake);
             let (staged, sha) = stage(r, &new);
-            let size = new.len() as u64;
             let ctx = Ctx::new();
             match cut {
                 // Leftovers of a cut in an earlier revert or link.
-                0 => {
+                "leftovers" => {
                     put(r, K3S_BACK, &old[..10]);
                     put(r, K3S_PREV_TMP, "");
                 }
                 // During the copy: half a file under the temporary name.
-                1 => put(r, K3S_NEW, &new[..new.len() / 2]),
-                // After the copy, after k3s.prev, after the rename, after
-                // the restart (the power went before the health check).
-                _ => {
-                    h.stage_k3s(&ctx, &staged, &sha, size, NEW).unwrap();
-                    if cut >= 3 {
-                        h.keep_prev().unwrap();
-                    }
-                    if cut >= 4 {
-                        fsx::rename(h.path(K3S_NEW), h.path(K3S_BIN)).unwrap();
-                    }
-                    if cut >= 5 {
-                        let _ = fake.run(&ctx, &Cmd::new("systemctl", &["restart", "--no-block", "k3s.service"]));
-                    }
+                "half a copy" => put(r, K3S_NEW, &new[..new.len() / 2]),
+                point => {
+                    let point = point.to_string();
+                    h.hook = Arc::new(move |p| {
+                        if p == point {
+                            std::panic::panic_any(PowerCut);
+                        }
+                        Ok(())
+                    });
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        h.k3s_install(&ctx, Some(&staged), &sha, NEW, Role::Node)
+                    }));
+                    assert!(res.is_err(), "{cut}: the power did not go");
+                    h.hook = Arc::new(|_| Ok(()));
                 }
             }
             let live = get(r, K3S_BIN);
-            assert!(live == old || live == new, "cut {cut}: k3s is half a binary");
-            assert!(cut < 3 || get(r, K3S_PREV) == old, "cut {cut}");
+            assert!(live == old || live == new, "{cut}: k3s is half a binary");
+            if live == new {
+                assert!(h.k3s_unchecked(&sha), "{cut}: swapped in, so the check is still due");
+            }
             // The machine boots, update apply runs again.
-            assert_eq!(h.k3s_install(&ctx, &staged, &sha, NEW, Role::Node).unwrap(), K3sOutcome::Running, "cut {cut}");
-            assert_eq!(get(r, K3S_BIN), new, "cut {cut}");
-            assert_eq!(get(r, K3S_PREV), old, "cut {cut}: k3s.prev must stay the binary from before the update");
+            assert_eq!(h.k3s_install(&ctx, Some(&staged), &sha, NEW, Role::Node).unwrap(), K3sOutcome::Running, "{cut}");
+            assert_eq!(get(r, K3S_BIN), new, "{cut}");
+            assert_eq!(get(r, K3S_PREV), old, "{cut}: k3s.prev must stay the binary from before the update");
+            assert!(!h.k3s_unchecked(&sha), "{cut}: checked now");
             untouched(r, &fake);
         }
+    }
+
+    #[test]
+    fn the_same_k3s_again_is_left_alone() {
+        let dir = k3s_machine(Role::Coordinator);
+        let r = dir.path();
+        let fake = Fake::new(r);
+        let (h, _) = host(r, &fake);
+        let (staged, sha) = stage(r, &binary(NEW, "good"));
+        assert_eq!(h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Coordinator).unwrap(), K3sOutcome::Running);
+        assert!(!fsx::under(r, K3S_CHECK).exists(), "checked: nothing left to check");
+        // The brain is down later on. Installing the same k3s again (a
+        // release that changed only dryserver) neither restarts the control
+        // plane nor, when the check then fails, puts k3s.prev back: that
+        // would be a downgrade.
+        *fake.brain_down.lock().unwrap() = true;
+        for staged in [Some(staged.as_path()), None] {
+            assert_eq!(h.k3s_install(&Ctx::new(), staged, &sha, NEW, Role::Coordinator).unwrap(), K3sOutcome::Unchanged);
+        }
+        assert_eq!(fake.count("systemctl restart"), 1, "{:?}", fake.lines());
+        assert_eq!(get(r, K3S_BIN), binary(NEW, "good"));
+        // Without the binary in place, one must be given.
+        let other = "c".repeat(64);
+        let e = h.k3s_install(&Ctx::new(), None, &other, NEW, Role::Coordinator).unwrap_err().to_string();
+        assert!(e.contains("not in place, and its binary was not given"), "{e}");
+        assert_eq!(get(r, K3S_BIN), binary(NEW, "good"));
+    }
+
+    #[test]
+    fn k3s_that_turns_healthy_just_before_the_limit_is_kept() {
+        // It answers after SLOW, and then has to stay up for longer than is
+        // left of the limit: settling is not cut short by the limit.
+        let dir = k3s_machine(Role::Node);
+        let r = dir.path();
+        let fake = Fake::new(r);
+        let (mut h, _) = host(r, &fake);
+        h.limits.k3s_ready_agent = SLOW + Duration::from_millis(100);
+        h.limits.k3s_settle = Duration::from_millis(300);
+        let (staged, sha) = stage(r, &binary(NEW, "slow"));
+        assert_eq!(h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap(), K3sOutcome::Running);
+        assert_eq!(fake.count("systemctl restart"), 1, "not reverted: {:?}", fake.lines());
+        assert_eq!(get(r, K3S_BIN), binary(NEW, "slow"));
+    }
+
+    #[test]
+    fn a_kill_switch_that_lands_while_k3s_starts_leaves_it_placed() {
+        let dir = k3s_machine(Role::Node);
+        let r = dir.path();
+        let mut fake = Fake::new(r);
+        fake.hold_on_restart = true;
+        let (h, _) = host(r, &fake);
+        let (staged, sha) = stage(r, &binary(NEW, "good"));
+        let start = std::time::Instant::now();
+        match h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap() {
+            K3sOutcome::Placed { why } => assert!(why.contains("kill switch"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(start.elapsed() < h.limits.k3s_ready_agent, "it waited for a k3s that may not start");
+        assert_eq!(fake.count("systemctl restart"), 1, "no revert: {:?}", fake.lines());
+        assert_eq!(get(r, K3S_BIN), binary(NEW, "good"));
+        assert!(h.k3s_unchecked(&sha), "never ran, so never checked");
+        untouched(r, &fake);
+    }
+
+    #[test]
+    fn a_failed_flush_after_the_swap_is_no_refusal() {
+        // Err means "refused, nothing changed": not once the new binary is
+        // in place.
+        let dir = k3s_machine(Role::Node);
+        let r = dir.path();
+        let fake = Fake::new(r);
+        let (mut h, logs) = host(r, &fake);
+        h.hook = Arc::new(|p| if p == "k3s swapped" { Err(io::Error::from_raw_os_error(libc::EIO)) } else { Ok(()) });
+        let (staged, sha) = stage(r, &binary(NEW, "good"));
+        assert_eq!(h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap(), K3sOutcome::Running);
+        assert!(logs.lock().unwrap().iter().any(|l| l.contains("could not be flushed")), "{:?}", logs.lock().unwrap());
+        // A failure before the swap is a refusal and leaves no trace.
+        let dir = k3s_machine(Role::Node);
+        let r = dir.path();
+        let fake = Fake::new(r);
+        let (mut h, _) = host(r, &fake);
+        h.hook = Arc::new(|p| if p == "k3s kept" { Err(io::Error::from_raw_os_error(libc::ENOSPC)) } else { Ok(()) });
+        let (staged, sha) = stage(r, &binary(NEW, "good"));
+        assert!(h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).is_err());
+        assert_eq!(get(r, K3S_BIN), binary(OLD, "good"));
+        assert!(!h.k3s_unchecked(&sha));
+        assert_eq!(fake.count("systemctl"), 0);
+        untouched(r, &fake);
+    }
+
+    #[test]
+    fn a_revert_puts_the_previous_k3s_back() {
+        let dir = k3s_machine(Role::Node);
+        let r = dir.path();
+        let fake = Fake::new(r);
+        let (h, _) = host(r, &fake);
+        let old_sha = release::hash_file(&fsx::under(r, K3S_BIN), MAX_K3S).unwrap().0;
+        let (staged, sha) = stage(r, &binary(NEW, "good"));
+        assert_eq!(h.k3s_install(&Ctx::new(), Some(&staged), &sha, NEW, Role::Node).unwrap(), K3sOutcome::Running);
+        assert!(h.k3s_put_back(&old_sha).unwrap());
+        assert_eq!(get(r, K3S_BIN), binary(OLD, "good"));
+        assert!(!h.k3s_put_back(&old_sha).unwrap(), "in place already");
+        // A k3s.prev that is not the one from before stays where it is (both
+        // names are one file now: new files, not writes through the link).
+        for (p, b) in [(K3S_BIN, binary(NEW, "good")), (K3S_PREV, binary("v1.35.0+k3s1", "good"))] {
+            fs::remove_file(fsx::under(r, p)).unwrap();
+            put(r, p, b);
+        }
+        let e = h.k3s_put_back(&old_sha).unwrap_err().to_string();
+        assert!(e.contains("not the k3s that ran before"), "{e}");
+        assert!(get(r, K3S_BIN) == binary(NEW, "good"), "the new k3s stays");
+        untouched(r, &fake);
     }
 }

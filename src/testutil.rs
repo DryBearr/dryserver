@@ -45,3 +45,20 @@ pub fn put(root: &Path, path: &str, content: impl AsRef<[u8]>) {
 pub fn get(root: &Path, path: &str) -> String {
     std::fs::read_to_string(crate::fsx::under(root, path)).unwrap_or_default()
 }
+
+/// A simulated power cut: a panic with this payload, which
+/// quiet_power_cuts keeps off the test output.
+pub struct PowerCut;
+
+/// The simulated power cuts are panics; only they are kept quiet.
+pub fn quiet_power_cuts() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !info.payload().is::<PowerCut>() {
+                default(info)
+            }
+        }));
+    });
+}
