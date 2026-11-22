@@ -1157,7 +1157,9 @@ impl<'a> Machine<'a> {
         self.update()
             .apply(&actx, &inc.join(RELEASE_FILE), &inc.join(DRYSERVER_FILE), &offer.brain_k3s)
             .map_err(|e| Stop::Failed(e.to_string()))?;
-        *l = Local { pending: r.serial, applied: now, installed: l.installed, ..Local::default() };
+        // The resume it acted on stays: if this goes back too, the same
+        // turn's offer must not clear that failure again.
+        *l = Local { pending: r.serial, applied: now, installed: l.installed, retry: l.retry, retried: l.retried, ..Local::default() };
         self.save(l).map_err(again)?;
         Ok(())
     }

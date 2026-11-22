@@ -1489,6 +1489,32 @@ fn resume_installs_a_release_that_went_back_again() {
     assert_eq!(sw.server(2).fake.sim().applied.len(), 2);
 }
 
+/// Resumed, installed again, and it goes back again: the rollout stops
+/// there again, and the same resume does not make it install a third time
+/// (installing cleared what it knew of the resume it acted on).
+#[test]
+fn a_release_that_goes_back_again_after_a_resume_is_not_tried_a_third_time() {
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().broken = true;
+    sw.publish(10, true);
+    sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+    sw.server(2).fake.revert();
+    sw.until(5, |s| !s.rollout().paused.is_empty());
+    sw.resume();
+    sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 2);
+    // It goes back while its turn still stands.
+    sw.server(2).fake.revert();
+    sw.until(5, |s| !s.rollout().paused.is_empty());
+    sw.ticks(10);
+    let r = sw.rollout();
+    assert!(r.paused.contains("node-a (the canary): update reverted again"), "{}", r.paused);
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 2, "installed again without a resume");
+    let l = Machine::new(&sw.server(2).node, false).load();
+    assert_eq!((l.failed, l.outcome.as_str()), (10, "reverted"), "{l:?}");
+    assert!(sw.server(3).fake.sim().applied.is_empty());
+}
+
 /// One that fails again stops the rollout again; -skip passes it over and
 /// the others go on. It keeps its release.
 #[test]
