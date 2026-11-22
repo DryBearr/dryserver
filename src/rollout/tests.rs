@@ -2675,3 +2675,41 @@ fn a_machine_on_its_fallback_kernel_is_not_well() {
     let ro = sw.rollout();
     assert!(ro.pause == Pause::Canary && ro.paused.contains("fallback kernel"), "{}", ro.paused);
 }
+
+// ---- found in review ----
+
+/// A newer normal release that came while the brain's own urgent update
+/// waited for its confirm, outside the window: the brain stopped settling
+/// its own update (only the brain's phase did), and its timer took the
+/// urgent fix back after 10 minutes. Now the brain settles its own update
+/// at every tick, whatever the phase.
+#[test]
+fn review_the_brains_own_update_is_confirmed_while_a_newer_release_waits_for_the_window() {
+    let mut sw = Swarm::new(1);
+    sw.minute = DAYTIME;
+    sw.publish(10, true);
+    sw.until(5, |s| s.brain.fake.sim().pending == 10);
+    sw.publish(11, false);
+    sw.ticks(9);
+    let confirmed = sw.brain.fake.sim().confirmed.clone();
+    assert!(confirmed.iter().any(|c| c.last().map(String::as_str) == Some("10")), "brain never confirmed 10");
+    assert_eq!((sw.installed(1), sw.rollout().phase), (10, Phase::Waiting), "{:#?}", sw.rollout());
+    // Its update went back meanwhile: recorded, and the newer release is
+    // tried in the window all the same.
+    let mut sw = Swarm::new(1);
+    sw.minute = DAYTIME;
+    sw.brain.fake.sim().broken = true;
+    sw.publish(10, true);
+    sw.until(5, |s| s.brain.fake.sim().pending == 10);
+    sw.publish(11, false);
+    sw.tick();
+    sw.brain.fake.revert();
+    sw.ticks(3);
+    let l = Machine::new(&sw.brain.node, true).load();
+    assert!(l.pending == 0 && l.failed == 10 && sw.brain.fake.sim().confirmed.is_empty(), "{l:?}");
+    assert_eq!(sw.rollout().phase, Phase::Waiting);
+    sw.brain.fake.sim().broken = false;
+    sw.minute = IN_WINDOW;
+    sw.until_unpaused(30, |s| s.everyone_on(11));
+    assert_eq!(sw.brain.fake.sim().applied.len(), 2);
+}

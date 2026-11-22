@@ -1999,6 +1999,14 @@ impl Brain<'_> {
     }
 
     fn advance(&mut self) {
+        // The brain's own update in the middle is settled at every tick,
+        // whatever the phase: a newer release that waits for the window
+        // replaced the rollout, not the update it installed, which would
+        // otherwise go back by itself at its deadline. Nothing else moves
+        // in that tick.
+        if self.r.phase != Phase::Brain && self.machine().load().pending != 0 {
+            return self.own_step(&Offer { serial: self.r.serial, ..Offer::default() });
+        }
         // A few steps per tick: waiting -> brain -> servers.
         for _ in 0..3 {
             match self.r.phase {
@@ -2035,10 +2043,8 @@ impl Brain<'_> {
             self.r.wait_for = 0;
         }
         // The brain's own k3s is the control plane's.
-        let offer = Offer { serial: self.r.serial, turn: true, brain_k3s: self.rep.k3s.clone(), retry: 0 };
-        if let Err(e) = m.step(self.ctx, &LocalSource(self.served), &offer, self.rep, self.now.unix) {
-            eprintln!("dryserver: rollout: the coordinator's own update: {e}");
-        }
+        let offer = Offer { serial: self.r.serial, turn: true, brain_k3s: self.rep.k3s.clone(), ..Offer::default() };
+        self.own_step(&offer);
         if m.installed_serial() >= self.r.serial {
             if let Some(why) = self.served_k3s_problem() {
                 // Every server that runs another k3s would refuse it, one
@@ -2059,6 +2065,15 @@ impl Brain<'_> {
                 if l.outcome.is_empty() { "failed" } else { &l.outcome },
                 l.why
             );
+        }
+    }
+
+    /// One step of the brain's own update: settles one it installed, or
+    /// loads and installs the offered release.
+    fn own_step(&self, offer: &Offer) {
+        let m = self.machine();
+        if let Err(e) = m.step(self.ctx, &LocalSource(self.served), offer, self.rep, self.now.unix) {
+            eprintln!("dryserver: rollout: the coordinator's own update: {e}");
         }
     }
 
