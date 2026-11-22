@@ -202,9 +202,9 @@ pub const APPLY_TIME: i64 = 30 * 60;
 /// The confirm window grows by this when the apply reboots the machine:
 /// the boot, k3s and a sync come first.
 pub const REBOOT_WINDOW: i64 = 15 * 60;
-/// How long a stopped detached apply gets (SIGINT to it and pacman)
-/// before systemd kills what is left: pacman finishes the package it is at
-/// and its hooks (a boot image) first.
+/// How long a stopped detached apply gets (SIGINT to it, passed on to
+/// pacman) before systemd kills what is left: pacman finishes the package
+/// it is at and its hooks (a boot image) first.
 const APPLY_STOP_TIME: &str = "30min";
 /// An update that sees this many restarts without being confirmed is
 /// reverted at the next one. A machine whose clock is wrong at every boot
@@ -1830,10 +1830,14 @@ fn steps(
 /// `update apply --detach`: starts the apply in a transient service of its
 /// own (APPLY_UNIT) and returns once it runs. The sync that starts it stays
 /// responsive while pacman works, and stopping or killing the sync never
-/// stops pacman half way: the service's own stop sends SIGINT to the apply
-/// and pacman, which then stops between two packages, and gives them
-/// APPLY_STOP_TIME. `update status` says how it goes (busy, then pending or
-/// last).
+/// stops pacman half way. The service's own stop (a shutdown, systemctl
+/// stop) sends SIGINT to the apply alone (KillMode=mixed), which passes it
+/// on to the new binary's step and that to pacman alone: pacman then stops
+/// between two packages, and the hooks it runs (mkinitcpio, ukify making a
+/// boot image) are never interrupted. With the default, every process of
+/// the service got SIGINT, those hooks too. What is left after
+/// APPLY_STOP_TIME is killed. `update status` says how it goes (busy, then
+/// pending or last).
 pub fn start_detached(m: &Machine, ctx: &Ctx, a: &Apply, out: &mut dyn Write) -> Result<()> {
     if !(MIN_WINDOW..=MAX_WINDOW).contains(&a.window) {
         bail!("the window must be between {MIN_WINDOW} and {MAX_WINDOW} seconds, not {}", a.window);
@@ -1849,6 +1853,7 @@ pub fn start_detached(m: &Machine, ctx: &Ctx, a: &Apply, out: &mut dyn Write) ->
         "--collect".into(),
         "--service-type=exec".into(),
         "--property=KillSignal=SIGINT".into(),
+        "--property=KillMode=mixed".into(),
         format!("--property=TimeoutStopSec={APPLY_STOP_TIME}"),
         format!("--description=Apply dryserver release {}", a.release.display()),
         m.shown(SERVER_BIN),
@@ -5093,6 +5098,7 @@ mod tests {
             "--unit=dryserver-update-apply",
             "--collect",
             "--property=KillSignal=SIGINT",
+            "--property=KillMode=mixed",
             "--property=TimeoutStopSec=30min",
             "/usr/local/bin/dryserver update apply --release /tmp/release-8.json --binary",
             "--k3s /tmp/k3s-8",

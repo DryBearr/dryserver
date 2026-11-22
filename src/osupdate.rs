@@ -818,7 +818,10 @@ impl Host<'_> {
     fn remake_images(&self, ctx: &Ctx, out: &mut ArchOutcome, kernel_changed: bool, kernels: &BTreeMap<String, SystemTime>) {
         self.say("Arch: the boot images are not current; making them again (mkinitcpio -P)");
         self.copy_kernels(out);
-        let tctx = ctx.with_timeout(self.limits.sync);
+        // Not stopped with the update: an image cut off half way is no use.
+        // Only one that hangs is.
+        let _ = ctx;
+        let tctx = Ctx::new().with_timeout(self.limits.sync);
         let (o, res) = self.run.run(&tctx, &Cmd::new("mkinitcpio", &["-P"]).interrupt(Some(PACMAN_GRACE)));
         match res {
             Ok(()) if !o.contains("==> ERROR") => out.hook_failed = false,
