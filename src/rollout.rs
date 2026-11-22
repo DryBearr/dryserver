@@ -980,10 +980,10 @@ impl<'a> Machine<'a> {
     }
 
     /// When this machine began to take releases (recorded now when it was
-    /// not yet) and the Arch day it is pinned to: what a release goes by
-    /// while none is installed here (update::start_of).
-    fn start(&self, now: i64) -> (i64, Option<String>) {
-        crate::update::start_of(&crate::update::Machine::at_root(&self.n.root, self.n.run.clone(), self.n.verifier.clone()), now)
+    /// not yet): what a rollback goes by while no release is installed
+    /// here (update::note_start).
+    fn start(&self, now: i64) -> i64 {
+        crate::update::note_start(&crate::update::Machine::at_root(&self.n.root, self.n.run.clone(), self.n.verifier.clone()), now)
     }
 
     fn update(&self) -> Update<'_> {
@@ -1186,8 +1186,8 @@ impl<'a> Machine<'a> {
                 (o.release, Meta { serial: offer.serial, k3s_size: o.k3s_size, need_k3s: false })
             }
         };
-        let (since, pinned) = self.start(now);
-        let floor = release::Start { arch_date: pinned.as_deref(), since };
+        let since = self.start(now);
+        let floor = release::Start { since };
         let (r, verdict) = release::check_from(self.n.verifier.as_ref(), &env, installed.as_ref(), floor, place, now)
             .map_err(|e| Stop::Refused(e.to_string()))?;
         if r.serial != offer.serial {
@@ -1475,6 +1475,11 @@ impl<'a> Machine<'a> {
 pub fn healthy(r: &Report, expect_k3s: bool) -> std::result::Result<(), String> {
     if r.firewall != Some(true) {
         return Err("its firewall is not loaded".into());
+    }
+    if r.boot == "fallback" {
+        // The kernel the update brought did not boot (or someone picked the
+        // fallback): not the machine the update was to leave.
+        return Err("it runs its fallback kernel: the main kernel did not boot well (dryserver boot status)".into());
     }
     match r.k3s_active {
         Some(false) => Err("k3s is not running".into()),
@@ -1859,8 +1864,8 @@ impl Brain<'_> {
             return;
         }
         let installed = self.machine().installed();
-        let (since, pinned) = self.machine().start(self.now.unix);
-        let start = release::Start { arch_date: pinned.as_deref(), since };
+        let since = self.machine().start(self.now.unix);
+        let start = release::Start { since };
         let checked = self
             .served
             .envelope(serial)

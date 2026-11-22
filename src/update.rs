@@ -427,6 +427,9 @@ pub struct ArchState {
     /// Why a reboot would not start the machine; empty when it would.
     pub boot_problem: String,
     pub summary: String,
+    /// The fallback kernel's update waits for the next run, once the main
+    /// kernel booted well (osupdate: one kernel at a time).
+    pub lts_waits: bool,
 }
 
 fn read_json<T: DeserializeOwned>(m: &Machine, path: &str) -> Result<Option<T>> {
@@ -942,6 +945,9 @@ enum Effect {
     Resolved,
     Docker,
     WireGuard,
+    /// systemd-tmpfiles makes what they say now (the registry account's
+    /// home becomes root's at the update, not at the next boot).
+    Tmpfiles,
 }
 
 /// Files without an effect are read when they are next used (cron, the
@@ -966,6 +972,8 @@ fn effect(p: &str) -> Option<Effect> {
         Effect::Docker
     } else if p.starts_with("/etc/wireguard/") {
         Effect::WireGuard
+    } else if p.starts_with("/etc/tmpfiles.d/") && p.ends_with(".conf") {
+        Effect::Tmpfiles
     } else {
         return None;
     })
@@ -1034,9 +1042,9 @@ fn validate(m: &Machine, ctx: &Ctx, paths: &[String]) -> Result<()> {
 /// Makes the running system use the changed files. Nothing is restarted
 /// that would drop a session: sshd and Docker reload, the firewall loads in
 /// one transaction (established connections stay accepted).
-fn reload(m: &Machine, ctx: &Ctx, fx: &[Effect]) -> Result<()> {
+fn reload(m: &Machine, ctx: &Ctx, paths: &[String]) -> Result<()> {
     let mut errs = Vec::new();
-    for e in fx {
+    for e in &effects(paths) {
         let res = match e {
             Effect::Units => m.cmd(ctx, "systemctl", &["daemon-reload"]).map(drop),
             Effect::Sysctl => m.cmd(ctx, "sysctl", &["-q", "--system"]).map(drop),
@@ -1052,6 +1060,18 @@ fn reload(m: &Machine, ctx: &Ctx, fx: &[Effect]) -> Result<()> {
                 }
             }
             Effect::WireGuard => reload_wg(m, ctx),
+            Effect::Tmpfiles => {
+                // Each file that is there (a revert may have removed one).
+                let files: Vec<String> =
+                    paths.iter().filter(|p| effect(p) == Some(Effect::Tmpfiles) && m.path(p).is_file()).map(|p| m.shown(p)).collect();
+                if files.is_empty() {
+                    Ok(())
+                } else {
+                    let mut args = vec!["--create"];
+                    args.extend(files.iter().map(String::as_str));
+                    m.cmd(ctx, "systemd-tmpfiles", &args).map(drop)
+                }
+            }
             Effect::Sudoers => Ok(()),
         };
         if let Err(e) = res {
@@ -1298,8 +1318,22 @@ fn host<'a>(m: &'a Machine, log: &HostLog) -> osupdate::Host<'a> {
     }
 }
 
+/// Whether the packages here are of a newer day (pinned) than the
+/// release's, and stay so: no going back without a rollback (a machine
+/// installed after the release, from a stick built later, runs newer
+/// packages, and that is no reason to refuse the rest of the release). A
+/// rollback takes them back; on a machine with no release installed, only
+/// one signed after it began to take releases: an old rollback sent again
+/// does not take its packages below what it was installed with.
+fn newer_here(pinned: &str, rel: &Release, installed: bool, since: i64) -> bool {
+    let (Ok(here), Ok(day)) = (release::arch_day(pinned), release::arch_day(&rel.arch_date)) else { return false };
+    let may_go_back = rel.rollback && (installed || (since > 0 && rel.created > since));
+    here > day && !may_go_back
+}
+
 /// Whether the packages have to be brought to date. The mirrorlist pins
-/// another day (or none), or the last run on that day did not finish.
+/// another day (or none), the last run on that day did not finish, or the
+/// fallback kernel waits for its own run (one kernel at a time).
 /// Pinned to the day without any record of a run: a fresh machine its
 /// installer pinned to the day it installed from, nothing to do.
 fn arch_due(m: &Machine, date: &str) -> bool {
@@ -1307,7 +1341,7 @@ fn arch_due(m: &Machine, date: &str) -> bool {
         return true;
     }
     match read_json::<ArchState>(m, ARCH_STATE) {
-        Ok(Some(s)) => !(s.date == date && s.done),
+        Ok(Some(s)) => !(s.date == date && s.done && !s.lts_waits),
         Ok(None) => false,
         Err(_) => true,
     }
@@ -1386,7 +1420,7 @@ fn plan(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, log: &HostLog, out: &mut dy
         Some(b) => Place::Worker { brain_k3s: b },
     };
     let (since, pinned) = start_of(m, now);
-    let start = release::Start { arch_date: pinned.as_deref(), since };
+    let start = release::Start { since };
     let (rel, verdict) =
         release::check_from(m.verifier.as_ref(), &env, installed.as_ref().map(|(_, r)| r), start, place, now).map_err(early(false))?;
     if verdict.stale {
@@ -1410,7 +1444,18 @@ fn plan(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, log: &HostLog, out: &mut dy
     let host = host(m, log);
     // The packages first: their checks are quick, and a pacman at work or
     // a full disk ends the apply before anything large is copied.
-    let arch = if arch_due(m, &rel.arch_date) {
+    let arch = if let Some(day) = pinned.as_deref().filter(|p| newer_here(p, &rel, installed.is_some(), since)) {
+        tell(
+            m,
+            out,
+            now,
+            &format!(
+                "the Arch packages here are of {day}, newer than the release's {} (installed later): they stay as they are, the next release moves them",
+                rel.arch_date
+            ),
+        );
+        None
+    } else if arch_due(m, &rel.arch_date) {
         let o = host.arch_check(&rel.arch_date, rel.rollback);
         log.flush(m, out);
         if let Some(f) = &o.failure {
@@ -1711,6 +1756,7 @@ fn save_arch_state(m: &Machine, o: &ArchOutcome) {
         kernel: o.kernel_replaced,
         boot_problem: o.boot_problem.clone().unwrap_or_default(),
         summary: o.summary(),
+        lts_waits: o.lts_waits,
     };
     if let Err(e) = save_json(m, ARCH_STATE, &s) {
         note(m, m.now(), &format!("cannot keep {ARCH_STATE}: {e}"));
@@ -1824,7 +1870,7 @@ pub fn activate(m: &Machine, ctx: &Ctx, id: &str, out: &mut dyn Write) -> Result
     let migrated = migrate(&mut ch, m.migrations)?;
     let changed = ch.changed.clone();
     validate(m, ctx, &changed)?;
-    reload(m, ctx, &effects(&changed))?;
+    reload(m, ctx, &changed)?;
     if changed.is_empty() {
         say(out, "no system file changed");
     }
@@ -1940,7 +1986,7 @@ fn revert(m: &Machine, ctx: &Ctx, mut p: Pending, why: &str, boot: bool, now: i6
         if fx.contains(&Effect::Units) { m.cmd(ctx, "systemctl", &["daemon-reload"]).map(drop) } else { Ok(()) }
     } else {
         disarm(m, ctx, &p.id);
-        let r = reload(m, ctx, &fx);
+        let r = reload(m, ctx, &paths);
         // Not waited for: it takes minutes on the brain, and a revert must
         // not. k3s comes back by itself (Restart=always) if it fails.
         let k = if k3s_back { m.cmd(ctx, "systemctl", &["try-restart", "--no-block", "k3s.service"]).map(drop) } else { Ok(()) };
@@ -3437,16 +3483,66 @@ mod tests {
         let e = lab.apply(&back).unwrap_err().to_string();
         assert!(e.contains("below what this machine was installed with") && e.contains("sent again"), "{e}");
         lab.assert_old("an old rollback sent again");
-        // Neither an older Arch day than the installer pinned, unless a
-        // rollback signed since.
-        let e = lab.apply(&Release { arch_date: "2026/11/01".into(), ..rel(7, NEW) }).unwrap_err().to_string();
-        assert!(e.contains("Arch snapshot 2026/11/01, older than the 2026/11/19"), "{e}");
+        // A release with an older Arch day than the installer pinned (the
+        // stick was built after it): dryserver and k3s go in, the newer
+        // packages stay; the same for an old rollback sent again.
+        let mut out = Vec::new();
+        let a = lab.opts(&Release { arch_date: "2026/11/01".into(), ..rel(7, NEW) }, lab.staged(NEW));
+        apply(&lab.m(), &Ctx::new(), &a, now(), &mut out).unwrap();
+        let said = String::from_utf8_lossy(&out).into_owned();
+        assert!(said.contains("newer than the release's 2026/11/01 (installed later): they stay"), "{said}");
+        lab.assert_new("an older day, newer packages here");
+        assert!(!lab.fake.has("pacman") && lab.pinned().as_deref() == Some(DAY), "{:?}", lab.fake.ran());
         // A machine that took its first look a day ago takes a rollback
-        // signed an hour ago: the release it runs may be the bad one.
+        // signed an hour ago: the release it runs may be the bad one, and
+        // its packages go back too.
         let lab = Lab::new();
         save_json(&lab.m(), START, &StartRecord { since: now() - release::DAY }).unwrap();
         lab.apply(&back).unwrap();
         lab.assert_new("a rollback on a fresh machine");
+        let lab = Lab::new();
+        save_json(&lab.m(), START, &StartRecord { since: now() - release::DAY }).unwrap();
+        lab.apply_os(&Release { arch_date: "2026/11/01".into(), ..back.clone() }, None).unwrap();
+        assert!(lab.fake.has("pacman -Suu") && lab.pinned().as_deref() == Some("2026/11/01"), "{:?}", lab.fake.ran());
+    }
+
+    #[test]
+    fn when_the_packages_are_due() {
+        let lab = Lab::new();
+        let m = lab.m();
+        // Pinned by the installer to the day, no run yet: nothing to do.
+        assert!(!arch_due(&m, DAY) && arch_due(&m, NEXT_DAY));
+        let state = |done: bool, lts_waits: bool| ArchState { date: DAY.into(), done, lts_waits, ..ArchState::default() };
+        for (s, due) in [(state(true, false), false), (state(false, false), true), (state(true, true), true)] {
+            save_json(&m, ARCH_STATE, &s).unwrap();
+            assert_eq!(arch_due(&m, DAY), due, "{s:?}");
+        }
+        // A record that cannot be read: run it.
+        lab.write(ARCH_STATE, b"{", 0o600);
+        assert!(arch_due(&m, DAY));
+        // Not pinned at all (an install from before the pin): run it.
+        lab.write(osupdate::MIRRORLIST, b"Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n", 0o644);
+        let _ = fs::remove_file(lab.p(ARCH_STATE));
+        assert!(arch_due(&m, DAY));
+    }
+
+    #[test]
+    fn changed_tmpfiles_rules_take_effect_now() {
+        // The registry account's home becomes root's at the update, not at
+        // the next boot.
+        let lab = Lab::new();
+        let rule = sysconf::REGISTRY_TMPFILES;
+        // Rendered on the coordinator only.
+        lab.write(ROLE_FILE, b"coordinator\n", 0o644);
+        let _ = fs::remove_file(lab.p(rule));
+        lab.apply(&rel(7, NEW)).unwrap();
+        let ran = lab.fake.ran();
+        assert!(ran.iter().any(|c| c == &format!("systemd-tmpfiles --create {rule}")), "{ran:#?}");
+        // On the way back the rule is gone again: nothing to create.
+        lab.fake.ran.lock().unwrap().clear();
+        revert_by_hand(&lab.m(), &Ctx::new(), now(), &mut Vec::new()).unwrap();
+        assert!(!lab.fake.has("systemd-tmpfiles"), "{:?}", lab.fake.ran());
+        assert_eq!(effect("/etc/tmpfiles.d/x.conf"), Some(Effect::Tmpfiles));
     }
 
     #[test]

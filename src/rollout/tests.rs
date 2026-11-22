@@ -296,6 +296,8 @@ struct Swarm {
     offline: Vec<u32>,
     /// Servers that send their heartbeat but never act on their turn.
     ignore_turn: Vec<u32>,
+    /// Servers that run their fallback kernel.
+    fallback: Vec<u32>,
     /// Servers whose k3s does not run.
     sick: Vec<u32>,
     /// The k3s version the brain reports.
@@ -346,6 +348,7 @@ impl Swarm {
             offline: vec![],
             ignore_turn: vec![],
             sick: vec![],
+            fallback: vec![],
             brain_k3s: K3S_VERSION.into(),
             faults: Mutex::new(vec![]),
             pieces: Mutex::new(vec![]),
@@ -371,6 +374,7 @@ impl Swarm {
             dryserver: "0.1.0".into(),
             k3s: if host == 1 { self.brain_k3s.clone() } else { K3S_VERSION.into() },
             k3s_active: Some(!self.sick.contains(&host)),
+            boot: if self.fallback.contains(&host) { "fallback".into() } else { String::new() },
             firewall: Some(true),
             ..Report::default()
         }
@@ -2647,4 +2651,27 @@ fn an_old_rollback_sent_again_does_not_move_a_fresh_machine_below_its_install() 
     let r = Release { serial: 10, created: sw.now - 60, ..r };
     sw.upload(&release::seal(&ADMIN, &r).unwrap(), &bin, None).unwrap();
     sw.until_unpaused(30, |s| s.everyone_on(10));
+}
+
+#[test]
+fn a_machine_on_its_fallback_kernel_is_not_well() {
+    // After its update it booted the fallback kernel: the new main kernel
+    // did not work. Not confirmed, and the rollout stops there.
+    let mut sw = Swarm::new(2);
+    sw.fallback.push(2);
+    sw.publish(10, true);
+    sw.until(30, |s| s.server(2).fake.sim().pending == 10);
+    sw.ticks(5);
+    assert!(sw.server(2).fake.sim().confirmed.is_empty(), "confirmed on its fallback kernel");
+    let r = sw.store.read().unwrap().members.iter().find(|m| m.host == 2).unwrap().report.clone().unwrap();
+    assert!(r.update_note.contains("fallback kernel"), "{r:?}");
+    // The canary that falls back after its update stops the rollout.
+    let mut sw = Swarm::new(2);
+    sw.publish(10, false);
+    sw.until(30, |s| s.rollout().canary != 0);
+    let canary = sw.rollout().canary;
+    sw.fallback.push(canary);
+    sw.until(5, |s| !s.rollout().paused.is_empty());
+    let ro = sw.rollout();
+    assert!(ro.pause == Pause::Canary && ro.paused.contains("fallback kernel"), "{}", ro.paused);
 }

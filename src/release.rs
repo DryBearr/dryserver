@@ -317,12 +317,13 @@ pub fn check_from(
 }
 
 /// What a machine that has no release installed goes by, besides the
-/// dryserver and k3s it runs: the Arch snapshot day its mirrorlist pins
-/// (the installer pins the day it installed from), and when it began to
-/// take releases (unix seconds; 0 when not known).
+/// dryserver and k3s it runs: when it began to take releases (unix
+/// seconds; 0 when not known). Its Arch day is not compared here: a
+/// machine installed after the newest release runs newer packages than
+/// that release names, which is no reason to refuse its dryserver and
+/// k3s; the update keeps those packages instead (update.rs, arch_plan).
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Start<'a> {
-    pub arch_date: Option<&'a str>,
+pub struct Start {
     pub since: i64,
 }
 
@@ -393,7 +394,7 @@ fn decide_from(new: &Release, installed: Option<&Release>, floor: Floor, start: 
         }
         None => {
             let than = |o: &str| format!("the {o} this machine runs (it has no release installed yet)");
-            if let Err(e) = no_older(new, floor.dryserver, floor.k3s, start.arch_date, &than) {
+            if let Err(e) = no_older(new, floor.dryserver, floor.k3s, None, &than) {
                 if !new.rollback {
                     return Err(e);
                 }
@@ -959,8 +960,8 @@ mod tests {
             ..rel()
         };
         // The machine took its first look at releases a day before rel()
-        // was signed, pinned to the day the installer installed from.
-        let start = Start { arch_date: Some("2026/11/10"), since: rel().created - DAY };
+        // was signed.
+        let start = Start { since: rel().created - DAY };
         let fresh = |r: &Release, place: Place| decide_from(r, None, floor, start, place, now());
         for place in [Place::Brain, BRAIN] {
             // The same or newer versions: taken, whatever the serial.
@@ -978,10 +979,6 @@ mod tests {
                 (at("0.2.9", "v1.37.2+k3s1", false), "dryserver 0.2.9, older than the 0.3.0 this machine runs"),
                 (at("0.3.0", "v1.37.1+k3s1", false), "k3s v1.37.1+k3s1, older than the v1.37.2+k3s1 this machine runs"),
                 (at("0.3.0", "v1.37.2+k3s0", false), "older than the v1.37.2+k3s1"),
-                (
-                    Release { arch_date: "2026/11/01".into(), ..at("0.3.0", "v1.37.2+k3s1", false) },
-                    "Arch snapshot 2026/11/01, older than the 2026/11/10",
-                ),
             ] {
                 let e = fresh(&r, place).unwrap_err().to_string();
                 assert!(e.contains(want) && e.contains("sign it with rollback"), "{e}");
@@ -989,17 +986,14 @@ mod tests {
                 assert!(fresh(&back, place).unwrap().install, "a rollback signed since");
                 // The same rollback signed before the machine took releases,
                 // or with that moment unknown: an old one sent again.
-                for start in
-                    [Start { since: back.created, ..start }, Start { since: back.created + DAY, ..start }, Start { since: 0, ..start }]
-                {
+                for start in [Start { since: back.created }, Start { since: back.created + DAY }, Start { since: 0 }] {
                     let e = decide_from(&back, None, floor, start, place, now()).unwrap_err().to_string();
                     assert!(e.contains("below what this machine was installed with") && e.contains("sent again"), "{e}");
                 }
             }
-            // A machine whose mirrorlist pins no day takes any.
-            let unpinned = Start { arch_date: None, ..start };
+            // Any Arch day: the update keeps newer packages than the release names.
             let r = Release { arch_date: "2020/01/01".into(), ..at("0.3.0", "v1.37.2+k3s1", false) };
-            assert!(decide_from(&r, None, floor, unpinned, place, now()).unwrap().install);
+            assert!(fresh(&r, place).unwrap().install);
         }
         // The brain's k3s still moves one minor version at a time from
         // the pinned one, rollback or not.
@@ -1019,7 +1013,7 @@ mod tests {
             assert!(e.contains("this machine runs (it has no release installed yet)"), "{e}");
             let back = Release { rollback: true, ..ancient.clone() };
             assert!(check(&key, &seal(&key, &back).unwrap(), None, place, now()).is_err(), "since unknown: no rollback below");
-            let start = Start { arch_date: None, since: back.created - 1 };
+            let start = Start { since: back.created - 1 };
             assert!(check_from(&key, &seal(&key, &back).unwrap(), None, start, place, now()).unwrap().1.install);
         }
         // The release of this very binary is taken on a fresh machine.
