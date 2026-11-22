@@ -1564,7 +1564,8 @@ fn arch_due(m: &Machine, date: &str, rollback: bool) -> bool {
 /// runs now.
 fn cut_off_install(m: &Machine) -> Option<String> {
     fs::symlink_metadata(m.path(osupdate::INSTALLING)).ok()?;
-    let day = fsx::read_or_empty(m.path(osupdate::INSTALLING)).trim().to_string();
+    // The day, then what the run installs (osupdate::Host::lost_packages).
+    let day = fsx::read_or_empty(m.path(osupdate::INSTALLING)).lines().next().unwrap_or("").trim().to_string();
     Some(if release::arch_day(&day).is_ok() { day } else { String::new() })
 }
 
@@ -4373,7 +4374,8 @@ mod tests {
         let m = lab.m();
         save_json(&m, ARCH_STATE, &ArchState { date: DAY.into(), done: true, ..ArchState::default() }).unwrap();
         assert!(!arch_due(&m, DAY, false));
-        lab.write(osupdate::INSTALLING, format!("{NEXT_DAY}\n").as_bytes(), 0o600);
+        // The day, then what the run installs.
+        lab.write(osupdate::INSTALLING, format!("{NEXT_DAY}\nlinux\nglibc\n").as_bytes(), 0o600);
         assert!(arch_due(&m, DAY, false));
         let s = status(&m, now());
         assert!(s.reboot.contains("do NOT reboot") && s.reboot.contains("stopped part way"), "{}", s.reboot);

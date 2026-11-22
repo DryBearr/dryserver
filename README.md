@@ -871,7 +871,10 @@ release that brings it. Step by step:
    is removed, never a package that shares a file with another one and
    never before the split is done; an edited config file it had stays as
    `.pacsave`), and an install cut off by a power
-   cut in the middle of a package (its own files, owned by no package).
+   cut in the middle of a package (its own files, owned by no package; a
+   package that left pacman's database that way, the main kernel among
+   them, is installed again by name: each install run notes what it
+   installs).
    Anything else is refused with the files, for you to look at. A machine
    installed after the release, whose packages are of a newer day, keeps
    them; the next release moves them. A rollback brings the packages to
