@@ -179,7 +179,9 @@ counter goes and it is `arch-linux.efi` again. After 3 failed tries the image
 is passed over and `linux-lts` starts.
 
 A boot passes when `/` is writable, the running kernel's modules are on
-disk, sshd runs and the kernel found a network device. Nothing else counts:
+disk, sshd runs, the kernel found a network device, the firewall is loaded
+and the WireGuard module loads (a kernel that cannot do either would leave
+the machine open on the LAN, or off the mesh). Nothing else counts:
 the coordinator, the mesh, the internet, a cable, a router or k3s being down
 never makes a good kernel bad (a missing driver does, an unplugged cable does
 not). A kernel panic restarts the machine after 10 seconds, a hang restarts

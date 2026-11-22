@@ -129,7 +129,8 @@ Documentation=man:systemd-bless-boot.service(8)
 # from this machine itself count: a brain, mesh or internet that is down
 # must never make a good kernel bad. So nothing here waits for them, nor
 # for multi-user.target, which waits for k3s, which waits for the brain.
-After=local-fs.target sshd.service systemd-networkd.service
+# The firewall is loaded first: a kernel that cannot load it fails.
+After=local-fs.target nftables.service sshd.service systemd-networkd.service
 Before=boot-complete.target
 
 [Service]
@@ -652,8 +653,14 @@ fn wait_for(ctx: &Ctx, lim: &CheckLimits, mut ok: impl FnMut() -> bool) -> bool 
 }
 
 /// Decides whether this boot is good, before boot-complete.target: / is
-/// writable, the running kernel's modules are on disk, sshd runs, and the
-/// kernel found a network device. Err when it is not; then, when the boot
+/// writable, the running kernel's modules are on disk, sshd runs, the
+/// kernel found a network device, the firewall is loaded (nftables.service
+/// ran before: a kernel whose nf_tables fails would leave the machine open
+/// on the LAN), and the WireGuard module loads (without it there is no
+/// mesh). wg0 itself is not waited for: wg-quick waits for the network to
+/// be online, which a cable decides. The kill switch keeps the firewall's
+/// table and adds one of its own, so a machine with it on passes too. Err
+/// when it is not; then, when the boot
 /// is counted and another image is not marked bad, the machine restarts,
 /// so the boot loader tries again or starts the other kernel. Otherwise it
 /// stays up as it is: restarting would only start the same image again.
@@ -672,6 +679,13 @@ pub fn check(ctx: &Ctx, run: &dyn Runner, root: &Path, lim: &CheckLimits, out: &
     }
     if !wait_for(ctx, lim, || !network_devices(root).is_empty()) {
         problems.push("the kernel found no network device".into());
+    }
+    let tables = run.output(ctx, &Cmd::new("nft", &["list", "tables"]).quiet().stdout_only());
+    if !tables.is_ok_and(|o| o.lines().any(|l| l.trim() == "table inet dryserver")) {
+        problems.push("the firewall is not loaded (no table inet dryserver; does nf_tables load with this kernel?)".into());
+    }
+    if run.ok(ctx, &Cmd::new("modprobe", &["wireguard"]).quiet()).is_err() {
+        problems.push("the wireguard module does not load with this kernel".into());
     }
     let image = counted_boot(root);
     let shown = image.as_ref().map(|i| i.name.clone()).unwrap_or_else(|| "this boot".into());
@@ -1112,6 +1126,10 @@ mod tests {
         /// sshd answers active after this many questions.
         sshd_after: usize,
         sshd_never: bool,
+        /// nftables.service failed: no dryserver table.
+        no_firewall: bool,
+        /// The wireguard module does not load.
+        no_wireguard: bool,
     }
 
     impl Runner for Fake {
@@ -1122,7 +1140,15 @@ mod tests {
             if c.args.iter().any(|a| a == "is-active") && (self.sshd_never || asked <= self.sshd_after) {
                 return (String::new(), Err("exit status 3".into()));
             }
-            (String::new(), Ok(()))
+            match c.name.as_str() {
+                "nft" if self.no_firewall => ("table inet filter\n".into(), Ok(())),
+                // The kill switch's table beside it.
+                "nft" => ("table inet filter\ntable inet dryserver\ntable inet dryserver_quarantine\n".into(), Ok(())),
+                "modprobe" if self.no_wireguard => {
+                    (String::new(), Err("modprobe failed: exit status 1: Module wireguard not found".into()))
+                }
+                _ => (String::new(), Ok(())),
+            }
         }
     }
 
@@ -1153,8 +1179,9 @@ mod tests {
         res.unwrap();
         assert!(out.contains("arch-linux+2-1.efi passed the boot check") && out.contains("enp1s0"), "{out}");
         assert!(!rebooted(&fake));
-        // Nothing but systemctl about sshd: no brain, mesh, k3s or internet.
-        assert!(fake.ran.lock().unwrap().iter().all(|l| l == "systemctl is-active --quiet sshd.service"), "{:?}", fake.ran);
+        // Nothing but local questions: no brain, mesh, k3s or internet.
+        let local = ["systemctl is-active --quiet sshd.service", "nft list tables", "modprobe wireguard"];
+        assert!(fake.ran.lock().unwrap().iter().all(|l| local.contains(&l.as_str())), "{:?}", fake.ran);
     }
 
     #[test]
@@ -1201,6 +1228,21 @@ mod tests {
         let (res, out) = run_check(root, &fake);
         assert!(res.unwrap_err().to_string().contains("sshd does not run"));
         assert!(!rebooted(&fake) && out.contains("not counted"), "{out}");
+    }
+
+    #[test]
+    fn a_kernel_without_its_firewall_or_wireguard_fails_the_check() {
+        for (fw, wg, want) in [(true, false, "the firewall is not loaded"), (false, true, "the wireguard module does not load")] {
+            let dir = machine(true);
+            let root = dir.path();
+            put_image(root, "arch-linux+2-1.efi", MAIN_V, "new");
+            put_image(root, "arch-linux-lts.efi", LTS_V, "lts");
+            set_efivar(root, "LoaderBootCountPath", "\\EFI\\Linux\\arch-linux+2-1.efi");
+            let fake = Fake { no_firewall: fw, no_wireguard: wg, ..Fake::default() };
+            let (res, out) = run_check(root, &fake);
+            assert!(res.unwrap_err().to_string().contains(want), "{out}");
+            assert!(rebooted(&fake), "the other kernel gets its turn: {out}");
+        }
     }
 
     #[test]
@@ -1278,6 +1320,7 @@ mod tests {
         for never in ["multi-user", "k3s", "wg-quick", "network-online", "dryserver-sync", "time-sync"] {
             assert!(!after.contains(never), "{after}");
         }
+        assert!(after.contains(" nftables.service "), "the firewall is loaded before it is looked at: {after}");
         assert!(unit.contains("\nBefore=boot-complete.target\n") && unit.contains("\nExecStart=/usr/local/bin/dryserver boot check\n"));
         assert!(unit.contains("\nType=oneshot\nRemainAfterExit=yes\n"), "{unit}");
         let name = CHECK_UNIT_PATH.rsplit('/').next().unwrap();

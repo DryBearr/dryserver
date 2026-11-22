@@ -457,7 +457,8 @@ Documentation=man:systemd-bless-boot.service(8)
 # from this machine itself count: a brain, mesh or internet that is down
 # must never make a good kernel bad. So nothing here waits for them, nor
 # for multi-user.target, which waits for k3s, which waits for the brain.
-After=local-fs.target sshd.service systemd-networkd.service
+# The firewall is loaded first: a kernel that cannot load it fails.
+After=local-fs.target nftables.service sshd.service systemd-networkd.service
 Before=boot-complete.target
 
 [Service]
