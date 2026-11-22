@@ -1548,6 +1548,45 @@ fn a_new_release_waits_for_the_server_in_the_middle_of_the_old_one() {
     assert!(!r.cordoned.contains(&"node-a".to_string()), "{r:#?}");
 }
 
+/// A normal release published while a server is in the middle of the
+/// urgent one: the server finishes, and its node is uncordoned then, not at
+/// 03:00 when the new release's window opens. The same while the brain's
+/// own update failed (Phase::Failed).
+#[test]
+fn review_a_server_done_with_the_old_release_is_uncordoned_before_the_window() {
+    for brain_fails in [false, true] {
+        let mut sw = Swarm::new(3);
+        sw.server(3).fake.sim().slow = 100_000;
+        sw.publish(10, true);
+        sw.until(120, |s| s.server(3).fake.sim().pending == 10);
+        sw.minute = DAYTIME;
+        sw.publish(11, false);
+        sw.ticks(2);
+        assert!(sw.rollout().phase == Phase::Waiting && sw.rollout().wait_for == 3, "{:#?}", sw.rollout());
+        if brain_fails {
+            let m = Machine::new(&sw.brain.node, true);
+            let r = Rollout { phase: Phase::Failed, paused: "the coordinator's own update to release 11 failed".into(), ..m.own_rollout() };
+            m.save_rollout(&r).unwrap();
+            sw.ticks(2);
+        }
+        assert!(sw.rollout().cordoned.contains(&"node-b".to_string()), "{:#?}", sw.rollout());
+        (sw.server(3).fake.sim().busy, sw.server(3).fake.sim().slow) = (0, 0);
+        sw.until(10, |s| s.installed(3) == 10);
+        sw.ticks(30);
+        let k = sw.kubectl();
+        let un = k.iter().rposition(|x| x == "uncordon -- node-b");
+        let co = k.iter().rposition(|x| x == "cordon -- node-b" || x.starts_with("drain") && x.ends_with("-- node-b"));
+        assert!(un > co, "node-b stays cordoned until the window: {k:?}");
+        let r = sw.rollout();
+        assert!(!r.cordoned.contains(&"node-b".to_string()) && r.wait_for == 0, "{r:#?}");
+        if brain_fails {
+            assert_eq!(r.phase, Phase::Failed, "{r:#?}");
+        } else {
+            assert_eq!((r.phase, sw.installed(1)), (Phase::Waiting, 10), "nothing else moved before the window: {r:#?}");
+        }
+    }
+}
+
 /// The brain's sync killed (or the brain switched off) right after it
 /// cordoned a server: the cordon was not written down, and once another
 /// server got the turn the first stayed cordoned for good.

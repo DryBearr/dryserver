@@ -2396,6 +2396,12 @@ impl Brain<'_> {
     }
 
     fn advance(&mut self) {
+        // The cordons this rollout keeps are let go at every tick, whatever
+        // the phase: a server that finishes the update it was in while a
+        // normal release waits for the window (or after the brain's own
+        // update failed) would otherwise stay cordoned for hours.
+        self.let_go_of_the_middle();
+        self.tidy_cordons();
         // The brain's own update in the middle is settled at every tick,
         // whatever the phase: a newer release that waits for the window
         // replaced the rollout, not the update it installed, which would
@@ -2503,16 +2509,8 @@ impl Brain<'_> {
     /// kept it cordoned.
     fn hold_for_the_middle(&mut self) -> bool {
         let now = self.now.unix;
+        self.let_go_of_the_middle();
         let middle = self.in_the_middle();
-        let was = self.r.wait_for;
-        if was != 0 && middle.as_ref().is_none_or(|(h, _)| *h != was) {
-            (self.r.wait_for, self.r.wait_since) = (0, 0);
-            if let Some(name) = self.member(was).map(|m| m.name.clone())
-                && self.r.cordoned.contains(&name)
-            {
-                self.uncordon(&name);
-            }
-        }
         let Some((host, name)) = middle else { return false };
         if self.r.wait_for != host {
             (self.r.wait_for, self.r.wait_since) = (host, now);
@@ -2535,6 +2533,28 @@ impl Brain<'_> {
             );
         }
         true
+    }
+
+    /// The server this rollout waits for (wait_for) is done with the update
+    /// it was in: the wait ends, its node is uncordoned if this rollout kept
+    /// it cordoned, and a stop at it (it took TURN_TIMEOUT) ends: the
+    /// rollout goes on by itself. At every tick, whatever the phase.
+    fn let_go_of_the_middle(&mut self) {
+        let was = self.r.wait_for;
+        if was == 0 || self.in_the_middle().is_some_and(|(h, _)| h == was) {
+            return;
+        }
+        (self.r.wait_for, self.r.wait_since) = (0, 0);
+        if let Some(name) = self.member(was).map(|m| m.name.clone())
+            && self.r.cordoned.contains(&name)
+        {
+            self.uncordon(&name);
+        }
+        if self.r.pause == Pause::Timeout && self.r.pause_host == was && matches!(self.r.phase, Phase::Brain | Phase::Servers) {
+            let next = if self.r.phase == Phase::Servers { "the rollout goes on" } else { "the coordinator updates itself" };
+            self.r.warn(format!("{} finished the update it was in; {next}", self.r.pause_name));
+            self.r.unpause();
+        }
     }
 
     /// One step of the brain's own update: settles one it installed, or
@@ -2581,8 +2601,8 @@ impl Brain<'_> {
     }
 
     fn servers(&mut self) {
+        // The cordons were tidied at the start of the tick (advance).
         self.tidy_lists();
-        self.tidy_cordons();
         if !self.r.paused.is_empty() {
             return self.watch_paused();
         }
@@ -2885,15 +2905,8 @@ impl Brain<'_> {
             }
             return;
         };
-        if self.r.pause == Pause::Timeout && self.r.wait_for == host && self.in_the_middle().is_none_or(|(h, _)| h != host) {
-            // Stopped at one in the middle of an update outside a turn of
-            // its own: done now, so the rollout goes on (its node is
-            // uncordoned with the wait).
-            self.r.warn(format!("{name} finished the update it was in; the rollout goes on"));
-            self.r.unpause();
-            self.hold_for_the_middle();
-            return;
-        }
+        // Stopped at one in the middle of an update outside a turn of its
+        // own: let_go_of_the_middle goes on once it is done.
         let Some(rep) = m.report.as_ref().filter(|_| self.online(&m)) else { return };
         let cordoned = self.r.cordoned.contains(&name);
         if matches!(self.r.pause, Pause::Timeout) && Self::updated(rep, target) {
