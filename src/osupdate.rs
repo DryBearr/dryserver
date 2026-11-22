@@ -505,6 +505,10 @@ pub struct ArchOutcome {
     pub boot_problem: Option<String>,
     /// New .pacnew and .pacsave files: reported, never merged here.
     pub pacnew: Vec<String>,
+    /// The fallback kernel has an update that waits for the next run: the
+    /// main kernel changed in this one (or did not boot well yet), and only
+    /// one kernel is ever in flight.
+    pub lts_waits: bool,
     pub warnings: Vec<String>,
     pub failure: Option<Failure>,
     /// The end of the output of the pacman run that failed.
@@ -567,6 +571,9 @@ impl ArchOutcome {
         }
         if let Some(p) = &self.boot_problem {
             s += &format!(" ({p})");
+        }
+        if self.lts_waits {
+            s += ", the fallback kernel linux-lts follows at the next update";
         }
         if !self.pacnew.is_empty() {
             s += &format!(", new config files to merge by hand: {}", self.pacnew.join(" "));
@@ -646,12 +653,35 @@ impl Host<'_> {
         }
         let mut args = vec![if out.downgrade { "-Suu" } else { "-Su" }];
         args.extend(upgrade_flags(out.downgrade));
+        // One kernel in flight at a time: with the fallback kernel there,
+        // everything else goes first and linux-lts on its own, and only
+        // while the main kernel is one that booted well. A power cut in
+        // either run leaves the other kernel as it was, known good.
+        let fallback = self.kernels().contains_key("linux-lts");
+        let all = args.clone();
+        if fallback {
+            args.extend(["--ignore", "linux-lts"]);
+        }
         out.failure = self.pacman_step(ctx, Stage::Install, &args, self.limits.install, out).err();
         out.installed = true;
         if let Err(e) = self.at("arch installed")
             && out.failure.is_none()
         {
             out.failure = Some(Failure { stage: Stage::Install, reason: e, again: false });
+        }
+        if fallback && out.failure.is_none() && self.fallback_due(ctx, out.downgrade) {
+            let main_changed = self.changes_since(out.log_offset).1.iter().any(|c| c.name == "linux");
+            if main_changed || !self.main_known_good() {
+                out.lts_waits = true;
+                self.say("Arch: the fallback kernel linux-lts waits for the next update: the main kernel has to boot well first, one kernel at a time");
+            } else {
+                out.failure = self.pacman_step(ctx, Stage::Install, &all, self.limits.install, out).err();
+                if let Err(e) = self.at("arch installed lts")
+                    && out.failure.is_none()
+                {
+                    out.failure = Some(Failure { stage: Stage::Install, reason: e, again: false });
+                }
+            }
         }
         (out.count, out.changes) = self.changes_since(out.log_offset);
         out.restart = restart_packages(&out.changes);
@@ -668,6 +698,12 @@ impl Host<'_> {
                 .iter()
                 .any(|c| c.action != "removed" && (KERNEL_PACKAGES.contains(&c.name.as_str()) || kernels.contains_key(&c.name)));
         out.boot_problem = self.boot_problem(out.hook_failed, kernel_changed, &kernels);
+        if out.failure.is_none() && out.boot_problem.is_some() {
+            // The images were not made (a power cut in pacman's hooks, and
+            // this run had nothing left to install), or not placed: make
+            // them again. mkinitcpio's post hook puts each in place.
+            self.remake_images(ctx, out, kernel_changed, &kernels);
+        }
         if out.failure.is_none() {
             // Old packages pile up in the cache with every update until the
             // disk is full; the archive keeps them for a rollback.
@@ -677,6 +713,49 @@ impl Host<'_> {
             }
         }
         self.say(&out.summary());
+    }
+
+    /// Whether linux-lts changes with this snapshot: pacman -Qu says so
+    /// going forward; going back, it may, so it counts as changing.
+    fn fallback_due(&self, ctx: &Ctx, downgrade: bool) -> bool {
+        if downgrade {
+            return true;
+        }
+        let q = self.run.output(&ctx.with_timeout(self.limits.sync), &pacman(&["-Qu", "linux-lts"]).quiet());
+        q.is_ok_and(|o| o.contains("linux-lts"))
+    }
+
+    /// The main kernel runs, is the one on disk (not replaced), and booted
+    /// well: on UEFI its newest image carries no boot counter any more
+    /// (systemd-bless-boot drops it after a good boot).
+    fn main_known_good(&self) -> bool {
+        let running = fsx::read_or_empty(self.path("/proc/sys/kernel/osrelease")).trim().to_string();
+        if running.is_empty() || running.contains('/') || running.ends_with("-lts") || kernel_replaced(&self.root) {
+            return false;
+        }
+        let pkgbase = fsx::read_or_empty(self.path(&format!("{MODULES}/{running}/pkgbase"))).trim().to_string();
+        if !pkgbase.is_empty() && pkgbase != "linux" {
+            return false;
+        }
+        if !self.path(UKI_DIR).is_dir() {
+            return true;
+        }
+        self.boot_images("linux").into_iter().max_by_key(|(_, t)| *t).is_some_and(|(name, _)| !name.contains('+'))
+    }
+
+    /// `mkinitcpio -P`: every preset's image made again, each put in place
+    /// by mkinitcpio's post hook; then the images are looked at again.
+    fn remake_images(&self, ctx: &Ctx, out: &mut ArchOutcome, kernel_changed: bool, kernels: &BTreeMap<String, SystemTime>) {
+        self.say("Arch: the boot images are not current; making them again (mkinitcpio -P)");
+        let tctx = ctx.with_timeout(self.limits.sync);
+        let (o, res) = self.run.run(&tctx, &Cmd::new("mkinitcpio", &["-P"]).interrupt(Some(PACMAN_GRACE)));
+        match res {
+            Ok(()) if !o.contains("==> ERROR") => out.hook_failed = false,
+            Ok(()) => out.warnings.push("mkinitcpio -P reported an error: the boot images may not be current".into()),
+            Err(e) => out.warnings.push(format!("mkinitcpio -P failed: {}", one_line(&e.to_string(), 200))),
+        }
+        let _ = self.at("images made");
+        out.boot_problem = self.boot_problem(out.hook_failed, kernel_changed, kernels);
     }
 
     fn arch_checks(&self, date: &str, rollback: bool, out: &mut ArchOutcome) -> Result<(), Failure> {
@@ -862,6 +941,18 @@ impl Host<'_> {
             return Some(
                 "a pacman hook failed, maybe the one that builds the boot image: reboot only after mkinitcpio -P ran cleanly".into(),
             );
+        }
+        // mkinitcpio makes an image under a staging name, and its post hook
+        // puts it in place: one left over means that hook failed, and the
+        // image systemd-boot would start is not the new one.
+        if let Ok(rd) = fs::read_dir(self.path(UKI_DIR))
+            && let Some(name) =
+                rd.flatten().take(MAX_KERNELS).map(|e| e.file_name().to_string_lossy().into_owned()).find(|n| n.ends_with(".efi.new"))
+        {
+            return Some(format!(
+                "{UKI_DIR}/{} was made but not put in place (mkinitcpio's post hook failed): reboot only after mkinitcpio -P ran cleanly",
+                printable(&name)
+            ));
         }
         if !kernel_changed {
             return None;
@@ -1746,6 +1837,11 @@ mod tests {
         /// pacman began to install.
         inhibiting: Mutex<bool>,
         inhibited_installs: Mutex<Vec<bool>>,
+        /// mkinitcpio -P fails; or makes these images (put in place).
+        mkinitcpio_fails: bool,
+        mkinitcpio_makes: Vec<&'static str>,
+        /// linux-lts has an update in the snapshot (pacman -Qu says so).
+        lts_newer: bool,
     }
 
     const SLOW: Duration = Duration::from_millis(200);
@@ -1770,6 +1866,9 @@ mod tests {
                 no_inhibit: false,
                 inhibiting: Mutex::new(false),
                 inhibited_installs: Mutex::default(),
+                mkinitcpio_fails: false,
+                mkinitcpio_makes: Vec::new(),
+                lts_newer: false,
             }
         }
 
@@ -1805,7 +1904,17 @@ mod tests {
             let args: Vec<&str> = c.args.iter().map(String::as_str).collect();
             match (c.name.as_str(), args.as_slice()) {
                 ("pacman", ["-Qu", "archlinux-keyring"]) if self.keyring_newer => ok("archlinux-keyring 20261001-1 -> 20261115-1\n"),
+                ("pacman", ["-Qu", "linux-lts"]) if self.lts_newer => ok("linux-lts 6.6.60-1 -> 6.6.63-1\n"),
                 ("pacman", ["-Qu", _]) => (String::new(), Err("pacman failed: exit status 1".into())),
+                ("mkinitcpio", ["-P"]) if self.mkinitcpio_fails => {
+                    ("==> ERROR: no space left on device\n".into(), Err("mkinitcpio failed: exit status 1".into()))
+                }
+                ("mkinitcpio", ["-P"]) => {
+                    for p in &self.mkinitcpio_makes {
+                        put(&self.root, p, "remade image");
+                    }
+                    ok("==> Image generation successful\n")
+                }
                 ("pacman", [a, ..]) if *a == "-Su" || *a == "-Suu" => {
                     // The inhibitor starts beside it: give it a moment.
                     let until = std::time::Instant::now() + Duration::from_secs(1);
@@ -2164,6 +2273,20 @@ mod tests {
         assert!(out.ok() && out.reboot_needed() && !out.reboot_safe(), "{}", out.summary());
         assert!(out.boot_problem.as_deref().unwrap().contains(UKI), "{:?}", out.boot_problem);
         assert!(out.summary().contains("NOT safe"), "{}", out.summary());
+        assert_eq!(fake.count("mkinitcpio -P"), 1, "made again once; it did not help");
+        // mkinitcpio -P makes them (a power cut in pacman's hooks, and the
+        // next run had nothing left to install): safe again.
+        let dir = machine();
+        let mut fake = Fake::with_pacman(dir.path(), |_, root, c| {
+            if c.args[0] == "-Su" {
+                new_kernel(root, &[VMLINUZ]);
+            }
+            (String::new(), Ok(()))
+        });
+        fake.mkinitcpio_makes = vec![UKI];
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok() && out.reboot_safe(), "{}", out.summary());
 
         // A hook failed (pacman still exits 0).
         let dir = machine();
@@ -2174,9 +2297,12 @@ mod tests {
             }
             (String::new(), Ok(()))
         });
+        let mut fake = fake;
+        fake.mkinitcpio_fails = true;
         let (h, _) = host(dir.path(), &fake);
         let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
         assert!(out.ok() && !out.reboot_safe() && out.boot_problem.as_deref().unwrap().contains("hook"), "{}", out.summary());
+        assert!(out.warnings.iter().any(|w| w.contains("mkinitcpio -P failed")), "{:?}", out.warnings);
 
         // BIOS: GRUB starts /boot/vmlinuz-linux with its initramfs.
         let dir = machine();
@@ -2648,6 +2774,115 @@ mod tests {
         let out = h.arch_update(&Ctx::new(), "2026/11/21", false);
         assert!(out.ok() && out.count == 0 && out.kernel_replaced, "{}", out.summary());
         assert!(out.reboot_needed() && out.reboot_safe(), "a false alarm: {}", out.summary());
+    }
+
+    /// A machine as lane 2's installer leaves it: the main kernel with its
+    /// blessed image, the fallback kernel with its own, both current.
+    fn two_kernels() -> TempDir {
+        let dir = machine();
+        let r = dir.path();
+        put(r, &format!("/usr/lib/modules/{RUNNING}/pkgbase"), "linux\n");
+        put_kernel(r, "6.6.60-1-lts", "linux-lts");
+        put(r, "/boot/EFI/Linux/arch-linux-lts.efi", "lts image");
+        put(r, "/boot/vmlinuz-linux-lts", "lts kernel");
+        dir
+    }
+
+    /// pacman -Su with lane 2's hooks: the new main image comes in counted
+    /// (+3) and the plain one goes.
+    fn new_counted_kernel(root: &Path) {
+        new_kernel(root, &[VMLINUZ, "/boot/EFI/Linux/arch-linux+3.efi"]);
+        let _ = fs::remove_file(fsx::under(root, UKI));
+    }
+
+    #[test]
+    fn a_kernel_update_with_lane_twos_images_is_safe() {
+        // The new main image is arch-linux+3.efi; the fallback's plain image
+        // stays as it was (its kernel did not change): safe.
+        let dir = two_kernels();
+        let fake = Fake::with_pacman(dir.path(), |_, root, c| {
+            if c.args[0] == "-Su" {
+                new_counted_kernel(root);
+            }
+            (String::new(), Ok(()))
+        });
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok() && out.kernel_replaced && out.reboot_safe(), "{}", out.summary());
+        assert_eq!(fake.count("mkinitcpio"), 0, "nothing to make again");
+        // Without the fallback kernel the image keeps its plain name.
+        let dir = machine();
+        let fake = Fake::with_pacman(dir.path(), |_, root, c| {
+            if c.args[0] == "-Su" {
+                new_kernel(root, &[VMLINUZ, UKI]);
+            }
+            (String::new(), Ok(()))
+        });
+        let (h, _) = host(dir.path(), &fake);
+        assert!(h.arch_update(&Ctx::new(), "2026/11/20", false).reboot_safe());
+        // An image left under its staging name: the post hook that puts it
+        // in place failed, whatever the other images look like.
+        let dir = two_kernels();
+        let fake = Fake::with_pacman(dir.path(), |_, root, c| {
+            if c.args[0] == "-Su" {
+                new_counted_kernel(root);
+                put(root, "/boot/EFI/Linux/arch-linux.efi.new", "made, not placed");
+            }
+            (String::new(), Ok(()))
+        });
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        let p = out.boot_problem.clone().unwrap_or_default();
+        assert!(!out.reboot_safe() && p.contains("arch-linux.efi.new") && p.contains("post hook"), "{p}");
+        assert_eq!(fake.count("mkinitcpio -P"), 1, "made again, but the image is still not placed");
+    }
+
+    #[test]
+    fn one_kernel_is_in_flight_at_a_time() {
+        // Everything but the fallback kernel first; linux-lts on its own,
+        // only while the main kernel booted well and did not change now.
+        let dir = two_kernels();
+        let mut fake = Fake::new(dir.path());
+        fake.lts_newer = true;
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok() && !out.lts_waits, "{}", out.summary());
+        let installs: Vec<String> = fake.pacman_lines().into_iter().filter(|l| l.starts_with("pacman -Su ")).collect();
+        assert_eq!(installs, ["pacman -Su --noconfirm --ignore linux-lts", "pacman -Su --noconfirm"]);
+        assert_eq!(*fake.inhibited_installs.lock().unwrap(), [true, true], "both under the inhibitor");
+
+        // The main kernel changed in this run: the fallback waits, known
+        // good, for the next update (after the new main kernel booted).
+        let dir = two_kernels();
+        let mut fake = Fake::with_pacman(dir.path(), |_, root, c| {
+            if c.args.iter().any(|a| a == "linux-lts") {
+                new_counted_kernel(root);
+            }
+            (String::new(), Ok(()))
+        });
+        fake.lts_newer = true;
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok() && out.lts_waits && out.summary().contains("linux-lts follows"), "{}", out.summary());
+        assert_eq!(fake.count("pacman -Su "), 1, "{:?}", fake.pacman_lines());
+
+        // A main kernel still on its boot counter has not booted well yet.
+        let dir = two_kernels();
+        fs::remove_file(fsx::under(dir.path(), UKI)).unwrap();
+        put(dir.path(), "/boot/EFI/Linux/arch-linux+2-1.efi", "being tried");
+        let mut fake = Fake::new(dir.path());
+        fake.lts_newer = true;
+        let (h, _) = host(dir.path(), &fake);
+        assert!(h.arch_update(&Ctx::new(), "2026/11/20", false).lts_waits);
+        assert_eq!(fake.count("pacman -Su "), 1);
+
+        // Nothing new for linux-lts: one run, nothing waits.
+        let dir = two_kernels();
+        let fake = Fake::new(dir.path());
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok() && !out.lts_waits);
+        assert_eq!(fake.count("pacman -Su "), 1);
     }
 
     #[test]
