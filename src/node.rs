@@ -2,6 +2,7 @@
 //! the coordinator to join, waits for approval, brings up the mesh and keeps
 //! it in sync.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -454,7 +455,12 @@ impl Node {
 
     /// Writes WireGuard, hosts and SSH files for the given members.
     pub fn apply(&self, me: SelfInfo, members: &[Member]) -> Result<()> {
-        self.write(WG_CONF, 0o600, &mesh::wg_config(&self.cfg, me, members))?;
+        self.apply_live(me, members, &BTreeMap::new(), 0)
+    }
+
+    /// apply, with what WireGuard knows of each peer now (mesh::wg_config_live).
+    pub fn apply_live(&self, me: SelfInfo, members: &[Member], live: &BTreeMap<String, mesh::Live>, now: i64) -> Result<()> {
+        self.write(WG_CONF, 0o600, &mesh::wg_config_live(&self.cfg, me, members, live, now))?;
         let cur = fsx::read_or_empty(self.path("/etc/hosts"));
         self.write("/etc/hosts", 0o644, &mesh::hosts(&cur, &self.cfg, members))?;
         self.write("/etc/ssh/ssh_known_hosts", 0o644, &mesh::known_hosts(&self.cfg, members))?;
@@ -1027,23 +1033,47 @@ impl Node {
         Ok(())
     }
 
-    /// Pings each peer's switch address when both sides report a cable link,
-    /// and uses the WiFi/router path for peers that do not answer (e.g. a
-    /// cable into the router instead of the switch).
+    /// On a server with a cable link (auto mode): which peers it reaches on
+    /// the switch. Each peer's switch address gets one ping, all at once,
+    /// and the answer decides, not the peer's word in the list: the
+    /// registry account keeps that list, and saying "no cable" for every
+    /// machine would move every link to a LAN address of its choosing. A
+    /// peer that does not answer is reached over the WiFi/router path (a
+    /// cable into the router instead of the switch, a pulled cable).
+    ///
+    /// The coordinator dials nobody (mesh::endpoint) and pings nothing.
     fn check_switch(&self, ctx: &Ctx, me: SelfInfo, members: &[Member]) -> Vec<Member> {
-        if !me.switch || self.cfg.wg_transport != config::TRANSPORT_AUTO {
-            return members.to_vec();
-        }
         let mut out = members.to_vec();
-        for m in out.iter_mut() {
-            if m.host == me.host || !m.switch {
-                continue;
-            }
-            if self.cmd(ctx, "ping", &["-c", "1", "-W", "1", &mesh::ip(&self.cfg.switch_subnet, m.host)]).is_err() {
-                m.switch = false;
-            }
+        if me.host == 1 || !me.switch || self.cfg.wg_transport != config::TRANSPORT_AUTO {
+            return out;
+        }
+        let run = self.run.as_ref();
+        let answers: Vec<bool> = std::thread::scope(|s| {
+            let pings: Vec<_> = out
+                .iter()
+                .map(|m| {
+                    let addr = mesh::ip(&self.cfg.switch_subnet, m.host);
+                    let mine = m.host == me.host;
+                    s.spawn(move || !mine && !addr.is_empty() && run.ok(ctx, &Cmd::new("ping", &["-c", "1", "-W", "1", &addr])).is_ok())
+                })
+                .collect();
+            pings.into_iter().map(|p| p.join().unwrap_or(false)).collect()
+        });
+        for (m, up) in out.iter_mut().zip(answers) {
+            m.switch = up;
         }
         out
+    }
+
+    /// On a server: what WireGuard knows of each peer now (mesh::live_peers);
+    /// nothing when wg0 is down or wg cannot tell.
+    fn live_links(&self, ctx: &Ctx) -> BTreeMap<String, mesh::Live> {
+        let wg = |what: &str| self.run.output(ctx, &Cmd::new("wg", &["show", "wg0", what]).quiet().stdout_only()).unwrap_or_default();
+        let endpoints = wg("endpoints");
+        if endpoints.trim().is_empty() {
+            return BTreeMap::new();
+        }
+        mesh::live_peers(&endpoints, &wg("latest-handshakes"))
     }
 
     /// Applies wg0.conf to the running interface without dropping
@@ -1303,9 +1333,10 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
             }
         }
     };
-    // The switch pings take up to a second each: before the lock, so a cut
+    // The switch pings take up to a second: before the lock, so a cut
     // never waits for them.
     let members = n.check_switch(ctx, me, &members);
+    let live = if coordinator { BTreeMap::new() } else { n.live_links(ctx) };
     // Check again under the lock: a cut may have landed while fetching.
     let _lock = fsx::lock(n.path(quarantine::MESH_LOCK))?;
     let q = quarantine::load(n)?;
@@ -1314,7 +1345,7 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     }
     let all = members;
     let members: Vec<Member> = all.iter().filter(|m| m.host == me.host || !q.blocks(m)).cloned().collect();
-    n.apply(me, &members)?;
+    n.apply_live(me, &members, &live, Time::now().0.timestamp())?;
     n.reload_wg(ctx)?;
     drop(_lock);
     // The cluster follows the mesh: the coordinator seals the token for
@@ -1527,6 +1558,10 @@ mod tests {
         crypto: Mutex<Vec<Cmd>>,
         /// age is not installed.
         no_age: Mutex<bool>,
+        /// `wg show wg0 endpoints` and `latest-handshakes`.
+        live: Mutex<(String, String)>,
+        /// Switch addresses that answer a ping; None: every one.
+        answers: Mutex<Option<Vec<String>>>,
     }
 
     impl FakeCoord {
@@ -1547,6 +1582,8 @@ mod tests {
                 heartbeat: Mutex::new(String::new()),
                 crypto: Mutex::new(Vec::new()),
                 no_age: Mutex::new(false),
+                live: Mutex::new((String::new(), String::new())),
+                answers: Mutex::new(None),
             })
         }
 
@@ -1593,7 +1630,12 @@ mod tests {
                     }
                     return (String::new(), Ok(()));
                 }
-                "ping" | "ip" | "agetty" | "networkctl" => return (String::new(), Ok(())),
+                "ping" => {
+                    let up = self.answers.lock().unwrap().as_ref().is_none_or(|a| a.contains(c.args.last().unwrap()));
+                    self.ran.lock().unwrap().push(format!("ping {}", c.args.last().unwrap()));
+                    return (String::new(), if up { Ok(()) } else { Err("ping failed: exit status 1".into()) });
+                }
+                "ip" | "agetty" | "networkctl" => return (String::new(), Ok(())),
                 // No blocked members in the firewall's set.
                 "nft" => return (String::new(), Err("no such set".into())),
                 // The cluster knows the coordinator, this node and one
@@ -1617,6 +1659,8 @@ mod tests {
                 }
                 // The report's look at the links: the coordinator only.
                 "wg" if c.args[2] == "allowed-ips" => return (format!("{COORD_WG}\t10.66.0.1/32\n"), Ok(())),
+                "wg" if c.args[2] == "endpoints" => return (self.live.lock().unwrap().0.clone(), Ok(())),
+                "wg" if !self.live.lock().unwrap().1.is_empty() => return (self.live.lock().unwrap().1.clone(), Ok(())),
                 "wg" => return (format!("{COORD_WG}\t{}\n", Time::now().0.timestamp() - 7), Ok(())),
                 _ => {}
             }
@@ -1945,6 +1989,99 @@ mod tests {
         }
         // node-c stays a member (it is signed), without the bad address.
         assert!(hosts.contains("10.66.0.3 node-c\n") && wg.contains(OTHER_WG) && kh.contains("node-c,10.66.0.3 ssh-ed25519"));
+    }
+
+    /// The registry account keeps the addresses in the member list. Were
+    /// they taken for both ends, it would point the coordinator at a wrong
+    /// address for every server and every server at a wrong one for the
+    /// coordinator, and wg syncconf would put that back every minute: no
+    /// handshake, and with the mesh down no server ever fetches a list
+    /// that sets it right.
+    #[test]
+    fn the_registry_cannot_move_mesh_endpoints() {
+        let (_dir, _tmp, n, _fc, _sd, store) = brain();
+        let env = sign(&ADMIN, 5, vec![coord_entry(), node_entry(2)]);
+        registry(&store, vec![coord_member(), Member { lan_ip: "203.0.113.20".into(), ..node_member(2) }], env.clone());
+        sync(&Ctx::new(), &n, true, &store).unwrap();
+        let brain_wg = get(&n.root, WG_CONF);
+        let (_dir, _tmp, n, fc) = joined();
+        *fc.peers.lock().unwrap() =
+            Some(peers(&[Member { lan_ip: "203.0.113.50".into(), switch: false, ..coord_member() }, node_member(2)], &env));
+        assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
+        let server_wg = get(&n.root, WG_CONF);
+        assert!(
+            !brain_wg.contains("203.0.113.20") && !brain_wg.contains("Endpoint") && brain_wg.contains(WG_PUBKEY),
+            "--- coordinator\n{brain_wg}"
+        );
+        assert!(server_wg.contains("Endpoint = 192.168.1.50:51820") && !server_wg.contains("203.0.113.50"), "--- server\n{server_wg}");
+    }
+
+    /// Between two servers the list's address is a hint: a link WireGuard
+    /// has a fresh handshake on keeps its endpoint, which only the peer's
+    /// own packets set.
+    #[test]
+    fn a_live_link_between_servers_stays() {
+        let (_dir, _tmp, n, fc) = joined();
+        let env = sign(&ADMIN, 5, vec![coord_entry(), node_entry(2), other_entry()]);
+        let c = other_entry();
+        let node_c = Member {
+            host: 3,
+            name: c.name,
+            wg_key: c.wg_key,
+            ssh_host_key: c.ssh_host_key,
+            lan_ip: "203.0.113.30".into(),
+            ..Member::default()
+        };
+        *fc.peers.lock().unwrap() = Some(peers(&[coord_member(), node_member(2), node_c.clone()], &env));
+        let now = Time::now().0.timestamp();
+        let block = |n: &Node| get(&n.root, WG_CONF).split("# node-c\n").nth(1).unwrap_or_default().to_string();
+        *fc.live.lock().unwrap() = (format!("{OTHER_WG}\t192.168.1.33:51820\n"), format!("{OTHER_WG}\t{}\n", now - 30));
+        assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
+        assert!(block(&n).contains("Endpoint = 192.168.1.33:51820"), "{}", block(&n));
+        // The link went silent: the list's address is tried again.
+        *fc.live.lock().unwrap() = (format!("{OTHER_WG}\t192.168.1.33:51820\n"), format!("{OTHER_WG}\t{}\n", now - 600));
+        assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
+        assert!(block(&n).contains("Endpoint = 203.0.113.30:51820"), "{}", block(&n));
+        // wg cannot tell (wg0 down): the list's address.
+        *fc.live.lock().unwrap() = (String::new(), String::new());
+        assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
+        assert!(block(&n).contains("Endpoint = 203.0.113.30:51820"), "{}", block(&n));
+    }
+
+    /// Whether a link goes over the switch is up to a ping of the peer's
+    /// switch address, not up to what the list says about its cable.
+    #[test]
+    fn the_switch_is_found_by_ping() {
+        let (_dir, _tmp, mut n, fc) = joined();
+        let c = other_entry();
+        let node_c = Member { host: 3, name: c.name, wg_key: c.wg_key, lan_ip: "192.168.1.30".into(), ..Member::default() };
+        // The list says nobody has a cable.
+        let members = vec![Member { switch: false, ..coord_member() }, node_member(2), node_c];
+        let me = SelfInfo { host: 2, switch: true };
+        let ctx = Ctx::new();
+        let cases: Vec<(Option<Vec<String>>, [bool; 2])> =
+            vec![(None, [true, true]), (Some(vec!["172.16.66.1".into()]), [true, false]), (Some(vec![]), [false, false])];
+        for (answers, want) in cases {
+            *fc.answers.lock().unwrap() = answers.clone();
+            let got = n.check_switch(&ctx, me, &members);
+            assert_eq!([got[0].switch, got[2].switch], want, "{answers:?}");
+            let wg = mesh::wg_config(&n.cfg, me, &got);
+            let coord = if want[0] { "172.16.66.1:51820" } else { "192.168.1.50:51820" };
+            assert!(wg.contains(&format!("AllowedIPs = 10.66.0.1/32\nEndpoint = {coord}")), "{wg}");
+        }
+        let pings = |fc: &FakeCoord| fc.ran.lock().unwrap().drain(..).filter(|c| c.starts_with("ping")).count();
+        assert_eq!(pings(&fc), 6, "two peers, three times; never itself");
+        // Without a cable, in LAN mode, and on the coordinator: no ping,
+        // and the list's word about cables changes nothing.
+        let lan = Config { wg_transport: config::TRANSPORT_LAN.into(), ..n.cfg.clone() };
+        for (cfg, me) in
+            [(n.cfg.clone(), SelfInfo { host: 2, switch: false }), (lan, me), (n.cfg.clone(), SelfInfo { host: 1, switch: true })]
+        {
+            n.cfg = cfg;
+            let wg = mesh::wg_config(&n.cfg, me, &n.check_switch(&ctx, me, &members));
+            assert!(!wg.contains("172.16.66."), "{wg}");
+        }
+        assert_eq!(pings(&fc), 0);
     }
 
     #[test]
@@ -2819,7 +2956,7 @@ mod tests {
         registry(&store, vec![coord_member(), Member { lan_ip: "192.168.1.20".into(), ..node_member(2) }, node_c.clone()], list.clone());
         sync(&Ctx::new(), &n, true, &store).unwrap();
         let wg = get(&n.root, WG_CONF);
-        assert!(wg.contains(WG_PUBKEY) && wg.contains(OTHER_WG) && wg.contains("Endpoint = 192.168.1.30:"), "{wg}");
+        assert!(wg.contains(WG_PUBKEY) && wg.contains(OTHER_WG) && !wg.contains("Endpoint"), "{wg}");
         assert!(get(&n.root, SIGNED_FILE).contains(&list.sig), "the version this coordinator has seen");
 
         // A machine of its own beside them, and node-a gone: neither

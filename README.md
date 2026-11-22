@@ -222,6 +222,15 @@ fallback off: `bootctl set-default ""` undoes it.
   or connected to it; no setting needed.
 - **WiFi/router network only**: WireGuard always goes over the router.
 
+Where WireGuard sends its packets is never taken from the coordinator's
+list alone (the registry account keeps it, see [Security](#security)):
+servers find the coordinator at the address in their own config
+(`COORD_LAN_IP`), or at its switch address when a ping there answers; the
+coordinator names no address for anyone and answers each server where its
+packets come from. Between two servers, the address each one reports is
+tried until their link is up; from then on the link stays where it works,
+and the switch is used whenever a ping over it answers.
+
 ## SSH between machines
 
 No private keys are stored on servers, and your desktop key is never forwarded
