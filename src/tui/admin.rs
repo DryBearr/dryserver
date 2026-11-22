@@ -20,7 +20,7 @@ use crate::err::{Error, Kind, Result};
 use crate::gotime::{Time, duration_string, round_ms};
 use crate::mesh;
 use crate::publish::{self, Choice, Days, Parts, Plan};
-use crate::registry::Member;
+use crate::registry::{Member, Request};
 use crate::release::{self, Release};
 use crate::report::{self, Concern, percent, short_age};
 use crate::rollout;
@@ -312,14 +312,10 @@ fn ago(t: Time, now: Time) -> String {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Action {
-    Approve {
-        id: String,
-        name: String,
-    },
-    Reject {
-        id: String,
-        name: String,
-    },
+    /// The waiting request as the admin saw it: its id, name and keys,
+    /// which its code covers. The desktop signs exactly those.
+    Approve(Request),
+    Reject(Request),
     Remove(String),
     /// The first signature: the coordinator's own entry.
     SignCoordinator,
@@ -531,10 +527,10 @@ impl Screen {
 
     fn run(&mut self, a: Action) {
         let res: Result<String> = match &a {
-            Action::Approve { id, name } => {
-                self.admin.approve(id).map(|host| format!("{name} approved and signed as {}.", mesh::ip(&self.subnet, host)))
+            Action::Approve(r) => {
+                self.admin.approve(r).map(|host| format!("{} approved and signed as {}.", r.name, mesh::ip(&self.subnet, host)))
             }
-            Action::Reject { id, name } => self.admin.reject(id).map(|_| format!("{name} rejected.")),
+            Action::Reject(r) => self.admin.reject(r).map(|_| format!("{} rejected.", r.name)),
             Action::Remove(name) => self.admin.remove(name).map(|_| format!("{name} removed; servers drop it within a minute.")),
             Action::SignCoordinator => self.admin.sign_coordinator().map(|_| "Coordinator signed. New machines can join now.".to_string()),
             Action::NewCoordinator(c) => self.admin.accept_new_coordinator(c).map(|_| {
@@ -641,7 +637,7 @@ impl Screen {
                     self.notice = "Select a waiting request first.".into();
                     return Flow::Continue;
                 };
-                let a = if c == 'a' { Action::Approve { id: r.id, name: r.name } } else { Action::Reject { id: r.id, name: r.name } };
+                let a = if c == 'a' { Action::Approve(r) } else { Action::Reject(r) };
                 self.decide(a, None, &[]);
             }
             Key::Char('d') => {
@@ -1040,8 +1036,7 @@ mod tests {
         let (mut admin, store) = setup(&dir);
         store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
         admin.load().unwrap();
-        let id = store.read().unwrap().requests[0].id.clone();
-        admin.approve(&id).unwrap();
+        admin.approve(&store.read().unwrap().requests[0]).unwrap();
 
         // Something without the stick's proof answers at the address.
         let (fake, key) = reinstalled(&dir, "coord", "another-secret-another-secret-another-secret");
@@ -1059,8 +1054,7 @@ mod tests {
         let (mut admin, store) = setup(&dir2);
         store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
         admin.load().unwrap();
-        let id = store.read().unwrap().requests[0].id.clone();
-        admin.approve(&id).unwrap();
+        admin.approve(&store.read().unwrap().requests[0]).unwrap();
         let (new_store, key) = reinstalled(&dir2, "coord", SECRET);
         let pinned = move_to(&mut admin, &new_store, &key);
         let mut s = Screen::new(admin);

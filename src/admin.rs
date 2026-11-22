@@ -635,18 +635,42 @@ impl Admin {
         // Requests are untrusted too; the code is computed here from the
         // keys in the request and the coordinator key this desktop pinned.
         let secret = self.join_secret()?;
+        let mut requests = Vec::new();
         for mut r in st.requests {
             if let Err(e) = registry::validate_request(&r) {
                 v.warnings.push(format!("The coordinator sent a bad join request, ignored: {e}"));
                 continue;
             }
             r.code = registry::pairing_code(&r.wg_key, &r.ssh_host_key, &coord_key);
+            requests.push(r);
+        }
+        // The registry lists one request per id, name and key. Two under
+        // one of them come from a registry account that was broken into:
+        // the admin would pick the line with the right code, and the
+        // desktop would sign whichever comes first under its id.
+        let twice = |r: &Request| requests.iter().filter(|q| q.id == r.id || q.name == r.name || q.wg_key == r.wg_key).count() > 1;
+        let doubled: Vec<bool> = requests.iter().map(twice).collect();
+        let mut dropped: Vec<String> = Vec::new();
+        for (r, d) in requests.into_iter().zip(doubled) {
+            if d {
+                if !dropped.contains(&r.name) {
+                    dropped.push(r.name.clone());
+                }
+                continue;
+            }
             // Without the proof the request does not come from a machine
             // installed from this stick, or the coordinator changed it.
             if !registry::proof_ok(&secret, &r) {
                 v.unproved.push(r.id.clone());
             }
             v.pending.push(r);
+        }
+        if !dropped.is_empty() {
+            v.warnings.push(format!(
+                "The coordinator lists more than one join request under the same id, name or WireGuard key ({}). None of them \
+                 is shown, and none can be approved while it does: its registry account may be broken into.",
+                dropped.join(", ")
+            ));
         }
         let newest = self.release.as_ref().map_or(0, |r| r.serial);
         let brain = members.iter().find(|m| m.host == 1).and_then(|m| m.report.as_ref());
@@ -705,11 +729,20 @@ impl Admin {
             .ok_or_else(|| Error::new("the mesh subnet is full"))
     }
 
-    /// Lets a waiting machine in. Returns its mesh host number.
-    pub fn approve(&mut self, id: &str) -> Result<u32> {
-        let Some(r) = self.pending.iter().find(|r| r.id == id).cloned() else {
-            bail!("that request is gone");
-        };
+    /// The waiting request the admin chose, as it was shown: its id, name
+    /// and both keys. A request that changed since is not taken for it.
+    fn chosen(&self, r: &Request) -> Result<Request> {
+        self.pending
+            .iter()
+            .find(|p| p.id == r.id && p.name == r.name && p.wg_key == r.wg_key && key_body(&p.ssh_host_key) == key_body(&r.ssh_host_key))
+            .cloned()
+            .ok_or_else(|| Error::new("that request is gone, or the coordinator changed it since you looked: look again"))
+    }
+
+    /// Lets the waiting machine chosen in, exactly the one the admin saw
+    /// (its keys, which the code covers). Returns its mesh host number.
+    pub fn approve(&mut self, chosen: &Request) -> Result<u32> {
+        let r = self.chosen(chosen)?;
         if self.unproved.contains(&r.id) {
             bail!(
                 "{} has no valid proof from your USB stick: it was not installed from it, or the coordinator changed the request. \
@@ -732,10 +765,8 @@ impl Admin {
         Ok(host)
     }
 
-    pub fn reject(&mut self, id: &str) -> Result<()> {
-        let Some(r) = self.pending.iter().find(|r| r.id == id).cloned() else {
-            bail!("that request is gone");
-        };
+    pub fn reject(&mut self, chosen: &Request) -> Result<()> {
+        let r = self.chosen(chosen)?;
         self.publish(|list, _| {
             list.rejected.push(r.wg_key.clone());
             Ok(())
@@ -1203,6 +1234,95 @@ pub mod tests {
         store.update(|s| s.add_request(request(name, seed), COORD_KEY, Time::now())).unwrap()
     }
 
+    /// The waiting request with id as the desktop shows it (one made up
+    /// when there is none).
+    pub fn by_id(a: &Admin, id: &str) -> Request {
+        a.pending.iter().find(|r| r.id == id).cloned().unwrap_or(Request { id: id.into(), ..Request::default() })
+    }
+
+    /// The review's case: the registry account lists, before the real
+    /// request, one under the same id from a machine of its own (with a
+    /// valid proof: a removed server keeps its join.proof). The admin
+    /// picks the line whose code matches; the desktop signs exactly that
+    /// machine, or nothing.
+    #[test]
+    fn review_two_requests_under_one_id_approve_the_wrong_machine() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        let id = ask(&store, "node-a", 2);
+        let real = store.read().unwrap().requests[0].clone();
+        let evil_under = |field: &str| {
+            let mut evil = request("node-x", 66);
+            match field {
+                "id" => evil.id = real.id.clone(),
+                "name" => {
+                    evil = request("node-a", 66);
+                    evil.id = "00000000000000ee".into();
+                }
+                _ => {
+                    evil.wg_key = real.wg_key.clone();
+                    evil.id = "00000000000000ee".into();
+                }
+            }
+            evil.status = registry::Status::Pending;
+            evil.created = real.created;
+            evil
+        };
+        for field in ["id", "name", "key"] {
+            let evil = evil_under(field);
+            store
+                .update(|s| {
+                    s.requests = vec![evil.clone(), real.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let v = a.load().unwrap();
+            assert!(v.pending.is_empty(), "{field}: both shown: {:?}", v.pending);
+            assert!(v.warnings.iter().any(|w| w.contains("more than one join request")), "{field}: {:?}", v.warnings);
+            let real_code = registry::pairing_code(&key32(2), &request("node-a", 2).ssh_host_key, COORD_KEY);
+            let chosen = Request { code: real_code, ..real.clone() };
+            assert!(a.approve(&chosen).unwrap_err().to_string().contains("gone"), "{field}");
+        }
+        // One request again: the admin approves the line with the code.
+        store
+            .update(|s| {
+                s.requests = vec![real.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let v = a.load().unwrap();
+        assert!(v.unproved.is_empty(), "both carry a valid proof");
+        let real_code = registry::pairing_code(&key32(2), &request("node-a", 2).ssh_host_key, COORD_KEY);
+        let chosen = v.pending.iter().find(|r| r.code == real_code).expect("the real machine's line").clone();
+        assert_eq!(chosen.id, id);
+        // Between the look and the key, the registry swaps another machine
+        // in under the same id: the one the admin saw is gone.
+        store
+            .update(|s| {
+                let mut evil = request("node-a", 66);
+                evil.id = real.id.clone();
+                evil.status = registry::Status::Pending;
+                evil.created = real.created;
+                s.requests = vec![evil];
+                Ok(())
+            })
+            .unwrap();
+        a.load().unwrap();
+        assert!(a.approve(&chosen).unwrap_err().to_string().contains("changed it since you looked"));
+        assert!(a.reject(&chosen).is_err());
+        store
+            .update(|s| {
+                s.requests = vec![real.clone()];
+                Ok(())
+            })
+            .unwrap();
+        a.load().unwrap();
+        a.approve(&chosen).unwrap();
+        let list = store.read().unwrap().signed.list(&Key("admin"), |h| h < 255).unwrap();
+        let signed: Vec<String> = list.members.iter().filter(|e| e.host != 1).map(|e| e.wg_key.clone()).collect();
+        assert_eq!(signed, vec![key32(2)], "the admin approved node-a with code {real_code}; the desktop signed another key");
+    }
+
     #[test]
     fn approve_signs_and_publishes() {
         let dir = TempDir::new();
@@ -1214,7 +1334,7 @@ pub mod tests {
         assert_eq!(v.pending.len(), 1);
         assert_eq!(v.pending[0].code, registry::pairing_code(&key32(2), &request("node-a", 2).ssh_host_key, COORD_KEY));
 
-        assert_eq!(a.approve(&id).unwrap(), 2);
+        assert_eq!(a.approve(&by_id(&a, &id)).unwrap(), 2);
         let s = store.read().unwrap();
         assert_eq!(s.members.len(), 2);
         assert_eq!(s.requests[0].status, Status::Approved);
@@ -1233,7 +1353,7 @@ pub mod tests {
         // Next free number; a second approval raises the version.
         let id = ask(&store, "node-b", 3);
         a.load().unwrap();
-        assert_eq!(a.approve(&id).unwrap(), 3);
+        assert_eq!(a.approve(&by_id(&a, &id)).unwrap(), 3);
         assert!(store.read().unwrap().signed_version > s.signed_version);
     }
 
@@ -1243,9 +1363,9 @@ pub mod tests {
         let (mut a, store) = setup(&dir);
         let (ida, idb) = (ask(&store, "node-a", 2), ask(&store, "node-b", 3));
         a.load().unwrap();
-        a.approve(&ida).unwrap();
+        a.approve(&by_id(&a, &ida)).unwrap();
         a.load().unwrap();
-        a.reject(&idb).unwrap();
+        a.reject(&by_id(&a, &idb)).unwrap();
         let s = store.read().unwrap();
         assert!(s.pending().is_empty());
         assert_eq!(s.members.len(), 2);
@@ -1254,7 +1374,7 @@ pub mod tests {
         assert!(a.remove("coord").unwrap_err().to_string().contains("cannot be removed"));
         a.remove("node-a").unwrap();
         assert_eq!(store.read().unwrap().members.len(), 1);
-        assert!(a.approve("nope").unwrap_err().to_string().contains("gone"));
+        assert!(a.approve(&by_id(&a, "nope")).unwrap_err().to_string().contains("gone"));
     }
 
     #[test]
@@ -1307,7 +1427,7 @@ pub mod tests {
             a.load().unwrap();
             assert!(a.sign_coordinator().unwrap_err().to_string().contains("no valid proof from your USB stick"));
             // The first approval would sign the coordinator too: refused.
-            assert!(a.approve(&id).unwrap_err().to_string().contains("no valid proof from your USB stick"));
+            assert!(a.approve(&by_id(&a, &id)).unwrap_err().to_string().contains("no valid proof from your USB stick"));
             assert_eq!(store.read().unwrap().signed_version, 0);
             assert!(!dir.join("secrets").join(SIGNED_COPY).exists());
         }
@@ -1349,7 +1469,7 @@ pub mod tests {
         let (mut a, store) = setup(&dir);
         let id = ask(&store, "node-a", 2);
         a.load().unwrap();
-        a.approve(&id).unwrap();
+        a.approve(&by_id(&a, &id)).unwrap();
         let v1 = store.read().unwrap().signed_version;
 
         // The coordinator was hacked, cut off and reinstalled.
@@ -1396,7 +1516,7 @@ pub mod tests {
         let (mut a, store) = setup(&dir);
         let id = ask(&store, "node-a", 2);
         a.load().unwrap();
-        a.approve(&id).unwrap();
+        a.approve(&by_id(&a, &id)).unwrap();
         let copy = std::fs::read(dir.join("secrets").join(SIGNED_COPY)).unwrap();
         let attach = |a: &mut Admin, store: &Store, key: &str| {
             let pinned = Arc::new(Mutex::new(COORD_KEY.to_string()));
@@ -1465,15 +1585,15 @@ pub mod tests {
         assert_eq!(v.pending.len(), 4);
         assert_eq!(v.unproved, vec!["00000000000000aa".to_string(), "00000000000000bb".into(), "00000000000000cc".into()]);
         for id in &v.unproved {
-            let e = a.approve(id).unwrap_err().to_string();
+            let e = a.approve(&by_id(&a, id)).unwrap_err().to_string();
             assert!(e.contains("no valid proof from your USB stick"), "{e}");
         }
         assert_eq!(store.read().unwrap().members.len(), 1, "an unproved request became a member");
         // The untouched request of the real machine goes through.
-        a.approve(&real).unwrap();
+        a.approve(&by_id(&a, &real)).unwrap();
         // They can still be rejected.
         a.load().unwrap();
-        a.reject("00000000000000aa").unwrap();
+        a.reject(&by_id(&a, "00000000000000aa")).unwrap();
 
         // Without the secret nothing can be judged: refused outright.
         std::fs::remove_file(dir.join("secrets").join(crate::iso::JOIN_SECRET)).unwrap();
@@ -1539,7 +1659,7 @@ pub mod tests {
         let (mut a, store) = setup(&dir);
         let id = ask(&store, "node-a", 2);
         a.load().unwrap();
-        a.approve(&id).unwrap();
+        a.approve(&by_id(&a, &id)).unwrap();
 
         // A hacked coordinator adds a machine, swaps a key and sends junk.
         store
@@ -1602,7 +1722,7 @@ pub mod tests {
         let id = ask(&store, "node-a", 2);
         let v = a.load().unwrap();
         assert!(v.warnings.join("\n").contains("Do not sign"), "{:?}", v.warnings);
-        assert!(a.approve(&id).unwrap_err().to_string().contains("nothing signed"));
+        assert!(a.approve(&by_id(&a, &id)).unwrap_err().to_string().contains("nothing signed"));
         assert!(!dir.join("secrets").join(SIGNED_COPY).exists());
         assert_eq!(store.read().unwrap().signed_version, 0);
     }
@@ -1613,7 +1733,7 @@ pub mod tests {
         let (mut a, store) = setup(&dir);
         let id = ask(&store, "node-a", 2);
         a.load().unwrap();
-        a.approve(&id).unwrap();
+        a.approve(&by_id(&a, &id)).unwrap();
         let v1 = store.read().unwrap().signed_version;
 
         // This desktop's copy is lost: the coordinator's verified list is
@@ -1624,7 +1744,7 @@ pub mod tests {
         assert!(dir.join("secrets").join(SIGNED_COPY).exists());
         let id = ask(&store, "node-b", 3);
         a.load().unwrap();
-        a.approve(&id).unwrap();
+        a.approve(&by_id(&a, &id)).unwrap();
         let v2 = store.read().unwrap().signed_version;
         assert!(v2 > v1);
 
@@ -1671,7 +1791,7 @@ pub mod tests {
 
         let id = ask(&store, "node-a", 2);
         a.load().unwrap();
-        assert_eq!(a.approve(&id).unwrap(), 2);
+        assert_eq!(a.approve(&by_id(&a, &id)).unwrap(), 2);
         let s = store.read().unwrap();
         assert_eq!(s.members.len(), 2);
 
@@ -2005,7 +2125,7 @@ pub mod tests {
         let id = ask(&store, "node-a", 2);
         a.load().unwrap();
         *fails.lock().unwrap() = true;
-        assert!(a.approve(&id).unwrap_err().to_string().contains("cannot reach"));
+        assert!(a.approve(&by_id(&a, &id)).unwrap_err().to_string().contains("cannot reach"));
         // Signed and kept here, not on the coordinator.
         assert_eq!(store.read().unwrap().members.len(), 1);
         assert!(dir.join("secrets").join(SIGNED_COPY).exists());
