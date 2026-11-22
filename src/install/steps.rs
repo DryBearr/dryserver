@@ -206,6 +206,9 @@ impl Real {
         // fstab from what is mounted now.
         let fstab = self.run.output(ctx, &Cmd::new("genfstab", &["-U", &target]).quiet())?;
         self.write("/etc/fstab", 0o644, fstab)?;
+        // pacman on the new system reads one day of the Arch archive, as
+        // every release later makes it.
+        self.pin_mirrors()?;
 
         // Files from the tool bundles; /etc/skel ones must exist before the
         // user is created.
@@ -693,6 +696,8 @@ mod tests {
         std::fs::write(dir.join(iso::SIGNING_PUB), "ssh-ed25519 AAAAsign dryserver-signing\n").unwrap();
         std::fs::write(dir.join(iso::BACKUP_PUB), "ssh-ed25519 AAAAbackup dryserver-backup\n").unwrap();
         std::fs::write(dir.join(iso::JOIN_SECRET), format!("{JOIN_SECRET}\n")).unwrap();
+        std::fs::write(dir.join(iso::ARCH_DATE), "2026/11/20\n").unwrap();
+        std::fs::write(dir.join("mirrorlist"), "Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n").unwrap();
 
         let cfg = Config {
             coord_lan_ip: "192.168.1.50".into(),
@@ -708,6 +713,7 @@ mod tests {
         r.run = fr.clone();
         r.target = target;
         r.key_dir = dir.path().to_path_buf();
+        r.mirror_list = dir.join("mirrorlist");
         *r.machine.lock().unwrap() = Machine { uefi, tpm2: uefi, ..Machine::default() };
         (dir, r, fr)
     }
@@ -810,6 +816,10 @@ mod tests {
         assert!(read(boot::COMPLETE_DROPIN).contains("Requires=dryserver-boot-check.service"));
         assert!(r.target("/boot/EFI/Linux/arch-linux+3.efi").is_file() && r.target("/boot/EFI/Linux/arch-linux-lts+3.efi").is_file());
         assert!(read("/usr/local/bin/dryserver") == "binary" && fr.index(&format!("arch-chroot {t} mkinitcpio -P")) > fr.index("genfstab"));
+        // pacman there reads the day the stick was built.
+        let ml = read("/etc/pacman.d/mirrorlist");
+        assert_eq!(crate::osupdate::pinned_date(&ml).as_deref(), Some("2026/11/20"), "{ml}");
+        assert!(ml.starts_with("# dryserver: written by the installer"), "{ml}");
         assert_eq!(mode(r.target("/etc/cryptsetup-keys.d/data0.key")), (0o400, 512), "data keyfile");
         assert!(read("/etc/crypttab").contains("data0 UUID=1111-uuid /etc/cryptsetup-keys.d/data0.key"), "{}", read("/etc/crypttab"));
         assert_eq!(read("/usr/local/bin/k3s"), "k3s binary");

@@ -12,7 +12,7 @@ use crate::err::{Error, Result};
 use crate::gotime::duration_string;
 use crate::runner::Cmd;
 use crate::sysconf::Role;
-use crate::{errf, fsx};
+use crate::{errf, fsx, iso, osupdate, release};
 
 const CLOCK_WAIT: Duration = Duration::from_secs(60);
 const MIRROR_TIMEOUT: Duration = Duration::from_secs(180);
@@ -150,6 +150,12 @@ impl Real {
     /// which looks like a hang.
     fn trim_mirrors(&self) -> Result<()> {
         let text = fsx::read_string(&self.mirror_list)?;
+        // A live system pinned to one day of the Arch archive installs
+        // exactly that day; mirrors in front would install today's.
+        if let Some(day) = osupdate::pinned_date(&text) {
+            self.log(&format!("the packages come from the Arch snapshot of {day}"));
+            return Ok(());
+        }
         let mut servers: Vec<String> = PREFERRED_MIRRORS.iter().map(|s| s.to_string()).collect();
         for l in text.split('\n') {
             let l = l.trim();
@@ -161,6 +167,28 @@ impl Real {
         fsx::write_file(&self.mirror_list, out, 0o644)?;
         let first = servers[0].split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
         self.log(&format!("using {} mirrors, first: {first}", servers.len()));
+        Ok(())
+    }
+
+    /// Pins pacman on the new system to one day of the Arch archive, the
+    /// way a release does later (see pin_day), so pacman run by hand there
+    /// installs nothing newer than the swarm was given; the first release
+    /// moves it forward. pacstrap copied the live system's mirrors there
+    /// before; without a day they stay until the first release.
+    pub(super) fn pin_mirrors(&self) -> Result<()> {
+        let live = fsx::read_or_empty(&self.mirror_list);
+        let stick = fsx::read_or_empty(fsx::dir(&self.registry_key).join(iso::ARCH_DATE));
+        match pin_day(&live, &stick, chrono::Utc::now().date_naive()) {
+            Some((day, why)) => {
+                let list = format!("# dryserver: written by the installer: {why}.\n{}", osupdate::mirrorlist(&day)?);
+                self.write(osupdate::MIRRORLIST, 0o644, list)?;
+                self.log(&format!("pacman on the new system reads the Arch snapshot of {day} ({why})"));
+            }
+            None => self.log(
+                "warning: this USB stick does not say which Arch day it was built on (build it again): \
+                 pacman on the new system keeps the mirrors until the first release pins a day",
+            ),
+        }
         Ok(())
     }
 
@@ -247,6 +275,31 @@ impl Real {
             }
         }
         Err(last.unwrap().wrap(format!("{} (after {PACSTRAP_ATTEMPTS} attempts)", pacman_problem(&out))))
+    }
+}
+
+/// Which Arch snapshot day the new system is pinned to, and why; None when
+/// no day is known.
+///
+/// - The live system reads one snapshot day itself: the packages came
+///   from exactly that day.
+/// - Otherwise they came from the mirrors as they are at install time, a
+///   day no snapshot names. The day the USB stick was built (written into
+///   it by `dryserver build`) is used: no installed package is older than
+///   that day's, so pacman on the new system finds nothing to install
+///   until a release, and a release published after the stick was built
+///   only moves it forward. A day ahead of this machine's clock (a wrong
+///   clock at the build) is not used.
+fn pin_day(live: &str, stick: &str, today: chrono::NaiveDate) -> Option<(String, &'static str)> {
+    if let Some(day) = osupdate::pinned_date(live) {
+        return Some((day, "the packages came from that snapshot"));
+    }
+    let stick = stick.trim();
+    match release::arch_day(stick) {
+        Ok(d) if d <= today + chrono::Days::new(1) => {
+            Some((stick.to_string(), "the day the USB stick was built; the packages installed are that day's or newer"))
+        }
+        _ => None,
     }
 }
 
@@ -378,6 +431,52 @@ mod tests {
         let pacman: Vec<String> = cr.cmds.lock().unwrap().iter().filter(|c| c.name == "pacman").map(|c| c.to_string()).collect();
         assert_eq!(pacman.len(), 2, "{pacman:?}");
         assert_eq!(pacman[0], "pacman -Sy --noconfirm");
+    }
+
+    #[test]
+    fn the_snapshot_day_a_new_system_is_pinned_to() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 22).unwrap();
+        let pinned = crate::osupdate::mirrorlist("2026/11/02").unwrap();
+        let mirrors = "# dryserver: nearby and CDN mirrors first\nServer = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n";
+        // Installed from one day of the archive: exactly that day.
+        assert_eq!(pin_day(&pinned, "2026/11/20\n", today).map(|d| d.0).as_deref(), Some("2026/11/02"));
+        // From the mirrors: the day the stick was built.
+        let (day, why) = pin_day(mirrors, "2026/11/20\n", today).unwrap();
+        assert!(day == "2026/11/20" && why.contains("USB stick was built"), "{day} {why}");
+        assert_eq!(pin_day(mirrors, "2026/11/23", today).map(|d| d.0).as_deref(), Some("2026/11/23"), "a day ahead: time zones");
+        // A day the archive cannot have yet (a wrong clock at the build),
+        // junk, or a stick from before: no pin, the mirrors stay.
+        for stick in ["2026/11/25", "", "2026-11-20", "../../x", "2026/13/01"] {
+            assert_eq!(pin_day(mirrors, stick, today), None, "{stick:?}");
+        }
+    }
+
+    #[test]
+    fn a_live_system_pinned_to_a_snapshot_keeps_it() {
+        let (_dir, r, _) = precheck_real("");
+        let list = crate::osupdate::mirrorlist("2026/11/02").unwrap();
+        std::fs::write(&r.mirror_list, &list).unwrap();
+        r.trim_mirrors().unwrap();
+        assert_eq!(std::fs::read_to_string(&r.mirror_list).unwrap(), list, "mirrors in front would install today's packages");
+    }
+
+    #[test]
+    fn pinning_the_new_system() {
+        let (dir, mut r, _) = precheck_real("");
+        r.target = dir.join("mnt");
+        r.registry_key = dir.join("keys/registry_ed25519");
+        std::fs::create_dir_all(dir.join("mnt/etc/pacman.d")).unwrap();
+        std::fs::write(dir.join("mnt/etc/pacman.d/mirrorlist"), "Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n").unwrap();
+        // A stick from before: the mirrors pacstrap copied stay.
+        r.pin_mirrors().unwrap();
+        assert!(std::fs::read_to_string(dir.join("mnt/etc/pacman.d/mirrorlist")).unwrap().contains("geo.mirror"));
+        std::fs::create_dir_all(dir.join("keys")).unwrap();
+        std::fs::write(dir.join(format!("keys/{}", iso::ARCH_DATE)), "2026/11/20\n").unwrap();
+        r.pin_mirrors().unwrap();
+        let got = std::fs::read_to_string(dir.join("mnt/etc/pacman.d/mirrorlist")).unwrap();
+        assert_eq!(crate::osupdate::pinned_date(&got).as_deref(), Some("2026/11/20"), "{got}");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(dir.join("mnt/etc/pacman.d/mirrorlist")).unwrap().permissions().mode() & 0o777, 0o644);
     }
 
     #[test]

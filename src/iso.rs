@@ -31,6 +31,10 @@ pub const BACKUP_PUB: &str = "backup_ed25519.pub";
 /// The secret installers use to prove a join request comes from this
 /// stick. On the stick and in secrets/; never on an installed machine.
 pub const JOIN_SECRET: &str = "join_secret";
+/// The UTC day the stick was built (YYYY/MM/DD), next to the keys. The
+/// installer pins the Arch snapshot of this day on the machines it
+/// installs (see install::precheck::pin_day).
+pub const ARCH_DATE: &str = "arch-date";
 /// The k3s release every machine gets, and the SHA-256 of its amd64
 /// binary as published with the release (sha256sum-amd64.txt). The ISO
 /// build downloads it and refuses anything else.
@@ -111,7 +115,13 @@ pub fn run(ctx: &Ctx, o: &Options, log: &mut (dyn Write + Send)) -> Result<()> {
     let _rm = Defer(|| {
         let _ = std::fs::remove_dir_all(&stage_c);
     });
-    let staged = Staged { key: &key, signing_pub: &signing_pub, backup_pub: &backup_pub, join_secret: &join_secret };
+    let staged = Staged {
+        key: &key,
+        signing_pub: &signing_pub,
+        backup_pub: &backup_pub,
+        join_secret: &join_secret,
+        arch_day: chrono::Utc::now().format("%Y/%m/%d").to_string(),
+    };
     write_stage(&stage, &me, &o.config, &staged).map_err(|e| e.wrap("prepare build files"))?;
 
     let _ = writeln!(tee, "==> Starting {IMAGE} (first run downloads ~1 GB)");
@@ -395,12 +405,14 @@ fn ensure_join_secret(dir: &Path, log: &mut dyn Write) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// The keys and secrets that go onto the stick.
+/// The keys and secrets that go onto the stick, and the day it is built.
 struct Staged<'a> {
     key: &'a Path,
     signing_pub: &'a Path,
     backup_pub: &'a Path,
     join_secret: &'a Path,
+    /// YYYY/MM/DD, UTC.
+    arch_day: String,
 }
 
 /// Lays out the directory mounted at /stage in the container: the embedded
@@ -408,7 +420,7 @@ struct Staged<'a> {
 /// halves of the signing and backup keys. Their private halves are never
 /// staged.
 fn write_stage(stage: &Path, me: &Path, cfg: &Config, k: &Staged) -> Result<()> {
-    let Staged { key, signing_pub, backup_pub, join_secret } = *k;
+    let Staged { key, signing_pub, backup_pub, join_secret, .. } = *k;
     match std::fs::remove_dir_all(stage) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
@@ -430,6 +442,8 @@ fn write_stage(stage: &Path, me: &Path, cfg: &Config, k: &Staged) -> Result<()> 
     copy_file(signing_pub, &etc.join(SIGNING_PUB), 0o644)?;
     copy_file(backup_pub, &etc.join(BACKUP_PUB), 0o644)?;
     copy_file(join_secret, &etc.join(JOIN_SECRET), 0o600)?;
+    crate::release::arch_day(&k.arch_day)?;
+    fsx::write_file(etc.join(ARCH_DATE), format!("{}\n", k.arch_day), 0o644)?;
     fsx::write_file(stage.join("k3s.env"), format!("K3S_VERSION='{K3S_VERSION}'\nK3S_SHA256='{K3S_SHA256}'\n"), 0o644)
 }
 
@@ -459,7 +473,14 @@ mod tests {
         std::fs::write(dir.join(BACKUP_KEY_NAME), "backup private").unwrap();
         std::fs::write(dir.join(BACKUP_PUB), "ssh-ed25519 AAAAbackup dryserver-backup\n").unwrap();
         let (signing, backup, secret) = (dir.join(SIGNING_PUB), dir.join(BACKUP_PUB), dir.join(JOIN_SECRET));
-        write_stage(&stage, &me, &cfg, &Staged { key: &key, signing_pub: &signing, backup_pub: &backup, join_secret: &secret }).unwrap();
+        let day = "2026/11/22".to_string();
+        let k = Staged { key: &key, signing_pub: &signing, backup_pub: &backup, join_secret: &secret, arch_day: day.clone() };
+        write_stage(&stage, &me, &cfg, &k).unwrap();
+        // The day the stick was built, for the installer's snapshot pin.
+        let pin = std::fs::read_to_string(stage.join(format!("overlay/airootfs/etc/dryserver/{ARCH_DATE}"))).unwrap();
+        assert_eq!(pin, "2026/11/22\n");
+        let bad = Staged { arch_day: "2026-11-22".into(), ..k };
+        assert!(write_stage(&dir.join("stage2"), &me, &cfg, &bad).is_err(), "a malformed day reached the stick");
 
         let key_pub = format!("overlay/airootfs/etc/dryserver/{KEY_NAME}.pub");
         let key_priv = format!("overlay/airootfs/etc/dryserver/{KEY_NAME}");
