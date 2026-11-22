@@ -65,6 +65,20 @@ pub const UPDATE_STATUS: &str = "/run/dryserver-update.status";
 pub const JOIN_POLL: Duration = Duration::from_secs(8);
 /// Shows join status on the console login screen.
 pub const ISSUE_FILE: &str = "/etc/issue.d/50-dryserver.issue";
+/// How many times in a row the machine at the coordinator's address may
+/// answer a waiting machine with another SSH host key before it forgets
+/// the pinned one and asks again (about a minute of polls). A machine on
+/// the home network that answered in the coordinator's place when the
+/// request went out would otherwise leave it stuck for good: every poll
+/// of the real coordinator fails on the key.
+pub const HOST_KEY_TRIES: u32 = 5;
+
+/// Whether ssh failed because the host has another key than the pinned
+/// one.
+fn host_key_failed(e: &Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("Host key verification failed") || msg.contains("HOST IDENTIFICATION HAS CHANGED")
+}
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
@@ -353,14 +367,22 @@ impl Node {
     }
 
     /// Polls until the request is decided. Approved returns the reply with
-    /// the host number and the coordinator's details.
+    /// the host number and the coordinator's details. Kind::HostKey when
+    /// the machine at the coordinator's address answered HOST_KEY_TRIES
+    /// times in a row with another SSH host key than the one pinned when
+    /// the request went out.
     pub fn wait(&self, ctx: &Ctx, every: Duration) -> Result<StatusReply> {
         let st = self.load_state();
         if st.request_id.is_empty() {
             return Err("no join request sent".into());
         }
+        let mut other_key = 0;
         loop {
             let (out, res) = self.ssh(ctx, &self.cfg.coord_lan_ip, &format!("status {}", st.request_id), "");
+            other_key = if res.as_ref().is_err_and(host_key_failed) { other_key + 1 } else { 0 };
+            if other_key >= HOST_KEY_TRIES {
+                return Err(self.other_key());
+            }
             match res {
                 Ok(()) => {
                     if let Ok(r) = serde_json::from_str::<StatusReply>(&out) {
@@ -389,6 +411,34 @@ impl Node {
             }
             ctx.sleep(every)?;
         }
+    }
+
+    /// What the machine at the coordinator's address answering with
+    /// another SSH host key than the pinned one means before approval.
+    fn other_key(&self) -> Error {
+        Error::with_kind(
+            Kind::HostKey,
+            format!(
+                "the coordinator at {} answers with another SSH host key than the one this machine saw when it asked to join. \
+                 Someone else on the network may have answered then (that request can never be approved), or the coordinator \
+                 was installed again",
+                self.cfg.coord_lan_ip
+            ),
+        )
+    }
+
+    /// Before approval only: forgets the pinned coordinator key and the
+    /// join request, so the next request pins whoever answers then and
+    /// shows a new code. Safe because a pin lets nobody in: the code the
+    /// admin compares covers the key this machine pinned, and an approval
+    /// counts only with a list the admin signed for that same key
+    /// (check_approval).
+    fn forget_coordinator(&self) -> Result<()> {
+        match std::fs::remove_file(self.path(KNOWN_HOSTS)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(Error::from(e).wrap(format!("remove {KNOWN_HOSTS}"))),
+            _ => {}
+        }
+        self.save_state(&State::default())
     }
 
     /// An approval counts only with a member list signed by the admin
@@ -1119,10 +1169,23 @@ fn populated(dir: &Path) -> bool {
     !fsx::read_or_empty(dir.join("cgroup.procs")).trim().is_empty()
 }
 
+/// How often join_loop asks: a waiting request, a request that did not go
+/// out, and after any other failure.
+struct Pace {
+    poll: Duration,
+    retry: Duration,
+    pause: Duration,
+}
+
 /// Runs at boot on a server that is not approved yet: sends (or resumes) a
 /// join request, shows the pairing code on the console and waits. On
 /// approval it brings up the mesh and disables itself.
 pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> Result<()> {
+    let pace = Pace { poll: JOIN_POLL, retry: Duration::from_secs(30), pause: Duration::from_secs(10) };
+    joining(ctx, n, params, log, &pace)
+}
+
+fn joining(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write, pace: &Pace) -> Result<()> {
     match n.read_state() {
         Ok(Some(s)) if s.host > 0 => return n.cmd(ctx, "systemctl", &["disable", "dryserver-join.service"]),
         Ok(_) => {}
@@ -1140,6 +1203,10 @@ pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> R
         let _ = n.write(ISSUE_FILE, 0o644, &format!("\n{msg}\n\n"));
         let _ = n.cmd(ctx, "agetty", &["--reload"]);
     };
+    // Why the code changed, shown with the next one.
+    let mut forgot = String::new();
+    // Requests in a row that failed on the coordinator's host key.
+    let mut other_key = 0;
     loop {
         if quarantine::blocks_join(n) {
             show("dryserver: quarantined, the coordinator is cut off: not joining.\nUndo with: sudo dryserver quarantine -lift");
@@ -1149,20 +1216,32 @@ pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> R
         if st.request_id.is_empty() {
             let sent = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).and_then(|lan| n.request(ctx, &lan, port_link(&n.switch_mac())));
             match sent {
-                Ok(code) => st.code = code,
+                Ok(code) => {
+                    other_key = 0;
+                    st.code = code;
+                }
                 Err(e) => {
+                    other_key = if host_key_failed(&e) { other_key + 1 } else { 0 };
+                    if other_key >= HOST_KEY_TRIES {
+                        // The key was pinned by an earlier request (or an
+                        // approval before a removal) and the machine there
+                        // now has another: ask again from the start.
+                        other_key = 0;
+                        forgot = forget(n, &n.other_key())?;
+                        continue;
+                    }
                     show(&format!("dryserver: cannot reach the coordinator at {} yet, retrying: {e}", n.cfg.coord_lan_ip));
-                    ctx.sleep(Duration::from_secs(30))?;
+                    ctx.sleep(pace.retry)?;
                     continue;
                 }
             }
         }
         show(&format!(
-            "dryserver: waiting for approval. On your own computer run: ./dryserver approve\n\
+            "{forgot}dryserver: waiting for approval. On your own computer run: ./dryserver approve\n\
              Approve only if it shows this code:  {}",
             st.code
         ));
-        match n.wait(ctx, JOIN_POLL) {
+        match n.wait(ctx, pace.poll) {
             Ok(r) => {
                 // A cut may have landed while waiting: check again under
                 // the mesh lock, so the coordinator's peer is never added
@@ -1187,10 +1266,20 @@ pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> R
             Err(e) if e.is(Kind::Expired) => {
                 let _ = n.save_state(&State::default());
             }
+            Err(e) if e.is(Kind::HostKey) => forgot = forget(n, &e)?,
             Err(_) if ctx.done() => return Err(ctx.err().unwrap()),
-            Err(_) => ctx.sleep(Duration::from_secs(10))?,
+            Err(_) => ctx.sleep(pace.pause)?,
         }
     }
+}
+
+/// Forgets the coordinator's pinned key and the join request after why
+/// (Node::forget_coordinator); returns what the console says about it,
+/// above the new code.
+fn forget(n: &Node, why: &Error) -> Result<String> {
+    n.forget_coordinator().map_err(|e| e.wrap(format!("{why}; cannot ask again")))?;
+    eprintln!("dryserver: {why}: forgot that key and asked again with a new code");
+    Ok(format!("dryserver: {why}.\nThis machine forgot that key and asked again: only the code below counts.\n\n"))
 }
 
 /// Refreshes the mesh from the member list. Nodes ask the coordinator over
@@ -1562,6 +1651,9 @@ mod tests {
         live: Mutex<(String, String)>,
         /// Switch addresses that answer a ping; None: every one.
         answers: Mutex<Option<Vec<String>>>,
+        /// How the next registry calls fail: "down" times out, "key" meets
+        /// another host key.
+        script: Mutex<Vec<&'static str>>,
     }
 
     impl FakeCoord {
@@ -1584,6 +1676,7 @@ mod tests {
                 no_age: Mutex::new(false),
                 live: Mutex::new((String::new(), String::new())),
                 answers: Mutex::new(None),
+                script: Mutex::new(Vec::new()),
             })
         }
 
@@ -1635,6 +1728,7 @@ mod tests {
                     self.ran.lock().unwrap().push(format!("ping {}", c.args.last().unwrap()));
                     return (String::new(), if up { Ok(()) } else { Err("ping failed: exit status 1".into()) });
                 }
+                "ip" if c.args.iter().any(|a| a == "get") => return (r#"[{"prefsrc":"192.168.1.23"}]"#.into(), Ok(())),
                 "ip" | "agetty" | "networkctl" => return (String::new(), Ok(())),
                 // No blocked members in the firewall's set.
                 "nft" => return (String::new(), Err("no such set".into())),
@@ -1668,6 +1762,25 @@ mod tests {
             let host = c.args[c.args.len() - 2].clone();
             self.calls.lock().unwrap().push(format!("{host} {cmd}"));
             let kh = fsx::under(&self.root, KNOWN_HOSTS);
+            let pinned = c.args.iter().any(|a| a == "StrictHostKeyChecking=accept-new");
+            let next = {
+                let mut script = self.script.lock().unwrap();
+                if script.is_empty() { "" } else { script.remove(0) }
+            };
+            match next {
+                "down" => {
+                    return (
+                        String::new(),
+                        Err("ssh failed: exit status 255: ssh: connect to host 192.168.1.50 port 22: Connection timed out".into()),
+                    );
+                }
+                "key" => return (String::new(), Err("ssh failed: exit status 255: Host key verification failed.".into())),
+                _ => {}
+            }
+            // A pin of another key than the coordinator's: ssh refuses.
+            if pinned && kh.exists() && !fsx::read_or_empty(&kh).contains(COORD_KEY) {
+                return (String::new(), Err("ssh failed: exit status 255: Host key verification failed.".into()));
+            }
             if !kh.exists() {
                 std::fs::write(&kh, format!("{} {COORD_KEY}\n", host.trim_start_matches("dryreg@"))).unwrap();
             }
@@ -3025,6 +3138,77 @@ mod tests {
         join_loop(&Ctx::new(), &n, &params, &mut Vec::new()).unwrap();
         assert!(fc.calls.lock().unwrap().is_empty(), "join asked a cut coordinator");
         assert!(get(&n.root, ISSUE_FILE).contains("quarantined"));
+    }
+
+    const EVIL_PIN: &str = "192.168.1.50 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIevil\n";
+
+    fn fast() -> Pace {
+        Pace { poll: Duration::from_millis(1), retry: Duration::from_millis(1), pause: Duration::from_millis(1) }
+    }
+
+    fn join_params(n: &Node) -> Params {
+        let plan = packages::resolve(&[], &[]).unwrap();
+        Params { config: n.cfg.clone(), plan, hostname: "node-a".into(), role: sysconf::Role::Node, ..Params::default() }
+    }
+
+    /// Something on the home network answered in the coordinator's place
+    /// when the request went out: this machine pinned its key, and every
+    /// poll of the real coordinator fails on it. Its code can never be
+    /// approved; without a way out the machine waits for good.
+    #[test]
+    fn a_coordinator_key_pinned_from_someone_else_is_forgotten() {
+        let env = sign(&ADMIN, 3, vec![coord_entry(), node_entry(4)]);
+        let (_dir, n, fc) = setup(vec![approved(4, env)]);
+        put(&n.root, KNOWN_HOSTS, EVIL_PIN);
+        n.save_state(&State { request_id: "fedcba9876543210".into(), code: "111 111".into(), host: 0 }).unwrap();
+        let mut log = Vec::new();
+        joining(&Ctx::new().with_timeout(Duration::from_secs(20)), &n, &join_params(&n), &mut log, &fast()).unwrap();
+        let log = String::from_utf8_lossy(&log).to_string();
+        let calls = fc.calls.lock().unwrap().clone();
+        let polls = calls.iter().take_while(|c| c.ends_with("status fedcba9876543210")).count();
+        assert_eq!(polls as u32, HOST_KEY_TRIES, "{calls:?}");
+        assert_eq!(calls[HOST_KEY_TRIES as usize], "dryreg@192.168.1.50 request", "a new request after forgetting: {calls:?}");
+        let code = registry::pairing_code(WG_PUBKEY, NODE_KEY, COORD_KEY);
+        assert!(log.contains("answers with another SSH host key") && log.contains("only the code below counts"), "{log}");
+        assert!(log.contains(&format!("Approve only if it shows this code:  {code}")), "{log}");
+        assert!(get(&n.root, KNOWN_HOSTS).contains(COORD_KEY) && !get(&n.root, KNOWN_HOSTS).contains("evil"));
+        assert_eq!(n.load_state().host, 4, "joined with the real coordinator");
+    }
+
+    /// The same when the pinned key fails the request itself (it expired
+    /// while someone else answered, or the machine left and the
+    /// coordinator was installed again).
+    #[test]
+    fn a_request_that_keeps_failing_on_the_key_starts_over() {
+        let env = sign(&ADMIN, 3, vec![coord_entry(), node_entry(4)]);
+        let (_dir, n, fc) = setup(vec![approved(4, env)]);
+        put(&n.root, KNOWN_HOSTS, EVIL_PIN);
+        let mut log = Vec::new();
+        joining(&Ctx::new().with_timeout(Duration::from_secs(20)), &n, &join_params(&n), &mut log, &fast()).unwrap();
+        let calls = fc.calls.lock().unwrap().clone();
+        assert_eq!(calls.iter().filter(|c| c.ends_with(" request")).count() as u32, HOST_KEY_TRIES + 1, "{calls:?}");
+        assert!(String::from_utf8_lossy(&log).contains("only the code below counts"));
+        assert_eq!(n.load_state().host, 4);
+    }
+
+    /// A coordinator that does not answer for a while is no reason to
+    /// forget its key, and neither are key failures with anything else
+    /// between them.
+    #[test]
+    fn a_coordinator_that_is_away_keeps_its_pin() {
+        let tries = HOST_KEY_TRIES as usize;
+        let scripts: Vec<Vec<&str>> =
+            vec![vec!["down"; 3 * tries], vec!["key"; tries - 1], [vec!["key"; tries - 1], vec!["down"], vec!["key"; tries - 1]].concat()];
+        for script in scripts {
+            let env = sign(&ADMIN, 3, vec![coord_entry(), node_entry(4)]);
+            let (_dir, n, fc) = setup(vec![StatusReply { status: Status::Pending, ..StatusReply::default() }, approved(4, env)]);
+            n.request(&Ctx::new(), "192.168.1.23", false).unwrap();
+            *fc.script.lock().unwrap() = script.clone();
+            joining(&Ctx::new().with_timeout(Duration::from_secs(20)), &n, &join_params(&n), &mut Vec::new(), &fast()).unwrap();
+            let calls = fc.calls.lock().unwrap().clone();
+            assert_eq!(calls.iter().filter(|c| c.ends_with(" request")).count(), 1, "asked again after {script:?}: {calls:?}");
+            assert!(get(&n.root, KNOWN_HOSTS).contains(COORD_KEY) && n.load_state().host == 4, "{script:?}");
+        }
     }
 
     #[test]

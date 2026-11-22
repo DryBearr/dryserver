@@ -924,7 +924,11 @@ ended.
   carries a proof made by the installer with a secret from your USB stick
   (`secrets/join_secret`); no installed machine keeps that secret. Without
   the proof a request cannot be approved, so a hacked coordinator cannot
-  swap its own keys into a waiting request. After approval, the
+  swap its own keys into a waiting request. A waiting server whose
+  coordinator answers five times in a row with another SSH host key than
+  the one it saw when it asked (something else answered in its place then,
+  or the coordinator was installed again) forgets that key, asks again
+  and shows a new code on its screen, saying why. After approval, the
   member list is only served over the mesh. Removing a machine (`d` in
   `./dryserver approve`) drops it from all servers within a minute.
 - **Unknown devices**: the coordinator scans its networks every 15 minutes and
