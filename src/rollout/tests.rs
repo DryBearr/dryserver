@@ -229,6 +229,11 @@ struct Swarm {
     faults: Mutex<Vec<(u32, Fault)>>,
     /// Pieces asked for: (host, name, offset).
     pieces: Mutex<Vec<(u32, String, u64)>>,
+    /// Slow links: at most this many bytes of a piece come before its
+    /// connection is cut off.
+    slow: Vec<(u32, u64)>,
+    /// Machines whose disk is full.
+    full_disk: Vec<u32>,
 }
 
 impl Swarm {
@@ -266,6 +271,8 @@ impl Swarm {
             brain_k3s: K3S_VERSION.into(),
             faults: Mutex::new(vec![]),
             pieces: Mutex::new(vec![]),
+            slow: vec![],
+            full_disk: vec![],
         };
         sw.brain_sync();
         for i in 0..sw.servers.len() {
@@ -310,8 +317,12 @@ impl Swarm {
         Ok(out)
     }
 
+    fn free(&self, host: u32) -> fn(&Path) -> Option<u64> {
+        if self.full_disk.contains(&host) { full } else { plenty }
+    }
+
     fn brain_sync(&self) {
-        let m = Machine { n: &self.brain.node, brain: true, free: plenty };
+        let m = Machine { n: &self.brain.node, brain: true, free: self.free(1) };
         let mut rep = self.healthy(1);
         m.describe(&mut rep);
         self.store.update(|s| s.heartbeat(1, Heartbeat { report: Some(rep.clone()), ..Heartbeat::default() }, time(self.now))).unwrap();
@@ -322,7 +333,7 @@ impl Swarm {
             &self.served,
             &rep,
             Now { unix: self.now, minute: self.minute },
-            plenty,
+            self.free(1),
         );
     }
 
@@ -331,7 +342,7 @@ impl Swarm {
         if self.offline.contains(&m.host) {
             return Ok(());
         }
-        let mach = Machine { n: &m.node, brain: false, free: plenty };
+        let mach = Machine { n: &m.node, brain: false, free: self.free(m.host) };
         let mut rep = self.healthy(m.host);
         mach.describe(&mut rep);
         let hb = Heartbeat { lan_ip: format!("192.168.1.{}", 20 + m.host), report: Some(rep.clone()), ..Heartbeat::default() };
@@ -529,6 +540,15 @@ impl Source for Reg<'_> {
             Some(Fault::More) => out.extend_from_slice(b"and more"),
             Some(Fault::Flip) => out[0] ^= 1,
             _ => {}
+        }
+        if let Some(&(_, most)) = self.sw.slow.iter().find(|(h, _)| *h == self.host)
+            && out.len() as u64 > most
+        {
+            // Like stream_to_file when its time runs out: what came is in
+            // the file, and the piece failed.
+            out.truncate(most as usize);
+            std::fs::write(dst, &out)?;
+            return Err(Error::deadline());
         }
         std::fs::write(dst, &out)?;
         Ok(())
@@ -1222,14 +1242,126 @@ fn skip_passes_over_a_server_but_never_the_brain() {
 
 #[test]
 fn a_cut_off_or_oversized_piece_is_loaded_again() {
-    for fault in [Fault::Cut, Fault::More, Fault::Down] {
+    let size = sw_bin_len();
+    for (fault, then) in [(Fault::Cut, size / 2), (Fault::More, 0), (Fault::Down, 0)] {
         let mut sw = Swarm::new(1);
         sw.fault(2, fault);
         sw.publish(10, true);
         sw.until(30, |s| s.everyone_on(10));
         let pieces = sw.pieces.lock().unwrap().clone();
-        assert_eq!(pieces, vec![(2, "dryserver".to_string(), 0), (2, "dryserver".to_string(), 0)], "{fault:?}");
+        // What came of a cut piece stays; more than asked for does not.
+        assert_eq!(pieces, vec![(2, "dryserver".to_string(), 0), (2, "dryserver".to_string(), then)], "{fault:?}");
     }
+}
+
+/// The size of the dryserver binary of Swarm::release.
+fn sw_bin_len() -> u64 {
+    Swarm::new(0).release(10, "0.2.0", true).1.len() as u64
+}
+
+/// A release of size bytes of dryserver.
+fn big_release(sw: &Swarm, serial: u64, size: u64) -> (Envelope, Vec<u8>) {
+    let big: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+    let (env, _) = sw.release(serial, "0.2.0", true);
+    let mut r: Release = serde_json::from_str(&env.doc).unwrap();
+    r.dryserver.sha256 = sha(&big);
+    r.dryserver.size = big.len() as u64;
+    (release::seal(&ADMIN, &r).unwrap(), big)
+}
+
+/// A 16 MiB piece took longer than its time on a slow link, and every try
+/// started it over: a slow server never finished. Now what came stays and
+/// the next piece starts where it ended, a few connections per sync at
+/// most, and the whole file is checked before it is used.
+#[test]
+fn a_slow_link_gets_on_at_every_sync() {
+    let mut sw = Swarm::new(1);
+    let mib = 1 << 20;
+    sw.slow.push((2, mib));
+    let (env, big) = big_release(&sw, 10, 10 * mib);
+    sw.upload(&env, &big, None).unwrap();
+    sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.ready));
+    let mut syncs = Vec::new();
+    while !sw.everyone_on(10) && syncs.len() < 10 {
+        let before = sw.pieces.lock().unwrap().len();
+        sw.tick();
+        syncs.push(sw.pieces.lock().unwrap().len() - before);
+    }
+    assert!(sw.everyone_on(10), "{:#?}", sw.rollout());
+    assert!(syncs.iter().all(|n| *n <= MAX_PIECES as usize), "pieces per sync: {syncs:?}");
+    let offsets: Vec<u64> = sw.pieces.lock().unwrap().iter().filter(|p| p.0 == 2).map(|p| p.2).collect();
+    assert_eq!(offsets, (0..10).map(|i| i * mib).collect::<Vec<_>>(), "each byte once");
+    assert_eq!(std::fs::read(exe(&sw.server(2).node.root)).unwrap(), big);
+    let note = Machine::new(&sw.server(2).node, false).load().note;
+    assert!(note.is_empty(), "{note}");
+
+    // One byte changed on the way, in a piece that was cut: refused, and
+    // nothing of it is kept.
+    let mut sw = Swarm::new(1);
+    sw.slow.push((2, mib));
+    for _ in 0..3 {
+        sw.fault(2, Fault::Fine);
+    }
+    sw.fault(2, Fault::Flip);
+    let (env, big) = big_release(&sw, 10, 10 * mib);
+    sw.upload(&env, &big, None).unwrap();
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    let l = Machine::new(&sw.server(2).node, false).load();
+    assert_eq!((l.failed, l.outcome.as_str()), (10, "refused"), "{l:?}");
+    assert!(l.why.contains("does not match the release"), "{}", l.why);
+    assert!(sw.server(2).fake.sim().applied.is_empty());
+    assert!(!sw.server(2).node.path(STORE).join(INCOMING).join("dryserver.part").exists());
+    // Resumed with the link fixed, it loads it again whole.
+    sw.resume();
+    sw.until_unpaused(30, |s| s.everyone_on(10));
+}
+
+/// The registry's copy of the binary went missing (the registry account,
+/// a damaged disk): the brain tried to load it at every sync for ever, and
+/// the rollout said only that the brain updates itself. Now it is a problem
+/// that may pass, and after MAX_TRIES syncs its own update failed.
+#[test]
+fn a_brain_whose_copy_of_the_release_is_gone_stops() {
+    let mut sw = Swarm::new(1);
+    let (env, bin) = sw.release(10, "0.2.0", true);
+    sw.upload(&env, &bin, None).unwrap();
+    std::fs::remove_file(sw.served.path(10, DRYSERVER_FILE)).unwrap();
+    sw.until(MAX_TRIES as usize + 3, |s| s.rollout().phase == Phase::Failed);
+    let r = sw.rollout();
+    assert!(r.paused.contains("update to release 10 failed: dryserver of release 10 on the coordinator"), "{}", r.paused);
+    assert_eq!(Machine::new(&sw.brain.node, true).load().tries, MAX_TRIES);
+    assert!(sw.kubectl().is_empty());
+    // Resumed, it has its MAX_TRIES syncs again, not one.
+    sw.resume();
+    sw.ticks(3);
+    assert_eq!(sw.rollout().phase, Phase::Brain, "{:#?}", sw.rollout());
+    // Put back: it goes on.
+    std::fs::write(sw.served.path(10, DRYSERVER_FILE), &bin).unwrap();
+    sw.until(30, |s| s.everyone_on(10));
+}
+
+/// A slow server whose turn timed out keeps what it loaded: resumed, it
+/// goes on from there.
+#[test]
+fn a_slow_server_that_timed_out_goes_on_where_it_was() {
+    let mut sw = Swarm::new(1);
+    let mib = 1 << 20;
+    sw.slow.push((2, mib));
+    let (env, big) = big_release(&sw, 10, 10 * mib);
+    sw.upload(&env, &big, None).unwrap();
+    // One sync's pieces, then it stops answering its turn.
+    sw.until(10, |s| !s.pieces.lock().unwrap().is_empty());
+    sw.ignore_turn.push(2);
+    sw.until(TURN_TIMEOUT as usize / 60 + 5, |s| s.rollout().pause == Pause::Timeout);
+    let had = sw.pieces.lock().unwrap().len();
+    assert_eq!(had, MAX_PIECES as usize);
+    assert!(sw.rollout().paused.contains("its update says fetching"), "{}", sw.rollout().paused);
+    sw.ignore_turn.clear();
+    sw.resume();
+    sw.until_unpaused(30, |s| s.everyone_on(10));
+    let offsets: Vec<u64> = sw.pieces.lock().unwrap().iter().map(|p| p.2).collect();
+    assert_eq!(offsets, (0..10).map(|i| i * mib).collect::<Vec<_>>(), "nothing loaded twice");
+    assert_eq!(std::fs::read(exe(&sw.server(2).node.root)).unwrap(), big);
 }
 
 #[test]
@@ -1248,20 +1380,15 @@ fn a_changed_file_is_refused() {
 #[test]
 fn a_large_release_comes_in_pieces_across_syncs() {
     let mut sw = Swarm::new(1);
-    let big: Vec<u8> = (0..CHUNK + 1000).map(|i| (i * 31 % 251) as u8).collect();
-    let (env, _) = sw.release(10, "0.2.0", true);
-    let mut r: Release = serde_json::from_str(&env.doc).unwrap();
-    r.dryserver.sha256 = sha(&big);
-    r.dryserver.size = big.len() as u64;
-    let env = release::seal(&ADMIN, &r).unwrap();
-    // The second piece is cut off at first: the first one stays, and the
-    // next sync goes on from it.
+    let (env, big) = big_release(&sw, 10, CHUNK + 1000);
+    // The second piece is cut off: the first one stays, and so does what
+    // came of the second; the next piece starts where it ended.
     sw.fault(2, Fault::Fine);
     sw.fault(2, Fault::Cut);
     sw.upload(&env, &big, None).unwrap();
     sw.until(20, |s| s.everyone_on(10));
     let mine: Vec<u64> = sw.pieces.lock().unwrap().iter().filter(|p| p.0 == 2).map(|p| p.2).collect();
-    assert_eq!(mine, vec![0, CHUNK, CHUNK], "each piece once, the cut one again");
+    assert_eq!(mine, vec![0, CHUNK, CHUNK + 500], "each byte once");
     assert_eq!(std::fs::read(exe(&sw.server(2).node.root)).unwrap(), big);
 }
 
@@ -1321,6 +1448,10 @@ fn stream_to_file_caps_and_times_out() {
     let ctx = Ctx::new().with_timeout(Duration::from_millis(200));
     assert!(stream_to_file(&ctx, &mut sh("sleep 10"), &dst, 10).is_err());
     assert!(start.elapsed() < Duration::from_secs(5), "a silent sender was not cut off");
+    // What came before the time ran out is in the file: fetch keeps it.
+    let ctx = Ctx::new().with_timeout(Duration::from_millis(500));
+    assert!(stream_to_file(&ctx, &mut sh("printf abc; sleep 10"), &dst, 10).is_err());
+    assert_eq!(std::fs::read(&dst).unwrap(), b"abc");
     // An endless sender stops at the cap without filling the disk.
     let e = stream_to_file(&Ctx::new(), &mut sh("yes"), &dst, 1 << 20).unwrap_err().to_string();
     assert!(e.contains("more than"), "{e}");

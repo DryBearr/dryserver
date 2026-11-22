@@ -91,6 +91,9 @@ pub const K3S_BIN: &str = report::K3S_BIN;
 /// connection, and the brain's firewall lets an address open only 10 a
 /// minute: a 70 MiB k3s takes five.
 pub const CHUNK: u64 = 16 << 20;
+/// The most pieces one sync loads, for the same reason: the sync needs a
+/// connection or two of its own (its heartbeat, the release's offer).
+pub const MAX_PIECES: u32 = 6;
 /// What must stay free on a disk after a release is stored on it: a full
 /// disk on the brain would stop the registry, and with it the swarm.
 pub const RESERVE: u64 = 256 << 20;
@@ -130,10 +133,12 @@ pub const SOAK_URGENT: i64 = 60;
 /// A machine confirms its update at a sync after the one that installed
 /// it, never in the same one: the new binary has to be the one that runs.
 const CONFIRM_AFTER: i64 = 45;
-/// How long one sync spends loading a release; the rest follows at the
-/// next sync.
+/// How long one sync starts new pieces of a release; the rest follows at
+/// the next sync. A piece started may take until the sync's own deadline.
 const FETCH_BUDGET: Duration = Duration::from_secs(25);
-/// One piece; a piece cut off by the sync's own deadline is loaded again.
+/// One piece at most. What came of a piece cut off by it or by the sync's
+/// deadline is kept: the next piece starts where it ended, so a slow link
+/// gets on at every sync instead of loading the same piece again.
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Installing and confirming are not cut off by the sync's deadline: a
 /// half-run installer is worse than a late sync.
@@ -622,8 +627,9 @@ impl Served {
 /// registry over SSH, the brain from its registry's directory.
 pub trait Source {
     fn offered(&self, ctx: &Ctx, serial: u64) -> Result<Offered>;
-    /// Writes exactly bytes [offset, offset+len) of the file to dst, or
-    /// fails.
+    /// Writes bytes [offset, offset+len) of the file to a new dst, or
+    /// fails. What it wrote before it failed is the start of them: the
+    /// caller keeps it and goes on from there.
     fn chunk(&self, ctx: &Ctx, serial: u64, name: &str, offset: u64, len: u64, dst: &Path) -> Result<()>;
 }
 
@@ -637,13 +643,16 @@ impl Source for LocalSource<'_> {
         self.0.offered(serial)
     }
 
+    /// A file that is not there, or shorter than asked, is NotFound: it is
+    /// no network that may come back by itself.
     fn chunk(&self, _: &Ctx, serial: u64, name: &str, offset: u64, len: u64, dst: &Path) -> Result<()> {
-        let mut f = open_regular(&self.0.path(serial, name))?;
+        let missing = |e: Error| Error::with_kind(Kind::NotFound, format!("{name} of release {serial} on the coordinator: {e}"));
+        let mut f = open_regular(&self.0.path(serial, name)).map_err(missing)?;
         f.seek(SeekFrom::Start(offset))?;
         let mut out = File::create(dst).map_err(|e| Error::from(e).wrap(format!("open {}", dst.display())))?;
         let n = io::copy(&mut f.take(len), &mut out)?;
         if n != len {
-            bail!("{name} of release {serial} ended after {} bytes", offset + n);
+            return Err(missing(errf!("it ends after {} bytes", offset + n)));
         }
         Ok(())
     }
@@ -1120,12 +1129,24 @@ impl<'a> Machine<'a> {
             write_atomic(&inc.join(RELEASE_FILE), &(serde_json::to_string(&env).map_err(|e| again(e.into()))? + "\n")).map_err(again)?;
         }
         let until = start + FETCH_BUDGET;
-        self.fetch(ctx, src, r.serial, DRYSERVER_FILE, r.dryserver.size, &r.dryserver.sha256, until)?;
+        let mut pieces = 0;
+        self.fetch(ctx, src, r.serial, DRYSERVER_FILE, r.dryserver.size, &r.dryserver.sha256, until, &mut pieces)?;
         if meta.need_k3s {
-            if meta.k3s_size == 0 || meta.k3s_size > MAX_K3S {
+            if meta.k3s_size == 0 {
+                // The coordinator had no k3s file for it when it was asked
+                // (it may be put back): asked again, a few times.
+                let o = src.offered(ctx, r.serial).map_err(|e| Stop::Again(e.wrap("ask the coordinator for the release")))?;
+                if o.k3s_size == 0 {
+                    return Err(Stop::Later(format!("the coordinator has no k3s {} for release {}", r.k3s.version, r.serial)));
+                }
+                room(self.free, &self.dir(), o.k3s_size, "this machine").map_err(|e| Stop::Later(e.to_string()))?;
+                meta.k3s_size = o.k3s_size;
+                fsx::write_file(inc.join(META_FILE), serde_json::to_string(&meta).map_err(|e| again(e.into()))?, 0o600).map_err(again)?;
+            }
+            if meta.k3s_size > MAX_K3S {
                 return Err(Stop::Refused(format!("the coordinator says its k3s is {} bytes", meta.k3s_size)));
             }
-            self.fetch(ctx, src, r.serial, K3S_FILE, meta.k3s_size, &r.k3s.sha256, until)?;
+            self.fetch(ctx, src, r.serial, K3S_FILE, meta.k3s_size, &r.k3s.sha256, until, &mut pieces)?;
         }
         // Everything is here and checked: install it. The update commands
         // check the release once more themselves.
@@ -1139,7 +1160,14 @@ impl<'a> Machine<'a> {
     }
 
     /// Loads one file of the release in pieces, going on from what earlier
-    /// syncs loaded, and checks it once it is whole.
+    /// syncs loaded, and checks it once it is whole. pieces counts the
+    /// pieces this sync asked for (MAX_PIECES).
+    ///
+    /// What came of a piece that was cut off (a slow link, the sync's own
+    /// deadline) is kept, and the next piece starts where it ended: a slow
+    /// server gets on at every sync instead of loading the same piece again
+    /// and again. More than was asked for is thrown away. Nothing of it is
+    /// used before the whole file matches the release's sha256.
     #[allow(clippy::too_many_arguments)]
     fn fetch(
         &self,
@@ -1150,6 +1178,7 @@ impl<'a> Machine<'a> {
         size: u64,
         sha256: &str,
         until: Instant,
+        pieces: &mut u32,
     ) -> std::result::Result<(), Stop> {
         let inc = self.dir().join(INCOMING);
         let done = inc.join(name);
@@ -1165,33 +1194,53 @@ impl<'a> Machine<'a> {
             let _ = std::fs::remove_file(&part);
             have = 0;
         }
+        let so_far = |have: u64| format!("loading {name}: {} of {} so far", report::size(have), report::size(size));
         while have < size {
-            if Instant::now() >= until {
-                return Err(Stop::Again(errf!(
-                    "loading {name}: {} of {} so far, more at the next sync",
-                    report::size(have),
-                    report::size(size)
-                )));
+            if Instant::now() >= until || *pieces >= MAX_PIECES || ctx.done() {
+                return Err(Stop::Again(errf!("{}, more at the next sync", so_far(have))));
             }
+            *pieces += 1;
             let len = CHUNK.min(size - have);
             let piece = inc.join(format!("{name}.piece"));
-            let got = src.chunk(&ctx.with_timeout(CHUNK_TIMEOUT), serial, name, have, len, &piece).and_then(|_| {
-                let n = file_len(&piece);
-                if n != len { Err(errf!("the coordinator sent {n} bytes of {name}, not {len}")) } else { Ok(()) }
-            });
-            if let Err(e) = got {
-                let _ = std::fs::remove_file(&piece);
-                return Err(Stop::Again(e.wrap(format!("load {name}"))));
-            }
-            // Only whole pieces join the part: a cut-off one is loaded again.
-            let appended = (|| -> Result<()> {
-                let mut out = OpenOptions::new().create(true).append(true).mode(0o600).open(&part)?;
-                io::copy(&mut File::open(&piece)?, &mut out)?;
-                Ok(())
-            })();
             let _ = std::fs::remove_file(&piece);
-            appended.map_err(|e| Stop::Again(e.wrap(format!("store {name}"))))?;
+            let res = src.chunk(&ctx.with_timeout(CHUNK_TIMEOUT), serial, name, have, len, &piece);
+            let got = file_len(&piece);
+            if got > len {
+                let _ = std::fs::remove_file(&piece);
+                return Err(Stop::Again(errf!("load {name}: the coordinator sent {got} bytes, not {len}")));
+            }
+            if got > 0 {
+                let appended = (|| -> Result<()> {
+                    let mut out = OpenOptions::new().create(true).append(true).mode(0o600).open(&part)?;
+                    io::copy(&mut File::open(&piece)?, &mut out)?;
+                    Ok(())
+                })();
+                if let Err(e) = appended {
+                    let _ = std::fs::remove_file(&piece);
+                    // A full disk may get room again (logs rotate, an old
+                    // image goes): tried MAX_TRIES times.
+                    return Err(match room(self.free, &self.dir(), size - have, "this machine") {
+                        Err(full) => Stop::Later(full.to_string()),
+                        Ok(()) => Stop::Again(e.wrap(format!("store {name}"))),
+                    });
+                }
+            }
+            let _ = std::fs::remove_file(&piece);
             have = file_len(&part);
+            match res {
+                // Short, and the coordinator says that is all: its copy
+                // ends there.
+                Ok(()) if got == 0 => {
+                    return Err(Stop::Later(format!("the coordinator's copy of {name} ends after {have} of {size} bytes")));
+                }
+                Ok(()) => {}
+                // Nothing came. A file the coordinator does not have will
+                // not come by itself; a link that is down may.
+                Err(e) if got == 0 && e.is_not_found() => return Err(Stop::Later(e.to_string())),
+                Err(e) if got == 0 => return Err(Stop::Again(e.wrap(format!("load {name}")))),
+                // Some came: on from where it ended.
+                Err(e) => eprintln!("dryserver: update: {}, cut off: {e}", so_far(have)),
+            }
         }
         if let Err(e) = release::verify_file(&part, sha256, size) {
             let _ = std::fs::remove_file(&part);
@@ -1267,7 +1316,7 @@ impl<'a> Machine<'a> {
     fn forget_failure(&self, serial: u64) {
         let mut l = self.load();
         if l.failed == serial {
-            l.failed = 0;
+            (l.failed, l.tries) = (0, 0);
             l.outcome.clear();
             l.why.clear();
         }

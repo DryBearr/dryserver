@@ -578,10 +578,12 @@ Then the coordinator rolls it out:
    fails, no server is touched.
 2. **Then one server at a time.** The coordinator drains the server
    (`kubectl drain`, keeping to PodDisruptionBudgets: its apps move first),
-   gives it its turn, and the server loads the release over the mesh,
-   checks the signature and the checksums itself, installs it, and keeps
-   it once the new binary runs, is healthy and reaches the coordinator.
-   Then the coordinator uncordons it and moves to the next one.
+   gives it its turn, and the server loads the release over the mesh (in
+   pieces, a few per minute; on a slow link each sync goes on where the
+   last one ended), checks the signature and the checksums itself,
+   installs it, and keeps it once the new binary runs, is healthy and
+   reaches the coordinator. Then the coordinator uncordons it and moves
+   to the next one.
 3. **The first server is the canary**: it is watched for 5 minutes before
    the next one gets its turn.
 
