@@ -789,6 +789,61 @@ pub fn unknown(found: &[Device], known: &[String], now: Time) -> Vec<Device> {
     found.iter().filter(|d| !known.contains(&d.ip)).take(MAX_UNKNOWN).map(|d| Device { seen: now, ..d.clone() }).collect()
 }
 
+/// The addresses a scan takes as members' (for unknown), and by address
+/// why it does not take a member's claim to one.
+///
+/// A server's LAN address is its own word (its heartbeat): a hacked one
+/// could name a rogue device's address as its own and so hide that device
+/// from the report. A claim counts only when nothing speaks against it:
+/// WireGuard on the coordinator sees that member's packets come from
+/// another LAN address (seen, by WireGuard key; only the member's key opens
+/// them), the address is the one WireGuard sees for another member, or
+/// another member claims it too. fixed gives the addresses that follow from
+/// a host number (switch, mesh) and the coordinator's own from its config;
+/// the coordinator's claim is not asked.
+pub fn member_addresses(
+    members: &[Member],
+    seen: &std::collections::BTreeMap<String, Ipv4Addr>,
+    fixed: impl Fn(u32) -> Vec<String>,
+) -> (Vec<String>, std::collections::BTreeMap<String, String>) {
+    let mut known: Vec<String> = Vec::new();
+    let mut notes = std::collections::BTreeMap::new();
+    let verified: Vec<(String, &str)> = members.iter().filter_map(|m| Some((seen.get(&m.wg_key)?.to_string(), m.name.as_str()))).collect();
+    for m in members {
+        known.extend(fixed(m.host));
+        let own = seen.get(&m.wg_key).map(|ip| ip.to_string());
+        known.extend(own.clone());
+        let claim = parse_ip4(&m.lan_ip).map(|ip| ip.to_string());
+        let Some(claim) = claim.filter(|_| m.host != 1) else { continue };
+        let others: Vec<&str> = members
+            .iter()
+            .filter(|o| o.host != m.host && o.host != 1 && parse_ip4(&o.lan_ip).is_some_and(|ip| ip.to_string() == claim))
+            .map(|o| o.name.as_str())
+            .collect();
+        let held = verified.iter().find(|(ip, name)| *ip == claim && *name != m.name).map(|(_, name)| *name);
+        let note = match (&own, held) {
+            (Some(own), _) if *own != claim => Some(format!("{} says it is here, but talks from {own}", m.name)),
+            // Where WireGuard sees it too.
+            (Some(_), _) => None,
+            (_, Some(other)) => Some(format!("{} says it is here, but this is {other}", m.name)),
+            _ if !others.is_empty() => Some(format!("claimed by {} and {}", m.name, others.join(", "))),
+            _ => None,
+        };
+        match note {
+            Some(note) => {
+                notes.entry(claim).or_insert(note);
+            }
+            None => known.push(claim),
+        }
+    }
+    // An address some claim spoke against is a member's only where
+    // WireGuard or the host number says so.
+    known.retain(|ip| {
+        !notes.contains_key(ip) || verified.iter().any(|(v, _)| v == ip) || members.iter().any(|m| fixed(m.host).contains(ip))
+    });
+    (known, notes)
+}
+
 // ---- the SSH forced command ----
 
 const MAX_INPUT: u64 = 16 << 10;
@@ -1628,6 +1683,66 @@ mod tests {
         assert_eq!(unknown.len(), 1);
         assert_eq!(unknown[0].ip, "192.168.1.1");
         assert_eq!(unknown[0].seen, t0());
+    }
+
+    /// A hacked server names a rogue device's address as its own LAN
+    /// address: the scan takes that only when nothing speaks against it.
+    #[test]
+    fn a_members_word_hides_no_device() {
+        let m = |host: u32, name: &str, lan: &str| Member {
+            host,
+            name: name.into(),
+            wg_key: format!("KEY{host}"),
+            lan_ip: lan.into(),
+            ..Member::default()
+        };
+        let fixed = |h: u32| {
+            let mut v = vec![format!("172.16.66.{h}"), format!("10.66.0.{h}")];
+            if h == 1 {
+                v.push("192.168.1.50".into());
+            }
+            v
+        };
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let members = vec![
+            // The registry account says anything for the coordinator: its
+            // own address comes from its config.
+            m(1, "coord", "192.168.1.66"),
+            // WireGuard sees node-a where it says it is.
+            m(2, "node-a", "192.168.1.20"),
+            // node-b says it is at the rogue device; WireGuard sees it at
+            // .21.
+            m(3, "node-b", "192.168.1.99"),
+            // node-c talks over the switch: its word is taken, unless
+            // node-d says the same.
+            m(4, "node-c", "192.168.1.30"),
+            m(5, "node-d", "192.168.1.30"),
+            // node-e claims node-a's address.
+            m(6, "node-e", "192.168.1.20"),
+            m(7, "node-f", "192.168.1.31"),
+            m(8, "node-g", "not an address"),
+        ];
+        let seen = std::collections::BTreeMap::from([("KEY2".to_string(), ip("192.168.1.20")), ("KEY3".to_string(), ip("192.168.1.21"))]);
+        let (known, notes) = member_addresses(&members, &seen, fixed);
+        for want in ["192.168.1.50", "192.168.1.20", "192.168.1.21", "192.168.1.31", "172.16.66.3", "10.66.0.8"] {
+            assert!(known.contains(&want.to_string()), "{want} not a member's: {known:?}");
+        }
+        for not in ["192.168.1.66", "192.168.1.99", "192.168.1.30", "not an address"] {
+            assert!(!known.contains(&not.to_string()), "{not} taken: {known:?}");
+        }
+        assert_eq!(notes["192.168.1.99"], "node-b says it is here, but talks from 192.168.1.21");
+        assert_eq!(notes["192.168.1.30"], "claimed by node-c and node-d");
+        assert_eq!(notes["192.168.1.20"], "node-e says it is here, but this is node-a");
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        // The rogue device shows up in the report.
+        let found = parse_arp_scan("192.168.1.99\taa:bb:cc:00:00:99\tEvil\n192.168.1.20\taa:bb:cc:00:00:20\tnode-a\n");
+        let report = unknown(&found, &known, t0());
+        assert_eq!(report.iter().map(|d| d.ip.as_str()).collect::<Vec<_>>(), vec!["192.168.1.99"]);
+        // Without WireGuard's word, only two claims for one address speak
+        // against one.
+        let (known, notes) = member_addresses(&members, &std::collections::BTreeMap::new(), fixed);
+        assert!(known.contains(&"192.168.1.99".to_string()) && !known.contains(&"192.168.1.30".to_string()));
+        assert_eq!(notes.keys().collect::<Vec<_>>(), vec!["192.168.1.20", "192.168.1.30"]);
     }
 
     /// One device answering for every address of a /16, with long names:

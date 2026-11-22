@@ -940,7 +940,13 @@ ended.
   member list is only served over the mesh. Removing a machine (`d` in
   `./dryserver approve`) drops it from all servers within a minute.
 - **Unknown devices**: the coordinator scans its networks every 15 minutes and
-  lists unknown devices in `./dryserver approve` (report only).
+  lists unknown devices in `./dryserver approve` (report only). A server's
+  own word about its address does not hide a device there: it counts only
+  where WireGuard on the coordinator sees that server's packets come from
+  (when it talks over the WiFi/router network), and an address two servers
+  claim, or one claims that is not where it talks from, is listed with a
+  note. Limit: a server that talks to the coordinator over the switch can
+  still name one address as its own.
 - **Hardening**: kernel sysctl hardening, no LLMNR/mDNS, WireGuard peers
   locked to their own mesh address.
 - **Nothing from the coordinator is used unchecked.** Servers check every

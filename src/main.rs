@@ -726,12 +726,30 @@ fn run_scan(args: &[String]) -> Result<()> {
     }
     let store = registry::Store::default_path();
     let st = store.read()?;
-    let mut known = Vec::new();
-    for m in &st.members {
-        known.extend([m.lan_ip.clone(), mesh::ip(&cfg.switch_subnet, m.host), mesh::ip(&cfg.wg_subnet, m.host)]);
-    }
+    // Where WireGuard here sees each member's packets come from: on the
+    // LAN, that is its LAN address, whatever it says (an address on the
+    // switch says nothing about it).
+    let endpoints = n.run.output(&ctx, &Cmd::new("wg", &["show", "wg0", "endpoints"]).quiet().stdout_only()).unwrap_or_default();
+    let switch = cidr::Cidr::parse(&cfg.switch_subnet).filter(|_| cfg.wg_transport == config::TRANSPORT_AUTO);
+    let seen: std::collections::BTreeMap<String, std::net::Ipv4Addr> = mesh::live_peers(&endpoints, "")
+        .into_iter()
+        .filter_map(|(key, live)| Some((key, live.endpoint.rsplit_once(':')?.0.parse().ok()?)))
+        .filter(|(_, ip)| !switch.is_some_and(|s| s.contains(*ip)))
+        .collect();
+    let fixed = |host: u32| {
+        let mut v = vec![mesh::ip(&cfg.switch_subnet, host), mesh::ip(&cfg.wg_subnet, host)];
+        if host == 1 {
+            v.push(cfg.coord_lan_ip.clone());
+        }
+        v
+    };
+    let (known, notes) = registry::member_addresses(&st.members, &seen, fixed);
     let mut unknown = registry::unknown(&found, &known, Time::now());
     for d in unknown.iter_mut() {
+        // A member's claim to it that was not taken.
+        if let Some(note) = notes.get(&d.ip) {
+            d.vendor = format!("{note}; {}", d.vendor).chars().take(64).collect();
+        }
         if let Ok(ip) = d.ip.parse::<std::net::IpAddr>() {
             d.ssh = TcpStream::connect_timeout(&SocketAddr::new(ip, 22), Duration::from_secs(1)).is_ok();
         }
