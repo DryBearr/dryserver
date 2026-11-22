@@ -730,8 +730,13 @@ screen cannot ask, so it refuses to start.
 Then the coordinator rolls it out:
 
 1. **The coordinator updates itself first.** It keeps the new binary only
-   once it runs and is healthy (k3s up, firewall loaded); otherwise it
-   goes back to the old one by itself after 10 minutes. If its update
+   once it runs and is healthy (k3s up, firewall loaded) and the ways in
+   still work: the servers sync through it, sshd lets you in, and a server
+   on the home network reaches its SSH at its LAN address, the way your
+   desktop comes in (with no server that can try, its firewall's rules
+   must take SSH from there, and `release status` says it was not proven
+   from outside). Otherwise it goes back to the old one by itself after 10
+   minutes, and the rollout stops there with the reason. If its update
    fails, no server is touched.
 2. **Then one server at a time.** The coordinator drains the server
    (`kubectl drain`, keeping to PodDisruptionBudgets: its apps move first),

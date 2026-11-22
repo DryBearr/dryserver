@@ -158,7 +158,18 @@ pub struct Report {
     /// a machine of an older version.
     #[serde(deserialize_with = "lenient", skip_serializing_if = "String::is_empty")]
     pub sig: String,
+    /// A server: whether it got the coordinator's registry to answer at
+    /// the coordinator's LAN address (COORD_LAN_IP port 22, the admin's way
+    /// in) as it made this report, which it tries while the coordinator
+    /// updates itself (rollout::Offer::probe_lan). One of COORD_SSH_STATES;
+    /// "" from a dryserver before it, or the coordinator.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "String::is_empty")]
+    pub coord_ssh: String,
 }
+
+/// What a server says of the coordinator's SSH at its LAN address: ok, it
+/// answered; failed, it did not; idle, the server was not asked to try.
+pub const COORD_SSH_STATES: [&str; 3] = ["ok", "failed", "idle"];
 
 /// How a machine boots (see install/boot.rs):
 /// - ready: the main kernel runs, the fallback kernel (linux-lts) waits;
@@ -308,6 +319,7 @@ impl Report {
             boot: if BOOT_STATES.contains(&self.boot.as_str()) { self.boot } else { String::new() },
             lan: if parse_ip4(&self.lan).is_some() { self.lan } else { String::new() },
             sig: if self.sig.len() <= MAX_SIG && self.sig.starts_with(SIG_BEGIN) { self.sig } else { String::new() },
+            coord_ssh: if COORD_SSH_STATES.contains(&self.coord_ssh.as_str()) { self.coord_ssh } else { String::new() },
         }
     }
 
@@ -494,6 +506,8 @@ pub fn gather(ctx: &Ctx, run: &dyn Runner, root: &Path, wg_subnet: &str) -> Repo
         // The caller's, with its signature (sync).
         lan: String::new(),
         sig: String::new(),
+        // Added by describe too.
+        coord_ssh: String::new(),
     };
     // What this machine sends is what every reader accepts, so nothing of
     // it is dropped on the way and it stays within the heartbeat's size.

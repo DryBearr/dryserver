@@ -13,8 +13,10 @@
 //!    runs and the brain is healthy. If that does not work, the rollout
 //!    stops there and no server is touched.
 //!    Before it confirms, the brain proves the ways in still work: a call
-//!    through sshd reaches the registry, sshd lets the admin in, and a
-//!    server synced through the new release (brain_paths).
+//!    through sshd reaches the registry, sshd lets the admin in, a server
+//!    synced through the new release, and a server on the home network got
+//!    the registry to answer at the brain's LAN address, the admin's way in
+//!    (brain_paths).
 //! 3. Then the servers, one at a time. The brain cordons and drains a
 //!    server and gives it the turn, signed by root with the brain's SSH
 //!    host key (Grant). The server sees that in its sync reply, checks the
@@ -117,6 +119,9 @@ const MAX_ENVELOPE: u64 = 32 << 10;
 const MAX_STATE: u64 = 16 << 10;
 /// The brain's rollout state: a list or two of host numbers, a few lines.
 const MAX_ROLLOUT: u64 = 256 << 10;
+/// The firewall sysconf renders, as the brain loads it at boot.
+const FIREWALL: &str = "/etc/nftables.conf";
+const MAX_FIREWALL: u64 = 1 << 20;
 
 // ---- timing ----
 
@@ -909,6 +914,11 @@ pub struct Offer {
     /// account's word, for servers from before.
     #[serde(skip_serializing_if = "Envelope::is_empty")]
     pub grant: Envelope,
+    /// The coordinator updates itself: a server says in its next reports
+    /// whether the coordinator's SSH answers at its LAN address (Report::
+    /// coord_ssh), which the coordinator cannot try on itself (brain_paths).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub probe_lan: bool,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -953,14 +963,19 @@ pub fn offer(s: &registry::State, host: u32) -> Offer {
     let r = &s.rollout;
     let mine = r.turn.as_ref().filter(|t| t.host == host && t.ready && !t.grant.is_empty());
     let turn = host != 1 && r.paused.is_empty() && r.phase == Phase::Servers && mine.is_some();
-    let brain_k3s = s.members.iter().find(|m| m.host == 1).and_then(|m| m.report.as_ref()).map(|r| r.k3s.clone()).unwrap_or_default();
+    let brain = s.members.iter().find(|m| m.host == 1).and_then(|m| m.report.as_ref());
+    let brain_k3s = brain.map(|r| r.k3s.clone()).unwrap_or_default();
     let mine = mine.filter(|_| turn);
+    // While the brain's own update runs or waits for its confirm, also one
+    // a newer release that waits for the window left in the middle.
+    let probe_lan = host != 1 && (r.phase == Phase::Brain || brain.is_some_and(|b| b.update == "pending"));
     Offer {
         serial: r.serial,
         turn,
         brain_k3s,
         retry: mine.map_or(0, |t| t.retry),
         grant: mine.map(|t| t.grant.clone()).unwrap_or_default(),
+        probe_lan,
     }
 }
 
@@ -990,6 +1005,14 @@ pub struct Local {
     /// The release a problem that may pass held up, and at how many syncs.
     pub tries_serial: u64,
     pub tries: u32,
+    /// A server: the last offer asked it to try the coordinator's SSH at
+    /// its LAN address (Offer::probe_lan), which its next report does.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub probe_lan: bool,
+    /// What held the pending release's confirm back when it was last
+    /// looked at: why it goes back when it reverts at its deadline.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub held: String,
 }
 
 /// What is known about the release being loaded, in STORE/incoming.
@@ -1018,8 +1041,8 @@ enum Stop {
 }
 
 /// What else must hold before an update is confirmed, given when its apply
-/// ended; the error says why not.
-type Proof<'a> = dyn Fn(&Ctx, i64) -> std::result::Result<(), String> + 'a;
+/// ended and the time now; the error says why not.
+type Proof<'a> = dyn Fn(&Ctx, i64, i64) -> std::result::Result<(), String> + 'a;
 
 /// One machine (the brain or a server) updating itself.
 pub struct Machine<'a> {
@@ -1132,6 +1155,29 @@ impl<'a> Machine<'a> {
         r.update = if report::UPDATE_STATES.contains(&state) { state.to_string() } else { String::new() };
         r.update_serial = serial;
         r.update_note = report::note(&note);
+        if !self.brain {
+            r.coord_ssh = match l.probe_lan {
+                false => "idle",
+                true if self.reaches_coordinator_lan() => "ok",
+                true => "failed",
+            }
+            .into();
+        }
+    }
+
+    /// Whether the coordinator's registry answers at its LAN address, the
+    /// way the admin's desktop comes in (`release publish`): through its
+    /// firewall's rule for the home network, its sshd and the registry's
+    /// forced command, with the host key this server pinned. The brain
+    /// cannot try that way on itself.
+    fn reaches_coordinator_lan(&self) -> bool {
+        let lan = self.n.cfg.coord_lan_ip.trim();
+        if lan.is_empty() {
+            return false;
+        }
+        let ctx = Ctx::new().with_timeout(Duration::from_secs(20));
+        let cmd = Cmd::new("ssh", &self.n.ssh_args(lan, "signed")).quiet().stdout_only();
+        self.n.run.output(&ctx, &cmd).is_ok_and(|o| o.trim_start().starts_with('{'))
     }
 
     /// One step towards the offered release, at a sync that reached the
@@ -1147,7 +1193,7 @@ impl<'a> Machine<'a> {
     /// tried again; a refused or failed update is recorded, shown in the
     /// report, and not tried again.
     pub fn step(&self, ctx: &Ctx, src: &dyn Source, offer: &Offer, rep: &Report, now: i64) -> Result<()> {
-        self.step_with(ctx, src, offer, rep, now, &|_, _| Ok(()))
+        self.step_with(ctx, src, offer, rep, now, &|_, _, _| Ok(()))
     }
 
     /// step, with what else must hold before an update is confirmed here
@@ -1157,6 +1203,10 @@ impl<'a> Machine<'a> {
         // From the first sync on: when this machine began to take releases.
         self.start(now);
         let mut l = self.load();
+        if !self.brain && l.probe_lan != offer.probe_lan {
+            l.probe_lan = offer.probe_lan;
+            self.save(&l)?;
+        }
         if l.pending != 0 {
             return self.settle(ctx, &mut l, rep, now, proof);
         }
@@ -1245,7 +1295,14 @@ impl<'a> Machine<'a> {
         if g.issued > now.saturating_add(GRANT_SKEW) {
             return Err(bad(format!("it was made at {}, ahead of this machine's clock ({}): check the clocks", at(g.issued), at(now))));
         }
-        Ok(Offer { serial: g.serial, turn: true, brain_k3s: g.brain_k3s, retry: g.retry, grant: offer.grant.clone() })
+        Ok(Offer {
+            serial: g.serial,
+            turn: true,
+            brain_k3s: g.brain_k3s,
+            retry: g.retry,
+            grant: offer.grant.clone(),
+            probe_lan: offer.probe_lan,
+        })
     }
 
     /// The coordinator's SSH host key, from the newest list the admin
@@ -1572,13 +1629,15 @@ impl<'a> Machine<'a> {
                     .or_else(|| {
                         // When the apply ended: its own record of it.
                         let at = st.last.as_ref().filter(|x| x.serial == l.pending && x.action == "applied").map_or(0, |x| x.at);
-                        proof(ctx, at.max(l.applied)).err()
+                        proof(ctx, at.max(l.applied), now).err()
                     }),
             };
             if let Some(why) = wait {
                 // Not confirmed: if it stays like this, the machine goes back
-                // by itself at the deadline.
-                if l.note != why {
+                // by itself at the deadline, and this is why.
+                let held = report::note(&why);
+                if l.note != why || l.held != held {
+                    l.held = held;
                     l.note = why;
                     self.save(l)?;
                 }
@@ -1620,9 +1679,15 @@ impl<'a> Machine<'a> {
             _ => {}
         }
         let why = st.reverted(l.pending).or_else(|| st.last.as_ref().filter(|x| !x.ok && !x.message.is_empty()).map(|x| x.message.clone()));
+        let mut why = why.unwrap_or_else(|| "it was not confirmed in time and went back".into());
+        if why.contains("not confirmed") && !l.held.is_empty() {
+            // What held its confirm back is why it went back.
+            why = format!("not confirmed: {}; {why}", l.held);
+        }
+        l.held.clear();
         l.failed = l.pending;
         l.outcome = "reverted".into();
-        l.why = report::note(why.as_deref().unwrap_or("it was not confirmed in time and went back"));
+        l.why = report::note(&why);
         l.pending = 0;
         l.note.clear();
         self.save(l)
@@ -1696,7 +1761,11 @@ pub fn healthy(r: &Report, expect_k3s: bool, new_kernel: bool) -> std::result::R
 /// - sshd -T for a login from the home network: the admin's account takes
 ///   public keys with no command forced on it, and the registry account,
 ///   the desktop's way in, gets the registry command forced.
-fn brain_paths(ctx: &Ctx, n: &Node, members: &[Member], since: i64) -> std::result::Result<(), String> {
+/// - The way in from the home network itself, which the brain cannot try
+///   on itself (lan_way_in).
+///
+/// Ok(Some(note)): kept, but the note says what was not proven.
+fn brain_paths(ctx: &Ctx, n: &Node, members: &[Member], since: i64, now: i64) -> std::result::Result<Option<String>, String> {
     let seen = members.iter().filter(|m| m.host != 1 && !m.last_seen.is_zero()).map(|m| m.last_seen.0.timestamp());
     let expected = seen.clone().any(|t| t >= since.saturating_sub(OFFLINE));
     if expected && !seen.clone().any(|t| t > since) {
@@ -1749,7 +1818,96 @@ fn brain_paths(ctx: &Ctx, n: &Node, members: &[Member], since: i64) -> std::resu
     }
     sshd_lets_in(&ctx, n, user, lan, None)?;
     let mesh = crate::cidr::Cidr::parse(&n.cfg.wg_subnet).ok_or_else(|| format!("WG_SUBNET {:?} is no subnet", n.cfg.wg_subnet))?;
-    sshd_lets_in(&ctx, n, crate::sysconf::REGISTRY_USER, lan, Some(&crate::sysconf::registry_command(&mesh)))
+    sshd_lets_in(&ctx, n, crate::sysconf::REGISTRY_USER, lan, Some(&crate::sysconf::registry_command(&mesh)))?;
+    lan_way_in(&ctx, n, members, since, now)
+}
+
+/// A report that came this long after the apply ended at the latest holds
+/// a try of the way in from the home network made after it (a server tries
+/// as it makes its report, and sends it right after).
+const LAN_PROBE_MARGIN: i64 = 30;
+/// How long after the apply the brain waits for a server that can try the
+/// way in from the home network to say how it went. Servers are asked from
+/// the moment the brain's update begins, and sync every minute.
+const LAN_PROBE_WAIT: i64 = 5 * 60;
+
+/// The way in from the home network, as the admin's desktop comes
+/// (`release publish`): the firewall's rule for the LAN, sshd and the
+/// registry's forced command at COORD_LAN_IP. A release whose firewall
+/// drops SSH from the LAN passes everything above (they go through
+/// loopback and the mesh), and once kept, no fix could be uploaded. The
+/// brain cannot try that way on itself; a server on the home network can
+/// (Offer::probe_lan, Report::coord_ssh), and one that got through since
+/// the apply is enough. Servers that could not get through, and none that
+/// could: the update is not confirmed, goes back at its deadline, and the
+/// rollout stops there with this reason. Servers that can try but were
+/// not asked (a hacked registry account keeps the ask from them), after
+/// LAN_PROBE_WAIT, or none that can (from a dryserver before this one, or
+/// none at all): the firewall's own rules must take SSH from the home
+/// network (lan_ssh_in_firewall), and the note says it was not proven
+/// from outside.
+fn lan_way_in(ctx: &Ctx, n: &Node, members: &[Member], since: i64, now: i64) -> std::result::Result<Option<String>, String> {
+    let said = |m: &Member| m.report.as_ref().map(|r| r.coord_ssh.clone()).unwrap_or_default();
+    let servers = || members.iter().filter(|m| m.host != 1 && !m.last_seen.is_zero());
+    let fresh: Vec<&Member> = servers().filter(|m| m.last_seen.0.timestamp() > since.saturating_add(LAN_PROBE_MARGIN)).collect();
+    if fresh.iter().any(|m| said(m) == "ok") {
+        return Ok(None);
+    }
+    let lan = shown(&n.cfg.coord_lan_ip, 40);
+    let failed: Vec<String> = fresh.iter().filter(|m| said(m) == "failed").map(|m| shown(&m.name, 40)).collect();
+    if !failed.is_empty() {
+        return Err(format!(
+            "{} cannot reach its SSH at {lan} from the home network since the update (its firewall or sshd)",
+            failed.join(", ")
+        ));
+    }
+    let can = servers().any(|m| m.last_seen.0.timestamp() >= since.saturating_sub(OFFLINE) && !said(m).is_empty());
+    if can && now < since.saturating_add(LAN_PROBE_WAIT) {
+        return Err(format!("no server has tried its SSH at {lan} from the home network since the update yet"));
+    }
+    lan_ssh_in_firewall(ctx, n)?;
+    let why = if can { "the servers were not asked to try it" } else { "no server can try it" };
+    Ok(Some(format!(
+        "kept without a server proving the coordinator's SSH at {lan} from the home network ({why}); its firewall's rules take SSH from there"
+    )))
+}
+
+/// The firewall the brain loads at boot passes nft -c, and its input chain
+/// takes SSH from the home network (the rule sysconf renders for it).
+fn lan_ssh_in_firewall(ctx: &Ctx, n: &Node) -> std::result::Result<(), String> {
+    let path = n.path(FIREWALL);
+    let text = read_small(&path, MAX_FIREWALL).map_err(|e| format!("its firewall cannot be read ({e})"))?;
+    n.run
+        .ok(ctx, &Cmd::new("nft", &["-c", "-f", &path.display().to_string()]).quiet())
+        .map_err(|e| format!("its firewall does not pass nft -c ({e})"))?;
+    if !chain_lines(&text, "input").iter().any(|l| l == "tcp dport 22 accept") {
+        return Err(format!("its firewall ({FIREWALL}) has no rule that takes SSH from the home network"));
+    }
+    Ok(())
+}
+
+/// The rules of chain name in an nft ruleset, each trimmed, without
+/// comments.
+fn chain_lines(text: &str, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    for line in text.lines() {
+        let l = line.split('#').next().unwrap_or("").trim();
+        if depth == 0 {
+            if l.strip_prefix("chain").is_some_and(|r| r.trim_start().strip_prefix(name).is_some_and(|r| r.trim() == "{")) {
+                depth = 1;
+            }
+            continue;
+        }
+        match (depth + l.matches('{').count()).checked_sub(l.matches('}').count()) {
+            None | Some(0) => break,
+            Some(d) => depth = d,
+        }
+        if !l.is_empty() {
+            out.push(l.to_string());
+        }
+    }
+    out
 }
 
 /// What sshd -T says of a login as user from addr: refused unless sshd
@@ -2559,12 +2717,17 @@ impl Brain<'_> {
 
     /// One step of the brain's own update: settles one it installed, or
     /// loads and installs the offered release.
-    fn own_step(&self, offer: &Offer) {
-        let m = self.machine();
+    fn own_step(&mut self, offer: &Offer) {
         let (n, members) = (self.n, self.members);
-        let proof = |ctx: &Ctx, since: i64| brain_paths(ctx, n, members, since);
+        // What the checks before the confirm could not prove, for status.
+        let note = std::cell::RefCell::new(None);
+        let proof = |ctx: &Ctx, since: i64, now: i64| brain_paths(ctx, n, members, since, now).map(|w| *note.borrow_mut() = w);
+        let m = Machine { n, brain: true, free: self.free };
         if let Err(e) = m.step_with(self.ctx, &LocalSource(self.served), offer, self.rep, self.now.unix, &proof) {
             eprintln!("dryserver: rollout: the coordinator's own update: {e}");
+        }
+        if let Some(w) = note.into_inner() {
+            self.r.warn(format!("release {}: {w}", self.r.serial));
         }
     }
 

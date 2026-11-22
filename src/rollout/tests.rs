@@ -96,6 +96,11 @@ struct Sim {
     sshd: Vec<String>,
     /// ssh-keygen calls (signing a turn, checking one).
     keygen: Vec<String>,
+    /// A server: the coordinator's SSH does not answer at its LAN address
+    /// (its firewall drops SSH from the home network).
+    lan_down: bool,
+    /// The brain: nft -c refuses its firewall.
+    nft_fails: bool,
 }
 
 /// What `sshd -T -C user=...` says on a machine set up as dryserver does.
@@ -263,6 +268,26 @@ impl Runner for Fake {
                 });
                 (st.to_string(), Ok(()))
             }
+            // A server tries the coordinator's way in from the home network,
+            // with the host key it pinned.
+            ("ssh", [.., "dryreg@192.168.1.50", "signed"]) => {
+                s.sshd.push("ssh dryreg@192.168.1.50 signed".into());
+                assert!(c.args.iter().any(|a| a.starts_with("UserKnownHostsFile=") && a.ends_with("known_hosts")), "{c}");
+                if s.lan_down {
+                    return (
+                        String::new(),
+                        Err("ssh failed: exit status 255: connect to host 192.168.1.50 port 22: Connection timed out".into()),
+                    );
+                }
+                (r#"{"signed":{"doc":"","sig":""}}"#.into(), Ok(()))
+            }
+            ("nft", ["-c", "-f", f]) => {
+                assert!(f.ends_with("/etc/nftables.conf"), "{c}");
+                if s.nft_fails {
+                    return (String::new(), Err("nft failed: exit status 1: syntax error".into()));
+                }
+                (String::new(), Ok(()))
+            }
             ("ssh", [.., target, "signed"]) => {
                 s.sshd.push(format!("ssh {target} signed"));
                 assert!(c.args.iter().any(|a| a == "StrictHostKeyChecking=yes"), "{c}");
@@ -283,6 +308,12 @@ impl Runner for Fake {
         }
     }
 }
+
+/// The input chain of the firewall sysconf renders, as far as SSH goes.
+const FIREWALL_TEXT: &str = "table inet dryserver {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\
+    \t\tiifname \"wg0\" jump mesh\n\t\t# SSH from the WiFi/router network\n\
+    \t\ttcp dport 22 ct state new add @ssh_meter4 { ip saddr limit rate over 10/minute burst 20 packets } drop\n\
+    \t\ttcp dport 22 accept\n\t}\n\tchain mesh {\n\t\ttcp dport 22 accept\n\t}\n}\n";
 
 /// A machine's SSH host key, "ssh-ed25519 BASE64".
 fn host_key(name: &str) -> String {
@@ -312,6 +343,7 @@ fn machine(host: u32, name: &str) -> Box_ {
     let list = crate::signed::List { version: 1, members: vec![coord], rejected: vec![] };
     put(dir.path(), crate::node::SIGNED_FILE, serde_json::to_string(&crate::signed::seal(&ADMIN, &list).unwrap()).unwrap());
     put(dir.path(), "/tmp/.keep", "");
+    put(dir.path(), FIREWALL, FIREWALL_TEXT);
     let fake = Arc::new(Fake(Mutex::new(Sim { root: dir.path().to_path_buf(), ..Sim::default() })));
     let node = Node {
         cfg: Config {
@@ -692,7 +724,7 @@ impl Swarm {
         g(&mut grant);
         let doc = serde_json::to_string(&grant).unwrap();
         let sig = crate::signed::fake::host_sig(&host_key("coord"), crate::signed::NS_TURN, &doc);
-        Offer { serial, turn: true, brain_k3s: K3S_VERSION.into(), retry: grant.retry, grant: Envelope { doc, sig } }
+        Offer { serial, turn: true, brain_k3s: K3S_VERSION.into(), retry: grant.retry, grant: Envelope { doc, sig }, probe_lan: false }
     }
 
     /// The admin's ask for op at time, for the stop the registry shows.
@@ -3235,6 +3267,105 @@ fn review_the_brain_keeps_a_release_only_once_the_ways_in_work() {
         .unwrap();
     sw.publish(10, true);
     sw.until(5, |s| s.installed(1) == 10);
+}
+
+/// A release whose firewall drops SSH from the home network passed every
+/// check before the brain kept it (they go through loopback and the mesh),
+/// and then `release publish` could not reach the brain again. A server on
+/// the home network tries that way in while the brain updates itself.
+#[test]
+fn review_the_brain_keeps_a_release_only_once_its_ssh_answers_from_the_lan() {
+    let brain_note = |sw: &Swarm| Machine::new(&sw.brain.node, true).load().note;
+    let mut sw = Swarm::new(2);
+    for h in [2, 3] {
+        sw.server(h).fake.sim().lan_down = true;
+    }
+    sw.publish(10, true);
+    sw.ticks(8);
+    assert!(sw.brain.fake.sim().confirmed.is_empty(), "kept a release the admin's desktop cannot reach");
+    let want = "node-a, node-b cannot reach its SSH at 192.168.1.50 from the home network";
+    assert!(brain_note(&sw).contains(want), "{}", brain_note(&sw));
+    // It goes back at its deadline: the rollout stops with the reason, no
+    // server touched, and it does not try again by itself.
+    sw.brain.fake.revert();
+    sw.ticks(5);
+    let r = sw.rollout();
+    assert!(r.phase == Phase::Failed && r.paused.contains(want), "{r:#?}");
+    assert!(sw.servers.iter().all(|m| m.fake.sim().applied.is_empty()));
+    assert_eq!(sw.brain.fake.sim().applied.len(), 1);
+
+    // One server that gets through is enough; they try only while the
+    // brain updates itself.
+    let mut sw = Swarm::new(2);
+    sw.server(3).fake.sim().lan_down = true;
+    sw.publish(10, true);
+    sw.until(5, |s| s.installed(1) == 10);
+    assert!(sw.rollout().warnings.iter().all(|w| !w.contains("without a server proving")), "{:#?}", sw.rollout());
+    let tries = |sw: &Swarm| sw.server(2).fake.sim().sshd.iter().filter(|c| c.contains("@192.168.1.50")).count();
+    sw.ticks(2);
+    let n = tries(&sw);
+    assert!(n > 0);
+    sw.ticks(5);
+    assert_eq!(tries(&sw), n, "the servers go on trying after the brain is done");
+
+    // A server that was not asked (the registry account kept the ask from
+    // it): the brain waits a while, then goes by its firewall's rules, and
+    // says so.
+    let mut sw = Swarm::new(1);
+    sw.forge = Some(|s, h| Offer { probe_lan: false, ..offer(s, h) });
+    sw.publish(10, true);
+    sw.ticks(3);
+    assert!(sw.brain.fake.sim().confirmed.is_empty() && brain_note(&sw).contains("no server has tried its SSH"), "{}", brain_note(&sw));
+    sw.until(6, |s| s.installed(1) == 10);
+    let r = sw.rollout();
+    assert!(r.warnings.iter().any(|w| w.contains("without a server proving") && w.contains("were not asked")), "{r:#?}");
+
+    // No server that can try (none at all, or from a dryserver before):
+    // the firewall's own rules decide.
+    let mut sw = Swarm::new(0);
+    sw.publish(10, true);
+    sw.until(5, |s| s.installed(1) == 10);
+    assert!(sw.rollout().warnings.iter().any(|w| w.contains("no server can try it")), "{:#?}", sw.rollout());
+    for (fw, why) in [
+        (
+            FIREWALL_TEXT.replace("\t\ttcp dport 22 accept\n\t}\n\tchain mesh", "\t}\n\tchain mesh"),
+            "has no rule that takes SSH from the home network",
+        ),
+        (FIREWALL_TEXT.into(), "does not pass nft -c"),
+    ] {
+        let mut sw = Swarm::new(0);
+        put(&sw.brain.node.root, FIREWALL, fw);
+        sw.brain.fake.sim().nft_fails = why.contains("nft");
+        sw.publish(10, true);
+        sw.ticks(5);
+        assert!(sw.brain.fake.sim().confirmed.is_empty() && brain_note(&sw).contains(why), "{why}: {}", brain_note(&sw));
+    }
+}
+
+#[test]
+fn the_rules_of_one_nft_chain() {
+    let lines = chain_lines(FIREWALL_TEXT, "input");
+    assert_eq!(lines.last().map(String::as_str), Some("tcp dport 22 accept"), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("mesh {") || l.starts_with('#')), "{lines:?}");
+    assert!(chain_lines(FIREWALL_TEXT, "inp").is_empty() && chain_lines("chain input {\n}\n", "input").is_empty());
+    // The firewall sysconf renders for the coordinator has the rule.
+    let config = Config {
+        coord_lan_ip: "192.168.1.50".into(),
+        admin_ssh_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest admin@desktop".into(),
+        ..Config::default()
+    };
+    let plan = crate::packages::resolve(&config.tool_list(), &[]).unwrap();
+    let p = crate::sysconf::Params {
+        config,
+        plan,
+        hostname: "coord".into(),
+        role: crate::sysconf::Role::Coordinator,
+        host_num: 1,
+        switch_mac: String::new(),
+    };
+    let fw = crate::sysconf::render(&p).unwrap().into_iter().find(|f| f.path == FIREWALL).unwrap().content;
+    let lines = chain_lines(&fw, "input");
+    assert!(lines.iter().any(|l| l == "tcp dport 22 accept") && lines.iter().any(|l| l.contains("jump mesh")), "{lines:?}");
 }
 
 /// The admin's signature on a resume or a skip was checked only in the
