@@ -2532,6 +2532,15 @@ mod tests {
         fc.ran.lock().unwrap().clear();
         assert!(sync(&ctx, &n, false, &store).unwrap());
         assert!(fc.k3s_moves().is_empty() && get(&n.root, K3S_TOKEN_STATUS) == "ok\n", "{:?}", fc.ran.lock().unwrap());
+        // Sealed anew with the same token (age output differs every time;
+        // a coordinator restored from its backup makes new ones): nothing
+        // written, k3s not restarted.
+        let age = mine.age.replacen('\n', "\n\n", 1);
+        let again = Sealed { sig: k3stoken::fake::sign(COORD_KEY, &k3stoken::signed_text(2, &me, &age)), age, ..mine.clone() };
+        assert_ne!(again, mine);
+        *fc.peers.lock().unwrap() = Some(peers_sealed(2, 5, Some(&again)));
+        assert!(sync(&ctx, &n, false, &store).unwrap());
+        assert!(fc.k3s_moves().is_empty() && get(&n.root, sysconf::K3S_TOKEN) == format!("{TOKEN}\n"), "{:?}", fc.ran.lock().unwrap());
     }
 
     /// age or ssh-keygen missing or failing on a server leaves the token
