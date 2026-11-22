@@ -816,23 +816,44 @@ impl Admin {
     }
 
     /// Builds the release that d describes, without signing or sending
-    /// it: what publish_release would sign, or why the coordinator would
-    /// refuse it.
+    /// it: what send_release would sign, or why the coordinator would
+    /// refuse it. publish::plan checks the rest (the Arch day, the k3s
+    /// file) and shows the admin what changes.
     pub fn draft_release(&self, d: &release::Draft) -> Result<Release> {
         rollout::check_static(d.binary)?;
         release::build(d, self.last_release().as_ref(), (self.now)().0.timestamp())
     }
 
-    /// Signs the release that d describes and uploads it with its
-    /// binaries to the coordinator, which then rolls it out. k3s is the
-    /// pinned k3s binary, sent only when the coordinator does not have it.
+    /// Drafts the release that d describes and sends it at once: the
+    /// tests' short way. k3s is the pinned k3s binary, sent only when the
+    /// coordinator does not have it.
     ///
     /// Refused here, before anything is signed, when the coordinator would
     /// refuse it (an older version without rollback, a malformed field) or
     /// when the binary would not run on the servers.
+    #[cfg(test)]
     pub fn publish_release(&mut self, d: &release::Draft, k3s: &Path) -> Result<Release> {
-        let now = (self.now)().0.timestamp();
         let r = self.draft_release(d)?;
+        self.send_release(&r, d.binary, k3s)?;
+        Ok(r)
+    }
+
+    /// Signs r, a release drafted a moment ago (draft_release), and
+    /// uploads it with binary, its dryserver; k3s goes along when the
+    /// coordinator asks for it. Refused before anything is signed when r
+    /// no longer fits: binary changed since, or another release was signed
+    /// in between (its serial would be used twice).
+    pub fn send_release(&mut self, r: &Release, binary: &Path, k3s: &Path) -> Result<()> {
+        let now = (self.now)().0.timestamp();
+        let unsigned = |e: Error| e.wrap("nothing was signed");
+        rollout::check_static(binary).map_err(unsigned)?;
+        let (sha, size) = release::hash_file(binary, release::MAX_BINARY).map_err(unsigned)?;
+        if sha != r.dryserver.sha256 || size != r.dryserver.size {
+            bail!("{} changed since the release was drafted (a new build?). Nothing was signed; look again", binary.display());
+        }
+        r.validate(now).map_err(unsigned)?;
+        release::decide(r, self.last_release().as_ref(), release::Place::Brain, now).map_err(unsigned)?;
+        let r = r.clone();
         let env = release::seal(self.signer.as_ref(), &r)?;
         // Our own signature must pass our own check, or no machine would
         // accept it.
@@ -843,28 +864,42 @@ impl Admin {
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
         fsx::write_file(&tmp, serde_json::to_string(&env)? + "\n", 0o600)?;
         fsx::rename(&tmp, &path)?;
+        // From here on the release is signed and kept: a failure says so.
+        let kept = |e: Error| {
+            errf!(
+                "release {} is signed and kept on this computer, but did not reach the coordinator: {e}. \
+                 Nothing changed on the machines; publish again once the coordinator answers (the new release gets a higher serial)",
+                r.serial
+            )
+        };
         let mut head = rollout::PutHeader { release: env, k3s_size: 0 };
-        match self.link.upload("release-put", &(serde_json::to_string(&head)? + "\n"), &[d.binary]) {
+        match self.link.upload("release-put", &(serde_json::to_string(&head)? + "\n"), &[binary]) {
             Ok(_) => {}
             Err(e) if e.to_string().contains(rollout::SEND_K3S) => {
                 // The coordinator runs another k3s: it gets the pinned one.
                 let (sha, size) = release::hash_file(k3s, rollout::MAX_K3S).map_err(|e| {
-                    e.wrap(format!(
-                        "the coordinator needs k3s {}, and this computer has none at {} (build the USB stick once to download it)",
+                    kept(e.wrap(format!(
+                        "the coordinator needs k3s {}, and this computer has none at {} (build the USB stick once to download it). {}",
                         r.k3s.version,
-                        k3s.display()
-                    ))
+                        k3s.display(),
+                        crate::publish::get_k3s(k3s, &r.k3s.version)
+                    )))
                 })?;
                 if sha != r.k3s.sha256 {
-                    bail!("{} is not k3s {}: its sha256 is {sha}, the release says {}", k3s.display(), r.k3s.version, r.k3s.sha256);
+                    return Err(kept(errf!(
+                        "{} is not k3s {}: its sha256 is {sha}, the release says {}",
+                        k3s.display(),
+                        r.k3s.version,
+                        r.k3s.sha256
+                    )));
                 }
                 head.k3s_size = size;
-                self.link.upload("release-put", &(serde_json::to_string(&head)? + "\n"), &[d.binary, k3s])?;
+                self.link.upload("release-put", &(serde_json::to_string(&head)? + "\n"), &[binary, k3s]).map_err(kept)?;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(kept(e)),
         }
-        self.release = Some(r.clone());
-        Ok(r)
+        self.release = Some(r);
+        Ok(())
     }
 
     /// Lets a stopped rollout go on (what that means depends on why it

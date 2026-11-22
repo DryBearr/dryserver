@@ -25,6 +25,7 @@ mod node;
 mod osupdate;
 mod owner;
 mod packages;
+mod publish;
 mod quarantine;
 mod registry;
 // Not called yet: later steps run the relay on the VPS entrance and wire
@@ -84,9 +85,10 @@ commands:
                       secrets/backups (encrypted; signed by the coordinator)
   outside             the ways in from the internet: open, sync or close
                       the Cloudflare Tunnel, see which names use it
-  release publish     sign a release of this dryserver and send it to the
-                      coordinator: it updates itself, then one server at a
-                      time (-urgent: at once, -notes TEXT, -rollback)
+  release publish     check a release of this dryserver, show what changes,
+                      sign it and send it to the coordinator: it updates
+                      itself, then one server at a time (-urgent: at once,
+                      -notes TEXT, -rollback; release help for the rest)
   release status      where the rollout stands
   release resume      let a stopped rollout go on
 
@@ -870,16 +872,26 @@ fn run_approve(args: &[String]) -> Result<()> {
     tui::run(&mut tui::admin::Screen::new(a))
 }
 
-const RELEASE_USAGE: &str = "usage: dryserver release publish|status|resume [flags]
+const RELEASE_USAGE: &str = r#"usage: dryserver release publish|status|resume [flags]
 
-  publish   sign a release of this dryserver binary and send it to the
-            coordinator. The coordinator updates itself first, then one
-            server at a time: normal releases in the update window on its
-            clock, urgent ones at once. -notes TEXT, -urgent, -rollback,
-            -arch-date YYYY/MM/DD, -k3s FILE, -yes (do not ask)
+  publish   sign a release of this dryserver and send it to the
+            coordinator. Everything is checked first and you see what
+            changes before you say yes. The coordinator updates itself
+            first, then one server at a time: normal releases in the
+            update window 03:00-05:00 on its clock, urgent ones at once.
+              -notes "TEXT"   what it is for, shown with it
+              -urgent         roll out at once (a security fix)
+              -rollback       allow older versions: the way back
+              -arch-date D    the Arch snapshot day YYYY/MM/DD (default: the
+                              newest day on archive.archlinux.org)
+              -k3s FILE       the pinned k3s (default: out/pkgcache/k3s-VERSION,
+                              from ./dryserver build)
+              -yes            do not ask
   status    where the rollout stands
   resume    let a stopped rollout go on
-";
+
+  every command also takes -config FILE, -host ADDRESS and -port N
+"#;
 
 fn run_release(args: &[String]) -> Result<()> {
     let Some(sub) = args.first() else {
@@ -899,12 +911,12 @@ fn run_release(args: &[String]) -> Result<()> {
         "publish" => release_publish(rest),
         "status" => {
             let f = Flags::parse("release status", rest, DESKTOP_FLAGS);
-            let (mut a, _) = desktop_admin(&f, "release status")?;
+            let (mut a, _) = release_admin(&f, "release status")?;
             print_rollout(&mut a)
         }
         "resume" => {
             let f = Flags::parse("release resume", rest, DESKTOP_FLAGS);
-            let (mut a, _) = desktop_admin(&f, "release resume")?;
+            let (mut a, _) = release_admin(&f, "release resume")?;
             a.load()?;
             a.resume_release()?;
             println!("The coordinator goes on at its next sync, within a minute.\n");
@@ -915,6 +927,20 @@ fn run_release(args: &[String]) -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+/// The admin's link for a release command, with a word first when
+/// ssh-keygen is going to ask for the signing key's passphrase.
+fn release_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
+    let a = desktop_admin(f, cmd)?;
+    let key = paths().secrets.join(iso::SIGNING_KEY_NAME);
+    if publish::has_passphrase(&key) {
+        eprintln!(
+            "{} has a passphrase: ssh-keygen asks for it at each signature (to read the coordinator's state, and to sign).",
+            key.display()
+        );
+    }
+    Ok(a)
 }
 
 /// The newest release and where its rollout stands.
@@ -938,40 +964,34 @@ fn release_publish(args: &[String]) -> Result<()> {
         ("notes", "", "what the release is for, shown with it (printable ASCII, at most 200 bytes)"),
         ("urgent", "false", "roll out at once, not in the nightly update window (a security fix)"),
         ("rollback", "false", "allow older versions than the machines run: the way back from a bad release"),
-        ("arch-date", "", "the Arch snapshot day YYYY/MM/DD (default: today, UTC)"),
-        ("k3s", "", "the pinned k3s binary (default: the one the USB stick build downloaded)"),
+        ("arch-date", "", "the Arch snapshot day YYYY/MM/DD (default: the newest day on archive.archlinux.org)"),
+        ("k3s", "", "the pinned k3s binary (default: out/pkgcache/k3s-VERSION, from ./dryserver build)"),
         ("yes", "false", "sign and send without asking"),
     ]);
     let f = Flags::parse("release publish", args, &spec);
-    let (mut a, host) = desktop_admin(&f, "release publish")?;
-    for w in a.load()?.warnings {
+    let (mut a, host) = release_admin(&f, "release publish")?;
+    let v = a.load().map_err(|e| e.wrap("not published, nothing was signed"))?;
+    for w in &v.warnings {
         eprintln!("warning: {w}");
     }
     // The release is this binary: the one the admin runs now.
-    let me = std::env::current_exe().map_err(|e| err::Error::from(e).wrap("find this program"))?;
-    let arch = match f.get("arch-date") {
-        "" => chrono::Utc::now().format("%Y/%m/%d").to_string(),
-        d => d.to_string(),
+    let k3s = match f.get("k3s") {
+        "" => None,
+        p => Some(PathBuf::from(p)),
     };
-    let d = release::Draft {
-        binary: &me,
-        version: env!("CARGO_PKG_VERSION"),
-        arch_date: &arch,
-        rollback: f.on("rollback"),
+    let parts = publish::Parts::this_program(&paths().out_dir, k3s)?;
+    let choice = publish::Choice {
+        arch_date: f.get("arch-date").into(),
+        notes: f.get("notes").into(),
         urgent: f.on("urgent"),
-        notes: f.get("notes"),
+        rollback: f.on("rollback"),
     };
-    let r = a.draft_release(&d).map_err(|e| e.wrap("not published"))?;
-    println!("{}", rollout::release_line(&r));
-    println!("  dryserver {} ({}, sha256 {})", r.dryserver.version, report::size(r.dryserver.size), r.dryserver.sha256);
-    println!("  k3s {}, Arch snapshot {}", r.k3s.version, r.arch_date);
-    if r.urgent {
-        println!("  urgent: the coordinator updates itself at once, then one server at a time");
-    } else {
-        println!("  rolls out in the update window {} on the coordinator's clock", rollout::window_text(rollout::WINDOW));
-    }
-    if r.rollback {
-        println!("  rollback: older versions than the machines run are allowed");
+    println!("Checking the release: the binary, the k3s file, the Arch archive, the coordinator...");
+    let today = chrono::Utc::now().date_naive();
+    let plan = publish::plan(&Ctx::new(), &a, &v, &publish::Archive::new(), &parts, &choice, today)
+        .map_err(|e| e.wrap("not published, nothing was signed"))?;
+    for l in plan.lines() {
+        println!("{l}");
     }
     if !f.on("yes") {
         print!("Sign it and send it to the coordinator at {host}? [y/N] ");
@@ -984,13 +1004,10 @@ fn release_publish(args: &[String]) -> Result<()> {
             return Ok(());
         }
     }
-    let k3s = match f.get("k3s") {
-        "" => paths().out_dir.join("pkgcache").join(format!("k3s-{}", iso::K3S_VERSION)),
-        p => PathBuf::from(p),
-    };
-    let r = a.publish_release(&d, &k3s)?;
+    let r = publish::publish(&mut a, &plan).map_err(|e| e.wrap("not published"))?;
     println!("Release {} is on the coordinator. It updates itself first, then one server at a time.", r.serial);
-    println!("Watch it: ./dryserver approve, or ./dryserver release status");
+    println!("Watch it: ./dryserver release status, or ./dryserver approve");
+    println!("Stop or go back: publish a fixed release, or the old dryserver with -rollback.");
     Ok(())
 }
 
