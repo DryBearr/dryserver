@@ -115,6 +115,9 @@ pub const FORMAT_FILE: &str = "/var/lib/dryserver-update/state-format";
 /// went (ArchState). Not part of what a revert puts back: the packages
 /// stay.
 pub const ARCH_STATE: &str = "/var/lib/dryserver-update/arch.json";
+/// When this machine began to take releases (StartRecord): what a release
+/// goes by while none is installed (release::Start).
+pub const START: &str = "/var/lib/dryserver-update/start.json";
 const LOCK: &str = "/var/lib/dryserver-update/lock";
 pub const LOG: &str = "/var/log/dryserver-update.log";
 
@@ -260,6 +263,13 @@ impl Machine {
         }
     }
 
+    /// The machine under root, for a caller that is not an update command
+    /// (the sync, as root): it records when the machine began to take
+    /// releases, and reads it.
+    pub fn at_root(root: &Path, run: Arc<dyn Runner>, verifier: Arc<dyn Verifier>) -> Machine {
+        Machine { root: root.to_path_buf(), verifier, owner: fsx::geteuid(), ..Machine::installed(run) }
+    }
+
     pub fn path(&self, p: &str) -> PathBuf {
         fsx::under(&self.root, p)
     }
@@ -367,6 +377,37 @@ pub struct Last {
 
 pub const POSTPONED: &str = "postponed";
 pub const REFUSED: &str = "refused";
+
+/// START: when this machine began to take releases, unix seconds.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StartRecord {
+    pub since: i64,
+}
+
+/// When this machine began to take releases. Recorded the first time the
+/// updates look (the sync does at every run, from the first boot on; or
+/// the first apply), and kept from then on. A machine with no release
+/// installed takes a rollback below what it was installed with only when
+/// it was signed after this moment (release::Start). 0 when the record
+/// cannot be read or written: no such rollback then.
+pub fn note_start(m: &Machine, now: i64) -> i64 {
+    match read_json::<StartRecord>(m, START) {
+        Ok(Some(s)) => s.since,
+        Ok(None) if now > 0 => match ensure_dirs(m).and_then(|_| save_json(m, START, &StartRecord { since: now })) {
+            Ok(()) => now,
+            Err(_) => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// What a release goes by while none is installed, besides what runs
+/// (release::Start): when this machine began to take releases (recorded
+/// now if it was not yet), and the Arch day its mirrorlist pins.
+pub fn start_of(m: &Machine, now: i64) -> (i64, Option<String>) {
+    (note_start(m, now), osupdate::pinned_date(&fsx::read_or_empty(m.path(osupdate::MIRRORLIST))))
+}
 
 /// The Arch packages after the last run that installed any (ARCH_STATE).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1313,7 +1354,10 @@ fn plan(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, log: &HostLog, out: &mut dy
         None => Place::Brain,
         Some(b) => Place::Worker { brain_k3s: b },
     };
-    let (rel, verdict) = release::check(m.verifier.as_ref(), &env, installed.as_ref().map(|(_, r)| r), place, now).map_err(early(false))?;
+    let (since, pinned) = start_of(m, now);
+    let start = release::Start { arch_date: pinned.as_deref(), since };
+    let (rel, verdict) =
+        release::check_from(m.verifier.as_ref(), &env, installed.as_ref().map(|(_, r)| r), start, place, now).map_err(early(false))?;
     if verdict.stale {
         tell(
             m,
@@ -3328,8 +3372,24 @@ mod tests {
         assert!(e.contains("older than the") && e.contains("this machine runs") && e.contains("rollback"), "{e}");
         lab.assert_old("an older release on a fresh machine");
         assert!(!lab.fake.has("systemd-run") && !lab.p(PREV_BIN).exists(), "something changed: {:?}", lab.fake.ran());
-        // Signed as a rollback, it is taken.
-        lab.apply(&Release { rollback: true, ..old }).unwrap();
+        // The first look was recorded, now: a rollback signed before it
+        // (an hour ago) was not made for this machine. A hacked coordinator
+        // sending an old one again does not move it below what it was
+        // installed with.
+        assert_eq!(read_json::<StartRecord>(&lab.m(), START).unwrap().unwrap().since, now());
+        let back = Release { rollback: true, ..old.clone() };
+        let e = lab.apply(&back).unwrap_err().to_string();
+        assert!(e.contains("below what this machine was installed with") && e.contains("sent again"), "{e}");
+        lab.assert_old("an old rollback sent again");
+        // Neither an older Arch day than the installer pinned, unless a
+        // rollback signed since.
+        let e = lab.apply(&Release { arch_date: "2026/11/01".into(), ..rel(7, NEW) }).unwrap_err().to_string();
+        assert!(e.contains("Arch snapshot 2026/11/01, older than the 2026/11/19"), "{e}");
+        // A machine that took its first look a day ago takes a rollback
+        // signed an hour ago: the release it runs may be the bad one.
+        let lab = Lab::new();
+        save_json(&lab.m(), START, &StartRecord { since: now() - release::DAY }).unwrap();
+        lab.apply(&back).unwrap();
         lab.assert_new("a rollback on a fresh machine");
     }
 

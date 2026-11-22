@@ -935,6 +935,13 @@ impl<'a> Machine<'a> {
         self.installed().map_or(0, |r| r.serial).max(self.load().installed)
     }
 
+    /// When this machine began to take releases (recorded now when it was
+    /// not yet) and the Arch day it is pinned to: what a release goes by
+    /// while none is installed here (update::start_of).
+    fn start(&self, now: i64) -> (i64, Option<String>) {
+        crate::update::start_of(&crate::update::Machine::at_root(&self.n.root, self.n.run.clone(), self.n.verifier.clone()), now)
+    }
+
     fn update(&self) -> Update<'_> {
         Update { run: self.n.run.as_ref(), bin: quarantine::SERVER_BIN }
     }
@@ -991,6 +998,8 @@ impl<'a> Machine<'a> {
     /// tried again; a refused or failed update is recorded, shown in the
     /// report, and not tried again.
     pub fn step(&self, ctx: &Ctx, src: &dyn Source, offer: &Offer, rep: &Report, now: i64) -> Result<()> {
+        // From the first sync on: when this machine began to take releases.
+        self.start(now);
         let mut l = self.load();
         if l.pending != 0 {
             return self.settle(ctx, &mut l, rep, now);
@@ -1115,8 +1124,10 @@ impl<'a> Machine<'a> {
                 (o.release, Meta { serial: offer.serial, k3s_size: o.k3s_size, need_k3s: false })
             }
         };
-        let (r, verdict) =
-            release::check(self.n.verifier.as_ref(), &env, installed.as_ref(), place, now).map_err(|e| Stop::Refused(e.to_string()))?;
+        let (since, pinned) = self.start(now);
+        let floor = release::Start { arch_date: pinned.as_deref(), since };
+        let (r, verdict) = release::check_from(self.n.verifier.as_ref(), &env, installed.as_ref(), floor, place, now)
+            .map_err(|e| Stop::Refused(e.to_string()))?;
         if r.serial != offer.serial {
             return Err(Stop::Refused(format!("the coordinator offered release {} and sent release {}", offer.serial, r.serial)));
         }
@@ -1595,6 +1606,7 @@ fn brain_tick_with(
 ) {
     let Ok(s) = store.read() else { return };
     let m = Machine { n, brain: true, free };
+    m.start(now.unix);
     let before = m.own_rollout();
     let mut b = Brain { ctx, n, served, rep, now, members, r: before.clone(), free, nodes: None };
     b.r.resume_asked = s.rollout.resume_asked;
@@ -1725,10 +1737,12 @@ impl Brain<'_> {
             return;
         }
         let installed = self.machine().installed();
+        let (since, pinned) = self.machine().start(self.now.unix);
+        let start = release::Start { arch_date: pinned.as_deref(), since };
         let checked = self
             .served
             .envelope(serial)
-            .and_then(|env| release::check(self.n.verifier.as_ref(), &env, installed.as_ref(), Place::Brain, self.now.unix));
+            .and_then(|env| release::check_from(self.n.verifier.as_ref(), &env, installed.as_ref(), start, Place::Brain, self.now.unix));
         match checked {
             Ok((rel, verdict)) if rel.serial == serial => {
                 let old = std::mem::take(&mut self.r);
