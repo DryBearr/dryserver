@@ -565,22 +565,43 @@ fn set_addresses(out: &str) -> Vec<Ipv4Addr> {
 /// a quarantine that lasts until the admin lifts it, and writes it down.
 /// The decision is this server's alone and holds for this server alone: it
 /// tells nobody else to cut, so a hacked machine can cut off only itself.
+///
+/// The coordinator is cut only for what the firewall counted for it alone
+/// (sysconf::COORD_OFFENDER_SET): tries no account but root on it may
+/// make, against a higher bar. Its cut stops every app on this server.
+/// Found among the members (an older firewall counted it with them), it
+/// is only reported.
 pub fn auto_cut(ctx: &Ctx, n: &Node, coordinator: bool) -> Result<()> {
-    let listed = match n.run.output(ctx, &Cmd::new("nft", &["list", "set", "inet", "dryserver", crate::sysconf::OFFENDERS_SET]).quiet()) {
-        Ok(o) => o,
-        // No such set: the firewall is not loaded or is an older one.
-        Err(_) => return Ok(()),
-    };
-    let offenders = set_addresses(&listed);
+    let listed = |set: &str| n.run.output(ctx, &Cmd::new("nft", &["list", "set", "inet", "dryserver", set]).quiet()).ok();
+    // No such set: the firewall is not loaded or is an older one.
+    let mut offenders: Vec<(Ipv4Addr, bool)> =
+        listed(crate::sysconf::OFFENDERS_SET).map(|o| set_addresses(&o)).unwrap_or_default().into_iter().map(|ip| (ip, false)).collect();
+    if !coordinator {
+        let by_itself = listed(crate::sysconf::COORD_OFFENDER_SET).map(|o| set_addresses(&o)).unwrap_or_default();
+        offenders.extend(by_itself.into_iter().map(|ip| (ip, true)));
+    }
     if offenders.is_empty() {
         return Ok(());
     }
     let me = membership(n, coordinator).host();
     let st = load(n)?;
     let peers = parse_peers(&fsx::read_or_empty(n.path(node::WG_CONF)));
-    for ip in offenders {
+    for (ip, counted_alone) in offenders {
         let host = mesh::host_of(&n.cfg.wg_subnet, ip);
         if host == 0 || host == me || st.cuts.iter().any(|c| c.hosts.contains(&host)) {
+            continue;
+        }
+        // Only the coordinator is counted alone; anything else in its set
+        // was not put there by this firewall.
+        if counted_alone != (host == 1 && !coordinator) {
+            if host == 1 {
+                eprintln!(
+                    "dryserver: the coordinator ({ip}) is in the firewall's {} set, counted like a member; not cut for it \
+                     (the coordinator is cut only for tries counted for it alone). If you do not trust it: \
+                     ./dryserver quarantine-all",
+                    crate::sysconf::OFFENDERS_SET
+                );
+            }
             continue;
         }
         // Its name, as this server knows the member with that address.
@@ -597,7 +618,7 @@ pub fn auto_cut(ctx: &Ctx, n: &Node, coordinator: bool) -> Result<()> {
         let line = format!(
             "{} cut off {who} ({ip}) by itself: more than {} tries on closed ports in a minute. Undo: sudo dryserver quarantine -lift\n",
             Time::now().0.format("%Y-%m-%d %H:%M:%S UTC"),
-            crate::sysconf::KNOCKS_PER_MINUTE
+            if counted_alone { crate::sysconf::COORD_KNOCKS_PER_MINUTE } else { crate::sysconf::KNOCKS_PER_MINUTE }
         );
         eprint!("dryserver: {line}");
         let path = n.path(AUTO_LOG);
@@ -971,7 +992,9 @@ pub fn lift(ctx: &Ctx, n: &Node, coordinator: bool, how: LiftOptions, out: &mut 
     // Lifting forgives: the firewall's own one-hour block of members that
     // tried closed ports goes too. With it left in place the next sync
     // would cut the same member off again within a minute.
-    let _ = n.run.ok(ctx, &Cmd::new("nft", &["flush", "set", "inet", "dryserver", crate::sysconf::OFFENDERS_SET]).quiet());
+    for set in [crate::sysconf::OFFENDERS_SET, crate::sysconf::COORD_OFFENDER_SET] {
+        let _ = n.run.ok(ctx, &Cmd::new("nft", &["flush", "set", "inet", "dryserver", set]).quiet());
+    }
     let _ = std::fs::remove_file(n.path(ISSUE_FILE));
     let _ = n.run.ok(ctx, &Cmd::new("agetty", &["--reload"]));
     let _ = std::fs::remove_file(n.path(STATE_FILE));
@@ -1410,6 +1433,8 @@ PersistentKeepalive = 25
         signed: Mutex<Option<String>>,
         /// `nft list set ... offenders4` output; None: no such set.
         offenders: Mutex<Option<String>>,
+        /// `nft list set ... coord_offender4` output; None: no such set.
+        coord_offender: Mutex<Option<String>>,
     }
 
     impl Runner for Fake {
@@ -1423,7 +1448,12 @@ PersistentKeepalive = 25
                     None => (String::new(), Err("ssh: connect to host 192.168.1.50 port 22: No route to host".into())),
                 },
                 "nft" if c.args.first().map(String::as_str) == Some("list") && c.args.get(1).map(String::as_str) == Some("set") => {
-                    match self.offenders.lock().unwrap().clone() {
+                    let set = match c.args.get(4).map(String::as_str) {
+                        Some(crate::sysconf::OFFENDERS_SET) => &self.offenders,
+                        Some(crate::sysconf::COORD_OFFENDER_SET) => &self.coord_offender,
+                        other => panic!("nft list set {other:?}"),
+                    };
+                    match set.lock().unwrap().clone() {
                         Some(o) => (o, Ok(())),
                         None => (String::new(), Err("No such file or directory".into())),
                     }
@@ -1773,28 +1803,33 @@ PersistentKeepalive = 25
         assert_eq!(load(&n).unwrap(), st);
         assert_eq!(get(dir.path(), AUTO_LOG).lines().count(), 1);
 
-        // The coordinator itself knocks: it is cut like anyone else, and
-        // sync stops talking to it.
-        *fake.offenders.lock().unwrap() = Some(listing("\t\telements = { 10.66.0.1 expires 59m }\n"));
+        // The coordinator itself knocks, counted for it alone: it is cut
+        // like anyone else, and sync stops talking to it.
+        *fake.coord_offender.lock().unwrap() = Some(listing("\t\telements = { 10.66.0.1 expires 59m }\n"));
         auto_cut(&ctx, &n, false).unwrap();
         let st = load(&n).unwrap();
         assert!(st.coordinator_cut() && st.cuts.iter().all(|c| c.auto));
-        assert!(get(dir.path(), AUTO_LOG).contains("cut off the coordinator (10.66.0.1)"));
+        assert!(get(dir.path(), AUTO_LOG).contains("cut off the coordinator (10.66.0.1) by itself: more than 100 tries"));
 
-        // Lifting clears the firewall's entry too; otherwise the next sync
-        // would cut the same member again.
+        // Lifting clears the firewall's entries too; otherwise the next
+        // sync would cut the same members again.
         let before = fake.calls.lock().unwrap().len();
         let (reply, env) = signed_reply(&ADMIN, 5, old_list());
         put(dir.path(), node::SIGNED_FILE, serde_json::to_string(&env).unwrap());
         *fake.signed.lock().unwrap() = Some(reply);
         lift(&ctx, &n, false, SAME, &mut Vec::new()).unwrap();
         let calls = fake.calls.lock().unwrap()[before..].join("\n");
-        assert!(calls.contains("nft flush set inet dryserver offenders4"), "{calls}");
+        assert!(
+            calls.contains("nft flush set inet dryserver offenders4") && calls.contains("nft flush set inet dryserver coord_offender4"),
+            "{calls}"
+        );
         *fake.offenders.lock().unwrap() = Some(listing(""));
+        *fake.coord_offender.lock().unwrap() = Some(listing(""));
         auto_cut(&ctx, &n, false).unwrap();
         assert!(load(&n).unwrap().is_empty(), "a lifted member was cut again");
 
-        // On the coordinator its own address in the set means nothing.
+        // On the coordinator its own address in the set means nothing,
+        // and it has no set of its own to read.
         let dir = TempDir::new();
         let fake = Arc::new(Fake::default());
         let n = server(dir.path(), fake.clone());
@@ -1802,6 +1837,39 @@ PersistentKeepalive = 25
         auto_cut(&ctx, &n, true).unwrap();
         let st = load(&n).unwrap();
         assert_eq!(st.cuts.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["node-c"]);
+        assert!(!fake.calls.lock().unwrap().join("\n").contains("coord_offender4"));
+    }
+
+    /// Tries counted against the coordinator's address with the members
+    /// (what any account on it could make before its firewall kept them
+    /// to root, and what a pod there could make through its address) no
+    /// longer stop every app. What only its root can make, counted for it
+    /// alone, still cuts it.
+    #[test]
+    fn review_knocks_from_the_coordinators_address_do_not_stop_every_app() {
+        let listing = |elems: &str| format!("table inet dryserver {{\n\tset offenders4 {{\n\t\telements = {{ {elems} }}\n\t}}\n}}\n");
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        *fake.offenders.lock().unwrap() = Some(listing("10.66.0.1 expires 59m"));
+        auto_cut(&Ctx::new(), &n, false).unwrap();
+        let held = fsx::exists(n.path(crate::sysconf::K3S_HOLD));
+        let stopped = fake.calls.lock().unwrap().iter().any(|c| c == "systemctl stop k3s.service");
+        assert!(!held && !stopped, "held {held}, stopped {stopped}");
+        assert!(load(&n).unwrap().is_empty() && get(dir.path(), node::WG_CONF).contains(&wg(1)));
+        // A member's address in the coordinator's set was not put there by
+        // this firewall: nothing happens either.
+        *fake.offenders.lock().unwrap() = None;
+        *fake.coord_offender.lock().unwrap() = Some(listing("10.66.0.3 expires 59m"));
+        auto_cut(&Ctx::new(), &n, false).unwrap();
+        assert!(load(&n).unwrap().is_empty());
+
+        // A scan by the coordinator's root: counted for it alone, it cuts.
+        *fake.coord_offender.lock().unwrap() = Some(listing("10.66.0.1 expires 59m"));
+        auto_cut(&Ctx::new(), &n, false).unwrap();
+        assert!(load(&n).unwrap().coordinator_cut() && fsx::exists(n.path(crate::sysconf::K3S_HOLD)));
+        assert!(fake.calls.lock().unwrap().iter().any(|c| c == "systemctl stop k3s.service"));
+        assert!(!get(dir.path(), node::WG_CONF).contains(&wg(1)));
     }
 
     #[test]

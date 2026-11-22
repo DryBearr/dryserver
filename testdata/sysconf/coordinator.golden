@@ -79,8 +79,13 @@ table inet dryserver {
 		tcp dport { 6443, 10250 } accept
 		udp dport 8472 accept
 
-		# Anything else from a member is a try on a closed port. Too many
-		# and it is cut off here; every refusal is logged (at a limit).
+		# Anything else from a member is a try on a closed port, but only
+		# a try to open something counts: a TCP packet in the middle of a
+		# connection this machine no longer knows (it restarted) is late.
+		tcp flags & (syn | ack) != syn drop
+
+		# Too many tries and a member is cut off here; every refusal is
+		# logged (at a limit).
 		add @knock4 { ip saddr limit rate over 30/minute burst 30 packets } add @offenders4 { ip saddr } log prefix "dryserver-autocut: "
 		limit rate 10/minute log prefix "dryserver-mesh-drop: "
 		drop
@@ -92,8 +97,10 @@ table inet dryserver {
 		type filter hook output priority filter; policy drop;
 		ct state vmap { established : accept, related : accept, invalid : drop }
 		oif lo accept
-		# The mesh: the firewall on the other side decides.
-		oifname "wg0" accept
+		# The mesh, also by address: a service address rewritten to a
+		# server's still goes "to the router" here (see below).
+		oifname "wg0" jump to_mesh
+		ip daddr 10.66.0.0/24 ip daddr != 10.66.0.1 jump to_mesh
 		# This machine's own pods (health checks), the pod network and
 		# the cluster's service addresses. By address: a service address
 		# is rewritten to a pod's only after the route was chosen, so
@@ -111,6 +118,24 @@ table inet dryserver {
 
 		limit rate 10/minute log prefix "dryserver-out-drop: "
 		reject with icmpx admin-prohibited
+	}
+
+	# What this machine may start over the mesh. A server cuts it off
+	# when it tries closed ports there, and that stops every app: only
+	# root (k3s, sync) may try them. Regular accounts reach the servers
+	# with SSH (the admin's "ssh <server>" jumps through here) and ping;
+	# system accounts, the registry's among them, not at all. Numbers,
+	# not names: the firewall loads where the accounts do not exist
+	# (the installer checks it there). What the kernel sends with no
+	# program behind it passes: the pod network's VXLAN for the pods
+	# here, and its answers.
+	chain to_mesh {
+		meta skuid 0 accept
+		meta skuid >= 1000 tcp dport 22 accept
+		meta skuid >= 1000 icmp type echo-request accept
+		meta skuid != 0 limit rate 10/minute log prefix "dryserver-out-drop: "
+		meta skuid != 0 reject with icmpx admin-prohibited
+		accept
 	}
 
 	# Containers. Before Docker's own chains; a drop here is final.

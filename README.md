@@ -840,13 +840,25 @@ ended.
   Containers get the same internet ports, reach the mesh only on
   `MESH_PORTS`, and never reach your home network (DNS excepted). Add ports
   your apps need with *Extra outgoing ports* (`EGRESS_PORTS`).
+  On the coordinator only root (k3s, sync) may start connections into the
+  mesh on any port: other accounts only SSH (your `ssh node-a` through it)
+  and ping, system accounts (the registry's among them) none. What the
+  registry account runs has no network at all (`IPAddressDeny=any` on its
+  slice, on coordinators installed from now on; the SSH connections it
+  serves belong to sshd). Pods there reach servers only on the ports
+  servers keep open (kubelet, `MESH_PORTS`).
 - **A member that tries closed ports is cut off.** More than 30 tries in a
   minute and the firewall blocks that member at once; within a minute the
   server makes it a quarantine that lasts until you lift it, writes it to
   `/var/log/dryserver-cuts.log` and its console, and tells the coordinator,
   so `./dryserver approve` shows who cut whom. Each server decides this for
   itself only and tells no other server to cut, so a hacked server can cut
-  off only itself.
+  off only itself. Only tries to open something count (a TCP SYN, UDP,
+  other protocols), not late packets of a connection a restarted machine
+  forgot. The coordinator is counted on its own and needs more than 100
+  tries: its cut stops every app on that server, and on it nothing but root
+  may try a server's closed ports, so an account or a pod there cannot
+  trigger it. A scan by its root still does.
 - **Blocked traffic is logged** (at a limit) with the prefixes
   `dryserver-mesh-drop`, `dryserver-out-drop`, `dryserver-container-drop`
   and `dryserver-autocut`: `journalctl -k -g dryserver-`.

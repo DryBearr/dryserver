@@ -130,6 +130,7 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
                 role: p.role,
                 wg_port,
                 switch,
+                mesh,
                 coord_mesh,
                 coord_lan,
                 mesh_tcp: ports_of(&mesh_ports, "tcp"),
@@ -391,6 +392,8 @@ pub struct Firewall {
     pub wg_port: u16,
     /// The switch subnet in auto mode.
     pub switch: Option<Cidr>,
+    /// The mesh subnet.
+    pub mesh: Cidr,
     /// The coordinator's mesh and LAN addresses.
     pub coord_mesh: Ipv4Addr,
     pub coord_lan: Ipv4Addr,
@@ -423,6 +426,15 @@ pub const K3S_SERVICE_CIDR: &str = "10.43.0.0/16";
 pub const KNOCKS_PER_MINUTE: u32 = 30;
 /// The set of members blocked for knocking; sync reads it.
 pub const OFFENDERS_SET: &str = "offenders4";
+/// On a server, the coordinator is counted on its own and against a
+/// higher bar: cut off, it takes every app on the server down with it. On
+/// the coordinator no account but root may try a closed port of a server
+/// (its output chain), and a scan sends far more than this.
+pub const COORD_KNOCKS_PER_MINUTE: u32 = 100;
+/// The set the coordinator lands in for that; sync reads it. A server cuts
+/// the coordinator off for knocks counted here, never for ones counted
+/// with the members in OFFENDERS_SET.
+pub const COORD_OFFENDER_SET: &str = "coord_offender4";
 
 fn nftables(f: &Firewall) -> String {
     let wg_port = f.wg_port;
@@ -469,6 +481,75 @@ fn nftables(f: &Firewall) -> String {
     };
     let web_tcp = port_set(&[80, 443], &f.out_tcp);
     let extra_udp = if f.out_udp.is_empty() { String::new() } else { format!("\n\t\tudp dport {} accept", port_set(&[], &f.out_udp)) };
+    // What this machine may start over the mesh. A server: anything, the
+    // firewall on the other side decides. The coordinator: what the
+    // to_mesh chain lets through.
+    let (to_mesh, to_mesh_chain) = match f.role {
+        Role::Node => ("\t\t# The mesh: the firewall on the other side decides.\n\t\toifname \"wg0\" accept".to_string(), String::new()),
+        Role::Coordinator => (
+            format!(
+                "\t\t# The mesh, also by address: a service address rewritten to a
+		# server's still goes \"to the router\" here (see below).
+		oifname \"wg0\" jump to_mesh
+		ip daddr {m} ip daddr != {c} jump to_mesh",
+                m = f.mesh.network_string(),
+                c = f.coord_mesh
+            ),
+            r#"
+
+	# What this machine may start over the mesh. A server cuts it off
+	# when it tries closed ports there, and that stops every app: only
+	# root (k3s, sync) may try them. Regular accounts reach the servers
+	# with SSH (the admin's "ssh <server>" jumps through here) and ping;
+	# system accounts, the registry's among them, not at all. Numbers,
+	# not names: the firewall loads where the accounts do not exist
+	# (the installer checks it there). What the kernel sends with no
+	# program behind it passes: the pod network's VXLAN for the pods
+	# here, and its answers.
+	chain to_mesh {
+		meta skuid 0 accept
+		meta skuid >= 1000 tcp dport 22 accept
+		meta skuid >= 1000 icmp type echo-request accept
+		meta skuid != 0 limit rate 10/minute log prefix "dryserver-out-drop: "
+		meta skuid != 0 reject with icmpx admin-prohibited
+		accept
+	}"#
+            .to_string(),
+        ),
+    };
+    // A server counts the coordinator's tries on its own (see
+    // COORD_KNOCKS_PER_MINUTE); the coordinator has no such rule for
+    // itself.
+    let (coord_set, coord_block, coord_knocks) = match f.role {
+        Role::Coordinator => (String::new(), String::new(), String::new()),
+        Role::Node => (
+            format!(
+                "
+
+	# The coordinator, blocked for an hour when it tried more than
+	# {ck} closed ports in a minute. \"dryserver sync\" makes that a
+	# quarantine that lasts.
+	set {COORD_OFFENDER_SET} {{
+		type ipv4_addr
+		flags dynamic, timeout
+		timeout 1h
+	}}",
+                ck = COORD_KNOCKS_PER_MINUTE
+            ),
+            format!("\n\t\tiifname \"wg0\" ip saddr @{COORD_OFFENDER_SET} drop"),
+            format!(
+                "
+		# The coordinator is counted on its own, against a higher bar:
+		# its cut stops every app here. On it only root may try a
+		# closed port of this machine, and a scan sends far more.
+		ip saddr {c} limit rate over {ck}/minute burst {ck} packets add @{COORD_OFFENDER_SET} {{ ip saddr }} log prefix \"dryserver-autocut: \"
+		ip saddr {c} limit rate 10/minute log prefix \"dryserver-mesh-drop: \"
+		ip saddr {c} drop",
+                c = f.coord_mesh,
+                ck = COORD_KNOCKS_PER_MINUTE
+            ),
+        ),
+    };
     format!(
         r#"#!/usr/bin/nft -f
 # dryserver firewall, generated from config.env. To open more ports to the
@@ -502,11 +583,11 @@ table inet dryserver {{
 		type ipv4_addr
 		flags dynamic, timeout
 		timeout 1h
-	}}
+	}}{coord_set}
 
 	chain input {{
 		type filter hook input priority filter; policy drop;
-		iifname "wg0" ip saddr @{offenders} drop
+		iifname "wg0" ip saddr @{offenders} drop{coord_block}
 		ct state vmap {{ established : accept, related : accept, invalid : drop }}
 		iif lo accept
 
@@ -544,8 +625,13 @@ table inet dryserver {{
 		{k3s_mesh}
 		udp dport 8472 accept
 
-		# Anything else from a member is a try on a closed port. Too many
-		# and it is cut off here; every refusal is logged (at a limit).
+		# Anything else from a member is a try on a closed port, but only
+		# a try to open something counts: a TCP packet in the middle of a
+		# connection this machine no longer knows (it restarted) is late.
+		tcp flags & (syn | ack) != syn drop{coord_knocks}
+
+		# Too many tries and a member is cut off here; every refusal is
+		# logged (at a limit).
 		add @knock4 {{ ip saddr limit rate over {knocks}/minute burst {knocks} packets }} add @{offenders} {{ ip saddr }} log prefix "dryserver-autocut: "
 		limit rate 10/minute log prefix "dryserver-mesh-drop: "
 		drop
@@ -557,8 +643,7 @@ table inet dryserver {{
 		type filter hook output priority filter; policy drop;
 		ct state vmap {{ established : accept, related : accept, invalid : drop }}
 		oif lo accept
-		# The mesh: the firewall on the other side decides.
-		oifname "wg0" accept
+{to_mesh}
 		# This machine's own pods (health checks), the pod network and
 		# the cluster's service addresses. By address: a service address
 		# is rewritten to a pod's only after the route was chosen, so
@@ -576,7 +661,7 @@ table inet dryserver {{
 
 		limit rate 10/minute log prefix "dryserver-out-drop: "
 		reject with icmpx admin-prohibited
-	}}
+	}}{to_mesh_chain}
 
 	# Containers. Before Docker's own chains; a drop here is final.
 	chain forward {{
@@ -653,11 +738,19 @@ table inet dryserver {{
 /// USB stick and server, so anyone holding it can log in (to the forced
 /// command only) as often as the firewall lets them. Without a ceiling,
 /// sessions that never end use up the coordinator's memory.
-pub const REGISTRY_SLICE: &str = "# dryserver: the registry account cannot starve the coordinator.
+///
+/// No network either: the registry only reads and writes files, and code
+/// running as the account must not reach the servers (tries on their
+/// closed ports cut the coordinator off), the home network or the
+/// internet. The SSH connections it serves are not affected: a socket
+/// stays with the unit that made it, and sshd.service accepted them.
+pub const REGISTRY_SLICE: &str = "# dryserver: the registry account cannot starve the coordinator, and
+# what it runs has no network (its SSH connections belong to sshd).
 [Slice]
 TasksMax=200
 MemoryMax=384M
 MemorySwapMax=0
+IPAddressDeny=any
 ";
 
 fn sshd(user: &str, role: Role, mesh: &Cidr) -> String {
@@ -989,7 +1082,7 @@ mod tests {
             // The mesh chain ends in a drop, so nothing from the mesh
             // reaches the LAN rules below it.
             "limit rate 10/minute log prefix \"dryserver-mesh-drop: \"\n\t\tdrop\n\t}",
-            "iifname \"wg0\" ip saddr @offenders4 drop\n\t\tct state vmap",
+            "iifname \"wg0\" ip saddr @offenders4 drop\n\t\tiifname \"wg0\" ip saddr @coord_offender4 drop\n\t\tct state vmap",
             // Outgoing: default drop, the registry on the coordinator's LAN
             // address, containers kept off the home network.
             "type filter hook output priority filter; policy drop;",
@@ -1182,9 +1275,16 @@ mod tests {
                 let (i, j) = (text.find(a), text.find(b));
                 assert!(i.is_some() && j.is_some() && i < j, "{name}: in {c}, {a:?} must come before {b:?}:\n{text}");
             };
-            // The asking pod: out through the pod network (VXLAN over the mesh).
+            // The asking pod: out through the pod network (VXLAN over the
+            // mesh, which the kernel sends with no program behind it).
             before("pods", "oifname { \"cni0\", \"flannel.1\" } accept", "oifname \"wg0\" drop");
-            before("output", "oifname \"wg0\" accept", "reject with icmpx admin-prohibited");
+            match p.role {
+                Role::Node => before("output", "oifname \"wg0\" accept", "reject with icmpx admin-prohibited"),
+                Role::Coordinator => {
+                    before("output", "oifname \"wg0\" jump to_mesh", "reject with icmpx admin-prohibited");
+                    assert!(chain("to_mesh").ends_with("reject with icmpx admin-prohibited\n\t\taccept"), "{name}: {}", chain("to_mesh"));
+                }
+            }
             // The machine with the copy: VXLAN in from the mesh, on to its pod.
             before("mesh", "udp dport 8472 accept", "\t\tdrop");
             let fwd = chain("forward");
@@ -1195,6 +1295,105 @@ mod tests {
             before("pods", "tcp dport 53 accept", "ip daddr { 10.0.0.0/8");
             before("pods", "oifname \"wg0\" ip daddr 10.66.0.1 tcp dport 6443 accept", "oifname \"wg0\" drop");
         }
+    }
+
+    #[test]
+    fn review_registry_account_cannot_reach_the_mesh() {
+        let cs = cases();
+        let coord = render(&cs[2].1).unwrap();
+        let nft = &find(&coord, "/etc/nftables.conf").content;
+        let fenced = nft.contains("skuid") || REGISTRY_SLICE.contains("IPAddressDeny");
+        assert!(fenced, "any local account on the coordinator may open connections into wg0:\n{nft}");
+    }
+
+    /// A server cuts the coordinator off for tries on its closed ports,
+    /// and with it every app. On the coordinator only root may make them:
+    /// other accounts reach the mesh with SSH and ping, system accounts
+    /// (the registry's) not at all, pods only on ports servers keep open.
+    #[test]
+    fn only_root_on_the_coordinator_tries_ports_of_the_servers() {
+        let cs = cases();
+        let coord = find(&render(&cs[2].1).unwrap(), "/etc/nftables.conf").content.clone();
+        let chain = |c: &str| {
+            let start = coord.find(&format!("chain {c} {{")).unwrap_or_else(|| panic!("no chain {c}:\n{coord}"));
+            coord[start..start + coord[start..].find("\n\t}").unwrap()].to_string()
+        };
+        let output = chain("output");
+        // Into the mesh by interface, and by address: a service address
+        // rewritten to a server's mesh address still names the router.
+        let lo = output.find("oif lo accept").unwrap();
+        let est = output.find("ct state vmap").unwrap();
+        for want in ["oifname \"wg0\" jump to_mesh", "ip daddr 10.66.0.0/24 ip daddr != 10.66.0.1 jump to_mesh"] {
+            let at = output.find(want).unwrap_or_else(|| panic!("missing {want:?}:\n{output}"));
+            assert!(est < at && lo < at, "open connections and loopback go first:\n{output}");
+            assert!(at < output.find("tcp dport { 53, 80, 443 } accept").unwrap(), "{want} after the web ports:\n{output}");
+        }
+        assert!(!output.contains("oifname \"wg0\" accept"), "{output}");
+        assert_eq!(
+            chain("to_mesh").lines().filter(|l| !l.trim_start().starts_with('#')).skip(1).map(str::trim).collect::<Vec<_>>(),
+            vec![
+                "meta skuid 0 accept",
+                "meta skuid >= 1000 tcp dport 22 accept",
+                "meta skuid >= 1000 icmp type echo-request accept",
+                "meta skuid != 0 limit rate 10/minute log prefix \"dryserver-out-drop: \"",
+                "meta skuid != 0 reject with icmpx admin-prohibited",
+                "accept",
+            ]
+        );
+        // Numbers only: a name nft cannot look up (the installer, a
+        // container) would leave the machine without a firewall.
+        assert!(!coord.contains("skuid \"") && !coord.contains("skgid"), "{coord}");
+        // Pods there: over the mesh only to the API server, kubelets and
+        // MESH_PORTS (all open on servers), never a closed port.
+        let pods = chain("pods");
+        let wg: Vec<&str> = pods.lines().map(str::trim).filter(|l| l.contains("oifname \"wg0\"")).collect();
+        assert_eq!(
+            wg,
+            vec![
+                "oifname \"wg0\" ip daddr 10.66.0.1 tcp dport 6443 accept",
+                "oifname \"wg0\" tcp dport 10250 accept",
+                "oifname \"wg0\" limit rate 10/minute log prefix \"dryserver-pod-drop: \"",
+                "oifname \"wg0\" drop",
+            ],
+            "{pods}"
+        );
+        // The registry account's slice has no network.
+        assert!(REGISTRY_SLICE.contains("\nIPAddressDeny=any\n") && !REGISTRY_SLICE.contains("IPAddressAllow"), "{REGISTRY_SLICE}");
+
+        // A server keeps its own way out: hostNetwork apps run as any
+        // account there.
+        let node = find(&render(&cs[0].1).unwrap(), "/etc/nftables.conf").content.clone();
+        assert!(node.contains("\t\t# The mesh: the firewall on the other side decides.\n\t\toifname \"wg0\" accept\n"), "{node}");
+        assert!(!node.contains("skuid") && !node.contains("chain to_mesh"), "{node}");
+    }
+
+    /// Servers count tries to open something, never late packets of a
+    /// connection they forgot; the coordinator on its own, against a
+    /// higher bar and into its own set.
+    #[test]
+    fn knock_counting() {
+        let cs = cases();
+        let node = find(&render(&cs[0].1).unwrap(), "/etc/nftables.conf").content.clone();
+        let mesh = &node[node.find("chain mesh {").unwrap()..];
+        let mesh = &mesh[..mesh.find("\n\t}").unwrap()];
+        let order = [
+            "udp dport 8472 accept",
+            "tcp flags & (syn | ack) != syn drop",
+            "ip saddr 10.66.0.1 limit rate over 100/minute burst 100 packets add @coord_offender4 { ip saddr } log prefix \"dryserver-autocut: \"",
+            "ip saddr 10.66.0.1 limit rate 10/minute log prefix \"dryserver-mesh-drop: \"",
+            "ip saddr 10.66.0.1 drop",
+            "add @knock4 { ip saddr limit rate over 30/minute burst 30 packets } add @offenders4 { ip saddr }",
+        ];
+        let at: Vec<usize> = order.iter().map(|w| mesh.find(w).unwrap_or_else(|| panic!("missing {w:?}:\n{mesh}"))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "out of order:\n{mesh}");
+        assert_eq!(mesh.matches("@offenders4").count(), 1, "the coordinator never lands with the members:\n{mesh}");
+        assert!(node.contains("iifname \"wg0\" ip saddr @offenders4 drop\n\t\tiifname \"wg0\" ip saddr @coord_offender4 drop\n"), "{node}");
+        assert!(node.contains("\tset coord_offender4 {\n\t\ttype ipv4_addr\n\t\tflags dynamic, timeout\n\t\ttimeout 1h\n\t}"), "{node}");
+        assert_eq!((COORD_KNOCKS_PER_MINUTE, KNOCKS_PER_MINUTE), (100, 30));
+
+        // The coordinator counts members only, and has no set for itself.
+        let coord = find(&render(&cs[2].1).unwrap(), "/etc/nftables.conf").content.clone();
+        assert!(coord.contains("tcp flags & (syn | ack) != syn drop") && !coord.contains("coord_offender4"), "{coord}");
     }
 
     /// What makes a kernel update fall back reaches every machine, also

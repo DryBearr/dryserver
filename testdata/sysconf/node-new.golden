@@ -39,9 +39,19 @@ table inet dryserver {
 		timeout 1h
 	}
 
+	# The coordinator, blocked for an hour when it tried more than
+	# 100 closed ports in a minute. "dryserver sync" makes that a
+	# quarantine that lasts.
+	set coord_offender4 {
+		type ipv4_addr
+		flags dynamic, timeout
+		timeout 1h
+	}
+
 	chain input {
 		type filter hook input priority filter; policy drop;
 		iifname "wg0" ip saddr @offenders4 drop
+		iifname "wg0" ip saddr @coord_offender4 drop
 		ct state vmap { established : accept, related : accept, invalid : drop }
 		iif lo accept
 
@@ -84,8 +94,19 @@ table inet dryserver {
 		tcp dport 10250 accept
 		udp dport 8472 accept
 
-		# Anything else from a member is a try on a closed port. Too many
-		# and it is cut off here; every refusal is logged (at a limit).
+		# Anything else from a member is a try on a closed port, but only
+		# a try to open something counts: a TCP packet in the middle of a
+		# connection this machine no longer knows (it restarted) is late.
+		tcp flags & (syn | ack) != syn drop
+		# The coordinator is counted on its own, against a higher bar:
+		# its cut stops every app here. On it only root may try a
+		# closed port of this machine, and a scan sends far more.
+		ip saddr 10.66.0.1 limit rate over 100/minute burst 100 packets add @coord_offender4 { ip saddr } log prefix "dryserver-autocut: "
+		ip saddr 10.66.0.1 limit rate 10/minute log prefix "dryserver-mesh-drop: "
+		ip saddr 10.66.0.1 drop
+
+		# Too many tries and a member is cut off here; every refusal is
+		# logged (at a limit).
 		add @knock4 { ip saddr limit rate over 30/minute burst 30 packets } add @offenders4 { ip saddr } log prefix "dryserver-autocut: "
 		limit rate 10/minute log prefix "dryserver-mesh-drop: "
 		drop

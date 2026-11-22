@@ -319,26 +319,42 @@ check "the coordinator still reaches the server over WireGuard" inb ping -c1 -W2
 out=$(inw "$BIN" sync 2>&1)
 check_not "sync cuts nobody while nobody knocks" grep -q "by itself" <<<"$out"
 check_not "no quarantine" test -e /etc/dryserver/quarantine.json
-# The coordinator (hacked, say) scans the server through the tunnel.
-inb python3 -I -c '
-import socket
-for port in range(9100, 9160):
+scan() { # first last: the coordinator tries each port once
+    inb python3 -I -c '
+import socket, sys
+for port in range(int(sys.argv[1]), int(sys.argv[2])):
     s = socket.socket(); s.setblocking(False)
     try: s.connect(("10.66.0.2", port))
     except OSError: pass
-    s.close()'
+    s.close()' "$1" "$2"
+}
+# What a member's tries would be (60 in a minute) does not cut the
+# coordinator: that stops every app.
+scan 9000 9060
 sleep 0.5
-check "the firewall blocked it at once" bash -c "nsenter -t $WK -n nft list set inet dryserver offenders4 | grep -q 10.66.0.1"
+check_not "60 tries do not block the coordinator" bash -c "nsenter -t $WK -n nft list set inet dryserver offenders4 | grep -q 10.66.0.1 || nsenter -t $WK -n nft list set inet dryserver coord_offender4 | grep -q 10.66.0.1"
+check "the coordinator still reaches the server" inb ping -c1 -W2 10.66.0.2
+# Counted with the members (an older firewall did that): reported, not cut.
+inw nft add element inet dryserver offenders4 '{ 10.66.0.1 }'
+out=$(inw "$BIN" sync 2>&1)
+check "sync says why it does not cut" grep -q "not cut for it" <<<"$out"
+check_not "no quarantine for it" test -e /etc/dryserver/quarantine.json
+inw nft flush set inet dryserver offenders4
+# The coordinator (hacked, say) scans the server through the tunnel.
+scan 9100 9300
+sleep 0.5
+check "the firewall blocked it at once" bash -c "nsenter -t $WK -n nft list set inet dryserver coord_offender4 | grep -q 10.66.0.1"
+check_not "not among the members" bash -c "nsenter -t $WK -n nft list set inet dryserver offenders4 | grep -q 10.66.0.1"
 check_not "it cannot even ping any more" inb ping -c1 -W1 10.66.0.2
 out=$(inw "$BIN" sync 2>&1); rc=$?
-check "sync made it a quarantine and says so ($rc)" grep -q "cut off the coordinator (10.66.0.1) by itself" <<<"$out"
+check "sync made it a quarantine and says so ($rc)" grep -q "cut off the coordinator (10.66.0.1) by itself: more than 100 tries" <<<"$out"
 check "sync is paused" grep -q "paused" <<<"$out"
 check "saved as an automatic cut" grep -q '"auto": true' /etc/dryserver/quarantine.json
 check_not "coordinator peer out of the running wg0" bash -c "nsenter -t $WK -n wg show wg0 peers | grep -qF '$BP2'"
 check "status tells why" bash -c "nsenter -t $WK -n $BIN quarantine -status | grep -q 'by this server itself'"
 # The one-hour entry in the firewall is gone after a reload; the cut is not.
 inw nft -f /etc/nftables.conf
-check_not "the firewall's own entry is gone after a reload" bash -c "nsenter -t $WK -n nft list set inet dryserver offenders4 | grep -q 10.66.0.1"
+check_not "the firewall's own entry is gone after a reload" bash -c "nsenter -t $WK -n nft list set inet dryserver coord_offender4 | grep -q 10.66.0.1"
 check "the quarantine table is loaded with it" inw nft list table inet dryserver_quarantine
 check_not "still cut off" inw ping -c1 -W1 10.66.0.1
 out=$(inw "$BIN" sync 2>&1)
@@ -350,9 +366,9 @@ import socket
 s = socket.socket(); s.setblocking(False)
 try: s.connect(('10.66.0.2', $port))
 except OSError: pass"; done
-inw nft add element inet dryserver offenders4 '{ 10.66.0.1 }'
+inw nft add element inet dryserver coord_offender4 '{ 10.66.0.1 }'
 check "lift -same (a false alarm)" inw "$BIN" quarantine -lift -same
-check_not "the firewall's entry is gone after the lift" bash -c "nsenter -t $WK -n nft list set inet dryserver offenders4 | grep -q 10.66.0.1"
+check_not "the firewall's entry is gone after the lift" bash -c "nsenter -t $WK -n nft list set inet dryserver coord_offender4 | grep -q 10.66.0.1"
 out=$(inw "$BIN" sync 2>&1)
 check_not "the next sync does not cut the lifted member again" grep -q "by itself" <<<"$out"
 check_not "no quarantine after it" test -e /etc/dryserver/quarantine.json
