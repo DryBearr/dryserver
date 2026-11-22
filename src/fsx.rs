@@ -35,6 +35,35 @@ pub fn write_file(path: impl AsRef<Path>, data: impl AsRef<[u8]>, mode: u32) -> 
     f.write_all(data.as_ref()).map_err(|e| op_err("write", p, e))
 }
 
+/// Makes a new file at path with exactly this mode, whatever the umask.
+/// Never an existing file and never through a link (O_EXCL, O_NOFOLLOW):
+/// a name taken by anything is an error, not something to write into.
+pub fn create_file(path: impl AsRef<Path>, data: impl AsRef<[u8]>, mode: u32) -> Result<()> {
+    let p = path.as_ref();
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(p)
+        .map_err(|e| op_err("create", p, e))?;
+    f.set_permissions(fs::Permissions::from_mode(mode)).map_err(|e| op_err("chmod", p, e))?;
+    f.write_all(data.as_ref()).map_err(|e| op_err("write", p, e))
+}
+
+/// The temporary file of a write and rename: what stands at its name (left
+/// by a run that was killed, with whatever mode, or a link) is removed,
+/// never followed, and the file is made new (create_file). A secret
+/// written there is never readable by others, not even for a moment.
+pub fn write_new(path: impl AsRef<Path>, data: impl AsRef<[u8]>, mode: u32) -> Result<()> {
+    let p = path.as_ref();
+    match fs::remove_file(p) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(op_err("remove", p, e)),
+        _ => {}
+    }
+    create_file(p, data, mode)
+}
+
 pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
     let (f, t) = (from.as_ref(), to.as_ref());
     fs::rename(f, t).map_err(|e| Error::from(e).wrap(format!("rename {} {}", f.display(), t.display())))
@@ -278,6 +307,36 @@ mod tests {
         assert_eq!(control_path(Some("".as_ref()), "x-%C"), None);
         set(&dir, 0o750);
         assert_eq!(control_path(Some(t.path().as_os_str()), "x-%C"), None);
+    }
+
+    #[test]
+    fn new_files_never_go_through_what_stands_at_the_name() {
+        let t = crate::testutil::TempDir::new();
+        let mode = |p: &Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        let victim = t.join("victim");
+        fs::write(&victim, "precious").unwrap();
+        // A link at the name: create_file refuses, write_new removes the
+        // link itself; the file it points to keeps its content.
+        let tmp = t.join("x.tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        assert!(create_file(&tmp, "secret", 0o600).is_err());
+        write_new(&tmp, "secret", 0o600).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(fs::symlink_metadata(&tmp).unwrap().is_file() && mode(&tmp) == 0o600);
+        // A file left with a looser mode: made again at exactly the mode.
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+        write_new(&tmp, "secret 2", 0o600).unwrap();
+        assert_eq!((fs::read_to_string(&tmp).unwrap().as_str(), mode(&tmp)), ("secret 2", 0o600));
+        // A directory there is an error, not removed.
+        let d = t.join("d.tmp");
+        fs::create_dir(&d).unwrap();
+        assert!(write_new(&d, "x", 0o600).is_err() && d.is_dir());
+        // The config (WiFi password) goes the same way.
+        let cfg = t.join("config.env");
+        std::os::unix::fs::symlink(&victim, t.join("config.env.tmp")).unwrap();
+        crate::config::Config::default().save(&cfg).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(mode(&cfg), 0o600);
     }
 
     #[test]

@@ -159,11 +159,13 @@ impl Config {
         (c, None)
     }
 
-    /// Writes the file atomically, readable by the owner only.
+    /// Writes the file atomically, readable by the owner only: the
+    /// temporary file is made new at 0600, never through a link and never
+    /// a file left there with another mode (it holds the WiFi password).
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let tmp = format!("{}.tmp", path.display());
-        fsx::write_file(&tmp, self.render(), 0o600)?;
+        fsx::write_new(&tmp, self.render(), 0o600)?;
         fsx::rename(&tmp, path)
     }
 

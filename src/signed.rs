@@ -245,8 +245,11 @@ impl Verifier for SshVerifier {
             }
         }
         let _rm = Remove(&allowed, &sig_file);
-        fsx::write_file(&allowed, format!("{SIGNER} namespaces=\"{namespace}\" {key}\n"), 0o600)?;
-        fsx::write_file(&sig_file, sig, 0o600)?;
+        // New files under names of their own: in a shared temporary
+        // directory a name taken already is someone else's, never ours to
+        // write through.
+        fsx::create_file(&allowed, format!("{SIGNER} namespaces=\"{namespace}\" {key}\n"), 0o600)?;
+        fsx::create_file(&sig_file, sig, 0o600)?;
         let (a, s) = (allowed.display().to_string(), sig_file.display().to_string());
         let out = ssh_keygen(&["-Y", "verify", "-f", &a, "-I", SIGNER, "-n", namespace, "-s", &s], doc)?;
         if !out.status.success() {

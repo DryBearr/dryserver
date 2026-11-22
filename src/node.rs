@@ -159,7 +159,9 @@ impl Node {
         let dst = self.path(p);
         fsx::mkdir_all(fsx::dir(&dst), 0o755)?;
         let tmp = PathBuf::from(format!("{}.tmp", dst.display()));
-        fsx::write_file(&tmp, content, mode)?;
+        // Made new at exactly mode: a file left at that name by a killed
+        // run, with another mode, never carries a secret.
+        fsx::write_new(&tmp, content, mode)?;
         fsx::rename(&tmp, &dst)
     }
 

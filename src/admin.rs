@@ -192,7 +192,7 @@ impl Link for SshLink {
             };
         }
         let tmp = PathBuf::from(format!("{}.tmp", self.known_hosts.display()));
-        fsx::write_file(&tmp, format!("{} {}\n", self.known_name(), key_body(key)), 0o600)?;
+        fsx::write_new(&tmp, format!("{} {}\n", self.known_name(), key_body(key)), 0o600)?;
         fsx::rename(&tmp, &self.known_hosts)
     }
 }
@@ -422,7 +422,7 @@ impl Admin {
     fn save_copy(&self, env: &Envelope) -> Result<()> {
         let path = self.copy_path();
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-        fsx::write_file(&tmp, serde_json::to_string(env)? + "\n", 0o600)?;
+        fsx::write_new(&tmp, serde_json::to_string(env)? + "\n", 0o600)?;
         fsx::rename(&tmp, &path)
     }
 

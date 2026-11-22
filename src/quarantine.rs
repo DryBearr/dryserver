@@ -457,7 +457,7 @@ fn issue(st: &State) -> String {
 fn write_rules(ctx: &Ctx, n: &Node, st: &State) -> Result<()> {
     fsx::mkdir_all(n.path(NFT_DIR), 0o700)?;
     let check = n.path(&format!("{NFT_FILE}.check"));
-    fsx::write_file(&check, nft_rules(st), 0o600)?;
+    fsx::write_new(&check, nft_rules(st), 0o600)?;
     if let Err(e) = n.run.ok(ctx, &Cmd::new("nft", &["-c", "-f", &check.display().to_string()])) {
         let _ = std::fs::remove_file(&check);
         return Err(e.wrap("the firewall rules failed nft -c, nothing loaded"));

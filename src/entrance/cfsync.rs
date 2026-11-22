@@ -529,9 +529,7 @@ pub fn save_token(path: &Path, token: &str) -> Result<()> {
     cloudflare::valid_tunnel_token(token)?;
     let tmp = path.with_extension("tmp");
     fsx::mkdir_all(fsx::dir(path), 0o700)?;
-    let _ = std::fs::remove_file(&tmp);
-    fsx::write_file(&tmp, format!("{token}\n"), 0o600)?;
-    fsx::chmod(&tmp, 0o600)?;
+    fsx::write_new(&tmp, format!("{token}\n"), 0o600)?;
     fsx::rename(&tmp, path)
 }
 

@@ -1306,7 +1306,7 @@ fn fetch_one(brain: &dyn Brain, verifier: &dyn Verifier, dir: &Path, name: &str,
         .verify(NAMESPACE, &receipt(name, size, &sum), &sig)
         .map_err(|e| e.wrap("not signed by the coordinator you pinned; not kept"))?;
     let sig_path = dir.join(format!("{name}.sig"));
-    fsx::write_file(&sig_path, &sig, 0o600)?;
+    fsx::write_new(&sig_path, &sig, 0o600)?;
     std::fs::hard_link(&part, dir.join(name)).map_err(|e| Error::from(e).wrap(format!("keep {name}")))?;
     Ok(())
 }
