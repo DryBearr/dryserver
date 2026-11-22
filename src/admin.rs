@@ -240,8 +240,9 @@ impl SshLink {
         // The pipe closes when the thread ends: the coordinator sees the
         // end of the input.
         let writer = std::thread::spawn(move || feed(&mut pipe));
-        let out = child.wait_with_output().map_err(|e| Error::from(e).wrap("ssh"))?;
+        let out = bounded_output(child, MAX_ANSWER);
         let _ = writer.join();
+        let out = out?;
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
         }
@@ -263,6 +264,41 @@ impl SshLink {
         // The registry's own error, e.g. "dryserver: this list is not newer".
         Err(errf!("the coordinator refused: {}", msg.trim_start_matches("dryserver: ")))
     }
+}
+
+/// The most the coordinator may answer one registry command with. Its
+/// largest answer, the admin's view of every member with its report, is
+/// far below this.
+const MAX_ANSWER: u64 = 16 << 20;
+
+/// Waits for child, keeping at most max bytes of what it prints and 64 KiB
+/// of its errors. More than max is an error, and the child is killed: what
+/// the coordinator sends never fills this computer's memory.
+fn bounded_output(mut child: std::process::Child, max: u64) -> Result<std::process::Output> {
+    use std::io::Read;
+    let mut err_pipe = child.stderr.take().ok_or_else(|| Error::new("ssh: no stderr"))?;
+    let errs = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let _ = (&mut err_pipe).take(64 << 10).read_to_end(&mut kept);
+        let _ = std::io::copy(&mut err_pipe, &mut std::io::sink());
+        kept
+    });
+    let mut stdout = Vec::new();
+    let read = match child.stdout.take() {
+        Some(mut pipe) => (&mut pipe).take(max + 1).read_to_end(&mut stdout).map(|_| ()),
+        None => Ok(()),
+    };
+    let too_long = stdout.len() as u64 > max;
+    if too_long {
+        let _ = child.kill();
+    }
+    let status = child.wait().map_err(|e| Error::from(e).wrap("ssh"))?;
+    let stderr = errs.join().unwrap_or_default();
+    if too_long {
+        bail!("the coordinator's answer is longer than {} MiB; not taken", max >> 20);
+    }
+    read.map_err(|e| Error::from(e).wrap("read from ssh"))?;
+    Ok(std::process::Output { status, stdout, stderr })
 }
 
 /// Text from the coordinator made safe to print: no control characters
@@ -1736,6 +1772,23 @@ pub mod tests {
         let (mut b, _) = setup(&other);
         b.load().unwrap();
         assert!(b.resend().unwrap_err().to_string().contains("nothing is signed yet"));
+    }
+
+    #[test]
+    fn the_coordinators_answer_has_a_ceiling() {
+        let sh = |script: &str| {
+            Command::new("sh").args(["-c", script]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+        };
+        // An answer that never ends: refused, and the child is gone.
+        let start = std::time::Instant::now();
+        let e = bounded_output(sh("yes"), 1 << 20).unwrap_err().to_string();
+        assert!(e.contains("longer than 1 MiB") && start.elapsed() < std::time::Duration::from_secs(10), "{e}");
+        // Endless errors are cut short, the answer is kept.
+        let out = bounded_output(sh("head -c 50000000 /dev/zero >&2; printf ok; exit 3"), 1 << 20).unwrap();
+        assert_eq!((out.stdout.as_slice(), out.stderr.len(), out.status.code()), (&b"ok"[..], 64 << 10, Some(3)));
+        // Exactly the ceiling is still an answer.
+        let out = bounded_output(sh("head -c 1048576 /dev/zero"), 1 << 20).unwrap();
+        assert_eq!(out.stdout.len(), 1 << 20);
     }
 
     #[test]
