@@ -912,3 +912,21 @@ fn a_load_takes_the_rollout_and_the_cuts_as_plain_text() {
     assert!(v.reports[0].starts_with("node-a cut off node-b by itself"), "{:?}", v.reports);
     assert_eq!(resume(&mut a).unwrap(), "gives the server its turn again, to try release 5 once more");
 }
+
+// ---- what the preview compares with ----
+
+/// With no release yet the machines' reports say the version and not the
+/// build: the same version is not "same", it may be another build.
+#[test]
+fn no_release_yet_the_same_version_is_not_called_the_same() {
+    let dir = TempDir::new();
+    let (mut a, _, _, _, _) = desk(&dir);
+    let days = FakeDays::with(&[days_ago(0)]);
+    let v = a.load().unwrap();
+    let rebuilt = super::tests::parts(&dir, "0.1.0");
+    let p = plan(&Ctx::new(), &a, &v, &days, &rebuilt, &Choice::default(), today()).unwrap();
+    let lines = p.lines();
+    assert_eq!(lines[1], "  dryserver  0.1.0 (the machines report 0.1.0, not which build: they all get this one)");
+    assert_eq!(lines[2], format!("  k3s        same ({})", iso::K3S_VERSION), "a k3s version is one pinned binary");
+    assert!(!lines.join("\n").contains("same (0.1.0)"), "{lines:?}");
+}

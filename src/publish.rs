@@ -545,9 +545,15 @@ impl Plan {
             }
             None => {
                 let ds = match self.reported_dryserver.as_slice() {
+                    // A report says the version, not the build: this one
+                    // may well be another, and it goes to every machine.
+                    [one] if *one == r.dryserver.version => {
+                        format!("{one} (the machines report {one}, not which build: they all get this one)")
+                    }
                     [one] => change(one, &r.dryserver.version),
                     l => format!("{} -> {}", joined(l), r.dryserver.version),
                 };
+                // A k3s version is one binary: this dryserver pins its sha256.
                 let k3s = match self.reported_k3s.as_slice() {
                     [one] => change(one, &r.k3s.version),
                     l => format!("{} -> {}", joined(l), r.k3s.version),
