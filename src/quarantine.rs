@@ -746,7 +746,8 @@ fn adopt(ctx: &Ctx, n: &Node, me: u32, rewrite: bool) -> Result<Coordinator> {
     let list = env
         .list(n.verifier.as_ref(), |h| !mesh::ip(&n.cfg.wg_subnet, h).is_empty())
         .map_err(|e| e.wrap(format!("the member list from {ip}")))?;
-    let seen = n.seen_version();
+    let known = n.seen_list()?;
+    let seen = known.as_ref().map_or(0, |(v, _)| *v);
     if list.version < seen {
         bail!("the coordinator at {ip} serves signed list version {}, older than version {seen} this server has seen", list.version);
     }
@@ -768,9 +769,7 @@ fn adopt(ctx: &Ctx, n: &Node, me: u32, rewrite: bool) -> Result<Coordinator> {
     };
     let key = crate::signed::key_body(&coord.ssh_host_key);
     if list.version == seen {
-        let known: Option<crate::signed::Envelope> =
-            std::fs::read(n.path(node::SIGNED_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok());
-        if known.is_some_and(|k| k.doc != env.doc) {
+        if known.is_some_and(|(_, k)| k.doc != env.doc) {
             bail!("the coordinator at {ip} serves a different signed list under the same version {seen}");
         }
         if !rewrite && n.coordinator_key().ok().as_deref() == Some(key.as_str()) {
@@ -1794,6 +1793,24 @@ PersistentKeepalive = 25
         lift(&ctx, &n, false, &mut Vec::new()).unwrap();
         assert!(load(&n).unwrap().is_empty() && get(dir.path(), node::KNOWN_HOSTS).is_empty());
         assert!(fake.calls.lock().unwrap().join("\n").contains("systemctl restart --no-block dryserver-join.service"));
+    }
+
+    #[test]
+    fn a_damaged_record_of_the_newest_list_keeps_the_cut() {
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        let ctx = Ctx::new();
+        cut(&ctx, &n, false, &[], &mut Vec::new()).unwrap();
+        // Without the record of version 5, an old list from before a
+        // removal would pass as new.
+        put(dir.path(), node::SIGNED_FILE, "garbage");
+        *fake.signed.lock().unwrap() = Some(signed_reply(&ADMIN, 2, old_list()).0);
+        let (kh, js) = (get(dir.path(), node::KNOWN_HOSTS), get(dir.path(), node::JOIN_STATE));
+        let e = lift(&ctx, &n, false, &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("is damaged") && e.contains("the quarantine stays"), "{e}");
+        still_cut(dir.path(), &n, &kh, &js, "damaged signed list");
+        assert_eq!(get(dir.path(), node::SIGNED_FILE), "garbage");
     }
 
     #[test]

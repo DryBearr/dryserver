@@ -582,15 +582,26 @@ impl Node {
         }
     }
 
-    /// Version of the newest signed list this server has verified, 0 if
-    /// none.
-    pub fn seen_version(&self) -> u64 {
-        std::fs::read(self.path(SIGNED_FILE))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Envelope>(&b).ok())
-            .and_then(|e| serde_json::from_str::<signed::List>(&e.doc).ok())
-            .map(|l| l.version)
-            .unwrap_or(0)
+    /// The newest signed list this machine has verified, with its version;
+    /// None when it has none. A file that cannot be read is an error, not
+    /// none: taken for none, any older list would pass as new and bring
+    /// back a machine the admin removed.
+    pub fn seen_list(&self) -> Result<Option<(u64, Envelope)>> {
+        let damaged = |e: String| {
+            errf!(
+                "{SIGNED_FILE} is damaged ({e}). It holds the newest member list this machine has seen, so no list is \
+                 taken until it is put right; remove it to take the coordinator's list as it comes"
+            )
+        };
+        match std::fs::read(self.path(SIGNED_FILE)) {
+            Ok(b) => {
+                let env: Envelope = serde_json::from_slice(&b).map_err(|e| damaged(e.to_string()))?;
+                let list: signed::List = serde_json::from_str(&env.doc).map_err(|e| damaged(e.to_string()))?;
+                Ok(Some((list.version, env)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::from(e).wrap(format!("read {SIGNED_FILE}"))),
+        }
     }
 
     /// The members this server uses: exactly the list the admin signed.
@@ -608,11 +619,7 @@ impl Node {
         }
         let list = env.list(self.verifier.as_ref(), |h| self.fits(h))?;
         // The stored list was verified when it was saved; root owns it.
-        let seen: Option<(u64, Envelope)> = std::fs::read(self.path(SIGNED_FILE)).ok().and_then(|b| {
-            let e: Envelope = serde_json::from_slice(&b).ok()?;
-            let l: signed::List = serde_json::from_str(&e.doc).ok()?;
-            Some((l.version, e))
-        });
+        let seen = self.seen_list()?;
         match &seen {
             Some((ver, _)) if list.version < *ver => {
                 return Err(errf!(
@@ -2475,6 +2482,31 @@ mod tests {
         join_loop(&Ctx::new(), &n, &params, &mut Vec::new()).unwrap();
         assert!(fc.calls.lock().unwrap().is_empty(), "join asked a cut coordinator");
         assert!(get(&n.root, ISSUE_FILE).contains("quarantined"));
+    }
+
+    #[test]
+    fn a_damaged_record_of_the_newest_list_takes_no_list() {
+        let (_dir, _tmp, n, fc) = joined();
+        let store = Store::new("/nonexistent");
+        let ctx = Ctx::new();
+        let v5 = sign(&ADMIN, 5, vec![coord_entry(), node_entry(2), other_entry()]);
+        *fc.peers.lock().unwrap() = Some(peers(&[coord_member(), node_member(2)], &v5));
+        assert!(sync(&ctx, &n, false, &store).unwrap());
+        let kept = get(&n.root, WG_CONF);
+        // The record is damaged; the coordinator then serves an older list
+        // without node-c. Taken for "none seen", it would pass as new.
+        put(&n.root, SIGNED_FILE, "{\"doc\": \"{\\\"version\\\":");
+        let v3 = sign(&ADMIN, 3, vec![coord_entry(), node_entry(2)]);
+        *fc.peers.lock().unwrap() = Some(peers(&[coord_member(), node_member(2)], &v3));
+        let e = sync(&ctx, &n, false, &store).unwrap_err().to_string();
+        assert!(e.contains("is damaged") && e.contains("mesh left as it is"), "{e}");
+        assert_eq!(get(&n.root, WG_CONF), kept);
+        assert_eq!(get(&n.root, SIGNED_FILE), "{\"doc\": \"{\\\"version\\\":", "the record was written over");
+        assert!(get(&n.root, SIGNED_STATUS).contains("REFUSED"));
+        // Removed by the admin's hand: the coordinator's list is taken.
+        std::fs::remove_file(n.path(SIGNED_FILE)).unwrap();
+        assert!(sync(&ctx, &n, false, &store).unwrap());
+        assert!(get(&n.root, SIGNED_FILE).contains(&v3.sig));
     }
 
     #[test]
