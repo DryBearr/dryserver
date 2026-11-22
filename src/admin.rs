@@ -33,6 +33,11 @@ pub const RELEASE_COPY: &str = "release.signed.json";
 const CLOCK_OFF: i64 = 120;
 /// The coordinator's SSH host key as first seen from this desktop.
 pub const KNOWN_HOSTS: &str = "coordinator_known_hosts";
+/// Host numbers of members this desktop removed, oldest first, in
+/// secrets/. A new machine gets none of them while another is free:
+/// servers that cut a removed machine off (quarantine) drop its mesh
+/// address, and would drop the new one's with it.
+pub const RETIRED: &str = "retired-hosts.json";
 
 /// A way to run one registry command on the coordinator.
 pub trait Link {
@@ -751,10 +756,28 @@ impl Admin {
         Ok(self.base.version)
     }
 
+    /// The numbers of removed members (RETIRED), oldest first.
+    fn retired(&self) -> Vec<u32> {
+        serde_json::from_str(&fsx::read_or_empty(self.secrets.join(RETIRED))).unwrap_or_default()
+    }
+
+    fn save_retired(&self, hosts: &[u32]) -> Result<()> {
+        let path = self.secrets.join(RETIRED);
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        let _ = std::fs::remove_file(&tmp);
+        fsx::write_new(&tmp, serde_json::to_string(hosts)? + "\n", 0o600)?;
+        fsx::rename(&tmp, &path)
+    }
+
+    /// The lowest number no member has and no removed member had; the
+    /// longest retired one when the subnet has no other.
     fn free_host(&self, list: &List) -> Result<u32> {
+        let retired = self.retired();
+        let free = |h: &u32| !list.members.iter().any(|e| e.host == *h);
         (2u32..)
             .take_while(|h| self.fits(*h))
-            .find(|h| !list.members.iter().any(|e| e.host == *h))
+            .find(|h| free(h) && !retired.contains(h))
+            .or_else(|| retired.iter().copied().find(|h| self.fits(*h) && free(h)))
             .ok_or_else(|| Error::new("the mesh subnet is full"))
     }
 
@@ -791,6 +814,11 @@ impl Admin {
             list.members.push(Entry { host, name: r.name.clone(), wg_key: r.wg_key.clone(), ssh_host_key: key_body(&r.ssh_host_key) });
             Ok(())
         })?;
+        // A number given out again is no longer kept back.
+        let retired = self.retired();
+        if retired.contains(&host) {
+            let _ = self.save_retired(&retired.into_iter().filter(|h| *h != host).collect::<Vec<_>>());
+        }
         Ok(host)
     }
 
@@ -803,8 +831,10 @@ impl Admin {
         .map(|_| ())
     }
 
-    /// Removes a member, signed or not. The coordinator stays.
+    /// Removes a member, signed or not. The coordinator stays. Its number
+    /// is kept back from the next machines (RETIRED).
     pub fn remove(&mut self, name: &str) -> Result<()> {
+        let mut gone = Vec::new();
         self.publish(|list, a| {
             if a.members.iter().any(|m| m.name == name && m.host == 1) {
                 bail!("the coordinator cannot be removed");
@@ -812,10 +842,19 @@ impl Admin {
             if list.members.iter().any(|e| e.name == name && e.host == 1) {
                 bail!("the coordinator cannot be removed");
             }
+            gone = list.members.iter().filter(|e| e.name == name).map(|e| e.host).collect();
             list.members.retain(|e| e.name != name);
             Ok(())
-        })
-        .map(|_| ())
+        })?;
+        let mut retired = self.retired();
+        retired.retain(|h| !gone.contains(h));
+        retired.extend(gone);
+        // The list is signed and sent: a lost record only means a number
+        // may come back.
+        if let Err(e) = self.save_retired(&retired) {
+            eprintln!("warning: cannot keep the removed member's number in {RETIRED}: {e}");
+        }
+        Ok(())
     }
 
     /// The first signature: signs the coordinator's own entry, which
@@ -1267,6 +1306,35 @@ pub mod tests {
     /// when there is none).
     pub fn by_id(a: &Admin, id: &str) -> Request {
         a.pending.iter().find(|r| r.id == id).cloned().unwrap_or(Request { id: id.into(), ..Request::default() })
+    }
+
+    /// A removed member's number is not given to the next machine while
+    /// another is free: servers that cut it off drop its address.
+    #[test]
+    fn a_removed_members_number_is_kept_back() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        let ida = ask(&store, "node-a", 2);
+        let idb = ask(&store, "node-b", 3);
+        a.load().unwrap();
+        assert_eq!((a.approve(&by_id(&a, &ida)).unwrap(), a.approve(&by_id(&a, &idb)).unwrap()), (2, 3));
+        a.load().unwrap();
+        a.remove("node-a").unwrap();
+        let idc = ask(&store, "node-c", 4);
+        a.load().unwrap();
+        assert_eq!(a.approve(&by_id(&a, &idc)).unwrap(), 4, "node-c got node-a's number");
+        assert_eq!(std::fs::read_to_string(a.secrets.join(RETIRED)).unwrap().trim(), "[2]");
+        // A subnet with no other number left gives the retired one.
+        a.subnet = "10.66.0.0/29".into();
+        let ide = ask(&store, "node-e", 5);
+        let idf = ask(&store, "node-f", 6);
+        a.load().unwrap();
+        assert_eq!(a.approve(&by_id(&a, &ide)).unwrap(), 5);
+        assert_eq!(a.approve(&by_id(&a, &idf)).unwrap(), 6);
+        let idg = ask(&store, "node-g", 7);
+        a.load().unwrap();
+        assert_eq!(a.approve(&by_id(&a, &idg)).unwrap(), 2, "the last free number");
+        assert_eq!(std::fs::read_to_string(a.secrets.join(RETIRED)).unwrap().trim(), "[]");
     }
 
     /// A machine installed again under a member's name, or one whose name

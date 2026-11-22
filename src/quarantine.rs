@@ -76,9 +76,13 @@ impl State {
         self.cuts.iter().any(|c| c.hosts.contains(&1))
     }
 
-    /// Whether m is cut, by WireGuard key or by mesh address.
+    /// Whether m is cut: by WireGuard key where the cut knows the keys,
+    /// else by mesh address. After a removal the admin's next approval may
+    /// give the number to another machine, which is not the one cut off.
     pub fn blocks(&self, m: &Member) -> bool {
-        self.cuts.iter().any(|c| c.hosts.contains(&m.host) || (!m.wg_key.is_empty() && c.wg_keys.contains(&m.wg_key)))
+        self.cuts
+            .iter()
+            .any(|c| if c.wg_keys.is_empty() || m.wg_key.is_empty() { c.hosts.contains(&m.host) } else { c.wg_keys.contains(&m.wg_key) })
     }
 
     fn ips(&self) -> Vec<Ipv4Addr> {
@@ -1342,6 +1346,33 @@ PersistentKeepalive = 25
         assert!(st.blocks(&Member { host: 9, wg_key: "COORDKEY=".into(), ..Member::default() }), "same key under a new address");
         assert!(!st.blocks(&Member { host: 3, wg_key: "NODECKEY=".into(), ..Member::default() }));
         assert!(!st.blocks(&Member { host: 3, ..Member::default() }), "empty keys never match");
+        // The coordinator by its number without a key (a member entry
+        // that has none).
+        assert!(st.blocks(&Member { host: 1, wg_key: String::new(), ..Member::default() }));
+    }
+
+    /// The review's case: after the admin removes a cut server, the next
+    /// machine approved may get its number. It is not the one cut off.
+    #[test]
+    fn review_a_new_machine_on_a_cut_machines_number_is_cut() {
+        let st = State {
+            cuts: vec![Cut {
+                name: "node-c".into(),
+                hosts: vec![3],
+                wg_keys: vec!["bm9kZS1jLXB1YmxpYy1rZXktMzItYnl0ZXMtbG9uZyE=".into()],
+                ips: vec!["10.66.0.3".into()],
+                ..Cut::default()
+            }],
+        };
+        let node_d =
+            Member { host: 3, name: "node-d".into(), wg_key: "bm9kZS1kLXB1YmxpYy1rZXktMzItYnl0ZXMtbG9uZyE=".into(), ..Member::default() };
+        assert!(!st.blocks(&node_d), "node-d, another machine with another key, is cut because it got node-c's number");
+        let node_c = Member { wg_key: "bm9kZS1jLXB1YmxpYy1rZXktMzItYnl0ZXMtbG9uZyE=".into(), ..node_d.clone() };
+        assert!(st.blocks(&node_c) && st.blocks(&Member { host: 7, ..node_c.clone() }), "node-c itself, wherever it is");
+        // A cut that knows no key (the member had no peer here) goes by
+        // the number.
+        let by_number = State { cuts: vec![Cut { hosts: vec![3], ..Cut::default() }] };
+        assert!(by_number.blocks(&node_d));
     }
 
     #[test]
