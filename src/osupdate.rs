@@ -1523,7 +1523,14 @@ impl Host<'_> {
             .run
             .output(&tctx, &Cmd::new(&bin.display().to_string(), &["--version"]).quiet().stdout_only())
             .map_err(|e| e.wrap("the new k3s does not run"))?;
-        let got = out.lines().next().and_then(|l| l.strip_prefix("k3s version ")).and_then(|v| v.split_whitespace().next()).unwrap_or("");
+        // k3s names itself by the file it was started as: the staged copy
+        // says ".k3s.dryserver-new version v1.37.1+k3s1 (356c0254)".
+        let got = out
+            .lines()
+            .next()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>())
+            .and_then(|w| if w.get(1) == Some(&"version") { w.get(2).copied() } else { None })
+            .unwrap_or("");
         if got != version {
             bail!("the new k3s says it is {}, the release says {version}", show(got));
         }
@@ -1974,7 +1981,11 @@ mod tests {
                 }
                 (bin, ["--version"]) => {
                     match fs::read_to_string(bin).unwrap_or_default().split_whitespace().find_map(|w| w.strip_prefix("version=")) {
-                        Some(v) => ok(&format!("k3s version {v} (1d2e3f4a)\ngo version go1.25.4\n")),
+                        // As the real k3s: it names itself by the file it runs as.
+                        Some(v) => {
+                            let me = Path::new(bin).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            ok(&format!("{me} version {v} (1d2e3f4a)\ngo version go1.25.4\n"))
+                        }
                         None => (String::new(), Err(errf!("{bin} failed: exec format error"))),
                     }
                 }
