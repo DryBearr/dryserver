@@ -728,7 +728,13 @@ only with `--reboot`. Step by step:
    killed while it installs: stopped, it gets SIGINT and finishes the
    package it is at; and no shutdown is let in meanwhile. After a new
    openssh, sshd restarts (running sessions stay) once `sshd -t` accepts
-   its settings.
+   its settings. The two kernels never change in one run: everything but
+   the fallback kernel (linux-lts) first, linux-lts in a run of its own and
+   only once the main kernel has booted well, else at the next update; so
+   one kernel is always known good. Boot images that were not made (a power
+   cut in pacman's hooks) are made again with `mkinitcpio -P`. A machine
+   installed after the release, whose packages are of a newer day, keeps
+   them; the next release moves them.
 7. **The confirm window starts** (10 minutes, from the end of the apply,
    however long it took). Unless `sudo dryserver update confirm` follows,
    the machine puts back the old binary, the files, the mirrorlist and the
