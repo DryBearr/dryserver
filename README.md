@@ -616,10 +616,14 @@ it, then publish a fixed release, or:
 Passed over without stopping, and shown: a server that is switched off
 (it updates when it is back, still one at a time), one whose kill switch
 is on (it updates nothing until it is lifted), and one with an older
-dryserver that cannot update itself. A server removed from the swarm
-while the rollout is stopped at it lets the rollout go on. The rollout
-also stops before the first server when the coordinator's copy of the
-release's k3s is gone or damaged.
+dryserver that cannot update itself. A server whose turn ends that way
+three times in one rollout (switched off, or its kill switch on, each
+time its turn comes) stops the rollout there, for you to look. A server
+removed from the swarm while the rollout is stopped at it lets the
+rollout go on. The rollout also stops before the first server when the
+coordinator's copy of the release's k3s is gone or damaged. Only the
+members you signed take part: one the coordinator lists on its own never
+gets a turn.
 
 A hacked coordinator cannot change a release, make a server install an
 older one, or hand it a binary other than the signed one: each server

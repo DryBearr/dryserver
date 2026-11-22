@@ -252,6 +252,9 @@ struct Swarm {
     slow: Vec<(u32, u64)>,
     /// Machines whose disk is full.
     full_disk: Vec<u32>,
+    /// The members the admin signed, by host and name: the brain's sync
+    /// hands the rollout only these (node::sync, signed_members).
+    signed: Vec<(u32, String)>,
 }
 
 impl Swarm {
@@ -276,6 +279,7 @@ impl Swarm {
                 Ok(())
             })
             .unwrap();
+        let signed = std::iter::once((1, "coord".to_string())).chain(servers.iter().map(|m| (m.host, m.name.clone()))).collect();
         let sw = Swarm {
             now,
             minute: IN_WINDOW,
@@ -291,6 +295,7 @@ impl Swarm {
             pieces: Mutex::new(vec![]),
             slow: vec![],
             full_disk: vec![],
+            signed,
         };
         sw.brain_sync();
         for i in 0..sw.servers.len() {
@@ -343,7 +348,27 @@ impl Swarm {
         let m = Machine { n: &self.brain.node, brain: true, free: self.free(1) };
         let mut rep = self.healthy(1);
         m.describe(&mut rep);
-        self.store.update(|s| s.heartbeat(1, Heartbeat { report: Some(rep.clone()), ..Heartbeat::default() }, time(self.now))).unwrap();
+        let all = self
+            .store
+            .update(|s| {
+                s.heartbeat(1, Heartbeat { report: Some(rep.clone()), ..Heartbeat::default() }, time(self.now))?;
+                Ok(s.members.clone())
+            })
+            .unwrap();
+        // What node::sync hands over (signed_members): the signed members,
+        // with what the registry says of them; one it does not list is
+        // still a member, of which nothing is known.
+        let members: Vec<Member> = self
+            .signed
+            .iter()
+            .map(|(h, n)| {
+                all.iter().find(|m| m.host == *h && m.name == *n).cloned().unwrap_or(Member {
+                    host: *h,
+                    name: n.clone(),
+                    ..Member::default()
+                })
+            })
+            .collect();
         brain_tick_with(
             &Ctx::new(),
             &self.brain.node,
@@ -351,6 +376,7 @@ impl Swarm {
             &self.served,
             &rep,
             Now { unix: self.now, minute: self.minute },
+            &members,
             self.free(1),
         );
     }
@@ -853,6 +879,7 @@ fn a_server_removed_in_its_turn() {
     sw.publish(10, true);
     sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.ready));
     sw.ignore_turn.push(2);
+    sw.signed.retain(|(h, _)| *h != 2);
     sw.store
         .update(|s| {
             s.members.retain(|m| m.host != 2);
@@ -1034,6 +1061,40 @@ fn a_hacked_server_lying_out_of_turn_stops_only_its_own_turn() {
     assert!(sw.server(4).fake.sim().applied.is_empty());
 }
 
+/// A server whose report says its kill switch is on whenever its turn
+/// comes, and off between (a hacked server, or a registry account that
+/// forges its reports), was cordoned and drained again and again. Now it
+/// gets MAX_TURNS turns, then the rollout stops at it for the admin.
+#[test]
+fn a_server_held_at_every_turn_gets_max_turns() {
+    let mut sw = Swarm::new(2);
+    sw.ignore_turn.push(2);
+    sw.publish(10, true);
+    let cut = sw.server(2).node.path(quarantine::STATE_FILE);
+    for _ in 0..120 {
+        if sw.rollout().turn.is_some_and(|t| t.host == 2 && t.ready) {
+            put(&sw.server(2).node.root, quarantine::STATE_FILE, r#"{"cuts":[{"name":"node-b","hosts":[3]}]}"#);
+        } else {
+            let _ = std::fs::remove_file(&cut);
+        }
+        sw.tick();
+        if !sw.rollout().paused.is_empty() {
+            break;
+        }
+    }
+    let r = sw.rollout();
+    assert_eq!((r.pause, r.pause_host), (Pause::Timeout, 2), "{r:#?}");
+    assert!(r.paused.contains("node-a had its turn 3 times, and each ended without its update"), "{}", r.paused);
+    assert_eq!(sw.installed(3), 10, "the others went on meanwhile");
+    let cordons = sw.kubectl().iter().filter(|l| *l == "cordon -- node-a").count();
+    assert_eq!(cordons, MAX_TURNS);
+    // The admin looks and resumes: its turns count again, and it updates.
+    let _ = std::fs::remove_file(&cut);
+    sw.ignore_turn.clear();
+    sw.resume();
+    sw.until_unpaused(30, |s| s.everyone_on(10));
+}
+
 #[test]
 fn a_server_that_holds_its_turn_does_not_stall_the_rollout_for_ever() {
     let mut sw = Swarm::new(2);
@@ -1129,6 +1190,7 @@ impl Swarm {
             })
             .unwrap();
         self.servers.push(m);
+        self.signed.push((host, name.into()));
     }
 
     /// A server the admin removed from the member list.
@@ -1140,6 +1202,7 @@ impl Swarm {
             })
             .unwrap();
         self.servers.retain(|m| m.host != host);
+        self.signed.retain(|(h, _)| *h != host);
     }
 }
 
@@ -1403,6 +1466,61 @@ fn a_release_whose_k3s_is_gone_on_the_brain_touches_no_server() {
     assert!(l.failed == 0 && l.note.contains("the coordinator has no k3s v1.37.2+k3s1 for release 10"), "{l:?}");
     std::fs::write(&at, K3S).unwrap();
     sw.until_unpaused(20, |s| s.everyone_on(10));
+}
+
+/// The rollout took its servers from the registry's member list, which the
+/// registry account writes. Now it takes the list the admin signed, as the
+/// mesh and the cluster do: a machine the registry account adds never gets
+/// a turn (nor its name to kubectl), and one it drops is still a server.
+#[test]
+fn the_rollout_follows_only_the_signed_members() {
+    let mut sw = Swarm::new(2);
+    let now = sw.now;
+    sw.store
+        .update(|s| {
+            let report = Some(Report { format: report::FORMAT, time: now, firewall: Some(true), ..Report::default() });
+            s.members.push(Member {
+                host: 9,
+                name: "rogue".into(),
+                wg_key: crate::admin::tests::key32(9),
+                last_seen: time(now),
+                report,
+                ..Member::default()
+            });
+            Ok(())
+        })
+        .unwrap();
+    let plant = |sw: &Swarm| {
+        let now = sw.now;
+        sw.store
+            .update(|s| {
+                if let Some(m) = s.members.iter_mut().find(|m| m.host == 9) {
+                    m.last_seen = time(now);
+                }
+                // node-b is gone from its list, or under another name.
+                s.members.retain(|m| m.host != 3);
+                Ok(())
+            })
+            .unwrap();
+    };
+    sw.publish(10, true);
+    for _ in 0..30 {
+        plant(&sw);
+        sw.tick();
+    }
+    assert_eq!((sw.installed(2), sw.installed(3)), (10, 0));
+    assert!(!sw.kubectl().iter().any(|l| l.contains("rogue")), "{:?}", sw.kubectl());
+    let r = sw.rollout();
+    assert!(!r.done.contains(&9) && r.turn.is_none() && r.paused.is_empty(), "{r:#?}");
+    // Listed again: node-b updates too.
+    let b = sw.server(3).name.clone();
+    sw.store
+        .update(|s| {
+            s.members.push(Member { host: 3, name: b, wg_key: crate::admin::tests::key32(3), last_seen: time(now), ..Member::default() });
+            Ok(())
+        })
+        .unwrap();
+    sw.until_unpaused(30, |s| s.everyone_on(10));
 }
 
 /// What the registry account may write in its copy of the rollout: root

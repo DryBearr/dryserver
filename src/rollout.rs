@@ -49,7 +49,6 @@ use sha2::{Digest, Sha256};
 
 use crate::ctx::Ctx;
 use crate::err::{Error, Kind, Result};
-use crate::mesh;
 use crate::node::Node;
 use crate::registry::{self, Member, Store};
 use crate::release::{self, Place, Release};
@@ -148,6 +147,12 @@ const APPLY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// yet) is tried again before the release counts as failed here: well
 /// within TURN_TIMEOUT, a sync a minute.
 pub const MAX_TRIES: u32 = 10;
+/// How many turns one server gets in a rollout before the rollout stops at
+/// it (the admin resumes or passes it over). A turn that ends without the
+/// update (its kill switch went on, it went silent) gives it another one
+/// later; a server, or a registry account that forges its reports, could
+/// otherwise have it cordoned and drained again and again.
+pub const MAX_TURNS: usize = 3;
 /// The most warnings a rollout keeps (the newest).
 const MAX_WARNINGS: usize = 8;
 /// What the registry says when an upload needs the k3s binary too; the
@@ -1457,6 +1462,9 @@ pub struct Rollout {
     /// How many tries again this rollout gave (Turn::retry numbers them).
     #[serde(skip_serializing_if = "is_zero")]
     pub retries: u64,
+    /// One entry per turn a server was given in this rollout (MAX_TURNS).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<u32>,
     /// Nodes this rollout cordoned and did not uncordon yet.
     pub cordoned: Vec<String>,
     /// Why the rollout stopped; empty while it runs.
@@ -1564,18 +1572,31 @@ struct Brain<'a> {
 /// a new upload, carries out a resume, updates the brain, and gives the
 /// servers their turns. Commands that take a while (draining) run without
 /// the registry lock; what changed is written back at the end.
-pub fn brain_tick(ctx: &Ctx, n: &Node, store: &Store, served: &Served, rep: &Report, now: Now) {
-    brain_tick_with(ctx, n, store, served, rep, now, free_bytes);
+///
+/// members is the swarm as this sync uses it for the mesh and the cluster:
+/// exactly the list the admin signed (Node::signed_members), with what the
+/// registry says of each member (its report, when it was last seen). Not
+/// the registry's own list: the registry account writes that, and the
+/// rollout names its servers to kubectl.
+pub fn brain_tick(ctx: &Ctx, n: &Node, store: &Store, served: &Served, rep: &Report, now: Now, members: &[Member]) {
+    brain_tick_with(ctx, n, store, served, rep, now, members, free_bytes);
 }
 
-fn brain_tick_with(ctx: &Ctx, n: &Node, store: &Store, served: &Served, rep: &Report, now: Now, free: fn(&Path) -> Option<u64>) {
+#[allow(clippy::too_many_arguments)]
+fn brain_tick_with(
+    ctx: &Ctx,
+    n: &Node,
+    store: &Store,
+    served: &Served,
+    rep: &Report,
+    now: Now,
+    members: &[Member],
+    free: fn(&Path) -> Option<u64>,
+) {
     let Ok(s) = store.read() else { return };
     let m = Machine { n, brain: true, free };
     let before = m.own_rollout();
-    // The registry account writes the member list too: only members that
-    // pass the checks a server makes take part (the sync logged the rest).
-    let (members, _) = registry::check_members(s.members.clone(), |h| !mesh::ip(&n.cfg.wg_subnet, h).is_empty());
-    let mut b = Brain { ctx, n, served, rep, now, members: &members, r: before.clone(), free, nodes: None };
+    let mut b = Brain { ctx, n, served, rep, now, members, r: before.clone(), free, nodes: None };
     b.r.resume_asked = s.rollout.resume_asked;
     b.r.skip_asked = s.rollout.skip_asked;
     b.take_upload();
@@ -1823,6 +1844,8 @@ impl Brain<'_> {
                     self.r.again.push(host);
                 }
                 self.r.deferred.retain(|h| *h != host);
+                // The admin looked: its turns count from here.
+                self.r.turns.retain(|h| *h != host);
                 let when = match self.member(host) {
                     Some(m) if !self.online(m) => "when it is back",
                     _ if !self.in_window() => "in the update window",
@@ -1953,6 +1976,7 @@ impl Brain<'_> {
         self.r.deferred.retain(here);
         self.r.force.retain(here);
         self.r.again.retain(here);
+        self.r.turns.retain(here);
         self.r.skipped.retain(|s| members.iter().any(|m| m.host == s.host && m.name == s.name));
         let on: Vec<u32> = self
             .r
@@ -2005,6 +2029,16 @@ impl Brain<'_> {
         self.r.again.retain(|h| !already.contains(h));
         self.r.done.extend(already);
         let Some((host, name)) = pick else { return };
+        let had = self.r.turns.iter().filter(|h| **h == host).count();
+        if had >= MAX_TURNS {
+            self.r.stop(
+                Pause::Timeout,
+                host,
+                &name,
+                format!("{name} had its turn {had} times, and each ended without its update (its kill switch went on, or it went silent)"),
+            );
+            return;
+        }
         self.start_turn(host, name);
     }
 
@@ -2026,6 +2060,7 @@ impl Brain<'_> {
             self.r.cordoned.push(name.clone());
         }
         self.r.deferred.retain(|d| *d != host);
+        self.r.turns.push(host);
         self.r.turn = Some(Turn { host, name: name.clone(), since: self.now.unix, ready: false, retry, cleared: false });
         if let Err(e) = self.machine().save_rollout(&self.r) {
             eprintln!("dryserver: rollout: cannot save its state, so {name} gets no turn yet: {e}");

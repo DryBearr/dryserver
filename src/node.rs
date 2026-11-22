@@ -1198,9 +1198,9 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
             n.k3s_share(ctx, store, &all);
         }
         // The rollout of the newest release: the coordinator first, then
-        // one server at a time.
+        // one server at a time, among the members the admin signed.
         let served = rollout::Served::beside(store, n.path(rollout::K3S_BIN));
-        rollout::brain_tick(ctx, n, store, &served, &rep, rollout::Now::current());
+        rollout::brain_tick(ctx, n, store, &served, &rep, rollout::Now::current(), &all);
     } else {
         if let Err(e) = n.k3s_join(ctx, me.host, &token) {
             eprintln!("dryserver: k3s: {e}");
