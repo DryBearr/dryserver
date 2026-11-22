@@ -55,8 +55,16 @@
 //!     confirm after the reboot carry the update across it.
 //!
 //! When a step of the new binary fails, the old binary goes back (its
-//! revert, as below). A release that keeps the k3s binary and the snapshot
-//! day restarts no k3s and runs no pacman: a dryserver fix stays fast.
+//! revert, as below). When the new binary says it is done, the old one
+//! does not take its word (kept_in_hand): it checks the record is armed,
+//! the release's binaries are in place and recorded, the mirrorlist is on
+//! the right day, and goes back at once otherwise; it puts its own boot
+//! unit back, and arms a confirm window timer of its own. Its apply timer
+//! stays as well, and reverts an update not confirmed by its deadline. So
+//! a new binary whose window timer never fires, or whose boot unit does
+//! not start, cannot keep an update nobody confirms. A release that keeps
+//! the k3s binary and the snapshot day restarts no k3s and runs no pacman:
+//! a dryserver fix stays fast.
 //!
 //! The handover, the contract between any two dryserver binaries (one may
 //! be years older than the other); every later version keeps it:
@@ -74,7 +82,8 @@
 //!   prepare sets Pending::why and Pending::again (postponed when true),
 //!   exits non-zero, and the old binary reverts. activate exits zero once
 //!   the record is armed and the release recorded as applied; non-zero, and
-//!   the old binary reverts.
+//!   the old binary reverts. On zero the old binary checks that this is so
+//!   (kept_in_hand) and keeps the boot unit and a window timer its own.
 //! - Protocol 0 (either binary from before the handover): the old binary
 //!   runs steps 4 and 7 to 10 itself, and `update activate` writes the
 //!   files only. A binary of this version does so when it hands over to an
@@ -184,9 +193,12 @@ const FIREWALL: &str = "/etc/nftables.conf";
 pub const GUARD_UNIT: &str = "dryserver-update-guard.service";
 pub const GUARD_UNIT_PATH: &str = "/etc/systemd/system/dryserver-update-guard.service";
 /// The transient revert timer of one update is this plus its id (the
-/// confirm window), or plus its id and APPLY_SUFFIX (while it applies).
+/// confirm window), plus its id and APPLY_SUFFIX (from the start of the
+/// apply), or plus its id and STARTED_SUFFIX (the confirm window as the
+/// binary that started the update armed it: Timer::Started).
 pub const TIMER_PREFIX: &str = "dryserver-update-revert-";
 const APPLY_SUFFIX: &str = "-apply";
+const STARTED_SUFFIX: &str = "-started";
 /// The transient service a detached apply runs in.
 pub const APPLY_UNIT: &str = "dryserver-update-apply";
 
@@ -1233,12 +1245,18 @@ enum Timer {
     /// The confirm window, from the moment the apply is done (and again
     /// after a restart).
     Window,
+    /// The confirm window as well, armed by the binary that started the
+    /// update once the new one said it is done (kept_in_hand): the new
+    /// binary armed Window with its own code, and a timer that never fires
+    /// would keep an update that nobody confirms.
+    Started,
 }
 
 fn timer_unit(id: &str, t: Timer) -> String {
     match t {
         Timer::Window => format!("{TIMER_PREFIX}{id}"),
         Timer::Apply => format!("{TIMER_PREFIX}{id}{APPLY_SUFFIX}"),
+        Timer::Started => format!("{TIMER_PREFIX}{id}{STARTED_SUFFIX}"),
     }
 }
 
@@ -1274,7 +1292,7 @@ fn arm_args(m: &Machine, t: Timer, id: &str, serial: u64, secs: i64, boot: bool)
         args.push(format!("--timer-property={p}"));
     }
     let (what, flag) = match t {
-        Timer::Window => ("it is confirmed", ""),
+        Timer::Window | Timer::Started => ("it is confirmed", ""),
         Timer::Apply => ("its apply finishes", " --applying"),
     };
     args.push(format!("--description=Revert dryserver release {serial} unless {what}"));
@@ -1334,9 +1352,9 @@ fn arm_retry(m: &Machine, ctx: &Ctx, p: &Pending) -> Result<()> {
     m.cmd(ctx, "systemd-run", &args.iter().map(String::as_str).collect::<Vec<_>>()).map(drop)
 }
 
-/// Stops an update's revert timers, both of them.
+/// Stops an update's revert timers, all of them.
 fn disarm(m: &Machine, ctx: &Ctx, id: &str) {
-    for t in [Timer::Window, Timer::Apply] {
+    for t in [Timer::Window, Timer::Apply, Timer::Started] {
         stop_timer(m, ctx, id, t);
     }
 }
@@ -1865,6 +1883,7 @@ fn steps(
 ) -> std::result::Result<(), (Undo, Error)> {
     let back = |e: Error| (Undo::Revert, e);
     let rel = &i.rel;
+    let before = Before { pinned: osupdate::pinned_date(&fsx::read_or_empty(m.path(osupdate::MIRRORLIST))), window: p.window };
     check_new_binary(m, ctx, &i.staged, rel, out).map_err(back)?;
     let new = m.path(NEW_BIN);
     let handover = handover_of(m, ctx, &new).min(HANDOVER);
@@ -1912,13 +1931,102 @@ fn steps(
     };
     let _ = out.write_all(o.as_bytes());
     let Some(mut w) = work else {
-        return res.map_err(|e| back(e.wrap("the new dryserver could not finish the update")));
+        res.map_err(|e| back(e.wrap("the new dryserver could not finish the update")))?;
+        return kept_in_hand(m, i, &p.id, &before, true).map_err(back);
     };
     res.map_err(|e| back(e.wrap("the new dryserver could not take over the system files")))?;
     let role = role_of(m).map_err(back)?;
     let rebooting = install_work(m, ctx, &p.id, &i.env, rel, role, &mut w, lock_fd, &log, out).map_err(back)?;
+    kept_in_hand(m, i, &p.id, &before, false).map_err(back)?;
     applied(m, ctx, rel.serial, w.arch.as_ref(), rebooting, &p.id, out);
     Ok(())
+}
+
+/// What the machine was like when the apply began, for kept_in_hand: the
+/// day the mirrorlist pinned, and the confirm window asked for.
+struct Before {
+    pinned: Option<String>,
+    window: i64,
+}
+
+/// What the binary that started an update checks and keeps in its own
+/// hands once the new binary said the update is done (its `update
+/// activate` exited 0), whatever that binary's code did. Anything that
+/// fails here reverts the update at once:
+/// - the update is what the new binary says (applied_problem);
+/// - the boot unit is this binary's own (keep_boot_guard): the new one
+///   wrote its own with the system files, and one that does not start
+///   would keep the update across a restart. The next update installs
+///   the text of the binary that starts it (ensure_boot_guard), and the
+///   unit runs only while an update waits;
+/// - a confirm window timer of its own (Timer::Started), armed by this
+///   code (new_armed: the new binary armed Window with its code): one that
+///   never fires would keep an update nobody confirms. Not when the machine
+///   reboots now: no timer outlives that, and the boot unit, which runs
+///   this binary first, arms the window again.
+///
+/// Its own context: the apply's may be stopped by then (the shutdown of
+/// the reboot the new binary started waits for this process), and this is
+/// short.
+fn kept_in_hand(m: &Machine, i: &Intake, id: &str, before: &Before, new_armed: bool) -> Result<()> {
+    let ctx = Ctx::new().with_timeout(REVERT_TIME);
+    let p = current(m, id)?;
+    if let Some(why) = applied_problem(m, i, &p, before) {
+        bail!("the new dryserver said the update is done, but {why}");
+    }
+    keep_boot_guard(m, &ctx, p.reboot)?;
+    if new_armed && !p.reboot {
+        let secs = (p.deadline - m.now()).clamp(1, before.window);
+        arm(m, &ctx, Timer::Started, id, p.serial, secs, false)
+            .map_err(|e| e.wrap("cannot arm the confirm window's timer of the binary that started the update"))?;
+    }
+    Ok(())
+}
+
+/// What is not as an update that went well leaves it, if anything: the
+/// record armed, the release's binary in place and recorded as installed,
+/// the release's k3s in place, and the mirrorlist on the release's day
+/// when the update brought packages (as it was otherwise).
+fn applied_problem(m: &Machine, i: &Intake, p: &Pending, before: &Before) -> Option<String> {
+    let rel = &i.rel;
+    if p.stage != STAGE_ARMED {
+        return Some(format!("its record is at stage {:?}, not {STAGE_ARMED}", p.stage.chars().take(40).collect::<String>()));
+    }
+    let sha = |path: &str, max: u64| release::hash_file(&m.path(path), max).ok().map(|(h, _)| h);
+    if sha(SERVER_BIN, release::MAX_BINARY).as_deref() != Some(rel.dryserver.sha256.as_str()) {
+        return Some(format!("{SERVER_BIN} is not the binary of release {}", rel.serial));
+    }
+    if !matches!(load_installed(m), Ok(Some((env, _))) if env.doc == i.env.doc) {
+        return Some(format!("{INSTALLED} does not record release {}", rel.serial));
+    }
+    if sha(K3S_BIN, osupdate::MAX_K3S).as_deref() != Some(rel.k3s.sha256.as_str()) {
+        return Some(format!("{K3S_BIN} is not the release's k3s {}", rel.k3s.version));
+    }
+    let pinned = osupdate::pinned_date(&fsx::read_or_empty(m.path(osupdate::MIRRORLIST)));
+    let want = if p.arch_date.is_empty() { before.pinned.clone() } else { Some(rel.arch_date.clone()) };
+    if pinned != want {
+        let day = |d: &Option<String>| d.clone().unwrap_or_else(|| "no day".into());
+        return Some(format!("{} pins {} where the update leaves {}", osupdate::MIRRORLIST, day(&pinned), day(&want)));
+    }
+    None
+}
+
+/// Puts this binary's boot unit back when the new binary's update wrote
+/// another one (see kept_in_hand). While the machine goes down for the
+/// reboot the update started, systemd may not reload: the file is what the
+/// next boot reads.
+fn keep_boot_guard(m: &Machine, ctx: &Ctx, rebooting: bool) -> Result<()> {
+    let p = m.path(GUARD_UNIT_PATH);
+    if fsx::read(&p).ok().as_deref() == Some(GUARD_UNIT_TEXT.as_bytes()) {
+        return Ok(());
+    }
+    write_atomic(m, &p, GUARD_UNIT_TEXT.as_bytes(), 0o644, None)
+        .map_err(|e| e.wrap("cannot put back the boot unit of the binary that started the update"))?;
+    let reloaded = m.cmd(ctx, "systemctl", &["daemon-reload"]).and_then(|_| m.cmd(ctx, "systemctl", &["enable", "--quiet", GUARD_UNIT]));
+    match reloaded {
+        Err(e) if !rebooting => Err(e.wrap("the boot unit of the binary that started the update is back, but systemd did not take it")),
+        _ => Ok(()),
+    }
 }
 
 /// `update apply --detach`: starts the apply in a transient service of its
@@ -2158,8 +2266,9 @@ fn install_work(
     p.reboot = reboot;
     save_pending(m, &p)?;
     m.at("armed")?;
-    // The apply's own timer has nothing left to do (and would do nothing).
-    stop_timer(m, ctx, id, Timer::Apply);
+    // The apply's own timer stays: it was armed by the binary that started
+    // the update, whose code reverts one that is not confirmed by its
+    // deadline when the timer fires (guard_timer). The confirm stops it.
     Ok(reboot)
 }
 
@@ -2600,17 +2709,20 @@ pub fn confirm(m: &Machine, ctx: &Ctx, serial: Option<u64>, now: i64, out: &mut 
 /// its window. The monotonic timer decides, not the wall clock, so a clock
 /// that jumped back does not keep an update.
 ///
-/// applying: the timer armed when the apply started (Timer::Apply). An
-/// apply that still runs holds the lock: it is waited for, however long
-/// pacman takes, and once it is done, one that finished (armed, with the
-/// confirm window's own timer) is left alone. One that stopped part way
-/// is reverted; one that stopped while it loaded the packages changed
-/// nothing but the mirrorlist, and is postponed.
+/// applying: the timer armed when the apply started (Timer::Apply), by
+/// the binary that started it. An apply that still runs holds the lock: it
+/// is waited for, however long pacman takes, and once it is done, one that
+/// finished (armed, with the confirm window's own timer) is left alone
+/// while its deadline is ahead; past it, it is reverted: the window's timer
+/// was armed by the new binary's code, and may never fire. One that
+/// stopped part way is reverted; one that stopped while it loaded the
+/// packages changed nothing but the mirrorlist, and is postponed.
 pub fn guard_timer(m: &Machine, ctx: &Ctx, id: &str, applying: bool, now: i64, out: &mut dyn Write) -> Result<()> {
     ensure_dirs(m)?;
     let wait = if applying { APPLY_GUARD_LOCK_WAIT } else { GUARD_LOCK_WAIT };
     let _lock = lock_wait(m, ctx, wait)?;
-    let now = if applying { m.now() } else { now };
+    // The wait for the lock may have taken hours.
+    let now = if applying { now.max(m.now()) } else { now };
     let Some(p) = load_pending(m)? else {
         say(out, "no update waits for confirm, nothing to revert");
         return Ok(());
@@ -2625,6 +2737,10 @@ pub fn guard_timer(m: &Machine, ctx: &Ctx, id: &str, applying: bool, now: i64, o
         return revert(m, &rctx, p, &why, false, now, out, Undo::Revert);
     }
     match p.stage.as_str() {
+        STAGE_ARMED if now >= p.deadline => {
+            let why = format!("it was not confirmed by {}", when(p.deadline));
+            revert(m, &rctx, p, &why, false, now, out, Undo::Revert)
+        }
         STAGE_ARMED => {
             say(out, format!("release {} finished applying; its confirm window has a timer of its own", p.serial));
             Ok(())
@@ -3147,6 +3263,10 @@ mod tests {
         old_os_code_broken: bool,
         /// update prepare dies without saying why.
         prepare_dies: bool,
+        /// update activate (a new binary with a bug) exits 0 but leaves
+        /// this wrong: "stage", "binary", "installed", "k3s", "mirrorlist",
+        /// or "guard unit" (it wrote a boot unit of its own).
+        activate_leaves: Option<&'static str>,
     }
 
     struct Fake {
@@ -3336,6 +3456,27 @@ mod tests {
                     let r = activate(&m, ctx, id, &mut o);
                     if s.activate_dies_late {
                         return fail("signal 6 (aborted)");
+                    }
+                    if r.is_ok() {
+                        let write = |p: &str, b: &[u8]| {
+                            let _ = fs::remove_file(fsx::under(&self.root, p));
+                            put(&self.root, p, b);
+                        };
+                        match s.activate_leaves {
+                            Some("stage") => {
+                                let mut p = load_pending(&m).unwrap().unwrap();
+                                p.stage = STAGE_INSTALLING.into();
+                                save_pending(&m, &p).unwrap();
+                            }
+                            Some("binary") => write(SERVER_BIN, b"\x7fELF a binary nobody signed"),
+                            Some("installed") => {
+                                let _ = fs::remove_file(fsx::under(&self.root, INSTALLED));
+                            }
+                            Some("k3s") => write(K3S_BIN, b"#!k3s version=v1.37.9+k3s1 good, nobody's"),
+                            Some("mirrorlist") => write(osupdate::MIRRORLIST, osupdate::mirrorlist("2026/11/22").unwrap().as_bytes()),
+                            Some("guard unit") => write(GUARD_UNIT_PATH, b"[Unit]\nDescription=a boot unit that reverts nothing\n"),
+                            _ => {}
+                        }
                     }
                     (String::from_utf8_lossy(&o).into_owned(), r)
                 }
@@ -3647,10 +3788,14 @@ mod tests {
         }
         let id = &p.id;
         let timers: Vec<String> = f.ran().into_iter().filter(|c| c.starts_with("systemd-run")).collect();
-        assert_eq!(timers.len(), 2, "{timers:?}");
+        assert_eq!(timers.len(), 3, "{timers:?}");
         // The first covers the apply, however long it takes; the second is
-        // the confirm window, armed once the apply is done.
-        let (during, window) = (&timers[0], &timers[1]);
+        // the confirm window, armed by the new binary once the apply is
+        // done; the third the same, armed by the binary that started it.
+        let (during, window, started) = (&timers[0], &timers[1], &timers[2]);
+        assert!(started.starts_with(&format!("systemd-run --unit=dryserver-update-revert-{id}-started --on-active=600s")), "{started}");
+        assert!(started.ends_with(&format!("guard --id {id}")), "{started}");
+        assert_eq!(f.who_ran("systemd-run --unit=dryserver-update-revert-"), ["old", "new", "old"]);
         assert!(
             during.starts_with(&format!("systemd-run --unit=dryserver-update-revert-{id}-apply --on-active={APPLY_TIME}s")),
             "{during}"
@@ -3660,10 +3805,10 @@ mod tests {
         let at = |c: &str| f.ran().iter().position(|r| r == c).unwrap();
         assert!(f.index("/usr/local/bin/dryserver update activate").unwrap() < at(window), "the window starts after the apply");
         assert!(
-            f.has(&format!("systemctl stop dryserver-update-revert-{id}-apply.timer")),
-            "the apply's timer goes once the window's runs"
+            !f.has(&format!("systemctl stop dryserver-update-revert-{id}-apply.timer")),
+            "the apply's timer stays: its guard reverts an update past its deadline"
         );
-        for timer in [during, window] {
+        for timer in [during, window, started] {
             // While the machine runs, systemd-run waits until the timer is
             // active: an apply that cannot arm it changes nothing.
             assert!(!timer.contains("--no-block"), "{timer}");
@@ -3691,7 +3836,9 @@ mod tests {
         assert!(lab.pending().is_none());
         assert!(!lab.p(&format!("{BACKUPS}/{id}")).exists(), "the backups outlived the confirm");
         assert!(f.has("/usr/local/bin/dryserver selfcheck"), "{:?}", f.ran());
-        assert!(f.has(&format!("systemctl stop dryserver-update-revert-{id}.timer")), "{:?}", f.ran());
+        for t in ["", "-apply", "-started"] {
+            assert!(f.has(&format!("systemctl stop dryserver-update-revert-{id}{t}.timer")), "{:?}", f.ran());
+        }
         assert_eq!(load_installed(&lab.m()).unwrap().unwrap().1.serial, 7);
         assert_eq!((lab.last().action.as_str(), lab.last().ok), ("confirmed", true));
         lab.assert_tidy("confirmed");
@@ -5159,6 +5306,8 @@ mod tests {
         let reboot = lab.first("systemctl --no-block reboot");
         assert!(lab.first(&format!("systemd-run --unit=dryserver-update-revert-{} ", p.id)) < reboot, "armed before the reboot");
         assert_eq!(lab.fake.ran().iter().filter(|c| c.contains("reboot")).count(), 1);
+        // No timer outlives the reboot; the boot unit arms the window again.
+        assert!(!lab.fake.has(&format!("systemd-run --unit=dryserver-update-revert-{}-started", p.id)));
         // The restart: the boot unit carries the update on.
         lab.write("/proc/sys/kernel/osrelease", b"6.12.4-arch1-1\n", 0o644);
         lab.write("/proc/stat", format!("cpu  1 2 3\nbtime {}\n", now() + 60).as_bytes(), 0o644);
@@ -5580,5 +5729,64 @@ mod tests {
         // Started by hand, or by anything but an apply: refused.
         let e = prepare(&lab.m(), &Ctx::new(), "0123456789abcdef", &mut Vec::new()).unwrap_err().to_string();
         assert!(e.contains("runs only inside it"), "{e}");
+    }
+
+    #[test]
+    fn review_the_old_binarys_timer_reverts_an_armed_update_past_its_deadline() {
+        // The new binary armed the window's timer with its own code, and
+        // that one may never fire: the apply's timer, armed by the binary
+        // that started the update, stays and reverts one past its deadline.
+        let lab = Lab::new();
+        lab.apply(&rel(7, NEW)).unwrap();
+        let p = lab.pending().unwrap();
+        guard_timer(&lab.m(), &Ctx::new(), &p.id, true, p.deadline - 1, &mut Vec::new()).unwrap();
+        assert!(lab.pending().is_some(), "within the window the window's timers decide");
+        guard_timer(&lab.m(), &Ctx::new(), &p.id, true, p.deadline + 3 * 3600, &mut Vec::new()).unwrap();
+        assert!(lab.pending().is_none(), "only the new binary's own timer would revert it");
+        lab.assert_old("reverted by the apply's timer");
+        assert_eq!(lab.last().action, "reverted");
+    }
+
+    #[test]
+    fn review_the_binary_that_started_the_update_checks_what_the_new_one_did() {
+        // A new binary whose activate exits 0 while the update is not what
+        // it says: the binary that started it reverts at once.
+        for (leaves, said) in [
+            ("stage", "not armed"),
+            ("binary", "/usr/local/bin/dryserver is not the binary of release 7"),
+            ("installed", "installed.json does not record release 7"),
+            ("k3s", "/usr/local/bin/k3s is not the release's k3s v1.37.2+k3s1"),
+            ("mirrorlist", "pins 2026/11/22 where the update leaves 2026/11/19"),
+        ] {
+            let lab = Lab::new();
+            lab.script(|s| s.activate_leaves = Some(leaves));
+            let e = lab.apply(&rel(7, NEW)).unwrap_err().to_string();
+            assert!(e.contains("the new dryserver said the update is done, but") && e.contains(said), "{leaves}: {e}");
+            assert_eq!(lab.bytes(SERVER_BIN), OLD, "{leaves}");
+            assert!(lab.pending().is_none() && load_installed(&lab.m()).unwrap().is_none(), "{leaves}");
+            assert_eq!(lab.last().action, "reverted", "{leaves}");
+        }
+        // A release with packages: the mirrorlist is on its day.
+        let lab = Lab::new();
+        lab.apply_os(&os_rel(8, K3S_NEW, NEXT_DAY), Some(K3S_NEW)).unwrap();
+        assert_eq!(lab.pending().unwrap().stage, STAGE_ARMED);
+    }
+
+    #[test]
+    fn review_a_boot_unit_the_new_binary_wrote_is_put_back() {
+        // A new binary that renders a boot unit which reverts nothing: the
+        // binary that started the update puts its own back before the
+        // update can be kept across a restart.
+        let lab = Lab::new();
+        lab.script(|s| s.activate_leaves = Some("guard unit"));
+        lab.apply(&rel(7, NEW)).unwrap();
+        assert_eq!(lab.get(GUARD_UNIT_PATH), GUARD_UNIT_TEXT);
+        let reloads: Vec<&str> =
+            lab.fake.by.lock().unwrap().iter().filter(|(_, c)| c == "systemctl daemon-reload").map(|(w, _)| *w).collect();
+        assert_eq!(reloads.last(), Some(&"old"), "systemd reads it again");
+        assert!(lab.fake.has("systemctl enable --quiet dryserver-update-guard.service"));
+        // A restart now runs it: the previous binary goes first.
+        guard_boot(&lab.m(), &Ctx::new(), now() + 30, &mut Vec::new()).unwrap();
+        assert_eq!(lab.pending().unwrap().boots, 1);
     }
 }

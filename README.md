@@ -875,7 +875,11 @@ release that brings it. Step by step:
    the machine puts back the old binary, the files, the mirrorlist and the
    old k3s by itself. That needs no network and no coordinator. The
    packages stay where they are: the way back for them is a release signed
-   with `-rollback` and the older `-arch-date`.
+   with `-rollback` and the older `-arch-date`. The old dryserver does not
+   take the new one's word that it is done: it checks the update is in
+   place (else it goes back at once), and the timers and the boot unit
+   that revert it are its own, so a new dryserver with a bug there cannot
+   keep an update nobody confirms.
 9. **A reboot**, when a new kernel or glibc, systemd and the like came,
    pacman finished cleanly and the boot images are current, and the machine
    can come back by itself (a disk that asks for its passphrase at boot
