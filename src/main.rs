@@ -77,8 +77,9 @@ commands:
                       -name a,b cuts those members instead, -lift undoes,
                       -status shows
 
-  approve             approve or reject machines, remove members; every
-                      decision is signed with secrets/signing_ed25519
+  approve             approve or reject machines, remove members, publish
+                      an update (u); every decision is signed with
+                      secrets/signing_ed25519
   apps                what runs on your cluster: start an app from a
                       container image, remove one
   backup-pull         copy the coordinator's newest backups into
@@ -185,6 +186,7 @@ fn finish(res: Result<()>) -> ExitCode {
 
 /// Parses Go-style flags: -name value, --name=value, -bool. Unknown flags
 /// and stray arguments print the command's usage and exit with status 2.
+#[derive(Clone)]
 struct Flags {
     values: HashMap<&'static str, String>,
 }
@@ -261,7 +263,7 @@ fn run_app() -> Result<()> {
         // the menu again.
         let f = Flags::parse("approve", &[], DESKTOP_FLAGS);
         let res = if app.open_machines {
-            desktop_admin(&f, "approve").and_then(|(a, _)| tui::run(&mut tui::admin::Screen::new(a)))
+            machines_screen(&f)
         } else if let Some(place) = app.open_cluster {
             cluster_screens(&f, place)
         } else {
@@ -868,8 +870,36 @@ fn run_approve(args: &[String]) -> Result<()> {
         // the computer that holds the signing key can.
         bail!("approve runs on your own computer, where the signing key is:\n  ./dryserver approve");
     }
-    let (a, _) = desktop_admin(&f, "approve")?;
-    tui::run(&mut tui::admin::Screen::new(a))
+    machines_screen(&f)
+}
+
+/// The approve screen, which also publishes releases and resumes a
+/// stopped rollout.
+fn machines_screen(f: &Flags) -> Result<()> {
+    let (a, _) = desktop_admin(f, "approve")?;
+    let key = paths().secrets.join(iso::SIGNING_KEY_NAME);
+    if publish::has_passphrase(&key) {
+        // ssh-keygen would ask for it on the terminal the screen draws on.
+        bail!(
+            "{k} has a passphrase, and the approve screen signs every few seconds: it cannot ask for it.\n\
+             In a terminal, ./dryserver release publish, status and resume ask for it at each signature.\n\
+             Or remove the passphrase: ssh-keygen -p -f {k}",
+            k = key.display()
+        );
+    }
+    let again = f.clone();
+    let publisher = tui::admin::Publisher {
+        admin: Arc::new(move || desktop_admin(&again, "approve").map(|(a, _)| a)),
+        days: Arc::new(publish::Archive::new()),
+        parts: publish::Parts::this_program(&paths().out_dir, None)?,
+        today: || chrono::Utc::now().date_naive(),
+    };
+    let mut s = tui::admin::Screen::new(a).with_publisher(publisher);
+    let res = tui::run(&mut s);
+    if let Some(m) = s.after() {
+        eprintln!("{m}");
+    }
+    res
 }
 
 const RELEASE_USAGE: &str = r#"usage: dryserver release publish|status|resume [flags]

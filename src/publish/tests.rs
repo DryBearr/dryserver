@@ -743,6 +743,11 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
     ] {
         assert!(text.contains(want), "{want}:\n{text}");
     }
+    let keys = stopped_keys(&v.rollout).unwrap();
+    assert!(
+        keys.contains("Press R to resume (the coordinator passes node-b over") && keys.contains("u to publish a fixed release"),
+        "{keys}"
+    );
 
     // Running: no advice. A server whose turn it is says so.
     let mut running = v.clone();
@@ -751,7 +756,7 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
     running.rollout.turn = Some(Turn { host: 4, name: "node-c".into(), since: now - 60, ready: true });
     running.members[3].0.last_seen = Time(chrono::DateTime::from_timestamp(now - 10, 0).unwrap());
     let text = status_lines(&running, 0).join("\n");
-    assert!(!text.contains("The rollout is stopped"), "{text}");
+    assert!(!text.contains("The rollout is stopped") && stopped_keys(&running.rollout).is_none(), "{text}");
     assert!(text.contains("  node-c         server       its turn: updating"), "{text}");
 
     // Nothing published yet.

@@ -1,14 +1,27 @@
 //! The admin's screen for join requests and members, on the desktop.
 //! Every decision made here is signed before it reaches the coordinator.
+//!
+//! Updates are published here too (u): the admin picks notes, urgent and
+//! rollback, the release is checked and shown with what it changes, and y
+//! signs and sends it. Checking and sending run on the screen's worker
+//! thread, so the screen keeps drawing while a binary of tens of MiB goes
+//! to the coordinator. R resumes a stopped rollout, after asking.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::{Doc, Emit, Event, Flow, Key, Model, dim, err, ok, sel, theme};
+use chrono::NaiveDate;
+
+use super::worker::{Waiting, Worker};
+use super::{Doc, Emit, Event, Flow, Key, Model, TextInput, dim, err, ok, sel, theme};
 use crate::admin::{Admin, NewCoordinator, View};
+use crate::ctx::Ctx;
 use crate::err::{Error, Kind, Result};
 use crate::gotime::{Time, duration_string, round_ms};
 use crate::mesh;
+use crate::publish::{self, Choice, Days, Parts, Plan};
 use crate::registry::Member;
+use crate::release::{self, Release};
 use crate::report::{self, Concern, percent, short_age};
 use crate::rollout;
 
@@ -204,7 +217,85 @@ fn details(m: &Member, names: &dyn Fn(u32) -> String, now: Time) -> Doc {
     d
 }
 
-pub enum Msg {}
+pub enum Msg {
+    /// The release to publish, checked, or why not.
+    Planned(Result<Box<Plan>>),
+    Published(Result<Release>),
+}
+
+/// What the screen needs to publish releases. Each job makes its own
+/// link to the coordinator on the worker's thread.
+pub struct Publisher {
+    /// A new Admin with this desktop's keys.
+    pub admin: Arc<dyn Fn() -> Result<Admin> + Send + Sync>,
+    pub days: Arc<dyn Days>,
+    /// This program and the k3s it pins.
+    pub parts: Parts,
+    /// The date in UTC.
+    pub today: fn() -> NaiveDate,
+}
+
+enum Job {
+    Plan(Choice),
+    Publish(Box<Plan>),
+}
+
+const CHECKING: &str = "checking the release: binary, k3s file, Arch archive, coordinator";
+
+impl Job {
+    fn label(&self) -> String {
+        match self {
+            Job::Plan(_) => CHECKING.into(),
+            Job::Publish(p) => format!("publishing release {}", p.release.serial),
+        }
+    }
+}
+
+fn work(ctx: &Ctx, p: &Publisher, job: Job) -> Msg {
+    match job {
+        Job::Plan(c) => Msg::Planned((|| {
+            let mut a = (p.admin)()?;
+            let v = a.load()?;
+            publish::plan(ctx, &a, &v, p.days.as_ref(), &p.parts, &c, (p.today)()).map(Box::new)
+        })()),
+        Job::Publish(plan) => Msg::Published((|| {
+            let mut a = (p.admin)()?;
+            publish::publish(&mut a, &plan)
+        })()),
+    }
+}
+
+/// The admin's choices for a new release, before anything is checked.
+struct Form {
+    notes: TextInput,
+    urgent: bool,
+    rollback: bool,
+    /// 0 the notes, 1 urgent, 2 rollback.
+    focus: usize,
+}
+
+impl Form {
+    fn new(c: &Choice) -> Form {
+        let mut notes = TextInput::new(release::MAX_NOTES);
+        notes.set_value(&c.notes);
+        notes.placeholder = "what it is for, like: fixes the join timeout".into();
+        notes.focus();
+        Form { notes, urgent: c.urgent, rollback: c.rollback, focus: 0 }
+    }
+
+    fn choice(&self) -> Choice {
+        Choice { notes: self.notes.value.trim().to_string(), urgent: self.urgent, rollback: self.rollback, ..Choice::default() }
+    }
+
+    fn move_focus(&mut self, by: usize) {
+        self.focus = (self.focus + by) % 3;
+        if self.focus == 0 {
+            self.notes.focus();
+        } else {
+            self.notes.blur();
+        }
+    }
+}
 
 /// "42s ago", "3m0s ago", "never".
 fn ago(t: Time, now: Time) -> String {
@@ -235,6 +326,8 @@ enum Action {
     /// A reinstalled coordinator takes the old one's place.
     NewCoordinator(NewCoordinator),
     Resend,
+    /// Let a stopped rollout go on.
+    Resume,
 }
 
 pub struct Screen {
@@ -250,6 +343,20 @@ pub struct Screen {
     last_load: Option<Instant>,
     /// Everything the selected member reports, under the list.
     details: bool,
+    /// Publishing; None: this screen cannot (u says so).
+    publisher: Option<Arc<Publisher>>,
+    worker: Option<Worker<Job>>,
+    waiting: Waiting,
+    /// The choices for a new release, while the admin makes them; the
+    /// last ones are kept for the next try.
+    form: Option<Form>,
+    choice: Choice,
+    /// A checked release waiting for "y".
+    plan: Option<Box<Plan>>,
+    /// q was pressed once while a publish ran.
+    quit_armed: bool,
+    /// What to tell the admin after the screen closed.
+    after: Option<String>,
 }
 
 impl Screen {
@@ -266,7 +373,147 @@ impl Screen {
             notice: String::new(),
             last_load: None,
             details: false,
+            publisher: None,
+            worker: None,
+            waiting: Waiting::default(),
+            form: None,
+            choice: Choice::default(),
+            plan: None,
+            quit_armed: false,
+            after: None,
         }
+    }
+
+    pub fn with_publisher(mut self, p: Publisher) -> Screen {
+        self.publisher = Some(Arc::new(p));
+        self
+    }
+
+    /// What the admin should know once the screen is closed: a publish
+    /// it cut off.
+    pub fn after(&self) -> Option<&str> {
+        self.after.as_deref()
+    }
+
+    fn start(&mut self, emit: &Emit<Msg>) {
+        let Some(p) = self.publisher.clone() else { return };
+        let emit = emit.clone();
+        self.worker = Some(Worker::start(move |ctx, job| emit(work(ctx, &p, job))));
+    }
+
+    fn send(&mut self, job: Job) {
+        let (label, change) = (job.label(), matches!(job, Job::Publish(_)));
+        if self.worker.as_ref().is_some_and(|w| w.send(job)) {
+            self.waiting.push(label, change);
+        } else {
+            self.notice = "The background worker stopped; quit and open the screen again.".into();
+        }
+    }
+
+    fn answer(&mut self, m: Msg) {
+        self.waiting.pop();
+        match m {
+            Msg::Planned(Ok(p)) => {
+                self.notice.clear();
+                self.plan = Some(p);
+            }
+            Msg::Planned(Err(e)) => self.notice = format!("Not published, nothing was signed: {e}"),
+            Msg::Published(res) => {
+                self.quit_armed = false;
+                self.notice = match res {
+                    Ok(r) => {
+                        // The next release starts from fresh choices.
+                        self.choice = Choice::default();
+                        format!(
+                            "Release {} is on the coordinator. It updates itself first, then one server at a time; \
+                             Updates below shows how it goes.",
+                            r.serial
+                        )
+                    }
+                    Err(e) => format!("Not published: {e}"),
+                };
+                self.load();
+            }
+        }
+    }
+
+    /// u: the form for a new release, unless one is on its way.
+    fn open_form(&mut self) {
+        if self.publisher.is_none() {
+            self.notice = "This screen cannot publish; use ./dryserver release publish".into();
+        } else if let Some(what) = self.waiting.change() {
+            self.notice = format!("Still {what}: one release at a time.");
+        } else if self.waiting.has(CHECKING) {
+            self.notice = "Already checking a release: wait for it.".into();
+        } else {
+            self.notice.clear();
+            self.form = Some(Form::new(&self.choice));
+        }
+    }
+
+    fn form_key(&mut self, mut f: Form, k: Key) {
+        match k {
+            Key::Esc => {
+                self.choice = f.choice();
+                self.notice = "Nothing signed.".into();
+                return;
+            }
+            Key::Enter => {
+                self.choice = f.choice();
+                self.send(Job::Plan(self.choice.clone()));
+                return;
+            }
+            Key::Tab | Key::Down => f.move_focus(1),
+            Key::BackTab | Key::Up => f.move_focus(2),
+            Key::Char(' ') if f.focus == 1 => f.urgent = !f.urgent,
+            Key::Char(' ') if f.focus == 2 => f.rollback = !f.rollback,
+            k if f.focus == 0 => {
+                f.notes.handle(&k);
+            }
+            _ => {}
+        }
+        self.form = Some(f);
+    }
+
+    /// The form, in place of the screen.
+    fn form_view(&self, f: &Form) -> Doc {
+        let mut b = Doc::new();
+        let version = self.publisher.as_ref().map(|p| p.parts.version.clone()).unwrap_or_default();
+        b.s("Publish an update\n");
+        let intro = format!(
+            "A release of this dryserver ({version}) for every machine, with the k3s it pins and the newest Arch \
+             snapshot day. Nothing is signed before you have seen what changes."
+        );
+        b.add(dim(super::wrap(&format!("  {intro}"), 78))).nl().nl();
+        let label = |b: &mut Doc, i: usize, name: &str| {
+            if f.focus == i {
+                b.add(sel(format!("> {name:<9} ")));
+            } else {
+                b.s(format!("  {name:<9} "));
+            }
+        };
+        label(&mut b, 0, "notes");
+        b.append(f.notes.view()).nl();
+        let check = |on: bool| if on { "[x]" } else { "[ ]" };
+        label(&mut b, 1, "urgent");
+        b.s(format!("{} ", check(f.urgent)))
+            .add(dim(format!("roll out at once, not only in the window {}", rollout::window_text(rollout::WINDOW))))
+            .nl();
+        label(&mut b, 2, "rollback");
+        b.s(format!("{} ", check(f.rollback))).add(dim("allow older versions than the swarm runs (the way back)")).nl();
+        b.nl().append(theme::keys(&[("tab", "next"), ("space", "switch"), ("enter", "see what changes"), ("esc", "cancel")])).nl();
+        b
+    }
+
+    /// The checked release, in place of the screen, waiting for y.
+    fn plan_view(&self, p: &Plan) -> Doc {
+        let mut b = Doc::new();
+        b.add(err("Sign and send this release to the coordinator?")).nl();
+        for line in p.lines() {
+            b.s(super::wrap(&format!("  {line}"), 78)).nl();
+        }
+        b.nl().append(theme::keys(&[("y", "sign and send it"), ("other keys", "nothing is signed")])).nl();
+        b
     }
 
     pub fn load(&mut self) {
@@ -294,9 +541,24 @@ impl Screen {
                 format!("{} is your coordinator now, with every machine you signed before. Let the servers follow it: ./dryserver quarantine-all -lift", c.name)
             }),
             Action::Resend => self.admin.resend().map(|v| format!("Signed list sent again as version {v}.")),
+            Action::Resume => publish::resume(&mut self.admin)
+                .map(|what| format!("Resumed: the coordinator {what}, at its next sync (within a minute)."))
+                .map_err(|e| e.wrap("not resumed")),
         };
         self.notice = res.unwrap_or_else(|e| format!("Failed: {e}"));
         self.load();
+    }
+
+    /// R: asks first, saying what resuming does, or why there is nothing
+    /// to resume.
+    fn ask_resume(&mut self) {
+        match publish::resume_does(&self.view.rollout) {
+            Ok(what) => {
+                let q = format!("Resume the rollout of release {}? The coordinator then {what}.", self.view.rollout.serial);
+                self.confirm = Some((format!("{q} y to confirm"), Action::Resume));
+            }
+            Err(e) => self.notice = format!("Nothing to resume: {e}."),
+        }
     }
 
     /// Runs a right away, or asks first when it would also drop members
@@ -318,6 +580,35 @@ impl Screen {
     }
 
     pub fn key(&mut self, k: Key) -> Flow {
+        let flow = self.key_inner(k);
+        if flow == Flow::Quit
+            && let Some(what) = self.waiting.change()
+        {
+            self.after = Some(format!(
+                "The screen closed while {what}. The upload stopped half way, and a cut-off upload is not taken: \
+                 ./dryserver release status shows whether it arrived. Publish again if not (it gets a new serial)."
+            ));
+        }
+        flow
+    }
+
+    fn key_inner(&mut self, k: Key) -> Flow {
+        if k == Key::Ctrl('c') {
+            return Flow::Quit;
+        }
+        if let Some(p) = self.plan.take() {
+            if k == Key::Char('y') {
+                self.notice.clear();
+                self.send(Job::Publish(p));
+            } else {
+                self.notice = "Nothing signed.".into();
+            }
+            return Flow::Continue;
+        }
+        if let Some(f) = self.form.take() {
+            self.form_key(f, k);
+            return Flow::Continue;
+        }
         if let Some((_, a)) = self.confirm.take() {
             if k == Key::Char('y') {
                 self.run(a);
@@ -330,9 +621,18 @@ impl Screen {
         let members = self.view.members.clone();
         let n = pending.len() + members.len();
         let member = self.cursor.checked_sub(pending.len()).and_then(|i| members.get(i)).cloned();
+        let armed = std::mem::take(&mut self.quit_armed);
         match k {
             Key::Esc if self.details => self.details = false,
-            Key::Char('q') | Key::Esc | Key::Ctrl('c') => return Flow::Quit,
+            Key::Char('q') | Key::Esc => match self.waiting.change() {
+                Some(what) if !armed => {
+                    self.notice = format!("Still {what}. Press q again to quit anyway: the upload stops half way.");
+                    self.quit_armed = true;
+                }
+                _ => return Flow::Quit,
+            },
+            Key::Char('u') => self.open_form(),
+            Key::Char('R') => self.ask_resume(),
             Key::Char('i') => self.details = !self.details,
             Key::Up | Key::Char('k') => self.cursor = self.cursor.saturating_sub(1),
             Key::Down | Key::Char('j') => self.cursor = (self.cursor + 1).min(n.saturating_sub(1)),
@@ -399,16 +699,24 @@ impl Screen {
 impl Model for Screen {
     type Msg = Msg;
 
-    fn init(&mut self, _: &Emit<Msg>) {
+    fn init(&mut self, emit: &Emit<Msg>) {
+        self.start(emit);
         self.load();
     }
 
     fn update(&mut self, ev: Event<Msg>, _: &Emit<Msg>) -> Flow {
         match ev {
             Event::Key(k) => self.key(k),
+            Event::Msg(m) => {
+                self.answer(m);
+                Flow::Continue
+            }
             Event::Tick => {
                 let wait = if self.err.is_some() { RETRY } else { REFRESH };
-                if self.confirm.is_none() && self.last_load.is_none_or(|t| t.elapsed() >= wait) {
+                // Not while the admin types or reads: a load holds the
+                // screen for a moment.
+                let busy = self.confirm.is_some() || self.form.is_some() || self.plan.is_some();
+                if !busy && self.last_load.is_none_or(|t| t.elapsed() >= wait) {
                     self.load();
                 }
                 Flow::Continue
@@ -421,6 +729,15 @@ impl Model for Screen {
         let mut b = Doc::new();
         let now = (self.now)();
         b.append(theme::header("machines")).s("   ").add(dim("what you decide here is signed with this computer's key")).s("\n\n");
+        // Choosing and confirming a release take the whole screen.
+        if let Some(f) = &self.form {
+            b.append(self.form_view(f));
+            return b;
+        }
+        if let Some(p) = &self.plan {
+            b.append(self.plan_view(p));
+            return b;
+        }
         if let Some(e) = &self.err {
             b.add(err(format!("Cannot talk to the coordinator: {e}"))).s("\n\n");
             if e.is(Kind::HostKey) {
@@ -482,7 +799,7 @@ impl Model for Screen {
             b.append(health(m, now, self.view.rollout.serial)).nl();
         }
         if self.view.version == 0 && !self.view.members.is_empty() {
-            b.add(dim("  Nothing is signed yet. Press S to sign the coordinator; then machines can join.")).nl();
+            b.add(dim("  Nothing signed yet. Press S to sign the coordinator; then machines can join.")).nl();
         } else if !self.view.unsigned().is_empty() {
             b.add(err("  NOT SIGNED: put on the coordinator without you. Servers ignore it. Press p to drop it.")).nl();
         }
@@ -514,9 +831,8 @@ impl Model for Screen {
                 b.s(l).nl();
             }
         }
-        let members: Vec<Member> = self.view.members.iter().map(|(m, _)| m.clone()).collect();
         let at = if self.view.coordinator_now > 0 { self.view.coordinator_now } else { now.0.timestamp() };
-        for (text, alarm) in rollout::lines(&self.view.rollout, &members, at) {
+        for (text, alarm) in publish::rollout_lines(&self.view, at) {
             for l in wrap(&text, 80, "  ") {
                 if alarm {
                     b.add(err(l));
@@ -524,6 +840,11 @@ impl Model for Screen {
                     b.add(dim(l));
                 }
                 b.nl();
+            }
+        }
+        if let Some(hint) = publish::stopped_keys(&self.view.rollout) {
+            for l in wrap(&hint, 80, "  ") {
+                b.add(err(l)).nl();
             }
         }
 
@@ -553,18 +874,22 @@ impl Model for Screen {
         } else {
             b.add(dim(format!("Signed list version {}.", self.view.version))).nl();
         }
-        if let Some((q, _)) = &self.confirm {
-            b.nl().add(err(q.clone())).nl();
-        } else if !self.notice.is_empty() {
-            b.nl().s(&self.notice).nl();
+        if let Some(w) = self.waiting.view(Duration::from_secs(30), "still going") {
+            b.nl().append(w).nl();
         }
-        // Two lines, so each fits 80 columns.
+        if let Some((q, _)) = &self.confirm {
+            b.nl().add(err(super::wrap(q, 78))).nl();
+        } else if !self.notice.is_empty() {
+            b.nl().s(super::wrap(&self.notice, 78)).nl();
+        }
+        // Three lines, so each fits 80 columns.
         let mut keys = vec![("↑↓", "select"), ("a", "approve"), ("r", "reject"), ("d", "remove")];
         if self.view.version == 0 {
             keys.push(("S", "sign coordinator"));
         }
         let more = [("i", if self.details { "hide details" } else { "details" }), ("p", "send list again"), ("q", "quit")];
-        b.nl().append(theme::keys(&keys)).nl().append(theme::keys(&more)).nl();
+        let updates = [("u", "publish an update"), ("R", "resume a stopped rollout")];
+        b.nl().append(theme::keys(&keys)).nl().append(theme::keys(&more)).nl().append(theme::keys(&updates)).nl();
         b
     }
 }
@@ -1027,5 +1352,214 @@ mod tests {
         s.key(Key::Char('p'));
         assert!(s.notice.contains("sent again"), "{:?}", s.notice);
         assert_eq!(store.read().unwrap().members.len(), 1);
+    }
+
+    // ---- updates ----
+
+    use crate::publish::tests::{FakeDays, Sent, days_ago, desk, today, twin};
+    use crate::tui::apps::tests::{Busy, Open};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    impl Busy for Screen {
+        fn busy(&self) -> bool {
+            !self.waiting.is_empty()
+        }
+    }
+
+    /// The screen of a desktop made by desk, with a publisher whose jobs
+    /// wait while hold is set.
+    fn publishing(dir: &TempDir, days: &Arc<FakeDays>) -> (Open<Screen>, crate::registry::Store, Sent, Arc<AtomicBool>) {
+        let (admin, store, sent, fail, parts) = desk(dir);
+        let hold = Arc::new(AtomicBool::new(false));
+        let (path, s, f, h) = (dir.path().to_path_buf(), sent.clone(), fail.clone(), hold.clone());
+        let p = Publisher {
+            admin: Arc::new(move || {
+                while h.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(twin(&path, &s, &f))
+            }),
+            days: days.clone(),
+            parts,
+            today,
+        };
+        (Open::new(Screen::new(admin).with_publisher(p)), store, sent, hold)
+    }
+
+    #[test]
+    fn an_update_is_checked_shown_and_published() {
+        let dir = TempDir::new();
+        let days = Arc::new(FakeDays::with(&[days_ago(1)]));
+        let (mut o, _store, sent, hold) = publishing(&dir, &days);
+        let v = o.view();
+        assert!(v.contains("u publish an update   R resume a stopped rollout"), "{v}");
+        o.fits(60);
+
+        // The choices: notes, then urgent.
+        o.key(Key::Char('u'));
+        for want in ["Publish an update", "A release of this dryserver (0.2.0)", "> notes", "[ ] roll out at once", "esc cancel"] {
+            assert!(o.view().contains(want), "{want}: {}", o.view());
+        }
+        o.fits(24);
+        for k in crate::tui::type_text("fixes the join timeout") {
+            o.key(k);
+        }
+        o.key(Key::Tab);
+        o.key(Key::Char(' '));
+        assert!(o.view().contains("> urgent    [x]"), "{}", o.view());
+        o.key(Key::Enter);
+        assert!(o.view().contains("checking the release"), "the screen says what runs: {}", o.view());
+        o.settle();
+
+        // What changes, before anything is signed.
+        let v = o.view();
+        for want in [
+            "Sign and send this release to the coordinator?",
+            "for 3 machines, urgent:",
+            "dryserver  0.1.0 -> 0.2.0",
+            "urgent     yes: the rollout starts at once",
+            "notes      fixes the join timeout",
+            "y sign and send it",
+        ] {
+            assert!(v.contains(want), "{want}: {v}");
+        }
+        o.fits(24);
+        assert!(sent.lock().unwrap().is_empty());
+        o.key(Key::Char('n'));
+        assert!(o.s.notice.contains("Nothing signed") && sent.lock().unwrap().is_empty(), "{}", o.s.notice);
+
+        // Again: the choices are kept. y sends it on the worker.
+        o.key(Key::Char('u'));
+        assert!(o.view().contains("fixes the join timeout") && o.view().contains("[x]"), "{}", o.view());
+        o.key(Key::Enter);
+        o.settle();
+        hold.store(true, Ordering::SeqCst);
+        o.key(Key::Char('y'));
+        let v = o.view();
+        assert!(v.contains("publishing release") && v.contains("Members"), "the screen goes on while it sends: {v}");
+        // One release at a time.
+        o.key(Key::Char('u'));
+        assert!(o.s.notice.contains("Still publishing release") && o.s.form.is_none(), "{}", o.s.notice);
+        hold.store(false, Ordering::SeqCst);
+        o.settle();
+        assert!(o.s.notice.contains("is on the coordinator. It updates itself first"), "{}", o.s.notice);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        let v = o.flat();
+        assert!(v.contains("(urgent), made") && v.contains("fixes the join timeout"), "the release shows under Updates: {v}");
+        assert!(v.contains("Not started yet: the coordinator takes the release up") && !v.contains("No release published yet"), "{v}");
+        // The next release starts from fresh choices.
+        o.key(Key::Char('u'));
+        let f = o.s.form.as_ref().unwrap();
+        assert!(f.notes.value.is_empty() && !f.urgent, "{}", o.view());
+        o.key(Key::Esc);
+        assert!(o.s.form.is_none() && o.s.notice.contains("Nothing signed"));
+    }
+
+    #[test]
+    fn a_refused_update_says_why_and_what_to_do() {
+        let dir = TempDir::new();
+        let days = Arc::new(FakeDays::with(&[]));
+        *days.fail.lock().unwrap() = Some("cannot find archive.archlinux.org (is this computer online?)".into());
+        let (mut o, _, sent, _) = publishing(&dir, &days);
+        o.key(Key::Char('u'));
+        o.key(Key::Enter);
+        o.settle();
+        let n = &o.s.notice;
+        assert!(n.starts_with("Not published, nothing was signed: cannot find the newest Arch snapshot"), "{n}");
+        assert!(n.contains("is this computer online?"), "{n}");
+        assert!(o.s.plan.is_none() && sent.lock().unwrap().is_empty());
+        o.fits(80);
+        // Notes that are not plain text.
+        o.key(Key::Char('u'));
+        o.key(Key::Paste("caf\u{e9}".into()));
+        o.key(Key::Enter);
+        o.settle();
+        assert!(o.s.notice.contains("not printable ASCII"), "{}", o.s.notice);
+    }
+
+    #[test]
+    fn closing_the_screen_while_it_publishes_asks_first_and_says_what_happened() {
+        let dir = TempDir::new();
+        let days = Arc::new(FakeDays::with(&[days_ago(0)]));
+        let (mut o, _, _, hold) = publishing(&dir, &days);
+        o.key(Key::Char('u'));
+        o.key(Key::Enter);
+        o.settle();
+        hold.store(true, Ordering::SeqCst);
+        o.key(Key::Char('y'));
+        assert_eq!(o.key(Key::Char('q')), Flow::Continue);
+        assert!(o.s.notice.contains("Press q again to quit anyway: the upload stops half way"), "{}", o.s.notice);
+        assert!(o.s.after().is_none());
+        assert_eq!(o.key(Key::Char('q')), Flow::Quit);
+        let after = o.s.after().unwrap().to_string();
+        assert!(after.contains("The screen closed while publishing release") && after.contains("./dryserver release status"), "{after}");
+        hold.store(false, Ordering::SeqCst);
+        // Ctrl+C quits at once, and says the same.
+        let dir = TempDir::new();
+        let (mut o, _, _, hold) = publishing(&dir, &days);
+        o.key(Key::Char('u'));
+        o.key(Key::Enter);
+        o.settle();
+        hold.store(true, Ordering::SeqCst);
+        o.key(Key::Char('y'));
+        assert_eq!(o.key(Key::Ctrl('c')), Flow::Quit);
+        assert!(o.s.after().is_some());
+        hold.store(false, Ordering::SeqCst);
+        // Nothing running: q quits at once, with nothing to say.
+        let dir = TempDir::new();
+        let (mut o, _, _, _) = publishing(&dir, &days);
+        assert_eq!(o.key(Key::Char('q')), Flow::Quit);
+        assert!(o.s.after().is_none());
+    }
+
+    #[test]
+    fn resume_asks_first_and_only_when_stopped() {
+        use crate::rollout::{Pause, Phase, Rollout};
+        let dir = TempDir::new();
+        let days = Arc::new(FakeDays::with(&[days_ago(0)]));
+        let (mut o, store, _, _) = publishing(&dir, &days);
+        o.key(Key::Char('R'));
+        assert!(o.s.notice.contains("Nothing to resume: there is no rollout to resume"), "{}", o.s.notice);
+        store
+            .update(|s| {
+                s.rollout = Rollout { serial: 5, phase: Phase::Servers, ..Rollout::default() };
+                Ok(())
+            })
+            .unwrap();
+        o.s.load();
+        o.key(Key::Char('R'));
+        assert!(o.s.notice.contains("is not stopped") && o.s.confirm.is_none(), "{}", o.s.notice);
+        store
+            .update(|s| {
+                s.rollout.paused = "node-a: update failed: no space left on device".into();
+                s.rollout.pause = Pause::Failed;
+                s.rollout.pause_host = 2;
+                s.rollout.pause_name = "node-a".into();
+                Ok(())
+            })
+            .unwrap();
+        o.s.load();
+        let v = o.flat();
+        assert!(v.contains("Press R to resume (the coordinator passes node-a over"), "{v}");
+        o.fits(60);
+        o.key(Key::Char('R'));
+        let v = o.flat();
+        assert!(v.contains("Resume the rollout of release 5? The coordinator then passes node-a over"), "{v}");
+        o.key(Key::Char('n'));
+        assert_eq!(store.read().unwrap().rollout.resume_asked, 0, "anything but y asks nothing");
+        o.key(Key::Char('R'));
+        o.key(Key::Char('y'));
+        assert!(o.s.notice.contains("Resumed: the coordinator passes node-a over"), "{}", o.s.notice);
+        assert_eq!(store.read().unwrap().rollout.resume_asked, 1);
+    }
+
+    #[test]
+    fn a_screen_without_a_publisher_says_where_to_publish() {
+        let dir = TempDir::new();
+        let (admin, _) = setup(&dir);
+        let mut s = Screen::new(admin);
+        s.load();
+        s.key(Key::Char('u'));
+        assert!(s.notice.contains("./dryserver release publish") && s.form.is_none(), "{}", s.notice);
     }
 }

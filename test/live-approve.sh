@@ -308,6 +308,13 @@ check "release status shows the release and its notes" grep -q "Release $SER (ur
 check "release status has a line per machine" grep -Eq "^[ !] coord +coordinator +" <<<"$out"
 out=$(desk release resume)
 check "resume without a rollout is refused" grep -q "no rollout to resume" <<<"$out"
+# The screen checks a release on its worker; this one is refused before
+# anything is signed (a build for this desktop, or older than 0.2.0).
+# The screen redraws only what changed: wait for text drawn fresh.
+out=$(screen "$S/desk" "u publish an update" "u" "esc cancel" $'\r' "nothing was signed|y sign and send" "R" "rollout to resume|y to confirm" "")
+check "u on the screen checks the release and says why not" grep -q "nothing was signed" <<<"$out"
+check "R on the screen with nothing stopped resumes nothing" grep -q "no rollout to resume" <<<"$out"
+check_not "nothing was signed from the screen" test -e "$S/desk/secrets/release.signed.json"
 out=$(reg "release-get $SER release" 2>&1)
 check "release-get is not answered outside the mesh" grep -q "only answered over the mesh" <<<"$out"
 

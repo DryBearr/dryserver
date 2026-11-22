@@ -772,5 +772,16 @@ pub fn status_lines(v: &View, now: i64) -> Vec<String> {
     out
 }
 
+/// The same advice for the approve screen, with its keys.
+pub fn stopped_keys(r: &Rollout) -> Option<String> {
+    if !stopped(r) {
+        return None;
+    }
+    let what = resume_does(r).ok()?;
+    Some(format!(
+        "Press R to resume (the coordinator {what}), or u to publish a fixed release: it gets a higher serial and replaces this rollout."
+    ))
+}
+
 #[cfg(test)]
 pub mod tests;
