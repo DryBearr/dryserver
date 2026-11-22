@@ -81,6 +81,23 @@ struct Sim {
     /// The apply rebooted the machine for new packages; restarts since.
     reboot: bool,
     boots: u32,
+    /// `dryserver registry` through sshd does not answer (the brain).
+    registry_down: bool,
+    /// What `sshd -T` says of a login as the admin, instead of what it
+    /// should.
+    sshd_admin: Option<String>,
+    /// sshd calls: ssh to the registry, sshd -T.
+    sshd: Vec<String>,
+}
+
+/// What `sshd -T -C user=...` says on a machine set up as dryserver does.
+fn sshd_t(user: &str) -> String {
+    let force =
+        if user == "dryreg" { crate::sysconf::registry_command(&crate::cidr::Cidr::parse("10.66.0.0/24").unwrap()) } else { "none".into() };
+    format!(
+        "PubkeyAuthentication yes\nPasswordAuthentication no\nAuthenticationMethods publickey\nForceCommand {force}\n\
+         AuthorizedKeysFile .ssh/authorized_keys\nAllowUsers admin\nAllowUsers dryreg\n"
+    )
 }
 
 struct Fake(Mutex<Sim>);
@@ -220,9 +237,30 @@ impl Runner for Fake {
                 });
                 (st.to_string(), Ok(()))
             }
+            ("ssh", [.., target, "signed"]) => {
+                s.sshd.push(format!("ssh {target} signed"));
+                assert!(c.args.iter().any(|a| a == "StrictHostKeyChecking=yes"), "{c}");
+                if s.registry_down {
+                    return (String::new(), Err("ssh failed: exit status 1: dryserver: registry: unknown command".into()));
+                }
+                (r#"{"signed":{"doc":"","sig":""}}"#.into(), Ok(()))
+            }
+            ("sshd", ["-T", "-C", spec]) => {
+                s.sshd.push(format!("sshd -T -C {spec}"));
+                let user = spec.strip_prefix("user=").and_then(|u| u.split(',').next()).unwrap_or_default();
+                match (&s.sshd_admin, user) {
+                    (Some(out), "admin") => (out.clone(), Ok(())),
+                    _ => (sshd_t(user), Ok(())),
+                }
+            }
             _ => (String::new(), Err(errf!("unexpected command {c}"))),
         }
     }
+}
+
+/// A machine's SSH host key, "ssh-ed25519 BASE64".
+fn host_key(name: &str) -> String {
+    format!("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI{}", name.replace('-', ""))
 }
 
 /// One machine: its own root, its fake commands.
@@ -238,9 +276,16 @@ fn machine(host: u32, name: &str) -> Box_ {
     let dir = TempDir::new();
     put(dir.path(), "/proc/self/exe", OLD_BIN);
     put(dir.path(), K3S_BIN, K3S);
+    put(dir.path(), crate::node::HOST_KEY, format!("{name} private\n"));
+    put(dir.path(), crate::node::HOST_KEY_PUB, format!("{} root@{name}\n", host_key(name)));
     let fake = Arc::new(Fake(Mutex::new(Sim { root: dir.path().to_path_buf(), ..Sim::default() })));
     let node = Node {
-        cfg: Config { wg_subnet: "10.66.0.0/24".into(), ..Config::default() },
+        cfg: Config {
+            wg_subnet: "10.66.0.0/24".into(),
+            username: "admin".into(),
+            coord_lan_ip: "192.168.1.50".into(),
+            ..Config::default()
+        },
         hostname: name.into(),
         root: dir.path().to_path_buf(),
         run: fake.clone(),
@@ -3007,4 +3052,76 @@ fn after_a_newest_that_went_back_a_release_between_is_taken() {
     let (below, below_bin) = sw.release(14, "0.1.0", true);
     let e = sw.upload(&below, &below_bin, None).unwrap_err().to_string();
     assert!(e.contains("older than"), "{e}");
+}
+
+/// The brain confirmed a release on its own health and self check, which
+/// say nothing of the ways in: one that broke `dryserver registry` or
+/// sshd's settings for the admin (sshd -t accepts those) was kept, and
+/// then no server could sync and no fix could be uploaded. Now the brain
+/// keeps a release only once a call through sshd reached the registry as
+/// a member's does, sshd -T lets the admin and the registry account in,
+/// and (with servers up) a server synced through the new release.
+#[test]
+fn review_the_brain_keeps_a_release_only_once_the_ways_in_work() {
+    let brain_note = |sw: &Swarm| Machine::new(&sw.brain.node, true).load().note;
+    // The registry does not answer through sshd.
+    let mut sw = Swarm::new(1);
+    sw.brain.fake.sim().registry_down = true;
+    sw.publish(10, true);
+    sw.ticks(5);
+    assert!(sw.brain.fake.sim().confirmed.is_empty(), "kept a release that broke the registry");
+    assert!(brain_note(&sw).contains("the registry does not answer through sshd"), "{}", brain_note(&sw));
+    sw.brain.fake.revert();
+    sw.tick();
+    assert_eq!(sw.rollout().phase, Phase::Failed);
+    assert!(sw.servers.iter().all(|m| m.fake.sim().applied.is_empty()));
+
+    // sshd would lock the admin out: a command forced on the account, or
+    // the account not let in.
+    for (bad, want) in [
+        (sshd_t("admin").replace("ForceCommand none", "ForceCommand /bin/false"), "would force a command on the admin admin"),
+        (sshd_t("admin").replace("AllowUsers admin\n", ""), "would not let the admin admin in"),
+        (sshd_t("admin").replace("PubkeyAuthentication yes", "PubkeyAuthentication no"), "no public key"),
+        (sshd_t("admin").replace("AuthorizedKeysFile .ssh/authorized_keys", "AuthorizedKeysFile none"), "no authorized keys"),
+    ] {
+        let mut sw = Swarm::new(1);
+        sw.brain.fake.sim().sshd_admin = Some(bad);
+        sw.publish(10, true);
+        sw.ticks(5);
+        assert!(sw.brain.fake.sim().confirmed.is_empty() && brain_note(&sw).contains(want), "{want}: {}", brain_note(&sw));
+        // Settings in lower case, as older OpenSSH writes them, that let
+        // the admin in: kept.
+        sw.brain.fake.sim().sshd_admin = Some(sshd_t("admin").to_lowercase());
+        sw.until(3, |s| s.installed(1) == 10);
+    }
+
+    // No server synced through the new release: not kept, and kept once
+    // one did.
+    let mut sw = Swarm::new(2);
+    sw.publish(10, true);
+    sw.until(5, |s| s.brain.fake.sim().pending == 10);
+    sw.offline = vec![2, 3];
+    sw.ticks(2);
+    assert!(sw.brain.fake.sim().confirmed.is_empty() && brain_note(&sw).contains("no server has synced"), "{}", brain_note(&sw));
+    sw.offline = vec![2];
+    sw.until(3, |s| s.installed(1) == 10);
+    let calls = sw.brain.fake.sim().sshd.clone();
+    for want in ["ssh dryreg@10.66.0.1 signed", "sshd -T -C user=admin,host=", "sshd -T -C user=dryreg,host="] {
+        assert!(
+            calls.iter().any(|c| c.starts_with(want) && (want.starts_with("ssh ") || c.contains("addr=192.168.1.50"))),
+            "{want}: {calls:?}"
+        );
+    }
+    // With every server off since long before, the registry call alone
+    // does.
+    let mut sw = Swarm::new(1);
+    sw.offline.push(2);
+    sw.store
+        .update(|s| {
+            s.members.iter_mut().find(|m| m.host == 2).unwrap().last_seen = time(t0() - 3600);
+            Ok(())
+        })
+        .unwrap();
+    sw.publish(10, true);
+    sw.until(5, |s| s.installed(1) == 10);
 }

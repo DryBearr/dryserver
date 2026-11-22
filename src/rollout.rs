@@ -959,6 +959,10 @@ enum Stop {
     Reverted(String),
 }
 
+/// What else must hold before an update is confirmed, given when its apply
+/// ended; the error says why not.
+type Proof<'a> = dyn Fn(&Ctx, i64) -> std::result::Result<(), String> + 'a;
+
 /// One machine (the brain or a server) updating itself.
 pub struct Machine<'a> {
     pub n: &'a Node,
@@ -1085,11 +1089,18 @@ impl<'a> Machine<'a> {
     /// tried again; a refused or failed update is recorded, shown in the
     /// report, and not tried again.
     pub fn step(&self, ctx: &Ctx, src: &dyn Source, offer: &Offer, rep: &Report, now: i64) -> Result<()> {
+        self.step_with(ctx, src, offer, rep, now, &|_, _| Ok(()))
+    }
+
+    /// step, with what else must hold before an update is confirmed here
+    /// (on the brain: the swarm's ways through it, brain_paths). proof is
+    /// given when the apply ended, and says why not.
+    fn step_with(&self, ctx: &Ctx, src: &dyn Source, offer: &Offer, rep: &Report, now: i64, proof: &Proof<'_>) -> Result<()> {
         // From the first sync on: when this machine began to take releases.
         self.start(now);
         let mut l = self.load();
         if l.pending != 0 {
-            return self.settle(ctx, &mut l, rep, now);
+            return self.settle(ctx, &mut l, rep, now, proof);
         }
         if !offer.turn || offer.serial == 0 || self.installed_serial() >= offer.serial {
             return Ok(());
@@ -1403,7 +1414,7 @@ impl<'a> Machine<'a> {
 
     /// An update this machine started: its apply runs, or it waits for its
     /// confirmation, or it ended without installing the release.
-    fn settle(&self, ctx: &Ctx, l: &mut Local, rep: &Report, now: i64) -> Result<()> {
+    fn settle(&self, ctx: &Ctx, l: &mut Local, rep: &Report, now: i64, proof: &Proof<'_>) -> Result<()> {
         let up = self.update();
         let st = up.status(ctx)?;
         l.installed = st.confirmed_serial();
@@ -1437,7 +1448,11 @@ impl<'a> Machine<'a> {
                 Some((_, r)) if running_sha(&self.n.root).as_deref() != Some(r.dryserver.sha256.as_str()) => {
                     Some("the new dryserver does not run yet".to_string())
                 }
-                Some(_) => healthy(rep, self.brain || self.n.path(crate::sysconf::K3S_TOKEN).exists()).err(),
+                Some(_) => healthy(rep, self.brain || self.n.path(crate::sysconf::K3S_TOKEN).exists()).err().or_else(|| {
+                    // When the apply ended: its own record of it.
+                    let at = st.last.as_ref().filter(|x| x.serial == l.pending && x.action == "applied").map_or(0, |x| x.at);
+                    proof(ctx, at.max(l.applied)).err()
+                }),
             };
             if let Some(why) = wait {
                 // Not confirmed: if it stays like this, the machine goes back
@@ -1537,6 +1552,123 @@ pub fn healthy(r: &Report, expect_k3s: bool) -> std::result::Result<(), String> 
     match r.k3s_active {
         Some(false) => Err("k3s is not running".into()),
         None if expect_k3s => Err("k3s is not running".into()),
+        _ => Ok(()),
+    }
+}
+
+/// On the brain, before it keeps a new release: the ways the swarm and the
+/// admin come in through it still work. Its health and its self check say
+/// nothing of them, and a release that broke them would be kept: then no
+/// server could sync and no fix could be uploaded. since is when the apply
+/// ended.
+///
+/// - A server synced through the new release: when one synced within
+///   OFFLINE before since, one must have since. Its heartbeat went through
+///   the new sshd settings and the new `dryserver registry`.
+/// - A registry call through sshd as a member makes it (`signed`, with the
+///   registry key, at the brain's mesh address): also with no server up.
+/// - sshd -T for a login from the home network: the admin's account takes
+///   public keys with no command forced on it, and the registry account,
+///   the desktop's way in, gets the registry command forced.
+fn brain_paths(ctx: &Ctx, n: &Node, members: &[Member], since: i64) -> std::result::Result<(), String> {
+    let seen = members.iter().filter(|m| m.host != 1 && !m.last_seen.is_zero()).map(|m| m.last_seen.0.timestamp());
+    let expected = seen.clone().any(|t| t >= since.saturating_sub(OFFLINE));
+    if expected && !seen.clone().any(|t| t > since) {
+        return Err("no server has synced through the new release yet".into());
+    }
+    let ctx = ctx.with_timeout(Duration::from_secs(30));
+    let addr = crate::mesh::ip(&n.cfg.wg_subnet, 1);
+    let host_key = fsx::read_string(n.path(crate::node::HOST_KEY_PUB)).map_err(|e| format!("its SSH host key cannot be read ({e})"))?;
+    let known = n.path(STORE).join("probe_known_hosts");
+    fsx::write_file(&known, format!("{addr} {}\n", crate::signed::key_body(&host_key)), 0o600).map_err(|e| e.to_string())?;
+    let id = n.path(crate::node::REGISTRY_KEY).display().to_string();
+    let known = format!("UserKnownHostsFile={}", known.display());
+    let target = format!("{}@{addr}", crate::sysconf::REGISTRY_USER);
+    let args = [
+        "-i",
+        &id,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "HostKeyAlgorithms=ssh-ed25519",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        &known,
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        &target,
+        "signed",
+    ];
+    let out = n
+        .run
+        .output(&ctx, &Cmd::new("ssh", &args).quiet().stdout_only())
+        .map_err(|e| format!("the registry does not answer through sshd as servers reach it ({e})"))?;
+    #[derive(Deserialize)]
+    struct Answer {
+        #[allow(dead_code)]
+        signed: Envelope,
+    }
+    serde_json::from_str::<Answer>(out.trim()).map_err(|e| format!("the registry's answer through sshd is none ({e})"))?;
+    let lan = if n.cfg.coord_lan_ip.is_empty() { "192.168.0.2" } else { n.cfg.coord_lan_ip.as_str() };
+    let user = n.cfg.username.trim();
+    if user.is_empty() || !user.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) {
+        return Err("config.env names no admin account to check sshd for".into());
+    }
+    sshd_lets_in(&ctx, n, user, lan, None)?;
+    let mesh = crate::cidr::Cidr::parse(&n.cfg.wg_subnet).ok_or_else(|| format!("WG_SUBNET {:?} is no subnet", n.cfg.wg_subnet))?;
+    sshd_lets_in(&ctx, n, crate::sysconf::REGISTRY_USER, lan, Some(&crate::sysconf::registry_command(&mesh)))
+}
+
+/// What sshd -T says of a login as user from addr: refused unless sshd
+/// takes public keys from user, lets user in, and forces force on it
+/// (None: no command forced).
+fn sshd_lets_in(ctx: &Ctx, n: &Node, user: &str, addr: &str, force: Option<&str>) -> std::result::Result<(), String> {
+    let spec = format!("user={user},host=dryserver-check,addr={addr}");
+    let out = n
+        .run
+        .output(ctx, &Cmd::new("sshd", &["-T", "-C", &spec]).quiet().stdout_only())
+        .map_err(|e| format!("sshd -T refuses its settings ({e})"))?;
+    let (mut pubkey, mut forced, mut methods, mut keys) = (String::new(), String::new(), String::new(), String::new());
+    let (mut allow, mut deny) = (Vec::new(), Vec::new());
+    for line in out.lines() {
+        let Some((k, v)) = line.trim().split_once(' ') else { continue };
+        let v = v.trim().to_string();
+        // OpenSSH 10 writes the keywords as in the settings, older ones in
+        // lower case.
+        match k.to_ascii_lowercase().as_str() {
+            "pubkeyauthentication" => pubkey = v.to_ascii_lowercase(),
+            "forcecommand" => forced = v,
+            "authenticationmethods" => methods = v,
+            "authorizedkeysfile" => keys = v,
+            "allowusers" => allow.extend(v.split_whitespace().map(String::from)),
+            "denyusers" => deny.extend(v.split_whitespace().map(String::from)),
+            _ => {}
+        }
+    }
+    let who = if force.is_some() { format!("the registry account {user}") } else { format!("the admin {user}") };
+    let named = |list: &[String]| list.iter().any(|p| p == "*" || p == user || p.strip_prefix(user).is_some_and(|r| r.starts_with('@')));
+    if pubkey != "yes" {
+        return Err(format!("sshd would take no public key from {who}"));
+    }
+    if (!allow.is_empty() && !named(&allow)) || named(&deny) {
+        return Err(format!("sshd would not let {who} in"));
+    }
+    if keys.is_empty() || keys == "none" {
+        return Err(format!("sshd would read no authorized keys for {who}"));
+    }
+    if !(methods.is_empty() || methods == "any" || methods.split_whitespace().any(|m| m == "publickey")) {
+        return Err(format!("sshd would ask {who} for more than a key ({methods})"));
+    }
+    match force {
+        None if !forced.is_empty() && forced != "none" => Err(format!("sshd would force a command on {who}: {}", shown(&forced, 60))),
+        Some(cmd) if forced != cmd => Err(format!("sshd would not force the registry command on {who}")),
         _ => Ok(()),
     }
 }
@@ -2243,7 +2375,9 @@ impl Brain<'_> {
     /// loads and installs the offered release.
     fn own_step(&self, offer: &Offer) {
         let m = self.machine();
-        if let Err(e) = m.step(self.ctx, &LocalSource(self.served), offer, self.rep, self.now.unix) {
+        let (n, members) = (self.n, self.members);
+        let proof = |ctx: &Ctx, since: i64| brain_paths(ctx, n, members, since);
+        if let Err(e) = m.step_with(self.ctx, &LocalSource(self.served), offer, self.rep, self.now.unix, &proof) {
             eprintln!("dryserver: rollout: the coordinator's own update: {e}");
         }
     }
