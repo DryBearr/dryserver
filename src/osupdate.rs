@@ -2618,10 +2618,22 @@ mod tests {
 
     const OLD: &str = "v1.36.5+k3s1";
     const NEW: &str = "v1.37.2+k3s1";
-    const STAGED: &str = "/var/lib/dryserver/staging/k3s";
+    const STAGED: &str = "/var/lib/dryserver-update/staging/k3s";
 
     fn binary(version: &str, how: &str) -> String {
         format!("#!k3s version={version} {how}\n{}\n", "x".repeat(4096))
+    }
+
+    #[test]
+    fn k3s_state_lives_in_roots_own_directory() {
+        // Not under /var/lib/dryserver: on the coordinator that belongs to
+        // the registry account, which could swap a directory there while
+        // root reads it.
+        let registry_dir = format!("{}/", fsx::dir(crate::registry::DEFAULT_PATH).display());
+        for p in [STAGED, K3S_CHECK] {
+            assert!(p.starts_with(&format!("{}/", crate::update::DIR)) && !p.starts_with(&registry_dir), "{p}");
+        }
+        assert!(STAGED.starts_with(&format!("{}/", crate::update::STAGING)));
     }
 
     /// A machine with k3s OLD running healthy, its token or config, and a
@@ -2635,10 +2647,14 @@ mod tests {
             Role::Node => put(r, sysconf::K3S_TOKEN, "K10abc::server:secret\n"),
             Role::Coordinator => put(r, sysconf::K3S_CONFIG, "node-ip: 10.66.0.1\n"),
         }
-        fs::create_dir_all(r.join("var/lib/dryserver/staging")).unwrap();
-        for (d, mode) in
-            [("", 0o755), ("var", 0o755), ("var/lib", 0o755), ("var/lib/dryserver", 0o755), ("var/lib/dryserver/staging", 0o700)]
-        {
+        fs::create_dir_all(r.join("var/lib/dryserver-update/staging")).unwrap();
+        for (d, mode) in [
+            ("", 0o755),
+            ("var", 0o755),
+            ("var/lib", 0o755),
+            ("var/lib/dryserver-update", 0o700),
+            ("var/lib/dryserver-update/staging", 0o700),
+        ] {
             fs::set_permissions(r.join(d), fs::Permissions::from_mode(mode)).unwrap();
         }
         dir
@@ -2752,7 +2768,7 @@ mod tests {
             ("file mode", |_, staged| fs::set_permissions(staged, fs::Permissions::from_mode(0o666)).unwrap(), "may be changed by others"),
             (
                 "dir mode",
-                |r, _| fs::set_permissions(r.join("var/lib/dryserver/staging"), fs::Permissions::from_mode(0o755)).unwrap(),
+                |r, _| fs::set_permissions(r.join("var/lib/dryserver-update/staging"), fs::Permissions::from_mode(0o755)).unwrap(),
                 "open to others",
             ),
             (
@@ -2763,8 +2779,8 @@ mod tests {
             (
                 "dir symlink",
                 |r, _| {
-                    let s = r.join("var/lib/dryserver/staging");
-                    fs::rename(&s, r.join("var/lib/dryserver/elsewhere")).unwrap();
+                    let s = r.join("var/lib/dryserver-update/staging");
+                    fs::rename(&s, r.join("var/lib/dryserver-update/elsewhere")).unwrap();
                     std::os::unix::fs::symlink("elsewhere", &s).unwrap();
                 },
                 "not a directory but a symbolic link",

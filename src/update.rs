@@ -60,7 +60,7 @@ use crate::release::{self, Place, Release};
 use crate::runner::{Cmd, Runner};
 use crate::signed::{Envelope, SshVerifier, Verifier};
 use crate::sysconf::{self, Params, Role};
-use crate::{bail, errf, fsx, gotime, packages, quarantine, registry};
+use crate::{bail, errf, fsx, gotime, packages, quarantine};
 
 /// Root only (0700), every file in it too.
 pub const DIR: &str = "/var/lib/dryserver-update";
@@ -1460,7 +1460,7 @@ pub fn selfcheck(m: &Machine, ctx: &Ctx) -> Vec<Check> {
     v.push(check("ssh", m.cmd(ctx, "sshd", &["-t", "-f", &m.shown(SSHD_CONFIG)]).map(|_| "sshd -t accepts the settings".to_string())));
     let joined = params.as_ref().map(|p| p.role == Role::Coordinator || p.host_num > 0).unwrap_or(true);
     v.push(check("wireguard", wg_check(m, joined)));
-    v.push(check("state", state_check(m, params.as_ref().map(|p| p.role).ok())));
+    v.push(check("state", state_check(m)));
     v
 }
 
@@ -1560,7 +1560,14 @@ fn parse_wg(text: &str) -> Result<usize> {
 
 /// dryserver's own state files parse as this binary reads them, and are in
 /// a format it knows.
-fn state_check(m: &Machine, role: Option<Role>) -> Result<String> {
+///
+/// Root's files only. The registry's file on the coordinator is not read:
+/// it lives in the registry account's directory (/var/lib/dryserver),
+/// where that account can put a link to /dev/zero or a FIFO in its place
+/// and make this check, run as root, read for ever or hang; and a file it
+/// damaged on purpose would then hold back every update of the
+/// coordinator, the fix for it included. The registry reads its own file.
+fn state_check(m: &Machine) -> Result<String> {
     let mut n = 0;
     let mut seen = |found: bool| n += usize::from(found);
     seen(load_installed(m)?.is_some());
@@ -1569,9 +1576,6 @@ fn state_check(m: &Machine, role: Option<Role>) -> Result<String> {
     seen(read_json::<node::State>(m, node::JOIN_STATE)?.is_some());
     seen(read_json::<quarantine::State>(m, quarantine::STATE_FILE)?.is_some());
     seen(read_json::<Envelope>(m, node::SIGNED_FILE)?.is_some());
-    if role == Some(Role::Coordinator) {
-        seen(read_json::<registry::State>(m, registry::DEFAULT_PATH)?.is_some());
-    }
     let format = state_format(m)?;
     let known = known_format(m.migrations)?;
     if format > known {
@@ -1700,6 +1704,7 @@ pub fn print_status(s: &Status, out: &mut dyn Write) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry;
     use crate::release::{Binary, K3s};
     use crate::signed::fake;
     use crate::testutil::{PowerCut, TempDir, put, quiet_power_cuts};
@@ -2940,6 +2945,32 @@ mod tests {
             lab.write(p, junk.as_bytes(), 0o600);
             failing(&lab, "state", p);
         }
+    }
+
+    #[test]
+    fn the_self_check_reads_nothing_of_the_registry_account() {
+        // On the coordinator the registry's file is the registry account's:
+        // a FIFO, a link to an endless file or garbage there must neither
+        // hang nor fail the self check every update runs as root.
+        let lab = Lab::new();
+        lab.write(ROLE_FILE, b"coordinator\n", 0o644);
+        let reg = lab.p(registry::DEFAULT_PATH);
+        fsx::mkdir_all(fsx::dir(&reg), 0o755).unwrap();
+        let c = std::ffi::CString::new(reg.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: c is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let m = lab.m();
+        std::thread::spawn(move || tx.send(selfcheck(&m, &Ctx::new())).unwrap());
+        let checks = rx.recv_timeout(Duration::from_secs(10)).expect("the self check hung on a FIFO");
+        let state = checks.iter().find(|c| c.name == "state").unwrap();
+        assert!(state.ok, "{state:?}");
+        fs::remove_file(&reg).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &reg).unwrap();
+        assert!(selfcheck(&lab.m(), &Ctx::new()).iter().find(|c| c.name == "state").unwrap().ok);
+        fs::remove_file(&reg).unwrap();
+        fs::write(&reg, "{ damaged").unwrap();
+        assert!(selfcheck(&lab.m(), &Ctx::new()).iter().find(|c| c.name == "state").unwrap().ok);
     }
 
     #[test]
