@@ -1751,9 +1751,9 @@ pub struct Skip {
 /// The rollout of the newest release. The brain's sync (root) keeps it in
 /// its own store and moves it on; the registry gets a copy, which the
 /// registry account reads to answer its callers. Of that copy root takes
-/// back only resume_asked, the admin's resumes the registry counts: the
-/// registry account could write anything else in it, and node names from
-/// it would end up on kubectl's command line.
+/// back only the admin's signed asks (resume_ask, skip_ask), and checks
+/// them itself: the registry account could write anything in it, and
+/// node names from it would end up on kubectl's command line.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Rollout {
@@ -1800,15 +1800,25 @@ pub struct Rollout {
     /// The newest upload, when the brain refused it, and why.
     pub refused_serial: u64,
     pub refused: String,
-    /// Resumes the admin asked for (the registry counts them) and the ones
-    /// the brain carried out. A resume tries the server the rollout stopped
-    /// at again; a skip (`release resume -skip`) passes it over.
+    /// How many resumes and skips the admin asked for, as the registry
+    /// counts them: for the admin's screens only. A resume tries the
+    /// server the rollout stopped at again; a skip (`release resume
+    /// -skip`) passes it over.
     pub resume_asked: u64,
-    pub resume_done: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub skip_asked: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub skip_done: u64,
+    /// The newest resume and skip the admin asked for, signed, as the
+    /// registry keeps them: root checks the signature itself, and carries
+    /// out only an ask for the stop it is at, once (ask_done).
+    #[serde(skip_serializing_if = "Envelope::is_empty")]
+    pub resume_ask: Envelope,
+    #[serde(skip_serializing_if = "Envelope::is_empty")]
+    pub skip_ask: Envelope,
+    /// Root's: the time of the newest ask it carried out or set aside. An
+    /// ask no newer does nothing, so one sent again within the admin's
+    /// 15 minutes does nothing either.
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub ask_done: i64,
     /// A server in the middle of an update (the one a release this one
     /// replaced was updating, or one whose report says its update is
     /// pending): nothing starts beside it, neither the brain's own update
@@ -1927,12 +1937,10 @@ fn brain_tick_with(
     m.start(now.unix);
     let before = m.own_rollout();
     let mut b = Brain { ctx, n, served, rep, now, members, r: before.clone(), free, nodes: None };
-    b.r.resume_asked = s.rollout.resume_asked;
-    b.r.skip_asked = s.rollout.skip_asked;
     b.take_upload();
     if b.r.serial != 0 {
         b.mind_the_gap();
-        b.resume();
+        b.resume(&s.rollout.resume_ask, &s.rollout.skip_ask);
         b.advance();
     }
     let r = b.r;
@@ -1943,10 +1951,17 @@ fn brain_tick_with(
         eprintln!("dryserver: rollout: cannot save its state: {e}");
         return;
     }
-    // The registry's counts of the admin's asks are the registry's; root's
-    // clock at each tick is root's alone (and would rewrite the registry
-    // every minute).
-    let copy = |s: &Rollout| Rollout { resume_asked: s.resume_asked, skip_asked: s.skip_asked, ticked: 0, ..r.clone() };
+    // The admin's asks and their counts are the registry's; root's clock
+    // at each tick is root's alone (and would rewrite the registry every
+    // minute).
+    let copy = |s: &Rollout| Rollout {
+        resume_asked: s.resume_asked,
+        skip_asked: s.skip_asked,
+        resume_ask: s.resume_ask.clone(),
+        skip_ask: s.skip_ask.clone(),
+        ticked: 0,
+        ..r.clone()
+    };
     if copy(&s.rollout) != s.rollout {
         let res = store.update(|s| {
             // A resume asked while this tick ran stays asked.
@@ -2068,9 +2083,10 @@ impl Brain<'_> {
             Ok((rel, verdict)) if rel.serial == serial => {
                 let old = std::mem::take(&mut self.r);
                 let mut fresh = Rollout::start(&rel, self.now.unix, verdict.stale);
-                // Asks for the old rollout do not carry over to the new one.
-                (fresh.resume_asked, fresh.resume_done) = (old.resume_asked, old.resume_asked);
-                (fresh.skip_asked, fresh.skip_done) = (old.skip_asked, old.skip_asked);
+                // Asks for the old rollout do not carry over to the new one
+                // (each names its release); an old one sent again stays
+                // done.
+                fresh.ask_done = old.ask_done;
                 if old.serial != 0 && (old.phase == Phase::Brain || old.turn.is_some()) {
                     fresh.warn(format!("release {} replaced release {} while it rolled out", rel.serial, old.serial));
                 }
@@ -2131,11 +2147,32 @@ impl Brain<'_> {
         }
     }
 
-    /// Carries out what the admin asked for at a stop. resume_asked and
-    /// skip_asked are the registry's counts, which anyone who can write the
-    /// registry can change: a count that grew is one ask (what the admin's
-    /// ask does anyway), one that went back is none. And what is resumed or
-    /// passed over is always the server root itself stopped at.
+    /// Whether the admin asked for op at the stop root is at: ask is the
+    /// newest one the registry keeps, which anyone who can write the
+    /// registry can put there or leave out. It counts only with the
+    /// admin's signature, for op, for this release and the host root
+    /// itself stopped at, made within ADMIN_WINDOW_SECS of now and after
+    /// the last ask root looked at (done): an ask sent again does nothing.
+    /// newest takes the time of a signed ask, which is then done whatever
+    /// it asked.
+    fn asked(&self, ask: &Envelope, op: &str, done: i64, newest: &mut i64) -> bool {
+        let Ok(req) = serde_json::from_str::<crate::signed::AdminRequest>(&ask.doc) else { return false };
+        if ask.is_empty() || req.time <= done {
+            return false;
+        }
+        // Its time counts only once the signature is checked.
+        if self.n.verifier.verify(crate::signed::NS_ADMIN, &ask.doc, &ask.sig).is_err() {
+            return false;
+        }
+        *newest = (*newest).max(req.time);
+        req.op == op
+            && self.now.unix.saturating_sub(req.time).saturating_abs() <= crate::signed::ADMIN_WINDOW_SECS
+            && req.serial == self.r.serial
+            && req.host == self.r.pause_host
+    }
+
+    /// Carries out what the admin asked for at a stop (asked): what is
+    /// resumed or passed over is always the server root itself stopped at.
     ///
     /// - resume: the server the rollout stopped at tries again (a fresh
     ///   turn, at once or in the window, or when it is back if it is
@@ -2143,11 +2180,11 @@ impl Brain<'_> {
     ///   canary the rollout goes on; the brain tries its own update again.
     /// - skip: the server is passed over for this release. The brain never
     ///   is: without it no server updates.
-    fn resume(&mut self) {
-        let resume = self.r.resume_asked > self.r.resume_done;
-        let skip = self.r.skip_asked > self.r.skip_done;
-        self.r.resume_done = self.r.resume_asked;
-        self.r.skip_done = self.r.skip_asked;
+    fn resume(&mut self, resume_ask: &Envelope, skip_ask: &Envelope) {
+        let (done, mut newest) = (self.r.ask_done, self.r.ask_done);
+        let resume = self.asked(resume_ask, "release-resume", done, &mut newest);
+        let skip = self.asked(skip_ask, "release-skip", done, &mut newest);
+        self.r.ask_done = newest;
         if !resume && !skip {
             return;
         }

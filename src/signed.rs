@@ -138,30 +138,61 @@ pub struct AdminRequest {
     pub op: String,
     /// Unix seconds; the coordinator accepts ADMIN_WINDOW_SECS either way.
     pub time: i64,
+    /// A resume or a skip: the release whose rollout stopped, and the host
+    /// it stopped at (0: the coordinator's own update), as the admin saw
+    /// them. Root on the coordinator carries out only an ask for the stop
+    /// it is at, once.
+    #[serde(skip_serializing_if = "is_zero64")]
+    pub serial: u64,
+    #[serde(skip_serializing_if = "is_zero32")]
+    pub host: u32,
+}
+
+fn is_zero64(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_zero32(n: &u32) -> bool {
+    *n == 0
 }
 
 pub fn seal_admin(s: &dyn Signer, op: &str, now_unix: i64) -> Result<Envelope> {
-    let doc = serde_json::to_string(&AdminRequest { op: op.into(), time: now_unix })?;
+    seal_request(s, &AdminRequest { op: op.into(), time: now_unix, ..AdminRequest::default() })
+}
+
+/// A resume or a skip (op) for the rollout of release serial, stopped at
+/// host.
+pub fn seal_ask(s: &dyn Signer, op: &str, now_unix: i64, serial: u64, host: u32) -> Result<Envelope> {
+    seal_request(s, &AdminRequest { op: op.into(), time: now_unix, serial, host })
+}
+
+fn seal_request(s: &dyn Signer, r: &AdminRequest) -> Result<Envelope> {
+    let doc = serde_json::to_string(r)?;
     let sig = s.sign(NS_ADMIN, &doc)?;
     Ok(Envelope { doc, sig })
 }
 
 /// Checks an admin request: signature, operation and freshness.
 pub fn open_admin(v: &dyn Verifier, e: &Envelope, op: &str, now_unix: i64) -> Result<()> {
+    open_request(v, e, op, now_unix).map(drop)
+}
+
+/// open_admin, and what the request says.
+pub fn open_request(v: &dyn Verifier, e: &Envelope, op: &str, now_unix: i64) -> Result<AdminRequest> {
     v.verify(NS_ADMIN, &e.doc, &e.sig)?;
     let r: AdminRequest = serde_json::from_str(&e.doc).map_err(|e| Error::from(e).wrap("admin request"))?;
     if r.op != op {
         bail!("admin request is for {:?}, not {op:?}", r.op);
     }
-    let off = now_unix - r.time;
-    if off.abs() > ADMIN_WINDOW_SECS {
+    let off = now_unix.saturating_sub(r.time);
+    if off.saturating_abs() > ADMIN_WINDOW_SECS {
         bail!(
             "admin request is {} seconds {}: check the clock on your computer and on the coordinator",
-            off.abs(),
+            off.saturating_abs(),
             if off > 0 { "old" } else { "in the future" }
         );
     }
-    Ok(())
+    Ok(r)
 }
 
 pub trait Signer {
@@ -369,6 +400,21 @@ mod tests {
             assert!(err.contains(want), "{op} {now}: {err}");
         }
         assert!(open_admin(&fake::Key("other"), &e, "state", 1000).is_err());
+        // A plain request reads as before; an ask names its stop, and an
+        // older coordinator, which knows only op and time, still reads it.
+        assert_eq!(e.doc, r#"{"op":"state","time":1000}"#);
+        let ask = seal_ask(&key, "release-skip", 1000, 9, 2).unwrap();
+        let r = open_request(&key, &ask, "release-skip", 1000).unwrap();
+        assert_eq!((r.serial, r.host, r.time), (9, 2, 1000));
+        #[derive(Deserialize)]
+        struct Older {
+            op: String,
+            time: i64,
+        }
+        let old: Older = serde_json::from_str(&ask.doc).unwrap();
+        assert_eq!((old.op.as_str(), old.time), ("release-skip", 1000));
+        let far = seal_admin(&key, "state", i64::MIN).unwrap();
+        assert!(open_admin(&key, &far, "state", i64::MAX).is_err(), "no overflow");
         // A member-list signature is not an admin request.
         let as_list = Envelope { doc: e.doc.clone(), sig: key.sign(NS_MEMBERS, &e.doc).unwrap() };
         assert!(open_admin(&key, &as_list, "state", 1000).is_err());

@@ -639,10 +639,17 @@ impl Swarm {
         self.faults.lock().unwrap().push((host, f));
     }
 
-    /// The admin's `release resume`, or with skip `release resume -skip`.
+    /// The admin's `release resume`, or with skip `release resume -skip`,
+    /// for the stop the registry shows.
     fn ask(&self, skip: bool) -> Result<Vec<u8>> {
         let op = if skip { "release-skip" } else { "release-resume" };
-        self.call(op, 0, serde_json::to_string(&crate::signed::seal_admin(&ADMIN, op, self.now).unwrap()).unwrap().as_bytes())
+        self.call(op, 0, serde_json::to_string(&self.signed_ask(op, self.now)).unwrap().as_bytes())
+    }
+
+    /// The admin's ask for op at time, for the stop the registry shows.
+    fn signed_ask(&self, op: &str, time: i64) -> Envelope {
+        let r = self.rollout();
+        crate::signed::seal_ask(&ADMIN, op, time, r.serial, r.pause_host).unwrap()
     }
 
     fn resume(&self) {
@@ -820,12 +827,7 @@ fn the_canary_is_watched_before_the_next_turn() {
     assert!(!sw.kubectl().iter().any(|l| l == "cordon -- node-b"), "the next server got a turn");
     // The admin looks and goes on.
     sw.sick.clear();
-    sw.call(
-        "release-resume",
-        0,
-        serde_json::to_string(&crate::signed::seal_admin(&ADMIN, "release-resume", sw.now).unwrap()).unwrap().as_bytes(),
-    )
-    .unwrap();
+    sw.resume();
     sw.until(30, |s| s.everyone_on(10));
 }
 
@@ -894,8 +896,7 @@ fn a_brain_whose_update_fails_touches_no_server() {
     assert_eq!(sw.brain.fake.sim().applied.len(), 1, "a failed update is not tried again by itself");
     // The admin fixed what was wrong and resumes: it tries again.
     sw.brain.fake.sim().apply_fails = None;
-    let ask = serde_json::to_string(&crate::signed::seal_admin(&ADMIN, "release-resume", sw.now).unwrap()).unwrap();
-    sw.call("release-resume", 0, ask.as_bytes()).unwrap();
+    sw.resume();
     sw.until(30, |s| s.everyone_on(10));
 }
 
@@ -922,8 +923,7 @@ fn a_brain_that_reverts_touches_no_server() {
     assert_eq!(sw.brain.fake.sim().applied.len(), 1, "a release that went back is not sent again by itself");
     // The admin found the problem and resumes: only then it is tried again.
     sw.brain.fake.sim().broken = false;
-    let ask = serde_json::to_string(&crate::signed::seal_admin(&ADMIN, "release-resume", sw.now).unwrap()).unwrap();
-    sw.call("release-resume", 0, ask.as_bytes()).unwrap();
+    sw.resume();
     sw.until(30, |s| s.everyone_on(10));
     assert_eq!(sw.brain.fake.sim().applied.len(), 2);
 }
@@ -1678,33 +1678,30 @@ fn the_registry_account_cannot_choose_what_is_passed_over() {
     sw.server(2).fake.sim().apply_fails = Some("dryserver failed: exit status 1: broken disk".into());
     sw.publish(10, true);
     sw.until(20, |s| !s.rollout().paused.is_empty());
-    // It names another server, gives it a retry, and counts a skip.
+    // It names another server and gives it a retry, and the admin, shown
+    // that, passes node-b over: root stopped at node-a, so that ask does
+    // nothing.
+    let skip_b = crate::signed::seal_ask(&ADMIN, "release-skip", sw.now, 10, 3).unwrap();
     sw.store
         .update(|s| {
             s.rollout.pause_host = 3;
             s.rollout.pause_name = "node-b".into();
             s.rollout.skipped.push(Skip { host: 4, name: "node-c".into(), why: "x".into() });
             s.rollout.again.push(4);
+            s.rollout.skip_ask = skip_b;
             s.rollout.skip_asked += 3;
             Ok(())
         })
         .unwrap();
     sw.tick();
     let r = sw.rollout();
-    assert_eq!(r.skipped.iter().map(|s| s.host).collect::<Vec<_>>(), vec![2], "{r:#?}");
-    assert!(r.again.is_empty(), "{r:#?}");
-    sw.until_unpaused(30, |s| s.installed(3) == 10 && s.installed(4) == 10);
-    // A count that goes back is no ask; the next one counts again.
-    sw.store
-        .update(|s| {
-            s.rollout.resume_asked = 0;
-            s.rollout.skip_asked = 0;
-            Ok(())
-        })
-        .unwrap();
+    assert!(r.skipped.is_empty() && r.again.is_empty() && (r.pause, r.pause_host) == (Pause::Failed, 2), "{r:#?}");
+    // The admin's skip of node-a passes node-a over, and only it.
+    sw.skip();
     sw.tick();
     let r = sw.rollout();
-    assert!(r.paused.is_empty() && (r.resume_done, r.skip_done) == (0, 0), "{r:#?}");
+    assert_eq!(r.skipped.iter().map(|s| s.host).collect::<Vec<_>>(), vec![2], "{r:#?}");
+    sw.until_unpaused(30, |s| s.installed(3) == 10 && s.installed(4) == 10);
 }
 
 // ---- resuming ----
@@ -1888,9 +1885,11 @@ fn skip_passes_over_a_server_but_never_the_brain() {
     let e = sw.ask(true).unwrap_err().to_string();
     assert!(e.contains("never passed over") && e.contains("./dryserver release resume"), "{e}");
     sw.brain.fake.sim().apply_fails = None;
+    // The registry account keeps the admin's skip anyway: a resume.
+    let skip = sw.signed_ask("release-skip", sw.now);
     sw.store
         .update(|s| {
-            s.rollout.skip_asked += 5;
+            s.rollout.skip_ask = skip;
             Ok(())
         })
         .unwrap();
@@ -2332,8 +2331,7 @@ fn a_drain_that_a_pdb_holds_back() {
     assert!(sw.server(2).fake.sim().applied.is_empty(), "updated without its turn");
     assert!(sw.lines().contains("updates node-a without draining"), "{}", sw.lines());
     // The admin resumes: it updates without the drain.
-    let ask = serde_json::to_string(&crate::signed::seal_admin(&ADMIN, "release-resume", sw.now).unwrap()).unwrap();
-    sw.call("release-resume", 0, ask.as_bytes()).unwrap();
+    sw.resume();
     sw.until(40, |s| s.everyone_on(10));
     assert!(sw.rollout().warnings.iter().any(|w| w.contains("it updates anyway, as you resumed")));
 
@@ -3124,4 +3122,72 @@ fn review_the_brain_keeps_a_release_only_once_the_ways_in_work() {
         .unwrap();
     sw.publish(10, true);
     sw.until(5, |s| s.installed(1) == 10);
+}
+
+/// The admin's signature on a resume or a skip was checked only in the
+/// forced command, the registry account's own code; root took the counts
+/// from registry.json. So the registry account alone could pass a failed
+/// canary over, or resume as often as it liked. Now root checks the signed
+/// ask itself, for the stop it is at, and carries each out once.
+#[test]
+fn review_the_registry_alone_cannot_pass_a_failed_canary_over() {
+    let mut sw = Swarm::new(3);
+    sw.server(2).fake.sim().apply_fails = Some("dryserver failed: exit status 1: no space left on device".into());
+    sw.publish(10, true);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    sw.store
+        .update(|s| {
+            s.rollout.skip_asked += 1;
+            Ok(())
+        })
+        .unwrap();
+    sw.ticks(15);
+    let updated: Vec<u32> = sw.servers[1..].iter().filter(|m| !m.fake.sim().applied.is_empty()).map(|m| m.host).collect();
+    assert!(updated.is_empty(), "servers {updated:?} updated without the admin's signed skip");
+
+    // Asks it may hold that do nothing: signed by another key, for
+    // another op than its slot, another release or stop, or too old.
+    let plant = |sw: &Swarm, resume: Envelope, skip: Envelope| {
+        sw.store
+            .update(|s| {
+                (s.rollout.resume_ask, s.rollout.skip_ask) = (resume.clone(), skip.clone());
+                Ok(())
+            })
+            .unwrap();
+    };
+    // Each newer than the one before, so each fails for its own reason.
+    let now = sw.now;
+    let ask = |op: &str, t: i64, serial: u64, host: u32| crate::signed::seal_ask(&ADMIN, op, t, serial, host).unwrap();
+    let resume = sw.signed_ask("release-resume", now + 5);
+    let none = Envelope::default;
+    for (resume, skip) in [
+        (none(), crate::signed::seal_ask(&Key("thief"), "release-skip", now, 10, 2).unwrap()),
+        (Envelope { doc: resume.doc.replace("\"host\":2", "\"host\":2,\"x\":1"), sig: resume.sig.clone() }, none()),
+        (ask("release-resume", now - 16 * 60, 10, 2), none()),
+        (none(), ask("release-resume", now + 1, 10, 2)),
+        (ask("release-resume", now + 2, 9, 2), none()),
+        (ask("release-resume", now + 3, 10, 3), none()),
+    ] {
+        plant(&sw, resume, skip);
+        sw.tick();
+        let r = sw.rollout();
+        assert!((r.pause, r.pause_host) == (Pause::Failed, 2) && r.again.is_empty() && r.skipped.is_empty(), "{r:#?}");
+    }
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 1);
+
+    // The admin's own resume: node-a tries once more, once. Sent again (the
+    // same ask, within its 15 minutes) it does nothing.
+    sw.resume();
+    let ask = sw.store.read().unwrap().rollout.resume_ask;
+    sw.until(10, |s| s.server(2).fake.sim().applied.len() == 2 && !s.rollout().paused.is_empty());
+    for _ in 0..5 {
+        plant(&sw, ask.clone(), Envelope::default());
+        sw.tick();
+    }
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 2, "one resume carried out twice");
+    assert!(sw.rollout().ask_done > 0 && sw.rollout().paused.contains("again"), "{:#?}", sw.rollout());
+    // The admin's skip: node-a is passed over, and the others go on.
+    sw.skip();
+    sw.until_unpaused(30, |s| s.installed(3) == 10 && s.installed(4) == 10);
+    assert!(sw.rollout().skipped.iter().any(|s| s.host == 2));
 }

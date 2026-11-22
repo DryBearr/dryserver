@@ -1019,6 +1019,26 @@ fn member_host(st: &Store, mesh: &dyn Mesh, client: &str) -> Result<u32> {
     Ok(host)
 }
 
+/// Refuses a resume or a skip made for another stop than the one the
+/// rollout is at: root would not carry it out.
+fn same_stop(r: &Rollout, ask: &signed::AdminRequest) -> Result<()> {
+    if ask.serial == 0 {
+        return Err(errf!(
+            "the request names no rollout (none was there when you looked, or this dryserver is older than the coordinator's); \
+             the rollout is at release {}: look again with ./dryserver release status",
+            r.serial
+        ));
+    }
+    if ask.serial != r.serial || ask.host != r.pause_host {
+        return Err(errf!(
+            "the rollout changed since you looked (it is at release {}{}): look again with ./dryserver release status",
+            r.serial,
+            if r.paused.is_empty() { ", not stopped".to_string() } else { format!(", stopped at host {}", r.pause_host) }
+        ));
+    }
+    Ok(())
+}
+
 /// A release serial as a caller writes it.
 fn parse_serial(s: &str) -> Result<u64> {
     if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_digit()) {
@@ -1149,11 +1169,15 @@ pub fn serve(
         }
         ("release-resume", 1) => {
             let req: Envelope = decode_first(input).ok_or_else(|| Error::new("bad admin request"))?;
-            signed::open_admin(verifier, &req, "release-resume", now.0.timestamp())?;
+            let ask = signed::open_request(verifier, &req, "release-resume", now.0.timestamp())?;
             let asked = st.update(|s| {
                 if s.rollout.serial == 0 {
                     return Err("there is no rollout to resume".into());
                 }
+                same_stop(&s.rollout, &ask)?;
+                // The ask itself, which root checks and carries out once;
+                // the count is for the admin's screens.
+                s.rollout.resume_ask = req.clone();
                 s.rollout.resume_asked = s.rollout.resume_asked.wrapping_add(1);
                 Ok(s.rollout.resume_asked)
             })?;
@@ -1161,7 +1185,7 @@ pub fn serve(
         }
         ("release-skip", 1) => {
             let req: Envelope = decode_first(input).ok_or_else(|| Error::new("bad admin request"))?;
-            signed::open_admin(verifier, &req, "release-skip", now.0.timestamp())?;
+            let ask = signed::open_request(verifier, &req, "release-skip", now.0.timestamp())?;
             let asked = st.update(|s| {
                 let r = &s.rollout;
                 if r.serial == 0 {
@@ -1173,6 +1197,8 @@ pub fn serve(
                 if r.paused.is_empty() || r.pause_host == 0 {
                     return Err("the rollout is not stopped at a server: there is nothing to pass over".into());
                 }
+                same_stop(r, &ask)?;
+                s.rollout.skip_ask = req.clone();
                 s.rollout.skip_asked = s.rollout.skip_asked.wrapping_add(1);
                 Ok(s.rollout.skip_asked)
             })?;
@@ -2158,14 +2184,32 @@ mod tests {
             |key: &signed::fake::Key, op: &str| serde_json::to_string(&signed::seal_admin(key, op, t0().0.timestamp()).unwrap()).unwrap();
         let adm: AdminState = serde_json::from_str(&call(&st, "admin", "192.168.1.9 5000 22", &ask(&ADMIN, "state")).unwrap()).unwrap();
         assert_eq!((adm.rollout.serial, adm.now), (9, t0().0.timestamp()));
-        // Only the admin resumes, with a request made for it.
-        assert!(call(&st, "release-resume", "192.168.1.9 5000 22", &ask(&signed::fake::Key("thief"), "release-resume")).is_err());
-        assert!(call(&st, "release-resume", "192.168.1.9 5000 22", &ask(&ADMIN, "state")).is_err());
-        let out = call(&st, "release-resume", "192.168.1.9 5000 22", &ask(&ADMIN, "release-resume")).unwrap();
+        // Only the admin resumes, with a request made for it, for the stop
+        // the rollout is at.
+        let resume = |key: &signed::fake::Key, op: &str, serial: u64, host: u32| {
+            serde_json::to_string(&signed::seal_ask(key, op, t0().0.timestamp(), serial, host).unwrap()).unwrap()
+        };
+        let lan = "192.168.1.9 5000 22";
+        assert!(call(&st, "release-resume", lan, &resume(&signed::fake::Key("thief"), "release-resume", 9, 0)).is_err());
+        assert!(call(&st, "release-resume", lan, &resume(&ADMIN, "state", 9, 0)).is_err());
+        let e = call(&st, "release-resume", lan, &ask(&ADMIN, "release-resume")).unwrap_err().to_string();
+        assert!(e.contains("names no rollout"), "{e}");
+        for (serial, host) in [(8, 0), (9, 2)] {
+            let e = call(&st, "release-resume", lan, &resume(&ADMIN, "release-resume", serial, host)).unwrap_err().to_string();
+            assert!(e.contains("the rollout changed since you looked (it is at release 9, not stopped)"), "{e}");
+        }
+        assert!(st.read().unwrap().rollout.resume_ask.is_empty());
+        let out = call(&st, "release-resume", lan, &resume(&ADMIN, "release-resume", 9, 0)).unwrap();
         assert!(out.contains(r#""resume":1"#), "{out}");
-        assert_eq!(st.read().unwrap().rollout.resume_asked, 1);
+        let r = st.read().unwrap().rollout;
+        assert_eq!(r.resume_asked, 1);
+        assert_eq!(signed::open_request(&ADMIN, &r.resume_ask, "release-resume", t0().0.timestamp()).unwrap().serial, 9);
+        set(Rollout { paused: "node-a: update failed".into(), pause_host: 2, ..running.clone() });
+        let e = call(&st, "release-skip", lan, &resume(&ADMIN, "release-skip", 9, 3)).unwrap_err().to_string();
+        assert!(e.contains("stopped at host 2"), "{e}");
+        assert!(call(&st, "release-skip", lan, &resume(&ADMIN, "release-skip", 9, 2)).unwrap().contains(r#""skip":1"#));
         set(Rollout::default());
-        let e = call(&st, "release-resume", "192.168.1.9 5000 22", &ask(&ADMIN, "release-resume")).unwrap_err().to_string();
+        let e = call(&st, "release-resume", lan, &resume(&ADMIN, "release-resume", 9, 0)).unwrap_err().to_string();
         assert!(e.contains("no rollout to resume"), "{e}");
     }
 

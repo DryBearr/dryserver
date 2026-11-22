@@ -450,6 +450,10 @@ pub struct Admin {
     /// When that one failed on the coordinator and went back, the release
     /// the machines run instead (rollout::went_back), as last loaded.
     went_back: Option<u64>,
+    /// Where the rollout stopped, as last loaded: its release and the
+    /// host (0: the coordinator's own update). A resume or a skip names
+    /// it, and the coordinator carries out only an ask for its own stop.
+    stop: Option<(u64, u32)>,
 }
 
 impl Admin {
@@ -468,6 +472,7 @@ impl Admin {
             coordinator_proved: false,
             release: None,
             went_back: None,
+            stop: None,
         }
     }
 
@@ -646,6 +651,7 @@ impl Admin {
         let newest = self.release.as_ref().map_or(0, |r| r.serial);
         let brain = members.iter().find(|m| m.host == 1).and_then(|m| m.report.as_ref());
         self.went_back = rollout::went_back(&v.rollout, brain, newest);
+        self.stop = Some((v.rollout.serial, v.rollout.pause_host));
         self.members = members;
         self.pending = v.pending.clone();
         self.unproved = v.unproved.clone();
@@ -1018,8 +1024,14 @@ impl Admin {
         self.release_ask("release-skip", "skip")
     }
 
+    /// Asks for op at the stop last loaded (one load first, when none
+    /// was).
     fn release_ask(&mut self, op: &str, field: &str) -> Result<u64> {
-        let ask = signed::seal_admin(self.signer.as_ref(), op, (self.now)().0.timestamp())?;
+        if self.stop.is_none() {
+            self.load()?;
+        }
+        let (serial, host) = self.stop.unwrap_or_default();
+        let ask = signed::seal_ask(self.signer.as_ref(), op, (self.now)().0.timestamp(), serial, host)?;
         let out = self.link.call(op, &serde_json::to_string(&ask)?)?;
         let v: serde_json::Value = serde_json::from_str(&out).map_err(|e| Error::from(e).wrap("the coordinator's answer"))?;
         Ok(v[field].as_u64().unwrap_or(0))
@@ -1955,24 +1967,35 @@ pub mod tests {
                 Ok(())
             })
             .unwrap();
+        // Asked for the stop as last seen: it changed since.
+        let e = a.resume_release().unwrap_err().to_string();
+        assert!(e.contains("look again") && e.contains("release 5"), "{e}");
+        a.load().unwrap();
         assert_eq!(a.resume_release().unwrap(), 1);
-        assert_eq!(store.read().unwrap().rollout.resume_asked, 1);
+        let r = store.read().unwrap().rollout;
+        assert_eq!(r.resume_asked, 1);
+        // The ask itself is kept, signed, naming the release and the stop.
+        let ask = signed::open_request(&Key("admin"), &r.resume_ask, "release-resume", Time::now().0.timestamp()).unwrap();
+        assert_eq!((ask.serial, ask.host), (5, 0));
         // Passing over needs a stop at a server, never the coordinator.
         assert!(a.skip_release().unwrap_err().to_string().contains("not stopped at a server"));
-        let at = |phase, pause_host| {
+        let at = |a: &mut Admin, phase, pause_host| {
             store
                 .update(|s| {
                     s.rollout = Rollout { serial: 5, phase, paused: "x".into(), pause_host, ..s.rollout.clone() };
                     Ok(())
                 })
-                .unwrap()
+                .unwrap();
+            a.load().unwrap();
         };
-        at(rollout::Phase::Failed, 0);
+        at(&mut a, rollout::Phase::Failed, 0);
         assert!(a.skip_release().unwrap_err().to_string().contains("never passed over"));
-        at(rollout::Phase::Servers, 2);
+        at(&mut a, rollout::Phase::Servers, 2);
         assert_eq!(a.skip_release().unwrap(), 1);
         let r = store.read().unwrap().rollout;
         assert_eq!((r.skip_asked, r.resume_asked), (1, 1));
+        let ask = signed::open_request(&Key("admin"), &r.skip_ask, "release-skip", Time::now().0.timestamp()).unwrap();
+        assert_eq!((ask.serial, ask.host), (5, 2));
     }
 
     #[test]
