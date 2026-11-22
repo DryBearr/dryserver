@@ -731,6 +731,7 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
             member(6, "node-e", Some(rep(1, "", 0, "")), now - 20),
             member(7, "node-f", Some(rep(1, "rebooting", s, "")), now - 20),
             member(8, "node-g", Some(rep(1, "held", 0, "")), now - 20),
+            member(9, "node-h", Some(rep(1, "pending", s, "installing the packages of Arch 2026/11/20")), now - 20),
         ],
         coordinator_now: now,
         ..View::default()
@@ -751,6 +752,8 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
         // A state this version does not know is shown as the machine says it.
         &format!("  node-f         server       rebooting (release {s})"),
         "! node-g         server       held: its kill switch is on",
+        // What its update does now, from the note.
+        &format!("  node-h         server       updating (release {s}): installing the packages of Arch 2026/11/20"),
         "The rollout is stopped. Look at the machine first, then either",
         "./dryserver release resume                       the coordinator gives node-b its turn again",
         "./dryserver release resume -skip                 the coordinator passes node-b over for release",

@@ -729,7 +729,9 @@ fn machine_state(m: &Member, r: &Rollout, now: i64) -> (String, bool) {
     match rep.update.as_str() {
         "" => {}
         "fetching" => return (format!("loading the update{about}"), false),
-        "pending" => return (format!("installed{about}, checking it before keeping it"), false),
+        // The note says what it does: loading or installing the packages,
+        // k3s, a reboot, or the check before it is kept.
+        "pending" => return (format!("updating{about}{}", if note.is_empty() { ", checking it before keeping it" } else { &note }), false),
         "held" => return ("held: its kill switch is on, it updates nothing until it is lifted".into(), true),
         s if rep.update_failed() && (target == 0 || rep.update_serial >= target) => {
             return (format!("update {s}{about}{note}"), true);
