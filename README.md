@@ -190,8 +190,11 @@ nobody at the machine. When nothing else is left, the machine stays up as it is.
 
 New firmware or a new systemd rebuild every image; `linux-lts` keeps the one
 it was made with (the installer's too) until `linux-lts` itself is updated,
-so one bad initramfs cannot reach both kernels. `sudo dryserver boot status` shows the images,
-which one started and whether the fallback waits; `./dryserver approve` shows
+so one bad initramfs cannot reach both kernels. While the fallback kernel
+runs, or the main image failed, every update looks at each kernel's image:
+one that was never made (a power cut before pacman's hook) is made again,
+and the machine reboots into the main kernel. `sudo dryserver boot status`
+shows the images, which one started and whether the fallback waits; `./dryserver approve` shows
 "running fallback kernel" or "no fallback kernel" for a machine.
 
 Limits: two kernels that are both broken (both updated in one go, or new

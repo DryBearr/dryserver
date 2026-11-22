@@ -398,6 +398,13 @@ pub struct Pending {
     /// only after that reboot.
     #[serde(default)]
     pub reboot: bool,
+    /// The update brought a new main kernel, or made its boot image again
+    /// (osupdate::ArchOutcome::main_new): the next boot is that kernel's
+    /// test, and a machine that runs its fallback kernel after it did not
+    /// pass it. False: a fallback kernel that runs is not this update's
+    /// doing.
+    #[serde(default)]
+    pub kernel: bool,
     /// The handover (see the module): the protocol the binary that started
     /// the update and the new one both speak; 0 when it was started by, or
     /// handed to, a binary from before it.
@@ -2035,6 +2042,7 @@ fn install_work(
             bail!("{}", o.summary());
         }
         reboot = p.may_reboot && o.reboot_needed() && o.reboot_safe() && host.reboot_blocker().is_none();
+        p.kernel = o.main_new;
     }
     let mut ch = Changes::new(m, p);
     ch.put(INSTALLED, 0o600, (serde_json::to_string_pretty(env)? + "\n").as_bytes())?;
@@ -2762,6 +2770,10 @@ pub struct PendingInfo {
     pub step: String,
     /// The apply rebooted the machine: confirm after the restart.
     pub reboot: bool,
+    /// The update brought a new main kernel (or its image): see
+    /// Pending::kernel. With boots > 0 the machine started since, so a
+    /// fallback kernel that runs now is that kernel failing.
+    pub kernel: bool,
 }
 
 /// When this machine started, unix seconds (/proc/stat); 0 when unknown.
@@ -2822,6 +2834,7 @@ pub fn status(m: &Machine, now: i64) -> Status {
             files: p.files.iter().map(|f| f.path.clone()).collect(),
             step: p.step.clone(),
             reboot: p.reboot,
+            kernel: p.kernel,
         }),
         Err(e) => {
             problems.push(e.to_string());
@@ -4867,6 +4880,13 @@ mod tests {
         guard_boot(&lab.m(), &Ctx::new(), now() + 120, &mut Vec::new()).unwrap();
         assert_eq!(lab.pending().unwrap().boots, 1);
         assert!(status(&lab.m(), now()).reboot.is_empty(), "the new kernel runs");
+        // The rollout's health check reads that this boot was the new
+        // kernel's test.
+        let json = serde_json::to_value(status(&lab.m(), now())).unwrap();
+        assert_eq!((json["pending"]["kernel"].as_bool(), json["pending"]["boots"].as_u64()), (Some(true), Some(1)), "{json}");
+        let lab = Lab::new();
+        lab.apply_os(&os_rel(8, K3S_OLD, NEXT_DAY), None).unwrap();
+        assert!(!lab.pending().unwrap().kernel, "no new kernel, no kernel test");
 
         // Without --reboot (by hand), or a disk that asks for its
         // passphrase: said, not done.

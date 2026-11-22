@@ -541,6 +541,10 @@ pub struct ArchOutcome {
     pub untouched: bool,
     /// What dryserver did to get pacman past files in the way, said.
     pub repairs: Vec<String>,
+    /// The main kernel, or its boot image, is new after this run: the next
+    /// boot is its test. A machine that then runs the fallback kernel did
+    /// not boot it (update.rs records it for the rollout's health check).
+    pub main_new: bool,
     #[serde(skip)]
     pub failure: Option<Failure>,
     /// What the pacman run that failed said.
@@ -740,17 +744,35 @@ impl Host<'_> {
         let after = self.pacnew_files();
         out.pacnew = after.iter().filter(|(p, t)| out.pacnew_before.get(*p) != Some(t)).map(|(p, _)| p.clone()).collect();
         let kernels = self.kernels();
+        let main_changed = out.changes.iter().any(|c| c.name == "linux" && c.action != "removed");
         let kernel_changed = out.kernel_replaced
             || out
                 .changes
                 .iter()
                 .any(|c| c.action != "removed" && (KERNEL_PACKAGES.contains(&c.name.as_str()) || kernels.contains_key(&c.name)));
-        out.boot_problem = self.boot_problem(out.hook_failed, kernel_changed, &kernels);
+        // Every kernel's image is looked at when a kernel changed, and also
+        // when the fallback runs or the main image failed: a run cut off
+        // between unpacking a kernel and making its image leaves the old
+        // image, which fails, and the fallback starts; later runs change no
+        // kernel, and the main one would never come back.
+        let fallback = self.fallback_runs();
+        let look = kernel_changed || fallback || self.main_image_bad();
+        out.boot_problem = self.boot_problem(out.hook_failed, look, &kernels);
+        let mut remade = false;
         if out.failure.is_none() && out.boot_problem.is_some() {
             // The images were not made (a power cut in pacman's hooks, and
             // this run had nothing left to install), or not placed: make
             // them again. mkinitcpio's post hook puts each in place.
-            self.remake_images(ctx, out, kernel_changed, &kernels);
+            self.remake_images(ctx, out, look, &kernels);
+            remade = true;
+        }
+        // The main kernel, or its image, is new: the next boot is its test.
+        // Running the fallback, a remade main image needs that boot too.
+        let main_image_new = remade && out.boot_problem.is_none() && !self.main_image_bad();
+        out.main_new = main_changed || (out.kernel_replaced && !fallback) || (fallback && main_image_new);
+        if fallback && main_image_new && !out.restart.iter().any(|r| r == "linux") {
+            self.say("Arch: the main kernel has a new boot image while the fallback kernel runs: a reboot starts it");
+            out.restart.push("linux".into());
         }
         if out.failure.is_none() {
             // Old packages pile up in the cache with every update until the
@@ -795,6 +817,7 @@ impl Host<'_> {
     /// by mkinitcpio's post hook; then the images are looked at again.
     fn remake_images(&self, ctx: &Ctx, out: &mut ArchOutcome, kernel_changed: bool, kernels: &BTreeMap<String, SystemTime>) {
         self.say("Arch: the boot images are not current; making them again (mkinitcpio -P)");
+        self.copy_kernels(out);
         let tctx = ctx.with_timeout(self.limits.sync);
         let (o, res) = self.run.run(&tctx, &Cmd::new("mkinitcpio", &["-P"]).interrupt(Some(PACMAN_GRACE)));
         match res {
@@ -1272,7 +1295,13 @@ impl Host<'_> {
     /// The kernel packages on disk, each with the time its newest vmlinuz
     /// was put there.
     fn kernels(&self) -> BTreeMap<String, SystemTime> {
-        let mut found: BTreeMap<String, SystemTime> = BTreeMap::new();
+        self.kernel_files().into_iter().map(|(base, (at, _))| (base, at)).collect()
+    }
+
+    /// The kernel packages on disk, each with its newest vmlinuz and the
+    /// time it was put there.
+    fn kernel_files(&self) -> BTreeMap<String, (SystemTime, PathBuf)> {
+        let mut found: BTreeMap<String, (SystemTime, PathBuf)> = BTreeMap::new();
         let Ok(rd) = fs::read_dir(self.path(MODULES)) else {
             return found;
         };
@@ -1286,10 +1315,48 @@ impl Host<'_> {
             let base = read_capped(&e.path().join("pkgbase"), 256).unwrap_or_default().trim().to_string();
             let base = if kernel_name(&base) { base } else { "linux".to_string() };
             let at = changed_at(&md);
-            let slot = found.entry(base).or_insert(at);
-            *slot = (*slot).max(at);
+            let path = e.path().join("vmlinuz");
+            let slot = found.entry(base).or_insert((at, path.clone()));
+            if at > slot.0 {
+                *slot = (at, path);
+            }
         }
         found
+    }
+
+    /// The fallback kernel runs (the main one did not boot, or was not
+    /// picked): its release name or its package says so.
+    fn fallback_runs(&self) -> bool {
+        let running = fsx::read_or_empty(self.path("/proc/sys/kernel/osrelease")).trim().to_string();
+        if running.is_empty() || running.contains('/') {
+            return false;
+        }
+        let pkgbase = fsx::read_or_empty(self.path(&format!("{MODULES}/{running}/pkgbase"))).trim().to_string();
+        pkgbase == "linux-lts" || (pkgbase.is_empty() && running.ends_with("-lts"))
+    }
+
+    /// The main kernel's newest image failed its tries (or has none left).
+    fn main_image_bad(&self) -> bool {
+        self.boot_images("linux").into_iter().max_by_key(|(_, t)| *t).is_some_and(|(name, _)| name.contains("+0.") || name.contains("+0-"))
+    }
+
+    /// Before mkinitcpio -P: the copy of each kernel in /boot that the
+    /// presets build from (/boot/vmlinuz-KERNEL) is that kernel's newest,
+    /// as pacman's mkinitcpio hook makes it; a run cut off before that hook
+    /// left the old one, and mkinitcpio would build from it.
+    fn copy_kernels(&self, out: &mut ArchOutcome) {
+        for (base, (at, src)) in self.kernel_files() {
+            let dst = self.path(&format!("/boot/vmlinuz-{base}"));
+            let current = fs::metadata(&dst).and_then(|m| m.modified()).is_ok_and(|t| t + TIME_SLACK >= at);
+            if current || !kernel_name(&base) {
+                continue;
+            }
+            let res = fsx::read(&src).and_then(|b| write_atomic(&dst, &b, 0o644));
+            match res {
+                Ok(()) => self.say(&format!("Arch: /boot/vmlinuz-{base} is the kernel on disk again")),
+                Err(e) => out.warnings.push(format!("cannot copy the kernel {base} to /boot: {e}")),
+            }
+        }
     }
 
     /// The boot images of the kernel package base in UKI_DIR, by name, with
@@ -3319,6 +3386,56 @@ mod tests {
         let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
         assert!(out.ok() && !out.lts_waits);
         assert_eq!(fake.count("pacman -Su "), 1);
+    }
+
+    #[test]
+    fn review_a_main_image_never_made_is_made_while_the_fallback_runs() {
+        // A power cut between unpacking linux and making its image: the old
+        // image failed its one try and linux-lts runs. This run changes no
+        // package, and the main kernel must come back all the same.
+        let setup = |makes: bool| {
+            let dir = two_kernels();
+            let r = dir.path();
+            fs::remove_dir_all(fsx::under(r, format!("/usr/lib/modules/{RUNNING}"))).unwrap();
+            put_kernel(r, "6.12.4-arch1-1", "linux");
+            fs::remove_file(fsx::under(r, UKI)).unwrap();
+            put(r, "/boot/EFI/Linux/arch-linux+0-1.efi", "the old kernel, its modules gone");
+            age(r, "/boot/EFI/Linux/arch-linux+0-1.efi");
+            put(r, "/proc/sys/kernel/osrelease", "6.6.60-1-lts\n");
+            let mut fake = Fake::new(r);
+            if makes {
+                fake.mkinitcpio_makes = vec!["/boot/EFI/Linux/arch-linux+3.efi"];
+            }
+            (dir, fake)
+        };
+        let (dir, fake) = setup(false);
+        let r = dir.path();
+        let (h, _) = host(r, &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.boot_problem.is_some() || fake.count("mkinitcpio -P") > 0, "{}", out.summary());
+        assert_eq!(fake.count("mkinitcpio -P"), 1);
+        // pacman's hook did not run either: the copy mkinitcpio builds
+        // from is the kernel on disk again first.
+        assert_eq!(get(r, VMLINUZ), "kernel", "the new kernel, not the old one");
+        assert!(!out.reboot_safe() && !out.main_new, "still no image: {}", out.summary());
+        // mkinitcpio makes it: a reboot is due, to start the main kernel,
+        // and that boot is the new image's test.
+        let (dir, fake) = setup(true);
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        let s = out.summary();
+        assert!(out.ok() && out.reboot_safe() && out.reboot_needed() && out.restart == ["linux"] && out.main_new, "{s}");
+        // The fallback runs with a main image that is good (made after its
+        // kernel, as on a machine): nothing to do.
+        let dir = two_kernels();
+        put(dir.path(), "/proc/sys/kernel/osrelease", "6.6.60-1-lts\n");
+        put(dir.path(), VMLINUZ, "kernel");
+        put(dir.path(), UKI, "image");
+        let fake = Fake::new(dir.path());
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok() && out.boot_problem.is_none() && !out.reboot_needed() && !out.main_new, "{}", out.summary());
+        assert_eq!(fake.count("mkinitcpio"), 0);
     }
 
     #[test]
