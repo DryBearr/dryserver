@@ -371,13 +371,35 @@ fn open_regular(path: &Path) -> Result<File> {
 
 /// A small text file, refused when it is larger than max.
 fn read_small(path: &Path, max: u64) -> Result<String> {
-    let f = open_regular(path)?;
+    read_capped(open_regular(path)?, max, path)
+}
+
+/// What an open file holds, refused when it is larger than max. path
+/// names it in messages.
+fn read_capped(f: File, max: u64, path: &Path) -> Result<String> {
     let mut s = String::new();
     f.take(max + 1).read_to_string(&mut s).map_err(|e| Error::from(e).wrap(format!("read {}", path.display())))?;
     if s.len() as u64 > max {
         bail!("{} is larger than {max} bytes", path.display());
     }
     Ok(s)
+}
+
+/// The sha256 of what r holds, at most max bytes of it; None when it
+/// cannot be read.
+fn sha_reader(r: impl Read, max: u64) -> Option<String> {
+    let mut h = Sha256::new();
+    let mut r = r.take(max);
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(k) => h.update(&buf[..k]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(fsx::hex(&h.finalize()))
 }
 
 fn file_len(path: &Path) -> u64 {
@@ -462,19 +484,7 @@ fn copy_exact(r: &mut dyn Read, dst: &Path, size: u64, sha256: &str, what: &str)
 /// The sha256 of the binary this process runs. /proc/self/exe is the
 /// running file even after an update put another one in its place.
 fn running_sha(root: &Path) -> Option<String> {
-    let f = File::open(fsx::under(root, "/proc/self/exe")).ok()?;
-    let mut h = Sha256::new();
-    let mut r = f.take(release::MAX_BINARY);
-    let mut buf = vec![0u8; 64 << 10];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(k) => h.update(&buf[..k]),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
-        }
-    }
-    Some(fsx::hex(&h.finalize()))
+    sha_reader(File::open(fsx::under(root, "/proc/self/exe")).ok()?, release::MAX_BINARY)
 }
 
 /// The sha256 of a file, None when it cannot be read.
@@ -533,9 +543,22 @@ impl Served {
         self.dir.join(serial.to_string())
     }
 
+    /// A file of the uploads: dir/name, or dir/SERIAL/name. Reached
+    /// through each directory opened by itself, never through a link:
+    /// root reads these, and the registry account owns every directory
+    /// on the way (O_NOFOLLOW alone covers only the last part of a path).
+    pub fn open(&self, serial: Option<u64>, name: &str) -> Result<File> {
+        let dir = registry::Dir::open(&self.dir)?;
+        let dir = match serial {
+            Some(n) => dir.sub(&n.to_string())?,
+            None => dir,
+        };
+        dir.open_regular(name, libc::O_RDONLY)
+    }
+
     /// The serial of the newest upload.
     pub fn current(&self) -> Option<u64> {
-        let s = read_small(&self.dir.join("current"), 32).ok()?;
+        let s = read_capped(self.open(None, "current").ok()?, 32, &self.dir.join("current")).ok()?;
         let s = s.trim();
         if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_digit()) {
             return None;
@@ -544,12 +567,19 @@ impl Served {
     }
 
     pub fn envelope(&self, serial: u64) -> Result<Envelope> {
-        let text = read_small(&self.release_dir(serial).join(RELEASE_FILE), MAX_ENVELOPE)?;
+        let text = read_capped(self.open(Some(serial), RELEASE_FILE)?, MAX_ENVELOPE, &self.path(serial, RELEASE_FILE))?;
         serde_json::from_str(&text).map_err(|e| Error::from(e).wrap(format!("release {serial} on the coordinator")))
     }
 
+    /// Where a file of an upload is. Root never opens it by this path
+    /// (open).
     pub fn path(&self, serial: u64, name: &str) -> PathBuf {
         self.release_dir(serial).join(name)
+    }
+
+    /// The length of a file of an upload; 0 when it cannot be opened.
+    fn len_of(&self, serial: u64, name: &str) -> u64 {
+        self.open(Some(serial), name).and_then(|f| Ok(f.metadata()?.len())).unwrap_or(0)
     }
 
     /// The newest upload's release, as the registry account stored it.
@@ -666,8 +696,7 @@ impl Served {
         if name != DRYSERVER_FILE && name != K3S_FILE {
             bail!("no file {name:?} in a release");
         }
-        let path = self.path(serial, name);
-        let mut f = open_regular(&path).map_err(|e| e.wrap(format!("release {serial} is not on the coordinator")))?;
+        let mut f = self.open(Some(serial), name).map_err(|e| e.wrap(format!("release {serial} is not on the coordinator")))?;
         let len = f.metadata().map(|m| m.len()).unwrap_or(0);
         if offset > len {
             bail!("offset {offset} is past the end of {name} ({len} bytes)");
@@ -679,7 +708,7 @@ impl Served {
 
     /// Answers `release-get SERIAL release`.
     pub fn offered(&self, serial: u64) -> Result<Offered> {
-        Ok(Offered { release: self.envelope(serial)?, k3s_size: file_len(&self.path(serial, K3S_FILE)) })
+        Ok(Offered { release: self.envelope(serial)?, k3s_size: self.len_of(serial, K3S_FILE) })
     }
 }
 
@@ -709,7 +738,7 @@ impl Source for LocalSource<'_> {
     /// no network that may come back by itself.
     fn chunk(&self, _: &Ctx, serial: u64, name: &str, offset: u64, len: u64, dst: &Path) -> Result<()> {
         let missing = |e: Error| Error::with_kind(Kind::NotFound, format!("{name} of release {serial} on the coordinator: {e}"));
-        let mut f = open_regular(&self.0.path(serial, name)).map_err(missing)?;
+        let mut f = self.0.open(Some(serial), name).map_err(missing)?;
         f.seek(SeekFrom::Start(offset))?;
         let mut out = File::create(dst).map_err(|e| Error::from(e).wrap(format!("open {}", dst.display())))?;
         let n = io::copy(&mut f.take(len), &mut out)?;
@@ -2107,8 +2136,15 @@ impl Brain<'_> {
             Ok(r) => return Some(format!("the coordinator's copy of it holds release {}", r.serial)),
             Err(e) => return Some(format!("the coordinator's copy of it cannot be read ({e})")),
         };
-        match release::hash_file(&self.served.path(serial, K3S_FILE), MAX_K3S) {
-            Ok((sha, _)) if sha == rel.k3s.sha256 => None,
+        let sha = self.served.open(Some(serial), K3S_FILE).and_then(|f| {
+            let len = f.metadata()?.len();
+            if len > MAX_K3S {
+                bail!("it is {len} bytes, more than {MAX_K3S}");
+            }
+            sha_reader(f, MAX_K3S).ok_or_else(|| errf!("it cannot be read"))
+        });
+        match sha {
+            Ok(sha) if sha == rel.k3s.sha256 => None,
             Ok(_) => Some(format!("the coordinator's copy of k3s {} is not the release's", rel.k3s.version)),
             Err(e) => Some(format!("the coordinator has no copy of k3s {} for it ({e})", rel.k3s.version)),
         }

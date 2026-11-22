@@ -2790,3 +2790,68 @@ fn review_a_k3s_size_from_the_registry_is_capped_before_it_is_added() {
         assert!(sw.server(2).fake.sim().applied.is_empty() && !sw.pieces.lock().unwrap().iter().any(|p| p.1 == "k3s"));
     }
 }
+
+/// O_NOFOLLOW covers only the last part of a path: a link the registry
+/// account put at release/ or release/SERIAL in its own directory was
+/// followed when root read the releases. Now root goes through each
+/// directory opened by itself, never through a link, so the links below
+/// lead nowhere even to the genuine release they point at.
+#[test]
+fn review_root_never_reads_releases_through_a_planted_link() {
+    let mut sw = Swarm::new(1);
+    sw.publish(10, true);
+    let real = sw.served.dir.with_file_name("elsewhere");
+    std::fs::rename(&sw.served.dir, &real).unwrap();
+    std::fs::write(real.join("current"), "123\n").unwrap();
+    std::fs::rename(real.join("10"), real.join("123")).unwrap();
+    std::os::unix::fs::symlink(&real, &sw.served.dir).unwrap();
+    assert_eq!(sw.served.current(), None);
+    assert!(sw.served.envelope(123).is_err() && sw.served.offered(123).is_err());
+    let dst = sw.brain.node.path("/tmp-piece");
+    assert!(LocalSource(&sw.served).chunk(&Ctx::new(), 123, DRYSERVER_FILE, 0, 4, &dst).is_err());
+    sw.ticks(3);
+    assert!(sw.rollout().serial == 0 && sw.brain.fake.sim().applied.is_empty(), "{:#?}", sw.rollout());
+
+    // A link at release/SERIAL, to the genuine release moved aside.
+    let mut sw = Swarm::new(1);
+    sw.publish(10, true);
+    let moved = sw.served.dir.join("moved");
+    std::fs::rename(sw.served.dir.join("10"), &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, sw.served.dir.join("10")).unwrap();
+    assert_eq!(sw.served.current(), Some(10));
+    let e = sw.served.envelope(10).unwrap_err().to_string();
+    assert!(e.contains("symbolic link"), "{e}");
+    assert!(sw.served.offered(10).is_err());
+    assert!(LocalSource(&sw.served).chunk(&Ctx::new(), 10, DRYSERVER_FILE, 0, 4, &dst).is_err());
+    let mut out = Vec::new();
+    assert!(sw.served.send(10, DRYSERVER_FILE, 0, &mut out).is_err() && out.is_empty());
+    sw.ticks(3);
+    let r = sw.rollout();
+    assert!(r.serial == 0 && r.refused_serial == 10 && r.refused.contains("symbolic link"), "{r:#?}");
+    assert!(sw.brain.fake.sim().applied.is_empty());
+
+    // Taken up first, then the files swapped for a link: the brain's copy
+    // stops, and so does the check of the servers' k3s.
+    let sw = Swarm::new(1);
+    sw.publish(10, true);
+    sw.brain_sync();
+    let other = sw.served.dir.join("other");
+    std::fs::rename(sw.served.dir.join("10"), &other).unwrap();
+    std::os::unix::fs::symlink(&other, sw.served.dir.join("10")).unwrap();
+    let n = &sw.brain.node;
+    let rep = sw.healthy(1);
+    let members = sw.store.read().unwrap().members;
+    let b = Brain {
+        ctx: &Ctx::new(),
+        n,
+        served: &sw.served,
+        rep: &rep,
+        now: Now { unix: sw.now, minute: IN_WINDOW },
+        members: &members,
+        r: Rollout { serial: 10, ..Rollout::default() },
+        free: plenty,
+        nodes: None,
+    };
+    let why = b.served_k3s_problem().unwrap_or_default();
+    assert!(why.contains("cannot be read") && why.contains("symbolic link"), "{why}");
+}

@@ -616,7 +616,9 @@ impl Store {
 
 /// A directory opened once, for files opened inside it by name. Its own
 /// path is not looked up again, and a link in place of a file is refused.
-struct Dir {
+/// Root reads the releases the registry account keeps through it too
+/// (rollout::Served).
+pub(crate) struct Dir {
     fd: OwnedFd,
     path: PathBuf,
     uid: u32,
@@ -637,12 +639,33 @@ impl Dir {
     /// write in it when root uses it (a test or a desktop may run with a
     /// umask that lets its group write), never anyone at all; for anyone
     /// but root it has to be ours, as files written in it go to its owner.
-    fn open(path: &Path) -> Result<Dir> {
+    pub(crate) fn open(path: &Path) -> Result<Dir> {
         let c = c_string(path.as_os_str().as_bytes(), path)?;
         // SAFETY: c is a valid C string; the descriptor is owned below.
         let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        Dir::opened(fd, path)
+    }
+
+    /// The directory name inside this one, opened the same way: never
+    /// through a link, whatever its path says.
+    pub(crate) fn sub(&self, name: &str) -> Result<Dir> {
+        let c = self.c_name(name)?;
+        // SAFETY: valid directory descriptor and C string.
+        let fd = unsafe {
+            libc::openat(self.fd.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        };
+        Dir::opened(fd, &self.path.join(name))
+    }
+
+    /// What open and sub opened, once it checks out.
+    fn opened(fd: RawFd, path: &Path) -> Result<Dir> {
         if fd < 0 {
-            return Err(os_err("open", path));
+            let e = std::io::Error::last_os_error();
+            let link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+            if e.raw_os_error() == Some(libc::ELOOP) || link {
+                return Err(errf!("{} is a symbolic link, not the directory itself", path.display()));
+            }
+            return Err(Error::from(e).wrap(format!("open {}", path.display())));
         }
         // SAFETY: fd was just opened and nothing else owns it.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -668,7 +691,7 @@ impl Dir {
     /// Opens name in the directory: never a link, never something that is
     /// not a regular file, and without blocking on a FIFO. With O_CREAT it
     /// is made 0600 when missing.
-    fn open_regular(&self, name: &str, flags: libc::c_int) -> Result<File> {
+    pub(crate) fn open_regular(&self, name: &str, flags: libc::c_int) -> Result<File> {
         let c = self.c_name(name)?;
         let path = self.path.join(name);
         let all = flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
