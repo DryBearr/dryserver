@@ -574,6 +574,17 @@ table inet dryserver {{
 		flags dynamic
 		timeout 1m
 	}}
+	# Addresses that pinged this machine in the last minute.
+	set ping_meter4 {{
+		type ipv4_addr
+		flags dynamic
+		timeout 1m
+	}}
+	set ping_meter6 {{
+		type ipv6_addr
+		flags dynamic
+		timeout 1m
+	}}
 
 	# Members that tried closed ports: counted in knock4, and with more
 	# than {knocks} tries in a minute blocked in {offenders} for an hour.
@@ -595,9 +606,12 @@ table inet dryserver {{
 		ct state vmap {{ established : accept, related : accept, invalid : drop }}
 		iif lo accept
 
-		icmp type echo-request limit rate 10/second accept
+		# Pings, at most 10 a second from each address: a flood from one
+		# machine on the home network takes no other's (the pings over
+		# the switch that keep the links there).
+		icmp type echo-request add @ping_meter4 {{ ip saddr limit rate 10/second burst 20 packets }} accept
 		icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert }} accept
-		icmpv6 type echo-request limit rate 10/second accept
+		icmpv6 type echo-request add @ping_meter6 {{ ip6 saddr limit rate 10/second burst 20 packets }} accept
 
 		# Pods on this machine reach its kubelet (and on the coordinator
 		# the API server). Nothing else on this machine is for pods or

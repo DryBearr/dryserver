@@ -365,6 +365,31 @@ else
     echo "  SKIP accounts other than root: this user has no subordinate ids (/etc/subuid, /etc/subgid, newuidmap)"
 fi
 
+echo "== a ping flood from one address takes no other's pings"
+# The pings over the switch keep links there; one machine on the home
+# network flooding this one must not use up what they get.
+in_ $LAN sysctl -qw net.ipv4.ping_group_range="0 0"
+want "the router -> ping this machine" open $LAN 192.168.1.1 192.168.1.20 0 icmp
+# Each with an id of its own: one id is one connection to conntrack, and
+# its later pings pass as established.
+in_ $LAN python3 -I - <<'PY' &
+import socket, struct, time
+s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP); s.bind(("192.168.1.99", 0))
+end, i = time.time() + 4, 0
+while time.time() < end:
+    i = (i + 1) & 0xffff
+    hdr = struct.pack("!BBHHH", 8, 0, 0, i, 1)
+    c = sum(struct.unpack("!4H", hdr)); c = (c & 0xffff) + (c >> 16); c = ~c & 0xffff
+    try: s.sendto(struct.pack("!BBHHH", 8, 0, c, i, 1), ("192.168.1.20", 0))
+    except OSError: pass
+PY
+flood=$!
+sleep 1
+got=0
+for _ in 1 2 3 4 5; do [ "$(reach $LAN 192.168.1.1 192.168.1.20 0 icmp)" = open ] && got=$((got + 1)); done
+if [ "$got" -ge 4 ]; then ok "the router's pings answered during the flood ($got of 5)"; else bad "the router's pings answered during the flood ($got of 5)"; fi
+wait $flood 2>/dev/null
+
 echo "== wg0 down: what is for the mesh never leaves another way"
 # Its route goes with it; the default route would carry it to the home
 # network in the clear. Something there answers at a mesh address.
