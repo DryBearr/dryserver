@@ -809,8 +809,10 @@ release that brings it. Step by step:
    openssh, sshd restarts (running sessions stay) once `sshd -t` accepts
    its settings. The two kernels never change in one run: everything but
    the fallback kernel (linux-lts) first, linux-lts in a run of its own and
-   only once the main kernel has booted well, else at the next update; so
-   one kernel is always known good. Boot images that were not made (a power
+   only once the main kernel has booted well, else at the next update that
+   finds it booted well (a release that keeps the Arch day runs pacman for
+   it only then, so a machine that waits for a reboot by hand is not sent
+   through pacman at every release); so one kernel is always known good. Boot images that were not made (a power
    cut in pacman's hooks) are made again with `mkinitcpio -P`. When pacman
    refuses (files in the way, a damaged package), the update says pacman's
    own error lines; it changed nothing then, and rebooting stays safe.
@@ -822,7 +824,9 @@ release that brings it. Step by step:
    cut in the middle of a package (its own files, owned by no package).
    Anything else is refused with the files, for you to look at. A machine
    installed after the release, whose packages are of a newer day, keeps
-   them; the next release moves them.
+   them; the next release moves them. A rollback brings the packages to
+   exactly its day, also on a machine installed from that day's stick
+   (its packages came from mirrors of that day or newer).
 8. **The confirm window starts** (10 minutes, from the end of the apply,
    however long it took). Unless `sudo dryserver update confirm` follows,
    the machine puts back the old binary, the files, the mirrorlist and the

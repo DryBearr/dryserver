@@ -800,6 +800,12 @@ impl Host<'_> {
         q.is_ok_and(|o| o.contains("linux-lts"))
     }
 
+    /// Whether the main kernel booted well (main_known_good): only then may
+    /// the fallback kernel's own update run.
+    pub fn main_booted_well(&self) -> bool {
+        self.main_known_good()
+    }
+
     /// The main kernel runs, is the one on disk (not replaced), and booted
     /// well: on UEFI its newest image carries no boot counter any more
     /// (systemd-bless-boot drops it after a good boot).

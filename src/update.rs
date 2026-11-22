@@ -1500,17 +1500,26 @@ fn newer_here(pinned: &str, rel: &Release, installed: bool, since: i64) -> bool 
 }
 
 /// Whether the packages have to be brought to date. The mirrorlist pins
-/// another day (or none), the last run on that day did not finish, or the
-/// fallback kernel waits for its own run (one kernel at a time).
+/// another day (or none), or the last run on that day did not finish.
+///
+/// The fallback kernel waiting for its own run (one kernel at a time)
+/// makes a run due only once the main kernel has booted well: until then
+/// that run could not take it anyway, and a dryserver-only release must
+/// not run pacman every time on a machine that cannot reboot by itself.
+///
 /// Pinned to the day without any record of a run: a fresh machine its
-/// installer pinned to the day it installed from, nothing to do.
-fn arch_due(m: &Machine, date: &str) -> bool {
+/// installer pinned to the day it installed from, nothing to do; unless
+/// the release is a rollback to that day, since the installer took its
+/// packages from mirrors of that day or newer, and a rollback asks for
+/// exactly that day's.
+fn arch_due(m: &Machine, date: &str, rollback: bool) -> bool {
     if osupdate::pinned_date(&fsx::read_or_empty(m.path(osupdate::MIRRORLIST))).as_deref() != Some(date) {
         return true;
     }
     match read_json::<ArchState>(m, ARCH_STATE) {
-        Ok(Some(s)) => !(s.date == date && s.done && !s.lts_waits),
-        Ok(None) => false,
+        Ok(Some(s)) if !(s.date == date && s.done) => true,
+        Ok(Some(s)) => s.lts_waits && host(m, &HostLog::default()).main_booted_well(),
+        Ok(None) => rollback,
         Err(_) => true,
     }
 }
@@ -1661,7 +1670,7 @@ fn plan_work(m: &Machine, rel: &Release, k3s_file: &str, log: &HostLog, out: &mu
             ),
         );
         None
-    } else if arch_due(m, &rel.arch_date) {
+    } else if arch_due(m, &rel.arch_date, rel.rollback) {
         let o = host.arch_check(&rel.arch_date, rel.rollback);
         log.flush(m, out);
         if let Some(f) = &o.failure {
@@ -4084,20 +4093,32 @@ mod tests {
     fn when_the_packages_are_due() {
         let lab = Lab::new();
         let m = lab.m();
-        // Pinned by the installer to the day, no run yet: nothing to do.
-        assert!(!arch_due(&m, DAY) && arch_due(&m, NEXT_DAY));
+        // Pinned by the installer to the day, no run yet: nothing to do,
+        // unless the release is a rollback to exactly that day (the
+        // installer's packages are of that day or newer).
+        assert!(!arch_due(&m, DAY, false) && arch_due(&m, NEXT_DAY, false));
+        assert!(arch_due(&m, DAY, true));
         let state = |done: bool, lts_waits: bool| ArchState { date: DAY.into(), done, lts_waits, ..ArchState::default() };
         for (s, due) in [(state(true, false), false), (state(false, false), true), (state(true, true), true)] {
             save_json(&m, ARCH_STATE, &s).unwrap();
-            assert_eq!(arch_due(&m, DAY), due, "{s:?}");
+            assert_eq!(arch_due(&m, DAY, false), due, "{s:?}");
         }
+        // The fallback kernel waits, but the main kernel has not booted well
+        // yet (still on its counter, or not started: a disk that asks for its
+        // passphrase): a dryserver-only release runs no pacman for it.
+        lab.write("/boot/EFI/Linux/arch-linux+2-1.efi", b"image", 0o644);
+        assert!(!arch_due(&m, DAY, false));
+        let _ = fs::remove_file(lab.p("/boot/EFI/Linux/arch-linux+2-1.efi"));
+        lab.write("/proc/sys/kernel/osrelease", b"6.12.4-arch1-1\n", 0o644);
+        assert!(!arch_due(&m, DAY, false), "the running kernel's modules are gone: not rebooted yet");
+        lab.write("/proc/sys/kernel/osrelease", b"6.12.1-arch1-1\n", 0o644);
         // A record that cannot be read: run it.
         lab.write(ARCH_STATE, b"{", 0o600);
-        assert!(arch_due(&m, DAY));
+        assert!(arch_due(&m, DAY, false));
         // Not pinned at all (an install from before the pin): run it.
         lab.write(osupdate::MIRRORLIST, b"Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n", 0o644);
         let _ = fs::remove_file(lab.p(ARCH_STATE));
-        assert!(arch_due(&m, DAY));
+        assert!(arch_due(&m, DAY, false));
     }
 
     #[test]
@@ -4971,7 +4992,7 @@ mod tests {
         assert!(!a.done && a.untouched && a.summary.contains(words), "{a:?}");
         assert!(!status(&lab.m(), now()).reboot.contains("do NOT reboot"), "{}", status(&lab.m(), now()).reboot);
         assert!(fs::read_to_string(lab.p(LOG)).unwrap().contains(words), "the update log has pacman's words");
-        assert!(arch_due(&lab.m(), NEXT_DAY), "tried again by the next release");
+        assert!(arch_due(&lab.m(), NEXT_DAY, false), "tried again by the next release");
     }
 
     #[test]
