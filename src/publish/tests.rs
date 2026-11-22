@@ -972,3 +972,140 @@ fn an_urgent_release_keeps_the_arch_day() {
     assert_eq!(days.asked(), [days.asked()[..asked].to_vec(), vec![days_ago(0)]].concat());
     assert!(p.lines().join("\n").contains(&format!("  Arch       {} -> {} (checked", days_ago(2), days_ago(0))));
 }
+
+/// The coordinator's report of itself: on release, its update of serial
+/// ended as update.
+fn brain_says(store: &Store, release: u64, update: &str, serial: u64) {
+    store
+        .update(|s| {
+            let rep = Report {
+                format: report::FORMAT,
+                time: Time::now().0.timestamp(),
+                dryserver: "0.2.0".into(),
+                k3s: iso::K3S_VERSION.into(),
+                release,
+                update: update.into(),
+                update_serial: serial,
+                ..Report::default()
+            };
+            s.heartbeat(1, Heartbeat { lan_ip: "192.168.1.50".into(), report: Some(rep), ..Heartbeat::default() }, Time::now())
+        })
+        .unwrap();
+}
+
+/// The VM lab's case: the newest release failed on the coordinator and
+/// went back. The next preview compares with the release the machines
+/// still run (this computer keeps a copy of each it signed), not with the
+/// failed one, and says so.
+#[test]
+fn after_a_release_went_back_the_preview_compares_with_what_runs() {
+    let dir = TempDir::new();
+    let (mut a, store, _, _, parts) = desk(&dir);
+    let days = FakeDays::with(&[days_ago(1), days_ago(10)]);
+    let ctx = Ctx::new();
+    let v = a.load().unwrap();
+    let p = plan(&ctx, &a, &v, &days, &parts, &Choice::default(), today()).unwrap();
+    let m = publish(&mut a, &p).unwrap();
+    assert_eq!(signed_copy(&a, m.serial).as_ref(), Some(&m), "a copy of each release signed here");
+    let v = a.load().unwrap();
+    let old = super::tests::parts(&dir, "0.1.9");
+    let back = Choice { rollback: true, arch_date: days_ago(10), ..Choice::default() };
+    let p = plan(&ctx, &a, &v, &days, &old, &back, today()).unwrap();
+    let n = publish(&mut a, &p).unwrap();
+    store
+        .update(|s| {
+            s.rollout = Rollout { serial: n.serial, phase: Phase::Failed, paused: "its own update failed".into(), ..Rollout::default() };
+            Ok(())
+        })
+        .unwrap();
+    brain_says(&store, m.serial, "reverted", n.serial);
+
+    let v = a.load().unwrap();
+    let p = plan(&ctx, &a, &v, &days, &parts, &Choice::default(), today()).unwrap();
+    assert_eq!((p.went_back, p.runs.as_ref().map(|r| r.serial)), (Some(m.serial), Some(m.serial)));
+    assert_eq!(p.release.arch_date, days_ago(1));
+    let text = p.lines().join("\n");
+    for want in [
+        "  dryserver  same (0.2.0)".to_string(),
+        format!("  Arch       same ({})", days_ago(1)),
+        format!("Release {} failed on the coordinator and went back; the machines run release {}.", n.serial, m.serial),
+        format!("Compared with release {}, which the machines run.", m.serial),
+        format!("Nothing changes on the machines: the same dryserver build, k3s and Arch day as release {}", m.serial),
+    ] {
+        assert!(text.contains(&want), "{want}:\n{text}");
+    }
+    assert!(!text.contains(&days_ago(10)) && !text.contains("0.1.9"), "{text}");
+    // The rollout alone says so as well (an older coordinator's report).
+    store
+        .update(|s| {
+            s.members.iter_mut().find(|m| m.host == 1).unwrap().report.as_mut().unwrap().update.clear();
+            Ok(())
+        })
+        .unwrap();
+    let v = a.load().unwrap();
+    assert_eq!(plan(&ctx, &a, &v, &days, &parts, &Choice::default(), today()).unwrap().went_back, Some(m.serial));
+
+    // Without a good copy of it here: compared with the reports. A copy
+    // whose signature does not check out does not count.
+    let copy = dir.join("secrets").join(COPIES).join(format!("{}.json", m.serial));
+    let mut env: Envelope = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+    env.sig = crate::signed::Signer::sign(&Key("someone"), release::NS_RELEASE, &env.doc).unwrap();
+    std::fs::write(&copy, serde_json::to_string(&env).unwrap()).unwrap();
+    for _ in 0..2 {
+        let p = plan(&ctx, &a, &v, &days, &parts, &Choice::default(), today()).unwrap();
+        assert_eq!((p.went_back, p.runs.is_none()), (Some(m.serial), true));
+        let text = p.lines().join("\n");
+        assert!(text.contains(&format!("  Arch       as in release {} -> {}", m.serial, days_ago(1))), "{text}");
+        assert!(text.contains(&format!("Compared with what the machines report: this computer has no copy of release {}.", m.serial)));
+        assert!(!text.contains("Nothing changes"), "{text}");
+        std::fs::remove_file(&copy).unwrap_or_default();
+    }
+
+    // Stopped at a server instead: the coordinator runs the newest, and
+    // the preview compares with it.
+    store
+        .update(|s| {
+            s.rollout = Rollout {
+                serial: n.serial,
+                phase: Phase::Servers,
+                paused: "x".into(),
+                pause: Pause::Failed,
+                pause_host: 2,
+                ..s.rollout.clone()
+            };
+            Ok(())
+        })
+        .unwrap();
+    brain_says(&store, n.serial, "", 0);
+    let v = a.load().unwrap();
+    let p = plan(&ctx, &a, &v, &days, &parts, &Choice::default(), today()).unwrap();
+    assert_eq!((p.went_back, p.runs.as_ref().map(|r| r.serial)), (None, Some(n.serial)));
+    assert!(p.lines().join("\n").contains(&format!("Compared with release {}, the newest on the coordinator.", n.serial)));
+}
+
+/// The copies: kept when the upload broke off too (the release is signed
+/// and may have arrived), and only the newest ones.
+#[test]
+fn copies_of_signed_releases_are_kept_and_few() {
+    let dir = TempDir::new();
+    let (mut a, _, _, fail, parts) = desk(&dir);
+    let days = FakeDays::with(&[days_ago(0)]);
+    let ctx = Ctx::new();
+    let copies = dir.join("secrets").join(COPIES);
+    fsx::mkdir_all(&copies, 0o700).unwrap();
+    for s in 1..=20 {
+        std::fs::write(copies.join(format!("{s}.json")), "{}").unwrap();
+    }
+    std::fs::write(copies.join("notes.txt"), "mine").unwrap();
+    let v = a.load().unwrap();
+    let p = plan(&ctx, &a, &v, &days, &parts, &Choice::default(), today()).unwrap();
+    fail.store(true, Ordering::SeqCst);
+    assert!(publish(&mut a, &p).is_err());
+    assert_eq!(signed_copy(&a, p.release.serial).as_ref(), Some(&p.release));
+    let left: Vec<String> = std::fs::read_dir(&copies).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(left.len(), KEPT_COPIES + 1, "{left:?}");
+    assert!(left.contains(&"notes.txt".to_string()) && !left.contains(&"5.json".to_string()) && left.contains(&"6.json".to_string()));
+    assert!(signed_copy(&a, 5).is_none() && signed_copy(&a, 0).is_none(), "not a signed release");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(copies.join(format!("{}.json", p.release.serial))).unwrap().permissions().mode() & 0o777, 0o600);
+}

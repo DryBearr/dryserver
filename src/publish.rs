@@ -27,13 +27,14 @@ use std::sync::Arc;
 
 use chrono::NaiveDate;
 
-use crate::admin::{Admin, View};
+use crate::admin::{self, Admin, View};
 use crate::ctx::Ctx;
 use crate::err::Result;
 use crate::registry::{self, Member};
 use crate::release::{self, K3sVersion, Release, Version};
 use crate::rollout::{self, Pause, Phase, Rollout, Skip, Turn};
 use crate::runner::{Cmd, ExecRunner, Runner};
+use crate::signed::Envelope;
 use crate::{bail, errf, fsx, iso, report};
 
 // ---- the Arch snapshot day ----
@@ -399,6 +400,12 @@ pub struct Plan {
     /// The coordinator's newest release when the plan was made: what the
     /// swarm runs, or moves to.
     pub current: Option<Release>,
+    /// When the newest failed on the coordinator and went back: the
+    /// release the machines run (0: what they ran before it).
+    pub went_back: Option<u64>,
+    /// What the release is compared with: the newest, or the release the
+    /// machines run when the newest went back (None: what they report).
+    pub runs: Option<Release>,
     /// A release signed on this computer after the coordinator's newest,
     /// that never reached it.
     pub unsent: Option<u64>,
@@ -408,7 +415,8 @@ pub struct Plan {
     /// The coordinator's name, and the servers in the order of the list.
     pub brain: Option<String>,
     pub servers: Vec<String>,
-    /// What the machines report running, for a swarm without a release.
+    /// What the machines report running, for a swarm without a release
+    /// (or without a copy here of the one it runs).
     pub reported_dryserver: Vec<String>,
     pub reported_k3s: Vec<String>,
 }
@@ -431,7 +439,17 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
     rollout::check_static(&parts.binary)?;
     release::check_notes(&c.notes)?;
     let given = normalize_day(&c.arch_date);
-    let current_day = current.as_ref().map(|r| r.arch_date.as_str());
+    let went_back = went_back(v);
+    let runs = match went_back {
+        Some(m) => signed_copy(a, m),
+        None => current.clone(),
+    };
+    // The newest day the swarm took: the newest release's, or the one the
+    // machines run when that is later. Below either the release would be
+    // refused, here (against the newest) or on the machines.
+    let swarm_day =
+        [current.as_ref(), runs.as_ref()].into_iter().flatten().map(|r| r.arch_date.clone()).max_by_key(|d| release::arch_day(d).ok());
+    let current_day = swarm_day.as_deref();
     day_rules(&given, current_day, c.rollback, today)?;
     if let Some(cur) = &current
         && !c.rollback
@@ -486,6 +504,8 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
         parts: parts.clone(),
         unsent: last.filter(|l| current.as_ref().is_none_or(|cur| *l > cur.serial)),
         current,
+        went_back,
+        runs,
         arch_how: day.how,
         k3s,
         brain: brain.map(|m| m.name.clone()),
@@ -497,6 +517,22 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
 
 /// How the preview says an urgent release keeps the Arch day.
 pub const URGENT_DAY: &str = "urgent releases keep the day; give -arch-date to move it";
+
+/// When the coordinator's newest release failed on the coordinator and
+/// went back (its own update failed, so no server took it): the release
+/// the machines run, by the coordinator's report (0: not known, or none).
+/// The rollout and the report are the coordinator's word; they only
+/// choose what the preview compares with, never what is allowed.
+fn went_back(v: &View) -> Option<u64> {
+    let newest = v.release.as_ref()?;
+    let rep = v.members.iter().find(|(m, _)| m.host == 1).and_then(|(m, _)| m.report.as_ref());
+    if rep.is_some_and(|r| r.release >= newest.serial) {
+        return None;
+    }
+    let failed = v.rollout.serial == newest.serial && v.rollout.phase == Phase::Failed;
+    let reverted = rep.is_some_and(|r| r.update_failed() && r.update_serial == newest.serial);
+    (failed || reverted).then(|| rep.map(|r| r.release).unwrap_or(0))
+}
 
 /// "old -> new", or "same (new)".
 fn change(old: &str, new: &str) -> String {
@@ -537,7 +573,7 @@ impl Plan {
         )];
         let row = |k: &str, v: String| format!("  {k:<10} {v}");
         let joined = |l: &[String]| if l.is_empty() { "?".to_string() } else { l.join(", ") };
-        let (ds, k3s, arch) = match &self.current {
+        let (ds, k3s, arch) = match &self.runs {
             Some(cur) => {
                 let ds = if cur.dryserver.version == r.dryserver.version && cur.dryserver.sha256 != r.dryserver.sha256 {
                     format!(
@@ -566,7 +602,11 @@ impl Plan {
                     [one] => change(one, &r.k3s.version),
                     l => format!("{} -> {}", joined(l), r.k3s.version),
                 };
-                (ds, k3s, format!("as installed -> {}", r.arch_date))
+                let was = match self.went_back {
+                    Some(m) if m > 0 => format!("as in release {m}"),
+                    _ => "as installed".into(),
+                };
+                (ds, k3s, format!("{was} -> {}", r.arch_date))
             }
         };
         out.push(row("dryserver", ds));
@@ -583,14 +623,23 @@ impl Plan {
         ));
         out.push(row("rollback", if r.rollback { "yes: older versions than the swarm runs are allowed".into() } else { "no".into() }));
         out.push(row("notes", if r.notes.is_empty() { "none".into() } else { r.notes.clone() }));
-        match &self.current {
-            Some(cur) => out.push(format!("Compared with release {}, the newest on the coordinator.", cur.serial)),
-            None => out.push("No release yet: compared with what the machines report.".into()),
+        match (&self.current, self.went_back) {
+            (Some(cur), Some(m)) => {
+                let what = if m > 0 { format!("release {m}") } else { "what they ran before it".into() };
+                out.push(format!("Release {} failed on the coordinator and went back; the machines run {what}.", cur.serial));
+                out.push(match &self.runs {
+                    Some(base) => format!("Compared with release {}, which the machines run.", base.serial),
+                    None if m > 0 => format!("Compared with what the machines report: this computer has no copy of release {m}."),
+                    None => "Compared with what the machines report.".into(),
+                });
+            }
+            (Some(cur), None) => out.push(format!("Compared with release {}, the newest on the coordinator.", cur.serial)),
+            (None, _) => out.push("No release yet: compared with what the machines report.".into()),
         }
         if let Some(u) = self.unsent {
             out.push(format!("Release {u} was signed here but never reached the coordinator; this one replaces it."));
         }
-        if let Some(cur) = &self.current
+        if let Some(cur) = &self.runs
             && cur.dryserver.sha256 == r.dryserver.sha256
             && cur.k3s == r.k3s
             && cur.arch_date == r.arch_date
@@ -650,8 +699,56 @@ pub fn publish(a: &mut Admin, p: &Plan) -> Result<Release> {
             now.map(|s| format!("release {s}")).unwrap_or_else(|| "none".into())
         );
     }
-    a.send_release(&p.release, &p.parts.binary, &p.parts.k3s)?;
+    let sent = a.send_release(&p.release, &p.parts.binary, &p.parts.k3s);
+    // Signed, whether or not it arrived: a copy for later previews. Only
+    // a preview needs it, so a copy that cannot be made fails nothing.
+    let _ = keep_copy(a, p.release.serial);
+    sent?;
     Ok(p.release.clone())
+}
+
+/// Where this computer keeps a copy of each release it signed, by serial
+/// (the newest KEPT_COPIES of them): when the newest fails and goes back,
+/// the preview compares with the one the machines still run.
+pub const COPIES: &str = "releases";
+const KEPT_COPIES: usize = 16;
+
+fn copy_path(a: &Admin, serial: u64) -> PathBuf {
+    a.secrets.join(COPIES).join(format!("{serial}.json"))
+}
+
+/// Release serial as this computer signed it, its signature checked.
+pub fn signed_copy(a: &Admin, serial: u64) -> Option<Release> {
+    if serial == 0 {
+        return None;
+    }
+    let b = std::fs::read(copy_path(a, serial)).ok()?;
+    let env: Envelope = serde_json::from_slice(&b).ok()?;
+    let r = release::open(a.verifier.as_ref(), &env, (a.now)().0.timestamp()).ok()?;
+    (r.serial == serial).then_some(r)
+}
+
+/// Keeps a copy of release serial, when it is the one this computer
+/// signed last (admin::RELEASE_COPY), and only the newest KEPT_COPIES.
+fn keep_copy(a: &Admin, serial: u64) -> Result<()> {
+    let b = std::fs::read(a.secrets.join(admin::RELEASE_COPY))?;
+    let env: Envelope = serde_json::from_slice(&b)?;
+    if release::open(a.verifier.as_ref(), &env, (a.now)().0.timestamp())?.serial != serial {
+        return Ok(());
+    }
+    let dir = a.secrets.join(COPIES);
+    fsx::mkdir_all(&dir, 0o700)?;
+    let tmp = dir.join(format!(".{serial}.json.tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    fsx::write_new(&tmp, &b, 0o600)?;
+    fsx::rename(&tmp, copy_path(a, serial))?;
+    let mut kept: Vec<u64> =
+        std::fs::read_dir(&dir)?.flatten().filter_map(|e| e.file_name().to_str()?.strip_suffix(".json")?.parse().ok()).collect();
+    kept.sort_unstable_by(|x, y| y.cmp(x));
+    for old in kept.into_iter().skip(KEPT_COPIES) {
+        let _ = std::fs::remove_file(copy_path(a, old));
+    }
+    Ok(())
 }
 
 // ---- the coordinator's rollout, as the desktop takes it ----

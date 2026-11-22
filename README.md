@@ -620,6 +620,14 @@ Sign it and send it to the coordinator at 192.168.1.50? [y/N]
 Or press `u` in `./dryserver approve`: the same checks and the same
 summary, `y` sends it.
 
+The summary compares with the newest release on the coordinator. When
+that one failed on the coordinator and went back, it compares with the
+release the machines still run instead, and says so; for that this
+computer keeps a copy of each release it signs in `secrets/releases/`.
+Without a release (or without the copy) it compares with what the
+machines report, which is a version and not a build: the same version
+is shown as maybe another build, never as the same.
+
 - **Checked before signing**: the binary is the static one `make`
   builds; nothing is older than what the swarm runs (unless you go back,
   below); the k3s binary has the checksum this dryserver pins
