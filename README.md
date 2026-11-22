@@ -157,6 +157,51 @@ wiped, so a typo cannot leave a half-installed laptop).
 SSH (OSC 52; Alacritty, kitty, WezTerm, foot and Ghostty support it). Paste
 into a server with your terminal's paste key.
 
+**Two kernels**: `linux` and `linux-lts` (the fallback, see below). pacman on
+the new machine reads the Arch archive of the day the USB stick was built
+(`/etc/pacman.d/mirrorlist`), so `pacman -Syu` by hand installs nothing
+newer than your releases give it; the first release moves it forward. The
+packages themselves come from fast mirrors at install time, that day's or
+newer. A stick built by an older dryserver keeps the mirrors until the
+first release. If you rebuild the stick after your last release, machines
+installed from it refuse that release's older Arch day until you publish a
+newer one.
+
+### When a kernel update does not boot
+
+On UEFI machines each kernel has its own signed boot image in
+`/boot/EFI/Linux`, and its own modules, so an update of `linux` leaves
+`linux-lts` untouched. A new image is first made under a name the boot loader
+never starts (`arch-linux.efi.new`), checked, written to disk, and only then
+renamed into place with a boot counter: `arch-linux+3.efi`. systemd-boot
+takes one try off the name at each start; once the boot check passes, the
+counter goes and it is `arch-linux.efi` again. After 3 failed tries the image
+is passed over and `linux-lts` starts.
+
+A boot passes when `/` is writable, the running kernel's modules are on
+disk, sshd runs and the kernel found a network device. Nothing else counts:
+the coordinator, the mesh, the internet, a cable, a router or k3s being down
+never makes a good kernel bad (a missing driver does, an unplugged cable does
+not). A kernel panic restarts the machine after 10 seconds, a hang restarts
+it through the hardware watchdog when it has one, and a failed check
+restarts it while another image has tries left, so this needs nobody at the
+machine. When nothing else is left, the machine stays up as it is.
+
+New firmware or a new systemd rebuild every image; `linux-lts` keeps the one
+it was made with until `linux-lts` itself is updated, so one bad initramfs
+cannot reach both kernels. `sudo dryserver boot status` shows the images,
+which one started and whether the fallback waits; `./dryserver approve` shows
+"running fallback kernel" or "no fallback kernel" for a machine.
+
+Limits: two kernels that are both broken (both updated in one go, or new
+firmware both need) leave the machine as it is. Machines installed before
+this have no `linux-lts`: nothing is counted there, and they show "no
+fallback kernel" until they are installed again. BIOS machines (GRUB) have
+`linux-lts` under *Advanced options* in GRUB's menu and restart after a
+panic, but someone has to pick the fallback kernel there. Pinning the boot
+entry by hand (`bootctl set-default`, or `d` in the boot menu) turns the
+fallback off: `bootctl set-default ""` undoes it.
+
 ## Networks
 
 | Network | Addresses | Used for |
@@ -679,10 +724,18 @@ wired into `update apply` yet.
   `dryserver-mesh-drop`, `dryserver-out-drop`, `dryserver-container-drop`
   and `dryserver-autocut`: `journalctl -k -g dryserver-`.
 - **SSH**: key login only, no root login, `MaxAuthTries 3`, rate limited.
+  The coordinator's registry account (whose key is on every stick) runs
+  only the registry whatever key it has: sshd forces the command and gives
+  it no terminal and no forwarding, and its key lives where only root
+  writes (`/etc/ssh/authorized_keys.d/dryreg`; its home belongs to root).
+- **The firewall always loads**: ports and addresses from the config are
+  taken only in their plain form (`51820`, `192.168.1.50`), and the setup
+  lets nft check the machine's firewall before it touches the disk.
 - **Accounts**: root is locked; sudo asks for your password.
 - **Disk encryption**: LUKS2 with argon2id; TPM unlock bound to the signed
   kernel image, Secure Boot state and kernel command line; no disk swap
-  (zram only).
+  (zram only). Both kernels' images are signed for the TPM with the same
+  key, so the fallback kernel unlocks the disk too.
 - **Joining**: needs your approval on your desktop with a matching pairing
   code. The code covers both machines' keys, so a fake coordinator or a
   swapped request shows a different code. A new machine joins only when it
@@ -752,6 +805,7 @@ On servers:
 | `sudo dryserver backup` | coordinator: make an encrypted backup now (a timer does it every night) |
 | `sudo dryserver update apply` | install a release the admin signed; it reverts by itself unless `update confirm` follows in time (`update status`, `update revert`) |
 | `sudo dryserver selfcheck` | check this binary, its settings, the firewall, SSH and wg0.conf, without the network |
+| `sudo dryserver boot status` | which kernel runs, its boot images and whether the fallback kernel waits (`boot place`, `mark` and `check` run from mkinitcpio, pacman and systemd) |
 | `dryserver sync`, `join`, `scan`, `registry`, `cluster-dns` | run automatically by systemd, cron and SSH |
 
 ### Health reports
@@ -761,10 +815,12 @@ is: its dryserver and k3s versions, the running kernel and whether a newer
 one waits for a reboot, when it was last fully upgraded (`pacman -Syu`),
 uptime, load, memory, root disk, its hottest temperature sensor, whether
 k3s runs and the firewall is loaded, when it last shook hands with
-each WireGuard peer, and which release it runs and how its update stands. `./dryserver approve` shows it under each member:
+each WireGuard peer, which release it runs and how its update stands, and
+whether it booted the fallback kernel (`boot`). `./dryserver approve` shows it under each member:
 problems in red (a disk or memory 90% full, 85 °C, k3s or the firewall
 down, a reboot due, a clock more than two minutes off, no upgrade for 30
-days, a peer silent for five minutes). `i` shows everything about the
+days, a peer silent for five minutes, the fallback kernel running, missing
+or broken). `i` shows everything about the
 selected machine.
 
 It is each machine's own word, relayed by the coordinator. A machine that
@@ -826,6 +882,7 @@ TPM refuses (firmware update, changed boot settings).
 | Setup fails | press `q` for a shell; the full log is in `/tmp/dryserver-install.log`. Old LVM, RAID, swap or encrypted volumes on the disk are released automatically |
 | New server cannot reach the coordinator | coordinator switched on? IP reserved in the router and matching the config? same WiFi? The server keeps retrying and shows its code on the login screen |
 | TPM laptop asks for the passphrase at boot | firmware or boot settings changed: type the passphrase, then `sudo dryserver tpm-enroll` |
+| `./dryserver approve` says "running fallback kernel" | the main kernel did not boot (`sudo dryserver boot status`, `journalctl -b -1 -u dryserver-boot-check`); the next release with a fixed kernel, or a rollback, makes it boot the main kernel again |
 | `ssh node-a` asks for a password or fails | run `./dryserver ssh-config` again; check `Include config.d/*` in `~/.ssh/config` |
 
 ## Development
@@ -833,6 +890,7 @@ TPM refuses (firmware update, changed boot settings).
 ```sh
 make test                           # unit tests (cargo test)
 test/validate-sysconf.sh            # check generated firewall/SSH/sudo files with real nft and sshd
+test/validate-boot.sh               # both kernels' images with the real mkinitcpio, ukify and pacman hooks
 test/live-firewall.sh               # the generated firewall with real connections: mesh, home network, containers
 test/live-quarantine.sh             # kill switch with real WireGuard and nftables, in private namespaces
 test/live-approve.sh                # signed approval: the real screen against a real sshd and registry
