@@ -52,7 +52,7 @@ use crate::err::{Error, Kind, Result};
 use crate::node::Node;
 use crate::registry::{self, Member, Store};
 use crate::release::{self, Place, Release};
-use crate::report::{self, Report};
+use crate::report::{self, Report, shown};
 use crate::runner::Cmd;
 use crate::signed::{Envelope, Verifier};
 use crate::{bail, errf, fsx, quarantine};
@@ -2585,11 +2585,6 @@ impl Brain<'_> {
 }
 
 // ---- for people ----
-
-/// Text from the coordinator made safe to show: printable ASCII, cut short.
-fn shown(s: &str, max: usize) -> String {
-    s.chars().map(|c| if (' '..='~').contains(&c) { c } else { '?' }).take(max).collect()
-}
 
 /// "Release 1795171200 (urgent), made 2026-11-21 12:00 UTC: fixes X". The
 /// notes are signed and printable ASCII (release::check_notes).
