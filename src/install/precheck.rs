@@ -211,6 +211,26 @@ impl Real {
         Ok(())
     }
 
+    /// Records when the new machine began to take releases (update::START):
+    /// now, at its install, instead of at its first sync. Only with a clock
+    /// that is not before the day the stick was built: a wrong one is left
+    /// to the first sync (update::note_start), whose clock has had the
+    /// network to set it. A release that goes below what the machine was
+    /// installed with is taken only when signed after this moment.
+    pub(super) fn note_start(&self) -> Result<()> {
+        let now = chrono::Utc::now();
+        let stick = fsx::read_or_empty(fsx::dir(&self.registry_key).join(iso::ARCH_DATE));
+        if release::arch_day(stick.trim()).is_ok_and(|built| now.date_naive() < built) {
+            self.log("warning: this machine's clock is before the day the USB stick was built: it records when it began to take releases at its first sync");
+            return Ok(());
+        }
+        let dir = self.target(crate::update::DIR);
+        fsx::mkdir_all(&dir, 0o700)?;
+        fsx::chmod(&dir, 0o700)?;
+        let record = serde_json::to_string_pretty(&crate::update::StartRecord { since: now.timestamp() })?;
+        self.write(crate::update::START, 0o600, record + "\n")
+    }
+
     /// Logs how much pacstrap has downloaded, every few seconds, until stop
     /// is set: pacman prints nothing while downloading when it has no
     /// terminal.

@@ -289,6 +289,7 @@ impl Real {
 
         // dryserver itself, the registry key and this machine's keys.
         self.write("/usr/local/bin/dryserver", 0o755, fsx::read(&self.self_path)?)?;
+        self.note_start()?;
         // k3s from the stick, next to dryserver: checked against its
         // checksum when the stick was built.
         let k3s = fsx::dir(&self.self_path).join("k3s");
@@ -842,6 +843,13 @@ mod tests {
         assert_eq!(mode(r.target("/etc/cryptsetup-keys.d/data0.key")), (0o400, 512), "data keyfile");
         assert!(read("/etc/crypttab").contains("data0 UUID=1111-uuid /etc/cryptsetup-keys.d/data0.key"), "{}", read("/etc/crypttab"));
         assert_eq!(read("/usr/local/bin/k3s"), "k3s binary");
+        // When it began to take releases: its install, in the update's own
+        // root-only directory.
+        let start: crate::update::StartRecord = serde_json::from_str(&read(crate::update::START)).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert!(start.since > now - 3600 && start.since <= now, "{start:?}");
+        assert_eq!(mode(r.target(crate::update::START)).0, 0o600);
+        assert_eq!(std::fs::metadata(r.target(crate::update::DIR)).unwrap().permissions().mode() & 0o7777, 0o700);
         assert_eq!(mode(r.target("/usr/local/bin/k3s")).0, 0o755);
         fr.index(&format!("arch-chroot {t} systemctl enable k3s.service dryserver-update-guard.service"));
         assert!(!fr.strings().iter().any(|c| c.contains("dryserver-dns")), "the DNS timer is the coordinator's");

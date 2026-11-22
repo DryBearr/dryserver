@@ -474,9 +474,10 @@ pub struct StartRecord {
     pub since: i64,
 }
 
-/// When this machine began to take releases. Recorded the first time the
-/// updates look (the sync does at every run, from the first boot on; or
-/// the first apply), and kept from then on. A machine with no release
+/// When this machine began to take releases. Recorded by the installer
+/// (with a plausible clock), else the first time the updates look (the
+/// sync does at every run, from the first boot on; or the first apply),
+/// and kept from then on. A machine with no release
 /// installed takes a rollback below what it was installed with only when
 /// it was signed after this moment (release::Start). 0 when the record
 /// cannot be read or written: no such rollback then.
@@ -5372,6 +5373,26 @@ mod tests {
         lab.script(|s| (s.old_os_code_broken, s.new_is_legacy) = (true, true));
         assert!(lab.apply_os(&os_rel(8, K3S_NEW, NEXT_DAY), Some(K3S_NEW)).is_err());
         lab.assert_os_old("the old code ran");
+    }
+
+    #[test]
+    fn the_lock_stays_held_while_a_step_that_kept_it_runs() {
+        // The apply dies (or is killed) while its new binary, or pacman
+        // under it, still runs: those keep the update lock, so no settle
+        // or timer reverts under them, and status says an update runs.
+        let lab = Lab::new();
+        let held = try_lock(&lab.m()).unwrap().unwrap();
+        let fd = held.as_raw_fd();
+        let step =
+            std::thread::spawn(move || crate::runner::ExecRunner::silent().ok(&Ctx::new(), &Cmd::new("sleep", &["1"]).keep_fd(Some(fd))));
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+        assert!(try_lock(&lab.m()).unwrap().is_none(), "the lock went with the process that took it");
+        assert!(status(&lab.m(), now()).busy);
+        let e = revert_by_hand(&lab.m(), &Ctx::new().with_timeout(Duration::from_millis(300)), now(), &mut Vec::new()).unwrap_err();
+        assert!(e.to_string().contains("another update is running") || e.is_canceled() || e.is(crate::err::Kind::DeadlineExceeded), "{e}");
+        step.join().unwrap().unwrap();
+        assert!(try_lock(&lab.m()).unwrap().is_some(), "free once the step ended");
     }
 
     #[test]

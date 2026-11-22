@@ -750,7 +750,8 @@ older one, or hand it a binary other than the signed one: each server
 checks for itself. One that never took an update counts the dryserver and
 k3s it was installed with and the Arch day its installer pinned as its own,
 and goes below them only for a rollback you signed after it began to take
-releases: an old signed rollback sent again does not move it back. The
+releases (its install, as the installer records it): an old signed
+rollback sent again does not move it back. The
 coordinator does decide when machines update (the window and the turns are
 its doing). A hacked server can fail or stall only its own turn, and a
 stalled turn ends after an hour. But a failed or stalled
