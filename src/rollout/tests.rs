@@ -60,6 +60,10 @@ struct Sim {
     before: Vec<u8>,
     /// kubectl calls that kill the sync right after they ran.
     die_on: Vec<String>,
+    /// The API server does not answer: every kubectl call fails.
+    api_down: bool,
+    /// `update status` does not answer this many more times.
+    status_fails: u32,
 }
 
 struct Fake(Mutex<Sim>);
@@ -86,6 +90,13 @@ impl Runner for Fake {
         let mut s = self.sim();
         let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
         match (c.name.as_str(), a.as_slice()) {
+            ("k3s", ["kubectl", ..]) if s.api_down => {
+                (String::new(), Err("k3s failed: exit status 1: The connection to the server 127.0.0.1:6443 was refused".into()))
+            }
+            (quarantine::SERVER_BIN, ["update", "status", "--json"]) if s.status_fails > 0 => {
+                s.status_fails -= 1;
+                (String::new(), Err(errf!("dryserver failed: killed after 30s")))
+            }
             ("k3s", ["kubectl", "get", "nodes", "-o", "name"]) => {
                 let names = s.nodes.clone().unwrap_or_else(|| {
                     std::iter::once("coord".to_string()).chain((b'a'..=b'h').map(|c| format!("node-{}", c as char))).collect()
@@ -952,7 +963,8 @@ fn the_registry_account_cannot_steer_kubectl() {
         free: plenty,
         nodes: None,
     };
-    for name in [evil, "coord", "node-z", "a\nb"] {
+    let long = "a".repeat(64);
+    for name in [evil, "coord", "node-z", "a\nb", "", " node-a", "node-a ", "Node-a", &long, "node-a\0", "--all", "-", "node-a/x"] {
         let e = b.kubectl(&["drain"], name).unwrap_err();
         assert!(name != "node-z" || e.is_not_found(), "{e}");
         b.r.cordoned = vec![name.into()];
@@ -997,6 +1009,29 @@ fn a_hacked_server_speaks_for_itself_only() {
     // knows callers by their mesh address.
     let s = sw.store.read().unwrap();
     assert_eq!(s.members.iter().find(|m| m.host == 3).unwrap().report.as_ref().unwrap().release, 10);
+}
+
+/// A hacked server that reports failures and updates in the middle while
+/// it is not its turn changes nothing for the others; at its own turn its
+/// lie stops the rollout there, at it.
+#[test]
+fn a_hacked_server_lying_out_of_turn_stops_only_its_own_turn() {
+    let mut sw = Swarm::new(3);
+    sw.offline.push(4);
+    sw.publish(10, true);
+    let lies = ["failed", "pending", "refused", "reverted", "fetching"];
+    for i in 0..60 {
+        let lie = Report { update: lies[i % lies.len()].into(), update_serial: 10, update_note: "lies".into(), ..sw.healthy(4) };
+        sw.store.update(|s| s.heartbeat(4, Heartbeat { report: Some(lie), ..Heartbeat::default() }, time(sw.now))).unwrap();
+        sw.tick();
+        if !sw.rollout().paused.is_empty() {
+            break;
+        }
+    }
+    let r = sw.rollout();
+    assert_eq!((sw.installed(2), sw.installed(3)), (10, 10), "{r:#?}");
+    assert_eq!((r.pause, r.pause_host), (Pause::Failed, 4), "{r:#?}");
+    assert!(sw.server(4).fake.sim().applied.is_empty());
 }
 
 #[test]
@@ -2080,6 +2115,97 @@ fn a_cordon_that_keeps_failing_stops_the_rollout() {
     assert!(sw.server(2).fake.sim().applied.is_empty() && sw.server(3).fake.sim().applied.is_empty());
     let cordons = sw.kubectl().iter().filter(|l| l.starts_with("cordon")).count();
     assert_eq!(cordons, 1, "the turn began at the first try: {:?}", sw.kubectl());
+}
+
+// ---- edges of the fixes before ----
+
+/// A server that is no node updates without a drain; an API server that
+/// does not answer is not the same thing: then nothing is drained, so
+/// nothing updates undrained (urgent releases aside), and a node cordoned
+/// before is uncordoned once the API answers again.
+#[test]
+fn an_api_that_does_not_answer_is_not_a_missing_node() {
+    let mut sw = Swarm::new(2);
+    sw.brain.fake.sim().api_down = true;
+    sw.publish(10, false);
+    sw.until(30, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert_eq!((r.pause, r.pause_host), (Pause::Drain, 2), "{r:#?}");
+    assert!(!r.warnings.iter().any(|w| w.contains("is not a node")), "{r:#?}");
+    assert!(sw.servers.iter().all(|m| m.fake.sim().applied.is_empty()), "updated undrained");
+    // The API answers again: node-a, cordoned at its turn, is uncordoned.
+    sw.brain.fake.sim().api_down = false;
+    sw.ticks(2);
+    assert!(sw.rollout().cordoned.is_empty(), "{:#?}", sw.rollout());
+    assert_eq!(sw.kubectl().last().map(String::as_str), Some("uncordon -- node-a"));
+}
+
+/// Update commands that do not answer for a while are asked again, and the
+/// release is not recorded as failed; for MAX_TRIES syncs in a row it is.
+#[test]
+fn update_commands_that_do_not_answer_are_asked_again() {
+    let mut sw = Swarm::new(1);
+    sw.server(2).fake.sim().status_fails = MAX_TRIES - 2;
+    sw.publish(10, true);
+    sw.until_unpaused(30, |s| s.everyone_on(10));
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 1);
+
+    let mut sw = Swarm::new(1);
+    sw.server(2).fake.sim().status_fails = 1000;
+    sw.publish(10, true);
+    sw.until(MAX_TRIES as usize + 10, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert!(r.paused.contains("cannot ask how its updates stand") && r.paused.contains("update failed"), "{}", r.paused);
+    // Counted for this release.
+    let l = Machine::new(&sw.server(2).node, false).load();
+    assert_eq!((l.tries_serial, l.tries), (10, MAX_TRIES));
+}
+
+thread_local! {
+    static EXTENDED: std::cell::RefCell<Vec<Duration>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_extension(d: Duration) {
+    EXTENDED.with(|e| e.borrow_mut().push(d));
+}
+
+/// Anyone with the key on the USB stick can start an upload: it gets the
+/// long deadline only once its header holds a release the admin signed.
+#[test]
+fn an_upload_gets_its_long_deadline_only_once_signed() {
+    let mut sw = Swarm::new(0);
+    sw.served.extend = record_extension;
+    let (env, bin) = sw.release(10, "0.2.0", false);
+    let thief = release::seal(&Key("thief"), &serde_json::from_str(&env.doc).unwrap()).unwrap();
+    let line = |e: &Envelope| serde_json::to_string(&PutHeader { release: e.clone(), k3s_size: 0 }).unwrap() + "\n";
+    for input in [
+        [line(&thief).as_bytes(), &bin].concat(),
+        b"{\"release\":{\"doc\":\"x\",\"sig\":\"y\"}}\n".to_vec(),
+        vec![b'{'; (MAX_HEADER + 10) as usize],
+        line(&Envelope { doc: env.doc.clone(), sig: String::new() }).into_bytes(),
+    ] {
+        assert!(sw.call("release-put", 0, &input).is_err());
+    }
+    assert!(EXTENDED.with(|e| e.borrow().is_empty()), "extended for an unsigned upload");
+    sw.upload(&env, &bin, None).unwrap();
+    assert_eq!(EXTENDED.with(|e| e.borrow().clone()), vec![registry::UPLOAD_DEADLINE]);
+}
+
+/// Root's own rollout file damaged or lost (a bad disk): the rollout
+/// starts over from the newest upload, and nobody updates twice.
+#[test]
+fn a_damaged_rollout_file_on_the_brain_starts_over() {
+    let mut sw = Swarm::new(3);
+    sw.publish(10, true);
+    sw.until(30, |s| s.installed(2) == 10 && s.rollout().turn.as_ref().is_some_and(|t| t.host == 3));
+    std::fs::write(sw.brain.node.path(STORE).join(ROLLOUT_FILE), "{\"serial\": \"garbage").unwrap();
+    sw.until_unpaused(40, |s| s.everyone_on(10));
+    sw.ticks(2);
+    for m in std::iter::once(&sw.brain).chain(&sw.servers) {
+        assert_eq!(m.fake.sim().applied.len(), 1, "{} updated twice", m.name);
+    }
+    let r = sw.rollout();
+    assert!(r.cordoned.is_empty() && r.done.len() == 3, "{r:#?}");
 }
 
 // ---- reports and words ----

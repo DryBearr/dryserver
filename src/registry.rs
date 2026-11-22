@@ -1500,6 +1500,41 @@ mod tests {
         assert!(Store::new(dir.join("real/registry.json")).read().is_ok());
     }
 
+    /// Under the registry file's own name: a FIFO or a directory is
+    /// refused at once, and a hard link to another file is never written
+    /// through (the new state is a new file renamed over the name). That
+    /// root hands only files with no other name to the registry account
+    /// (fchown in give) needs root to test.
+    #[test]
+    fn store_never_writes_through_what_is_not_its_own_file() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new();
+        let path = dir.join("registry.json");
+        let st = Store::new(&path);
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(st.read().unwrap_err().to_string().contains("not a regular file"));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(st.read().unwrap_err().to_string().contains("not a regular file"));
+        std::fs::remove_dir(&path).unwrap();
+
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "{}").unwrap();
+        std::fs::hard_link(&victim, &path).unwrap();
+        st.update(|s| s.add_request(req("node-a"), COORD_KEY, Time::now())).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "{}");
+        assert_eq!(std::fs::metadata(&victim).unwrap().nlink(), 1, "the link was replaced, not written");
+        assert_eq!(st.read().unwrap().requests.len(), 1);
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
     #[test]
     fn reads_go_written_state() {
         let dir = TempDir::new();
@@ -1829,6 +1864,12 @@ mod tests {
         assert_eq!(offer(&st), serde_json::json!({"serial": 0, "turn": false, "brain_k3s": "v1.37.2+k3s1"}));
         set(running.clone());
         assert_eq!(offer(&st), serde_json::json!({"serial": 9, "turn": true, "brain_k3s": "v1.37.2+k3s1"}));
+        // A try again the admin asked for goes with the turn, never without.
+        set(Rollout { turn: Some(rollout::Turn { retry: 3, ..turn(true) }), ..running.clone() });
+        assert_eq!(offer(&st), serde_json::json!({"serial": 9, "turn": true, "brain_k3s": "v1.37.2+k3s1", "retry": 3}));
+        set(Rollout { turn: Some(rollout::Turn { retry: 3, ..turn(false) }), ..running.clone() });
+        assert_eq!(offer(&st), serde_json::json!({"serial": 9, "turn": false, "brain_k3s": "v1.37.2+k3s1"}));
+        set(running.clone());
         // Not drained yet, stopped, or the brain's own phase: no turn.
         for r in [
             Rollout { turn: Some(turn(false)), ..running.clone() },

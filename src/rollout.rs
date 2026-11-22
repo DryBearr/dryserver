@@ -455,11 +455,14 @@ pub struct Served {
     /// The brain's own k3s, used when an upload does not carry one.
     pub k3s: PathBuf,
     pub free: fn(&Path) -> Option<u64>,
+    /// Gives an upload more time once its signature checked out
+    /// (registry::extend_deadline).
+    pub extend: fn(Duration),
 }
 
 impl Served {
     pub fn new(dir: impl Into<PathBuf>, k3s: impl Into<PathBuf>) -> Served {
-        Served { dir: dir.into(), k3s: k3s.into(), free: free_bytes }
+        Served { dir: dir.into(), k3s: k3s.into(), free: free_bytes, extend: registry::extend_deadline }
     }
 
     /// Beside the registry file of store.
@@ -527,7 +530,7 @@ impl Served {
         let r = release::open(v, &head.release, now)?;
         // Signed by the admin: moving the binaries may take as long as
         // the network needs.
-        registry::extend_deadline(registry::UPLOAD_DEADLINE);
+        (self.extend)(registry::UPLOAD_DEADLINE);
         if head.k3s_size > MAX_K3S {
             bail!("the upload's k3s is {} bytes, more than {MAX_K3S}", head.k3s_size);
         }
