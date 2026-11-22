@@ -297,25 +297,23 @@ fn run_install(args: &[String]) -> Result<()> {
 fn new_real_backend(cfg: &Config) -> Result<install::Real> {
     let me = std::env::current_exe()?;
     let rootfs = assets::ROOTFS.iter().map(|(p, d)| (p.to_string(), d.to_vec())).collect();
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode_600()
-        .open(INSTALL_LOG)
-        .map_err(|e| err::Error::from(e).wrap(format!("open {INSTALL_LOG}")))?;
+    let log = open_log(Path::new(INSTALL_LOG))?;
     let r = install::Real::new(cfg.clone(), rootfs, me, "/etc/dryserver/registry_ed25519");
     *r.log.file.lock().unwrap() = Some(log);
     Ok(r)
 }
 
-trait Mode600 {
-    fn mode_600(&mut self) -> &mut Self;
-}
-
-impl Mode600 for std::fs::OpenOptions {
-    fn mode_600(&mut self) -> &mut Self {
-        std::os::unix::fs::OpenOptionsExt::mode(self, 0o600)
-    }
+/// The installer's log, appended to: made for root alone when it is new,
+/// and never opened through a link (/tmp is anyone's to put one in).
+fn open_log(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| err::Error::from(e).wrap(format!("open {}", path.display())))
 }
 
 fn run_build(args: &[String]) -> Result<()> {
@@ -793,7 +791,7 @@ fn run_backup_pull(args: &[String]) -> Result<()> {
     let dir = secrets.join("backups");
     fsx::mkdir_all(&dir, 0o700)?;
     let signer = dir.join(".coordinator.pub");
-    fsx::write_file(&signer, format!("{host_key}\n"), 0o600)?;
+    fsx::write_new(&signer, format!("{host_key}\n"), 0o600)?;
     let verifier = signed::SshVerifier { pubkey: signer.clone(), tmp_dir: std::env::temp_dir() };
     let brain = backup::SshBrain::new(&host, f.get("port"), &cfg.username, known_hosts);
     let res = backup::pull(&brain, &verifier, &dir, chrono::Utc::now(), &mut std::io::stdout());
@@ -1202,6 +1200,25 @@ mod tests {
 
     fn args(l: &[&str]) -> Vec<String> {
         l.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_install_log_is_never_opened_through_a_link() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = testutil::TempDir::new();
+        let log = dir.join("install.log");
+        open_log(&log).unwrap().write_all(b"one\n").unwrap();
+        open_log(&log).unwrap().write_all(b"two\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "one\ntwo\n", "appended to");
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+        // A link put in its place, to a file the installer must not touch.
+        let target = dir.join("shadow");
+        std::fs::write(&target, "untouched").unwrap();
+        let link = dir.join("linked.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_log(&link).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
     }
 
     #[test]

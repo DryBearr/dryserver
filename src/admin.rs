@@ -134,23 +134,38 @@ impl Link for SshLink {
 
     fn upload(&self, command: &str, header: &str, files: &[&Path]) -> Result<String> {
         use std::io::Write;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
         // Opened before connecting: a file that is not there is this
         // computer's problem, said as such.
         let mut opened = Vec::new();
+        let mut total = header.len() as u64;
         for p in files {
-            opened.push(std::fs::File::open(p).map_err(|e| Error::from(e).wrap(format!("open {}", p.display())))?);
+            let f = std::fs::File::open(p).map_err(|e| Error::from(e).wrap(format!("open {}", p.display())))?;
+            total += f.metadata().map(|m| m.len()).unwrap_or(0);
+            opened.push(f);
         }
         let head = header.to_string();
-        self.run(command, move |pipe| {
-            if pipe.write_all(head.as_bytes()).is_err() {
+        let sent = Arc::new(AtomicU64::new(0));
+        let counter = sent.clone();
+        let res = self.run(command, move |pipe| {
+            let mut w = Counted { inner: pipe, n: &counter };
+            if w.write_all(head.as_bytes()).is_err() {
                 return;
             }
             for mut f in opened {
-                if std::io::copy(&mut f, pipe).is_err() {
+                if std::io::copy(&mut f, &mut w).is_err() {
                     return;
                 }
             }
-        })
+        });
+        let sent = sent.load(Ordering::SeqCst);
+        match res {
+            Err(e) => Err(cut_off(e, sent, total)),
+            // The registry reads every byte of an upload before it answers.
+            Ok(_) if sent < total => Err(cut_off(Error::new("the coordinator answered before the upload was whole"), sent, total)),
+            ok => ok,
+        }
     }
 
     fn host_key(&self) -> Result<String> {
@@ -238,8 +253,13 @@ impl SshLink {
             .map_err(|e| Error::from(e).wrap("ssh"))?;
         let mut pipe = child.stdin.take().ok_or_else(|| Error::new("ssh: no stdin"))?;
         // The pipe closes when the thread ends: the coordinator sees the
-        // end of the input.
-        let writer = std::thread::spawn(move || feed(&mut pipe));
+        // end of the input. ssh may end first (the coordinator refused
+        // early, the connection broke): the feed then fails, it does not
+        // end this program.
+        let writer = std::thread::spawn(move || {
+            quiet_broken_pipe();
+            feed(&mut pipe)
+        });
         let out = bounded_output(child, MAX_ANSWER);
         let _ = writer.join();
         let out = out?;
@@ -264,6 +284,52 @@ impl SshLink {
         // The registry's own error, e.g. "dryserver: this list is not newer".
         Err(errf!("the coordinator refused: {}", msg.trim_start_matches("dryserver: ")))
     }
+}
+
+/// Makes a write to a pipe whose reader is gone fail with "broken pipe"
+/// in this thread, instead of ending the whole program: main lets
+/// SIGPIPE end it (quietly, for `| head`), and ssh can end while a
+/// release of tens of MiB is still being fed to it. A SIGPIPE blocked
+/// here stays with this thread and goes when the thread ends.
+fn quiet_broken_pipe() {
+    // SAFETY: changes only this thread's signal mask, with a set made here.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGPIPE);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// A writer that counts what went through it.
+struct Counted<'a, W: std::io::Write> {
+    inner: &'a mut W,
+    n: &'a std::sync::atomic::AtomicU64,
+}
+
+impl<W: std::io::Write> std::io::Write for Counted<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let k = self.inner.write(buf)?;
+        self.n.fetch_add(k as u64, std::sync::atomic::Ordering::SeqCst);
+        Ok(k)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// An upload's failure, with how far it got when it did not go out whole.
+/// The coordinator keeps nothing of an upload that did not arrive whole.
+fn cut_off(e: Error, sent: u64, total: u64) -> Error {
+    if sent >= total || e.is(crate::err::Kind::HostKey) {
+        return e;
+    }
+    let got = if sent == 0 {
+        "nothing of the upload went out".to_string()
+    } else {
+        format!("the upload stopped after {} of {}", crate::report::size(sent), crate::report::size(total))
+    };
+    errf!("{e} ({got}; the coordinator keeps nothing of an upload that did not arrive whole)")
 }
 
 /// The most the coordinator may answer one registry command with. Its
@@ -862,13 +928,17 @@ impl Admin {
         // Saved before sending: a serial is never used for two releases.
         let path = self.secrets.join(RELEASE_COPY);
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-        fsx::write_file(&tmp, serde_json::to_string(&env)? + "\n", 0o600)?;
+        fsx::write_new(&tmp, serde_json::to_string(&env)? + "\n", 0o600)?;
         fsx::rename(&tmp, &path)?;
-        // From here on the release is signed and kept: a failure says so.
+        // From here on the release is signed and kept: a failure says so,
+        // and that publishing again is safe. A cut-off upload is not kept
+        // by the coordinator; one that arrived whole just before the
+        // connection broke is, and status shows which.
         let kept = |e: Error| {
             errf!(
-                "release {} is signed and kept on this computer, but did not reach the coordinator: {e}. \
-                 Nothing changed on the machines; publish again once the coordinator answers (the new release gets a higher serial)",
+                "release {} is signed and kept on this computer, but the coordinator did not take it: {e}. \
+                 ./dryserver release status shows what the coordinator has. Publishing again is safe: \
+                 the next release gets a higher serial",
                 r.serial
             )
         };
@@ -1862,5 +1932,86 @@ pub mod tests {
         std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         assert_eq!(a.control_path(Some(t.path().as_os_str())), None);
         assert!(!ours.exists(), "nothing made there");
+    }
+
+    /// Set in the copy of the test program that a_dead_ssh_does_not_end_the_program starts.
+    const SIGPIPE_CHILD: &str = "DRYSERVER_TEST_SIGPIPE_CHILD";
+
+    #[test]
+    fn a_dead_ssh_does_not_end_the_program() {
+        if std::env::var_os(SIGPIPE_CHILD).is_some() {
+            // As main has it: a write to a broken pipe ends the program.
+            // SAFETY: a signal disposition, in a process of this one test.
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            }
+            // ssh that ends after a little of a large upload, like a
+            // coordinator that refuses it at once.
+            let mut child = Command::new("sh")
+                .args(["-c", "head -c 100 >/dev/null; echo refused >&2; exit 1"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut pipe = child.stdin.take().unwrap();
+            let feeder = std::thread::spawn(move || {
+                use std::io::Write;
+                quiet_broken_pipe();
+                let chunk = vec![0u8; 1 << 20];
+                (0..64).try_for_each(|_| pipe.write_all(&chunk))
+            });
+            let out = bounded_output(child, MAX_ANSWER).unwrap();
+            let fed = feeder.join().unwrap();
+            assert_eq!(out.status.code(), Some(1));
+            assert_eq!(fed.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+            return;
+        }
+        let me = std::env::current_exe().unwrap();
+        let out = Command::new(me)
+            .args(["--exact", "admin::tests::a_dead_ssh_does_not_end_the_program", "--test-threads=1"])
+            .env(SIGPIPE_CHILD, "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && text.contains("1 passed"), "the program ended: {:?}\n{text}", out.status);
+    }
+
+    #[test]
+    fn an_upload_that_did_not_go_out_whole_says_how_far_it_got() {
+        let e = cut_off("cannot reach the coordinator at 192.168.1.50: Broken pipe".into(), 12 << 20, 30 << 20).to_string();
+        assert!(
+            e.starts_with("cannot reach the coordinator at 192.168.1.50: Broken pipe (the upload stopped after 12 MiB of 30 MiB"),
+            "{e}"
+        );
+        assert!(e.contains("the coordinator keeps nothing of an upload that did not arrive whole"), "{e}");
+        let e = cut_off("the coordinator refused: bad signature".into(), 0, 30 << 20).to_string();
+        assert!(e.contains("(nothing of the upload went out;"), "{e}");
+        // Whole: the coordinator's own words only.
+        assert_eq!(cut_off("the coordinator refused: no room".into(), 5, 5).to_string(), "the coordinator refused: no room");
+        let k = cut_off(Error::with_kind(crate::err::Kind::HostKey, "another key"), 0, 5);
+        assert!(k.is(crate::err::Kind::HostKey) && k.to_string() == "another key");
+    }
+
+    #[test]
+    fn the_release_copy_is_never_written_through_a_link() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        recording(&mut a, &store);
+        a.load().unwrap();
+        // Left behind by someone else, pointing outside secrets/.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::write(&elsewhere, "untouched").unwrap();
+        let tmp = dir.join("secrets").join(format!("{RELEASE_COPY}.tmp"));
+        std::os::unix::fs::symlink(&elsewhere, &tmp).unwrap();
+        let bin = static_binary(&dir, "dryserver", "0.2.0");
+        let d = release::Draft { binary: &bin, version: "0.2.0", arch_date: "2026/11/19", ..release::Draft::default() };
+        a.publish_release(&d, &dir.join("no-k3s")).unwrap();
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "untouched");
+        let copy = dir.join("secrets").join(RELEASE_COPY);
+        let m = std::fs::symlink_metadata(&copy).unwrap();
+        assert!(m.is_file(), "a file of its own");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(m.permissions().mode() & 0o777, 0o600);
     }
 }

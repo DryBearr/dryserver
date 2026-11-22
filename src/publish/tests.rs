@@ -534,10 +534,11 @@ fn a_cut_off_upload_is_said_and_the_next_one_goes_up() {
     fail.store(true, Ordering::SeqCst);
     let e = publish(&mut a, &p).unwrap_err().to_string();
     assert!(
-        e.contains(&format!("release {} is signed and kept on this computer, but did not reach the coordinator", p.release.serial)),
+        e.contains(&format!("release {} is signed and kept on this computer, but the coordinator did not take it", p.release.serial)),
         "{e}"
     );
-    assert!(e.contains("Connection timed out") && e.contains("Nothing changed on the machines"), "{e}");
+    assert!(e.contains("Connection timed out") && e.contains("./dryserver release status shows what the coordinator has"), "{e}");
+    assert!(e.contains("Publishing again is safe"), "{e}");
     assert_eq!(sent.lock().unwrap().len(), 1);
     // The next plan says so and goes up from it.
     fail.store(false, Ordering::SeqCst);
