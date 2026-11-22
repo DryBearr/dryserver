@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::cidr::parse_ip4;
 use crate::err::{Error, Result};
 use crate::gotime::{Time, null_default};
+use crate::k3stoken::Sealed;
 use crate::report::{self, Report};
 use crate::rollout::{self, Rollout, Served};
 use crate::signed::{self, Envelope, List, Verifier};
@@ -154,10 +155,16 @@ pub struct State {
     /// admin's USB stick (see join_proof). The coordinator cannot make one.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub coordinator_proof: String,
-    /// The cluster's token for joining as a k3s agent. The coordinator's
-    /// sync copies it here; only members get it, with the member list.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub k3s_token: String,
+    /// The cluster's token for joining as a k3s agent, sealed by the
+    /// coordinator's sync for each member the admin signed (k3stoken.rs):
+    /// this file, which the registry account writes, never holds the token
+    /// itself. Each member gets its own with the member list; nobody gets
+    /// another's. Older versions kept the token here in plain text as
+    /// "k3s_token", a field this version does not know: the first write
+    /// after the update leaves it out. A form this version cannot read
+    /// reads as none, and the coordinator's sync makes them again.
+    #[serde(deserialize_with = "report::lenient", skip_serializing_if = "Vec::is_empty")]
+    pub k3s_tokens: Vec<Sealed>,
     /// The rollout of the newest release (rollout.rs). The brain's sync
     /// moves it on; a form this version does not know reads as none
     /// instead of making the registry unreadable.
@@ -946,7 +953,7 @@ fn parse_serial(s: &str) -> Result<u64> {
 ///
 ///   request      stdin: Request JSON        -> {"id": ...}         (any source)
 ///   status ID                               -> StatusReply         (any source)
-///   peers        stdin: Heartbeat           -> {"members": [...], "signed": ..., "release": Offer}  (mesh members only)
+///   peers        stdin: Heartbeat           -> {"members": [...], "signed": ..., "k3s_sealed": Sealed, "release": Offer}  (mesh members only)
 ///   signed                                  -> {"signed": ...}     (any source; it proves itself)
 ///   admin        stdin: signed admin request -> AdminState          (holder of the signing key)
 ///   publish      stdin: signed member list   -> {"version": N}      (holder of the signing key)
@@ -1003,16 +1010,18 @@ pub fn serve(
             }
             // Longer than MAX_INPUT reads as cut off, and is refused.
             let hb: Heartbeat = decode_first(input).ok_or_else(|| Error::new("bad heartbeat JSON"))?;
-            let (members, signed, token, offer) = st.update(|s| {
+            let (members, signed, sealed, offer) = st.update(|s| {
                 s.heartbeat(host, hb, now)?;
                 Ok((
                     s.members.iter().map(without_report).collect::<Vec<_>>(),
                     s.signed.clone(),
-                    s.k3s_token.clone(),
+                    // Its own sealed token only: another member's is none
+                    // of its business, encrypted or not.
+                    s.k3s_tokens.iter().find(|t| t.host == host).cloned(),
                     rollout::offer(s, host),
                 ))
             })?;
-            send(out, &serde_json::json!({ "members": members, "signed": signed, "k3s_token": token, "release": offer }))
+            send(out, &serde_json::json!({ "members": members, "signed": signed, "k3s_sealed": sealed, "release": offer }))
         }
         ("signed", 1) => {
             // Not secret, and nobody can change it without the admin's key.
@@ -1877,20 +1886,28 @@ mod tests {
         let out: serde_json::Value = serde_json::from_str(&call(&st, "peers", "10.66.0.2 5000 22", hb).unwrap()).unwrap();
         let env: Envelope = serde_json::from_value(out["signed"].clone()).unwrap();
         assert_eq!(env.list(&ADMIN, |h| h < 255).unwrap(), list, "nodes must get the list exactly as it was signed");
-        // Members get the cluster token with it; nobody else, by any command.
+        // Before the coordinator sealed a cluster token: none, and never a
+        // plain one.
+        let out: serde_json::Value = serde_json::from_str(&call(&st, "peers", "10.66.0.2 5000 22", hb).unwrap()).unwrap();
+        assert!(out["k3s_sealed"].is_null() && out.get("k3s_token").is_none(), "{out}");
+        // Each member gets its own sealed token with it; nobody else gets
+        // any, by any command.
+        let sealed = |host: u32| crate::k3stoken::fake::sealed(COORD_KEY, host, &format!("ssh-ed25519 AAAAnode{host}"), "x");
         st.update(|s| {
-            s.k3s_token = "K10abc::node:secret".into();
+            s.k3s_tokens = vec![sealed(3), sealed(2), sealed(4)];
             Ok(())
         })
         .unwrap();
-        let out = call(&st, "peers", "10.66.0.2 5000 22", hb).unwrap();
-        assert!(out.contains(r#""k3s_token":"K10abc::node:secret""#), "{out}");
+        let out: serde_json::Value = serde_json::from_str(&call(&st, "peers", "10.66.0.2 5000 22", hb).unwrap()).unwrap();
+        assert_eq!(serde_json::from_value::<Sealed>(out["k3s_sealed"].clone()).unwrap(), sealed(2));
+        let text = out.to_string();
+        assert!(!text.contains("AAAAnode3") && !text.contains("AAAAnode4") && out.get("k3s_token").is_none(), "{text}");
         for (cmd, stdin) in [
             ("signed", String::new()),
             ("admin", serde_json::to_string(&signed::seal_admin(&ADMIN, "state", t0().0.timestamp()).unwrap()).unwrap()),
         ] {
             let out = call(&st, cmd, "192.168.1.77 5000 22", &stdin).unwrap();
-            assert!(!out.contains("K10abc") && !out.contains("k3s_token"), "{cmd} leaks the cluster token: {out}");
+            assert!(!out.contains("AGE ENCRYPTED") && !out.contains("k3s"), "{cmd} hands out a cluster token: {out}");
         }
         // The same list for anyone who asks from the LAN, and nothing else.
         let out = call(&st, "signed", "192.168.1.77 5000 22", "").unwrap();
@@ -2018,6 +2035,26 @@ mod tests {
             } else {
                 assert!(s.rollout.is_none(), "{rollout}: {:?}", s.rollout);
             }
+        }
+    }
+
+    /// An older version kept the cluster token in the file in plain text.
+    #[test]
+    fn the_plain_cluster_token_goes_with_the_first_write() {
+        let dir = TempDir::new();
+        let path = dir.join("registry.json");
+        let plain = "K10abc::node:5ecre7plain";
+        std::fs::write(&path, format!(r#"{{"members":[{{"host":1,"name":"coord","wg_key":"K"}}],"k3s_token":"{plain}"}}"#)).unwrap();
+        let st = Store::new(&path);
+        assert_eq!(st.read().unwrap().members.len(), 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains(plain) && !text.contains("k3s_token"), "{text}");
+        // What the registry account may put there in place of sealed
+        // tokens reads as none, and leaves the rest readable.
+        for junk in [r#""K10abc::node:x""#, r#"[{"host":"two"}]"#, "7", r#"{"host":2}"#] {
+            std::fs::write(&path, format!(r#"{{"members":[{{"host":1,"name":"coord","wg_key":"K"}}],"k3s_tokens":{junk}}}"#)).unwrap();
+            let s = st.read().unwrap();
+            assert!(s.k3s_tokens.is_empty() && s.members.len() == 1, "{junk}: {s:?}");
         }
     }
 

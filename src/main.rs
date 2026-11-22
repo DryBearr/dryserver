@@ -17,6 +17,7 @@ mod fsx;
 mod gotime;
 mod install;
 mod iso;
+mod k3stoken;
 mod mesh;
 mod node;
 mod osupdate;
