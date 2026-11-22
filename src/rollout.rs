@@ -2660,7 +2660,15 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
                 let age = report::short_age((now - t.since).max(0) as u64);
                 let canary = if r.canary == 0 { ", the canary" } else { "" };
                 let who = name(t.host);
-                if t.ready {
+                // Its report may say it is done before the brain read it.
+                let confirmed = members
+                    .iter()
+                    .find(|m| m.host == t.host)
+                    .and_then(|m| m.report.as_ref())
+                    .is_some_and(|rep| rep.release >= r.serial && rep.update.is_empty());
+                if t.ready && confirmed {
+                    out.push((format!("{who} confirmed release {}; the coordinator takes note at its next sync.", r.serial), false));
+                } else if t.ready {
                     out.push((format!("{who} updates (its turn for {age}{canary})."), false));
                 } else {
                     out.push((format!("Draining {who} for its update ({age}{canary})."), false));

@@ -2947,3 +2947,30 @@ fn a_server_that_says_it_is_in_the_middle_for_ever_holds_up_until_passed_over() 
         assert!(sw.rollout().skipped.iter().any(|s| s.host == 4));
     }
 }
+
+/// Seen on a VM rollout: a server confirmed, and `release status` said
+/// "its turn: updating" again until the brain read its new report. Now it
+/// says the server confirmed and the coordinator takes note of it next.
+#[test]
+fn review_a_confirmed_server_is_not_shown_updating_again() {
+    let mut sw = Swarm::new(2);
+    sw.publish(10, true);
+    let report = |s: &Swarm| s.store.read().unwrap().members.iter().find(|m| m.host == 2).unwrap().report.clone().unwrap();
+    sw.until(20, |s| report(s).release == 10);
+    assert!(sw.rollout().turn.is_some_and(|t| t.host == 2 && t.ready), "{:#?}", sw.rollout());
+    let l = sw.lines();
+    assert!(l.contains("node-a confirmed release 10; the coordinator takes note at its next sync"), "{l}");
+    assert!(!l.contains("node-a updates"), "{l}");
+    let s = sw.store.read().unwrap();
+    let v = crate::admin::View {
+        members: s.members.iter().map(|m| (m.clone(), true)).collect(),
+        rollout: s.rollout.clone(),
+        ..Default::default()
+    };
+    let status = crate::publish::status_lines(&v, sw.now).join("\n");
+    assert!(status.contains("confirmed release 10, the coordinator takes note at its next sync"), "{status}");
+    assert!(!status.contains("its turn: updating"), "{status}");
+    drop(s);
+    sw.tick();
+    assert!(sw.lines().contains("Watching the canary node-a"), "{}", sw.lines());
+}

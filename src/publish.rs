@@ -897,6 +897,10 @@ fn machine_state(m: &Member, r: &Rollout, now: i64) -> (String, bool) {
     }
     if r.turn.as_ref().is_some_and(|t| t.host == m.host) {
         let ready = r.turn.as_ref().is_some_and(|t| t.ready);
+        // Done before the coordinator read the report that says so.
+        if ready && target != 0 && rep.release >= target {
+            return (format!("confirmed release {}, the coordinator takes note at its next sync", rep.release), false);
+        }
         return ((if ready { "its turn: updating" } else { "its turn: draining" }).into(), false);
     }
     if r.pause_host == m.host && !r.paused.is_empty() {
