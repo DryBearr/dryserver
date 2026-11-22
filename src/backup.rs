@@ -1020,7 +1020,7 @@ pub struct SshBrain {
 
 impl SshBrain {
     pub fn new(host: &str, port: &str, user: &str, known_hosts: PathBuf) -> SshBrain {
-        let ctl = control_path(std::env::var_os("XDG_RUNTIME_DIR").as_deref().map(Path::new), std::process::id());
+        let ctl = control_path(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), std::process::id());
         let b = SshBrain { host: host.into(), port: port.into(), user: user.into(), known_hosts, ctl };
         if let Some(ctl) = &b.ctl {
             // Started with nothing attached, like approve's: a master that
@@ -1118,14 +1118,18 @@ impl SshBrain {
     }
 }
 
-/// Where the shared connection's socket goes: the user's private runtime
-/// directory. None without one, or when the path would be too long for a
-/// socket (ssh adds %C, 40 characters, and a temporary suffix): then every
-/// call connects by itself.
-fn control_path(runtime_dir: Option<&Path>, pid: u32) -> Option<String> {
-    let dir = runtime_dir.filter(|d| !d.as_os_str().is_empty())?;
-    let path = dir.join(format!("dsp-{pid}-%C")).display().to_string();
-    (path.len() - 2 + 40 + 20 < 108).then(|| format!("ControlPath={path}"))
+/// Where the shared connection's socket goes: a directory of this user's
+/// alone in the user's runtime directory (fsx::socket_dir), one socket per
+/// pull. None without one, or when the path would be too long for a
+/// socket: then every call connects by itself. What answers on that socket
+/// speaks for the coordinator: one that someone else could put there is
+/// never used.
+fn control_path(runtime_dir: Option<&std::ffi::OsStr>, pid: u32) -> Option<String> {
+    fsx::control_path(runtime_dir, &socket_name(pid))
+}
+
+fn socket_name(pid: u32) -> String {
+    format!("pull-{pid}-%C")
 }
 
 impl Brain for SshBrain {
@@ -2078,13 +2082,27 @@ mod tests {
     }
 
     #[test]
-    fn control_socket_fits() {
-        assert_eq!(control_path(Some(Path::new("/run/user/1000")), 4242).as_deref(), Some("ControlPath=/run/user/1000/dsp-4242-%C"));
+    fn control_socket_fits_and_is_ours_alone() {
+        assert_eq!(
+            fsx::socket_in(Path::new("/run/user/1000/dryserver"), &socket_name(4242)).as_deref(),
+            Some("ControlPath=/run/user/1000/dryserver/pull-4242-%C")
+        );
         assert_eq!(control_path(None, 1), None);
-        assert_eq!(control_path(Some(Path::new("")), 1), None);
+        assert_eq!(control_path(Some("".as_ref()), 1), None);
         // A socket path longer than the kernel takes: no shared connection
         // rather than no connection.
-        assert_eq!(control_path(Some(&Path::new("/tmp").join("x".repeat(60))), 1), None);
+        assert_eq!(fsx::socket_in(&Path::new("/tmp").join("x".repeat(60)), &socket_name(1)), None);
+        // Never straight in the runtime directory, where someone else may
+        // have put a socket: in dryserver/ there, made for this user alone.
+        let t = TempDir::new();
+        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ours = fsx::socket_dir(t.path(), fsx::geteuid()).unwrap();
+        assert_eq!(control_path(Some(t.path().as_os_str()), 7), fsx::socket_in(&ours, &socket_name(7)));
+        std::fs::set_permissions(&ours, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(control_path(Some(t.path().as_os_str()), 7), None, "a directory others may write to is not used");
+        std::fs::remove_dir(&ours).unwrap();
+        std::os::unix::fs::symlink(t.path(), &ours).unwrap();
+        assert_eq!(control_path(Some(t.path().as_os_str()), 7), None, "nor a link in its place");
     }
 
     #[test]

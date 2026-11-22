@@ -85,23 +85,22 @@ impl SshLink {
         o
     }
 
-    /// Where the shared connection's socket goes: the user's private
-    /// runtime directory. None without one (then every call connects).
-    ///
-    /// The name carries which key file and which pinned host key file the
-    /// connection was made with. A connection is checked against the
-    /// pinned key once, when it is made: one made from another directory
-    /// (another stick's secrets) must never be reused here.
-    fn control_path(&self) -> Option<String> {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
-        let full = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
-        let mut id: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in
-            full(&self.key).as_os_str().as_encoded_bytes().iter().chain(&[0]).chain(full(&self.known_hosts).as_os_str().as_encoded_bytes())
-        {
-            id = (id ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
-        }
-        Some(format!("ControlPath={}", Path::new(&dir).join(format!("dryserver-%C-{id:016x}")).display()))
+    /// Where the shared connection's socket goes: a directory of this
+    /// user's alone in the user's runtime directory (fsx::socket_dir).
+    /// None without one (then every call connects). Signed lists and
+    /// releases go through that socket, and what answers on it speaks for
+    /// the coordinator: one that someone else could put there is never
+    /// used.
+    fn control_path(&self, runtime_dir: Option<&std::ffi::OsStr>) -> Option<String> {
+        fsx::control_path(runtime_dir, &self.socket_name())
+    }
+
+    /// The socket's name. It carries which key file and which pinned host
+    /// key file the connection was made with. A connection is checked
+    /// against the pinned key once, when it is made: one made from another
+    /// directory (another stick's secrets) must never be reused here.
+    fn socket_name(&self) -> String {
+        format!("reg-%C-{:016x}", fsx::paths_id(&[&self.key, &self.known_hosts]))
     }
 
     /// The host as known_hosts writes it.
@@ -212,7 +211,7 @@ impl SshLink {
         // attached: one that inherits our pipes would keep every call
         // waiting until it exits. Without a master the call connects by
         // itself and reports what is wrong.
-        if let Some(ctl) = self.control_path() {
+        if let Some(ctl) = self.control_path(std::env::var_os("XDG_RUNTIME_DIR").as_deref()) {
             let quiet =
                 |c: &mut Command| c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
             // The check and the master get the same options. The socket's
@@ -1737,5 +1736,43 @@ pub mod tests {
         let (mut b, _) = setup(&other);
         b.load().unwrap();
         assert!(b.resend().unwrap_err().to_string().contains("nothing is signed yet"));
+    }
+
+    #[test]
+    fn the_registry_connection_is_shared_only_through_a_directory_of_ours() {
+        use std::os::unix::fs::PermissionsExt;
+        let link =
+            |key: &str, kh: &str| SshLink { key: key.into(), known_hosts: kh.into(), host: "192.168.1.50".into(), port: "22".into() };
+        let a = link("s/registry_ed25519", "s/coordinator_known_hosts");
+        assert_eq!(a.control_path(None), None, "without a runtime directory every call connects");
+        assert_eq!(a.control_path(Some("".as_ref())), None);
+        // Another stick's key or pinned host key: another connection.
+        assert_ne!(a.socket_name(), link("t/registry_ed25519", "s/coordinator_known_hosts").socket_name());
+        assert_ne!(a.socket_name(), link("s/registry_ed25519", "t/coordinator_known_hosts").socket_name());
+        // In dryserver/ of the runtime directory, never in the runtime
+        // directory itself, where another could have put a socket.
+        let t = TempDir::new();
+        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ours = fsx::socket_dir(t.path(), fsx::geteuid()).unwrap();
+        let p = a.control_path(Some(t.path().as_os_str()));
+        assert_eq!(p, fsx::socket_in(&ours, &a.socket_name()));
+        // (The temporary directory may be too deep for a socket.)
+        if let Some(p) = p {
+            assert!(p.starts_with(&format!("ControlPath={}/reg-%C-", ours.display())), "{p}");
+        }
+        // A directory others may enter, or a link in its place: not used.
+        std::fs::set_permissions(&ours, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(a.control_path(Some(t.path().as_os_str())), None);
+        std::fs::remove_dir(&ours).unwrap();
+        let elsewhere = t.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &ours).unwrap();
+        assert_eq!(a.control_path(Some(t.path().as_os_str())), None);
+        // A runtime directory anyone may write to.
+        std::fs::remove_file(&ours).unwrap();
+        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(a.control_path(Some(t.path().as_os_str())), None);
+        assert!(!ours.exists(), "nothing made there");
     }
 }

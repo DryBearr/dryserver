@@ -156,3 +156,144 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
 pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
+
+// ---- the desktop's shared SSH connections ----
+
+/// The directory for the sockets of the SSH connections the desktop
+/// shares between calls (approve, apps, outside, backup-pull):
+/// dryserver/ in the runtime directory, made for uid alone. None when it
+/// is not safe.
+///
+/// Every call goes through whatever listens on the socket, signed lists,
+/// releases and the tunnel's token on stdin included: a socket someone
+/// else put there would get them, and could answer in the coordinator's
+/// place. So the directory must be a real one (not a link), owned by uid
+/// and mode 0700, and it must sit in a runtime directory nobody else can
+/// rename it out of: owned by uid or root, writable by nobody else unless
+/// sticky. One that is not like that is left as it is, and every call
+/// connects by itself.
+pub fn socket_dir(runtime: &Path, uid: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = fs::symlink_metadata(runtime).ok()?;
+    let others_write = parent.mode() & 0o022 != 0 && parent.mode() & 0o1000 == 0;
+    if !parent.is_dir() || !(parent.uid() == uid || parent.uid() == 0) || others_write {
+        return None;
+    }
+    let dir = runtime.join("dryserver");
+    match DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    let m = fs::symlink_metadata(&dir).ok()?;
+    (m.is_dir() && m.uid() == uid && m.mode() & 0o777 == 0o700).then_some(dir)
+}
+
+/// ssh's ControlPath option for the socket name (with one %C in it) in
+/// socket_dir of runtime, the user's $XDG_RUNTIME_DIR. None without a
+/// safe directory, or when the name is too long for a socket: then every
+/// call connects by itself.
+pub fn control_path(runtime: Option<&std::ffi::OsStr>, name: &str) -> Option<String> {
+    let runtime = Path::new(runtime.filter(|d| !d.is_empty())?);
+    socket_in(&socket_dir(runtime, geteuid())?, name)
+}
+
+/// The ControlPath option for name in dir. ssh puts 40 characters in
+/// place of %C and binds the socket under the name plus 17 characters
+/// first; a socket's name has room for 107.
+pub fn socket_in(dir: &Path, name: &str) -> Option<String> {
+    let path = dir.join(name).display().to_string();
+    if !name.contains("%C") || name.contains('/') || path.len() - 2 + 40 + 17 > 107 {
+        return None;
+    }
+    Some(format!("ControlPath={path}"))
+}
+
+/// A short id for a set of files (absolute paths), for socket names: a
+/// connection made with one stick's keys and pinned host key is never
+/// reused with another's.
+pub fn paths_id(paths: &[&Path]) -> u64 {
+    let mut id: u64 = 0xcbf2_9ce4_8422_2325;
+    for (i, p) in paths.iter().enumerate() {
+        let full = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let sep: &[u8] = if i == 0 { &[] } else { &[0] };
+        for b in sep.iter().chain(full.as_os_str().as_encoded_bytes()) {
+            id = (id ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_socket_directory_is_ours_alone() {
+        let me = geteuid();
+        let mode = |p: &Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        let set = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+        let t = crate::testutil::TempDir::new();
+        set(t.path(), 0o700);
+        let dir = t.join("dryserver");
+        // Made for this user alone, and found again.
+        assert_eq!(socket_dir(t.path(), me), Some(dir.clone()));
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(socket_dir(t.path(), me), Some(dir.clone()));
+        // Someone else's (here: owned by another uid than asked for).
+        assert_eq!(socket_dir(t.path(), me + 1), None);
+        // Open to others: not shared, and left as it is.
+        set(&dir, 0o755);
+        assert_eq!(socket_dir(t.path(), me), None);
+        assert_eq!(mode(&dir), 0o755);
+        set(&dir, 0o710);
+        assert_eq!(socket_dir(t.path(), me), None, "a group that may only pass through is still not alone");
+        // A link to a directory that would pass: not followed.
+        fs::remove_dir(&dir).unwrap();
+        let elsewhere = t.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        set(&elsewhere, 0o700);
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        assert_eq!(socket_dir(t.path(), me), None);
+        // A file in its place.
+        fs::remove_file(&dir).unwrap();
+        fs::write(&dir, "").unwrap();
+        assert_eq!(socket_dir(t.path(), me), None);
+        fs::remove_file(&dir).unwrap();
+        // A runtime directory others may write to could have ours renamed
+        // away and replaced; with the sticky bit (like /tmp) it cannot.
+        set(t.path(), 0o777);
+        assert_eq!(socket_dir(t.path(), me), None);
+        assert!(!dir.exists(), "nothing made there");
+        set(t.path(), 0o1777);
+        assert_eq!(socket_dir(t.path(), me), Some(dir.clone()));
+        set(t.path(), 0o700);
+        // The runtime directory itself a link, or not there at all.
+        let link = t.join("runtime-link");
+        std::os::unix::fs::symlink(t.path(), &link).unwrap();
+        assert_eq!(socket_dir(&link, me), None);
+        assert_eq!(socket_dir(&t.join("missing"), me), None);
+        // Without a safe directory there is no ControlPath at all.
+        assert_eq!(control_path(None, "x-%C"), None);
+        assert_eq!(control_path(Some("".as_ref()), "x-%C"), None);
+        set(&dir, 0o750);
+        assert_eq!(control_path(Some(t.path().as_os_str()), "x-%C"), None);
+    }
+
+    #[test]
+    fn socket_names() {
+        let run = Path::new("/run/user/1000/dryserver");
+        assert_eq!(socket_in(run, "reg-%C-1").as_deref(), Some("ControlPath=/run/user/1000/dryserver/reg-%C-1"));
+        // A socket's name has room for 107 bytes, and ssh adds 17 while
+        // it makes one: a deep runtime directory means no sharing.
+        let deep = format!("/run/user/{}/dryserver", "x".repeat(40));
+        assert_eq!(socket_in(deep.as_ref(), "reg-%C-0123456789abcdef"), None);
+        assert_eq!(socket_in(run, "no-percent-c"), None, "one socket for every coordinator would mix them up");
+        assert_eq!(socket_in(run, "../up-%C"), None);
+        // Another key or pinned host key file: another id.
+        let (a, b) = (Path::new("a/known_hosts"), Path::new("b/known_hosts"));
+        assert_ne!(paths_id(&[a]), paths_id(&[b]));
+        assert_ne!(paths_id(&[a, b]), paths_id(&[b, a]));
+        assert_eq!(paths_id(&[a]), paths_id(&[a]));
+    }
+}
