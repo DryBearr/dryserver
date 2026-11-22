@@ -1212,7 +1212,11 @@ impl<'a> Machine<'a> {
         if !inc.join(RELEASE_FILE).exists() {
             // Its k3s is loaded only when this machine's is another one.
             meta.need_k3s = sha_of(&self.n.path(K3S_BIN), MAX_K3S).as_deref() != Some(r.k3s.sha256.as_str());
-            let need = r.dryserver.size + if meta.need_k3s { meta.k3s_size } else { 0 };
+            // The registry's word on its size: capped before it counts.
+            if meta.need_k3s && meta.k3s_size > MAX_K3S {
+                return Err(Stop::Refused(format!("the coordinator says its k3s is {} bytes", meta.k3s_size)));
+            }
+            let need = r.dryserver.size.saturating_add(if meta.need_k3s { meta.k3s_size } else { 0 });
             // Room may be made (logs rotate, an old image goes).
             room(self.free, &self.dir(), need, "this machine").map_err(|e| Stop::Later(e.to_string()))?;
             fsx::write_file(inc.join(META_FILE), serde_json::to_string(&meta).map_err(|e| again(e.into()))?, 0o600).map_err(again)?;
@@ -1228,6 +1232,9 @@ impl<'a> Machine<'a> {
                 let o = src.offered(ctx, r.serial).map_err(|e| Stop::Again(e.wrap("ask the coordinator for the release")))?;
                 if o.k3s_size == 0 {
                     return Err(Stop::Later(format!("the coordinator has no k3s {} for release {}", r.k3s.version, r.serial)));
+                }
+                if o.k3s_size > MAX_K3S {
+                    return Err(Stop::Refused(format!("the coordinator says its k3s is {} bytes", o.k3s_size)));
                 }
                 room(self.free, &self.dir(), o.k3s_size, "this machine").map_err(|e| Stop::Later(e.to_string()))?;
                 meta.k3s_size = o.k3s_size;

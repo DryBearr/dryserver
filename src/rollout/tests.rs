@@ -313,6 +313,8 @@ struct Swarm {
     /// The members the admin signed, by host and name: the brain's sync
     /// hands the rollout only these (node::sync, signed_members).
     signed: Vec<(u32, String)>,
+    /// The size of k3s the registry tells the servers, instead of its own.
+    k3s_size_lie: Option<u64>,
 }
 
 impl Swarm {
@@ -355,6 +357,7 @@ impl Swarm {
             slow: vec![],
             full_disk: vec![],
             signed,
+            k3s_size_lie: None,
         };
         sw.brain_sync();
         for i in 0..sw.servers.len() {
@@ -628,7 +631,11 @@ struct Reg<'a> {
 impl Source for Reg<'_> {
     fn offered(&self, _: &Ctx, serial: u64) -> Result<Offered> {
         let out = self.sw.call(&format!("release-get {serial} release"), self.host, b"")?;
-        Ok(serde_json::from_slice(&out)?)
+        let mut o: Offered = serde_json::from_slice(&out)?;
+        if let Some(n) = self.sw.k3s_size_lie {
+            o.k3s_size = n;
+        }
+        Ok(o)
     }
 
     fn chunk(&self, _: &Ctx, serial: u64, name: &str, offset: u64, _len: u64, dst: &Path) -> Result<()> {
@@ -2763,4 +2770,23 @@ fn review_a_revert_that_half_failed_is_no_update() {
     }
     sw.until_unpaused(5, |s| s.everyone_on(10));
     assert!(sw.server(2).node.path(STORE).join(INSTALLED).join(RELEASE_FILE).exists());
+}
+
+/// The registry's word on the size of its k3s was added to the release's
+/// dryserver size before it was checked against MAX_K3S: a size near
+/// u64::MAX panicked in a debug build and wrapped to a small room check in
+/// a release build. Now it is capped first.
+#[test]
+fn review_a_k3s_size_from_the_registry_is_capped_before_it_is_added() {
+    for lie in [u64::MAX, u64::MAX - sw_bin_len() + 1, MAX_K3S + 1] {
+        let mut sw = Swarm::new(1);
+        put(&sw.server(2).node.root, K3S_BIN, b"k3s v1.36.0+k3s1, older");
+        sw.k3s_size_lie = Some(lie);
+        sw.publish(10, true);
+        sw.until(20, |s| !s.rollout().paused.is_empty());
+        let l = Machine::new(&sw.server(2).node, false).load();
+        assert_eq!((l.failed, l.outcome.as_str()), (10, "refused"), "{lie}: {l:?}");
+        assert!(l.why.contains(&format!("the coordinator says its k3s is {lie} bytes")), "{lie}: {}", l.why);
+        assert!(sw.server(2).fake.sim().applied.is_empty() && !sw.pieces.lock().unwrap().iter().any(|p| p.1 == "k3s"));
+    }
 }
