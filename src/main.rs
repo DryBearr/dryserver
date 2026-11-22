@@ -1243,8 +1243,11 @@ fn run_update(args: &[String]) -> Result<()> {
             let m = update_machine()?;
             keep_going_on_hangup();
             if f.on("started-it") {
-                // The running program, also when its name was taken since.
-                update::started_it(&m, Path::new("/proc/self/exe"))?;
+                // The running program's file (a hard link, no symbolic one);
+                // one replaced since it started does not read, and the next
+                // binary in line goes.
+                let own = std::env::current_exe().map_err(|e| err::Error::from(e).wrap("find the running program"))?;
+                update::started_it(&m, &own)?;
             }
             match (f.get("id"), f.on("boot")) {
                 ("", true) => update::guard_boot(&m, &Ctx::new(), now, &mut out),
