@@ -67,6 +67,9 @@ const TIME_SLACK: Duration = Duration::from_secs(2);
 /// them). pacman still exits 0 after a failed hook that runs after the
 /// transaction, so its output is the only sign.
 const HOOK_FAILED: &str = "error: command failed to execute correctly";
+/// How long pacman gets after SIGINT before it is killed, when it only
+/// refreshes or downloads.
+const PACMAN_GRACE: Duration = Duration::from_secs(30);
 
 pub const K3S_BIN: &str = crate::report::K3S_BIN;
 /// The binary that ran before the last update, kept to go back to.
@@ -97,9 +100,16 @@ pub struct Limits {
     pub sync: Duration,
     /// Downloading the packages: may be stopped at any time without harm.
     pub download: Duration,
-    /// Installing them from the cache: stopping it leaves a partly
-    /// upgraded system, so it gets plenty.
+    /// Installing them from the cache. pacman is never killed while it
+    /// installs: a package cut off half way leaves files that belong to no
+    /// package, and every later run then fails on them ("exists in
+    /// filesystem"). Past this limit it gets SIGINT, which makes it stop
+    /// between two packages, and is waited for. An install takes minutes;
+    /// the limit is for one that hangs.
     pub install: Duration,
+    /// How long the shutdown inhibitor gets to take its lock before pacman
+    /// installs.
+    pub inhibit_wait: Duration,
     /// How long k3s may take to answer healthy after a restart. The
     /// control plane on a slow mini PC takes minutes, an agent less.
     pub k3s_ready_brain: Duration,
@@ -117,7 +127,8 @@ impl Default for Limits {
             min_free_boot: 200 << 20,
             sync: Duration::from_secs(10 * 60),
             download: Duration::from_secs(45 * 60),
-            install: Duration::from_secs(30 * 60),
+            install: Duration::from_secs(2 * 3600),
+            inhibit_wait: Duration::from_millis(300),
             k3s_ready_brain: Duration::from_secs(10 * 60),
             k3s_ready_agent: Duration::from_secs(5 * 60),
             k3s_settle: Duration::from_secs(30),
@@ -610,7 +621,7 @@ impl Host<'_> {
             // Old packages pile up in the cache with every update until the
             // disk is full; the archive keeps them for a rollback.
             let tctx = ctx.with_timeout(self.limits.sync);
-            if let Err(e) = self.run.ok(&tctx, &pacman(&["-Sc", "--noconfirm"])) {
+            if let Err(e) = self.run.ok(&tctx, &pacman(&["-Sc", "--noconfirm"]).interrupt(Some(PACMAN_GRACE))) {
                 out.warnings.push(format!("cleaning the package cache failed: {e}"));
             }
         }
@@ -684,16 +695,29 @@ impl Host<'_> {
         hook_failed: &mut bool,
     ) -> Result<(), Failure> {
         let tctx = ctx.with_timeout(limit);
-        let (o, res) = self.run.run(&tctx, &pacman(args));
+        let (o, res) = if stage == Stage::Install {
+            // Never killed (see Limits::install), and no shutdown while it
+            // runs: that would stop it half way through a package as well.
+            let cmd = pacman(args).interrupt(None);
+            self.inhibited("pacman installs an update", &mut out.warnings, || self.run.run(&tctx, &cmd))
+        } else {
+            self.run.run(&tctx, &pacman(args).interrupt(Some(PACMAN_GRACE)))
+        };
         *hook_failed |= o.contains(HOOK_FAILED);
         let Err(e) = res else {
             return Ok(());
         };
         out.tail = tail(&o);
+        // The error ends with pacman's last line of output: text from the
+        // mirror (a file name, a server's answer) on its way to the log and
+        // the report.
+        let e = Error::new(one_line(&e.to_string(), 600));
         let e = if ctx.done() {
             e.wrap("the update was stopped")
+        } else if tctx.done() && stage == Stage::Install {
+            errf!("pacman ran longer than {} and was asked to stop between two packages ({e})", took(limit))
         } else if tctx.done() {
-            errf!("pacman ran longer than {} and was stopped ({e}); the lock it leaves is cleared at the next run", took(limit))
+            errf!("pacman ran longer than {} and was stopped ({e}); a lock it leaves is cleared at the next run", took(limit))
         } else {
             e
         };
@@ -706,6 +730,34 @@ impl Host<'_> {
             _ => errf!("downloading the packages failed ({problem}); nothing was installed: {e}"),
         };
         Err(Failure { stage, reason })
+    }
+
+    /// Runs f while shutdowns, sleep and the power key are held off (a
+    /// logind inhibitor lock, held by systemd-inhibit for as long as f
+    /// runs). f starts once the inhibitor had limits.inhibit_wait to take
+    /// its lock. Best effort: without it, f runs anyway, with a warning.
+    fn inhibited<T>(&self, why: &str, warnings: &mut Vec<String>, f: impl FnOnce() -> T) -> T {
+        let ictx = Ctx::new();
+        let why = format!("--why={why}");
+        let args = ["--what=shutdown:sleep:idle:handle-power-key", "--who=dryserver", &why, "--mode=block", "sleep", "infinity"];
+        let cmd = Cmd::new("systemd-inhibit", &args).quiet();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let (_, res) = self.run.run(&ictx, &cmd);
+                let _ = tx.send(res);
+            });
+            // It ends before it is let go only when it failed.
+            let early = rx.recv_timeout(self.limits.inhibit_wait).ok();
+            let out = f();
+            let early = early.or_else(|| rx.try_recv().ok());
+            ictx.cancel();
+            if let Some(res) = early {
+                let why = res.err().map(|e| e.to_string()).unwrap_or_else(|| "systemd-inhibit ended early".into());
+                warnings.push(format!("shutdowns were not held off while pacman installed: {}", one_line(&why, 200)));
+            }
+            out
+        })
     }
 
     /// What changed, from what pacman wrote to its log since offset. pacman
@@ -1572,10 +1624,17 @@ fn printable(s: &str) -> String {
     s.chars().map(|c| if c.is_control() && c != '\n' { '?' } else { c }).collect()
 }
 
+/// Text from outside as one printable line of at most max characters.
+fn one_line(s: &str, max: usize) -> String {
+    let t = printable(s.trim()).replace('\n', "; ");
+    if t.chars().count() > max { t.chars().take(max).collect::<String>() + "..." } else { t }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::install::{Encryption, crypttab};
+    use crate::runner::Stop;
     use crate::testutil::{PowerCut, TempDir, get, put, quiet_power_cuts};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
@@ -1606,6 +1665,12 @@ mod tests {
         brain_down: Mutex<bool>,
         /// sshd -t fails.
         sshd_fails: bool,
+        /// systemd-inhibit is not installed.
+        no_inhibit: bool,
+        /// systemd-inhibit holds its lock now; and whether it did each time
+        /// pacman began to install.
+        inhibiting: Mutex<bool>,
+        inhibited_installs: Mutex<Vec<bool>>,
     }
 
     const SLOW: Duration = Duration::from_millis(200);
@@ -1627,6 +1692,9 @@ mod tests {
                 hold_on_restart: false,
                 brain_down: Mutex::new(false),
                 sshd_fails: false,
+                no_inhibit: false,
+                inhibiting: Mutex::new(false),
+                inhibited_installs: Mutex::default(),
             }
         }
 
@@ -1663,7 +1731,28 @@ mod tests {
             match (c.name.as_str(), args.as_slice()) {
                 ("pacman", ["-Qu", "archlinux-keyring"]) if self.keyring_newer => ok("archlinux-keyring 20261001-1 -> 20261115-1\n"),
                 ("pacman", ["-Qu", _]) => (String::new(), Err("pacman failed: exit status 1".into())),
+                ("pacman", [a, ..]) if *a == "-Su" || *a == "-Suu" => {
+                    // The inhibitor starts beside it: give it a moment.
+                    let until = std::time::Instant::now() + Duration::from_secs(1);
+                    while !*self.inhibiting.lock().unwrap() && !self.no_inhibit && std::time::Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let held = *self.inhibiting.lock().unwrap();
+                    self.inhibited_installs.lock().unwrap().push(held);
+                    (self.pacman)(ctx, &self.root, c)
+                }
                 ("pacman", _) => (self.pacman)(ctx, &self.root, c),
+                ("systemd-inhibit", _) if self.no_inhibit => {
+                    (String::new(), Err("exec: \"systemd-inhibit\": executable file not found in $PATH".into()))
+                }
+                ("systemd-inhibit", _) => {
+                    *self.inhibiting.lock().unwrap() = true;
+                    while !ctx.done() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    *self.inhibiting.lock().unwrap() = false;
+                    (String::new(), Err("systemd-inhibit failed: signal: killed".into()))
+                }
                 ("systemctl", ["restart", "--no-block", "k3s.service"]) => {
                     if self.hold_on_restart {
                         put(&self.root, sysconf::K3S_HOLD, "the coordinator is cut off\n");
@@ -1719,6 +1808,7 @@ mod tests {
             k3s_ready_agent: Duration::from_millis(300),
             k3s_settle: Duration::from_millis(1),
             k3s_poll: Duration::from_millis(1),
+            inhibit_wait: Duration::from_millis(20),
             ..Limits::default()
         };
         let log: LogFn = Arc::new(move |s: &str| l.lock().unwrap().push(s.to_string()));
@@ -1891,7 +1981,7 @@ mod tests {
                 "pacman -Sc --noconfirm",
             ]
         );
-        for c in fake.ran.lock().unwrap().iter() {
+        for c in fake.ran.lock().unwrap().iter().filter(|c| c.name == "pacman") {
             assert_eq!(c.env, ["LC_ALL=C"], "{c}");
             for f in FORBIDDEN {
                 assert!(!c.args.iter().any(|a| a.contains(f)), "{c}");
@@ -2029,11 +2119,14 @@ mod tests {
         let n = calls.clone();
         let fake = Fake::with_pacman(r, move |ctx, root, c| {
             if c.args[0] == "-Su" && n.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Asked to stop (SIGINT, never SIGKILL: see the next test),
+                // it finishes the package it is at, then stops.
+                assert_eq!(c.stop, crate::runner::Stop::Interrupt(None));
                 while !ctx.done() {
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                put(root, PACMAN_LOCK, ""); // as a killed pacman leaves it
-                return (String::new(), Err("pacman failed: signal: killed".into()));
+                put(root, PACMAN_LOCK, ""); // as a pacman cut off by a power cut leaves it
+                return (String::new(), Err("pacman failed: exit status 130: interrupt received".into()));
             }
             (String::new(), Ok(()))
         });
@@ -2041,13 +2134,66 @@ mod tests {
         h.limits.install = Duration::from_millis(50);
         let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
         let f = out.failure.as_ref().unwrap();
-        assert!(f.stage == Stage::Install && f.reason.to_string().contains("ran longer than"), "{}", f.reason);
+        let why = f.reason.to_string();
+        assert!(f.stage == Stage::Install && why.contains("ran longer than") && why.contains("between two packages"), "{why}");
         assert!(h.path(PACMAN_LOCK).exists());
         let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
         assert!(out.ok(), "{}", out.summary());
         assert!(out.warnings.iter().any(|w| w.contains("stale pacman lock")), "{:?}", out.warnings);
         assert!(logs.lock().unwrap().iter().any(|l| l.contains("removed the stale pacman lock")), "it is logged");
         assert!(!h.path(PACMAN_LOCK).exists());
+    }
+
+    #[test]
+    fn pacman_is_never_killed_while_it_installs() {
+        // A package cut off half way leaves files that belong to no package
+        // and fail every later run: an install is only ever interrupted,
+        // and no shutdown is let in while it runs. Refreshing and loading
+        // may be killed after a grace.
+        let dir = machine();
+        let r = dir.path();
+        let fake = Fake::new(r);
+        let (h, _) = host(r, &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok() && out.warnings.iter().all(|w| !w.contains("held off")), "{}: {:?}", out.summary(), out.warnings);
+        for c in fake.ran.lock().unwrap().iter().filter(|c| c.name == "pacman" && c.args[0] != "-Qu") {
+            let want = if c.args[0] == "-Su" { Stop::Interrupt(None) } else { Stop::Interrupt(Some(PACMAN_GRACE)) };
+            assert_eq!(c.stop, want, "{c}");
+        }
+        assert_eq!(*fake.inhibited_installs.lock().unwrap(), [true], "the install ran under the inhibitor");
+        let inhibit = fake.lines().into_iter().find(|l| l.starts_with("systemd-inhibit")).unwrap();
+        assert!(inhibit.contains("--what=shutdown:sleep") && inhibit.contains("--mode=block"), "{inhibit}");
+        assert!(!*fake.inhibiting.lock().unwrap(), "the inhibitor is let go afterwards");
+        // Without systemd-inhibit the install still runs, with a warning.
+        let dir = machine();
+        let mut fake = Fake::new(dir.path());
+        fake.no_inhibit = true;
+        let (mut h, _) = host(dir.path(), &fake);
+        h.limits.inhibit_wait = Duration::from_secs(5);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok(), "{}", out.summary());
+        assert!(out.warnings.iter().any(|w| w.contains("not held off") && w.contains("not found")), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn pacmans_last_line_is_cleaned_before_it_is_shown() {
+        // The runner's error ends with pacman's last line, which names a
+        // file or quotes a server: no terminal escapes reach the log or the
+        // monitor through it.
+        let dir = machine();
+        let fake = Fake::with_pacman(dir.path(), |_, _, c| {
+            if c.args[0] == "-Suw" {
+                let evil = "error: failed retrieving file 'x\u{1b}]52;c;ZXZpbA==\u{7}.pkg' from evil\u{1b}[2J";
+                return (format!("{evil}\n"), Err(errf!("pacman failed: exit status 1: {evil}")));
+            }
+            (String::new(), Ok(()))
+        });
+        let (h, logs) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        let why = out.failure.as_ref().unwrap().reason.to_string();
+        assert!(why.contains("failed retrieving file") && !why.chars().any(|c| c.is_control()), "{why:?}");
+        assert!(!out.summary().chars().any(|c| c.is_control()) && !out.tail.contains('\u{1b}'), "{:?}", out.summary());
+        assert!(logs.lock().unwrap().iter().all(|l| !l.contains('\u{1b}')));
     }
 
     #[test]

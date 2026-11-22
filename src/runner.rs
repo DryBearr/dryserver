@@ -25,6 +25,20 @@ pub struct Cmd {
     /// Return only stdout (e.g. JSON replies); stderr is still logged
     /// unless quiet.
     pub stdout_only: bool,
+    /// What the command gets when its context is done.
+    pub stop: Stop,
+}
+
+/// How a running command is stopped when its context is done.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Stop {
+    /// SIGKILL at once.
+    #[default]
+    Kill,
+    /// SIGINT, so it can stop at a safe point (pacman between two
+    /// packages); then SIGKILL after the grace if it still runs, or with
+    /// None never: it is waited for.
+    Interrupt(Option<Duration>),
 }
 
 impl Cmd {
@@ -44,6 +58,12 @@ impl Cmd {
 
     pub fn stdout_only(mut self) -> Cmd {
         self.stdout_only = true;
+        self
+    }
+
+    /// Stopped with SIGINT instead of SIGKILL (see Stop::Interrupt).
+    pub fn interrupt(mut self, grace: Option<Duration>) -> Cmd {
+        self.stop = Stop::Interrupt(grace);
         self
     }
 }
@@ -170,7 +190,7 @@ fn exec(ctx: &Ctx, c: &Cmd, emit: LogFn) -> Result<Exec> {
             let e = err_lines.clone();
             s.spawn(move || copy_lines(r, &e));
         }
-        wait_child(ctx, &mut child)
+        wait_child(ctx, &mut child, c.stop)
     });
     let out = std::mem::take(&mut out.lock().unwrap().all);
     let err_out = std::mem::take(&mut err_lines.lock().unwrap().all);
@@ -182,15 +202,33 @@ fn exec(ctx: &Ctx, c: &Cmd, emit: LogFn) -> Result<Exec> {
     Ok((String::from_utf8_lossy(&out).into_owned(), String::from_utf8_lossy(&err_out).into_owned(), res))
 }
 
-/// Waits for the child, killing it when ctx is done.
-fn wait_child(ctx: &Ctx, child: &mut std::process::Child) -> Result<ExitStatus> {
+/// Waits for the child, stopping it as stop says when ctx is done.
+fn wait_child(ctx: &Ctx, child: &mut std::process::Child, stop: Stop) -> Result<ExitStatus> {
+    let mut interrupted: Option<std::time::Instant> = None;
     loop {
         if let Some(st) = child.try_wait()? {
             return Ok(st);
         }
         if ctx.done() {
-            let _ = child.kill();
-            return Ok(child.wait()?);
+            let kill = match stop {
+                Stop::Kill => true,
+                Stop::Interrupt(grace) => {
+                    let since = *interrupted.get_or_insert_with(|| {
+                        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+                            // SAFETY: kill(2) on the pid of our own child,
+                            // which has not been waited for yet, so the pid
+                            // cannot have been reused.
+                            unsafe { libc::kill(pid, libc::SIGINT) };
+                        }
+                        std::time::Instant::now()
+                    });
+                    grace.is_some_and(|g| since.elapsed() >= g)
+                }
+            };
+            if kill {
+                let _ = child.kill();
+                return Ok(child.wait()?);
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -383,5 +421,26 @@ mod tests {
         let (_, res) = r.run(&ctx, &Cmd::new("sleep", &["10"]));
         assert!(res.unwrap_err().to_string().contains("signal: killed"));
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn exec_runner_interrupts_and_waits() {
+        // Stopped with SIGINT, it finishes what it does and is waited for,
+        // well past the moment its context ended.
+        let r = ExecRunner::silent();
+        let ctx = Ctx::new().with_timeout(Duration::from_millis(100));
+        let script = "trap 'sleep 0.5; echo between packages; exit 3' INT; sleep 10 </dev/null >/dev/null 2>&1 & wait";
+        let start = std::time::Instant::now();
+        let (out, res) = r.run(&ctx, &Cmd::new("sh", &["-c", script]).interrupt(None));
+        assert!(res.unwrap_err().to_string().contains("exit status 3"), "{out}");
+        assert!(out.contains("between packages"), "{out}");
+        assert!(start.elapsed() >= Duration::from_millis(500), "it was not waited for");
+        // With a grace, one that ignores SIGINT is killed after it.
+        let ctx = Ctx::new().with_timeout(Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        let (_, res) = r.run(&ctx, &Cmd::new("sh", &["-c", "trap '' INT; exec sleep 10"]).interrupt(Some(Duration::from_millis(200))));
+        assert!(res.unwrap_err().to_string().contains("signal: killed"));
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(250) && took < Duration::from_secs(5), "{took:?}");
     }
 }
