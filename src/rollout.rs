@@ -280,12 +280,21 @@ impl UpdateStatus {
     /// go back, so the one before it is what counts meanwhile. Taking the
     /// applied one let the brain count itself updated, stop settling its
     /// own update and go back at the deadline (seen after a reboot inside
-    /// the window).
+    /// the window). And a release whose last record is its revert never
+    /// counts, whatever is named installed: a revert that half failed may
+    /// leave it named (the store's own record of what was confirmed
+    /// decides then).
     pub fn confirmed_serial(&self) -> u64 {
         match &self.pending {
             Some(p) if p.serial == self.installed.serial => p.previous.unwrap_or(0),
+            _ if self.last.as_ref().is_some_and(|l| l.serial == self.installed.serial && l.action == "reverted") => 0,
             _ => self.installed.serial,
         }
+    }
+
+    /// Whether the last update action confirmed release serial.
+    pub fn confirmed(&self, serial: u64) -> bool {
+        self.last.as_ref().is_some_and(|l| l.serial == serial && l.action == "confirmed")
     }
 
     /// Why release serial went back, when it did.
@@ -1402,8 +1411,11 @@ impl<'a> Machine<'a> {
             l.installed = l.installed.max(l.pending);
             return self.promote(l);
         }
-        if st.confirmed_serial() >= l.pending {
-            // Confirmed meanwhile.
+        if st.confirmed(l.pending) {
+            // Confirmed meanwhile (a sync killed after the confirm, or the
+            // admin by hand). Only its record says so: a revert that half
+            // failed may leave the release named installed.
+            l.installed = l.installed.max(l.pending);
             return self.promote(l);
         }
         // Nothing waits and nothing runs: the apply ended without

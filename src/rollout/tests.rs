@@ -2713,3 +2713,54 @@ fn review_the_brains_own_update_is_confirmed_while_a_newer_release_waits_for_the
     sw.until_unpaused(30, |s| s.everyone_on(11));
     assert_eq!(sw.brain.fake.sim().applied.len(), 2);
 }
+
+/// A revert that half failed (the old binary could not be put back) left
+/// nothing pending and the new release named as installed: settle took
+/// that for a confirm made meanwhile, and the server counted as updated.
+/// Only a confirm record for the release counts.
+#[test]
+fn review_a_revert_that_half_failed_is_no_update() {
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().broken = true;
+    sw.publish(10, true);
+    sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+    {
+        let mut s = sw.server(2).fake.sim();
+        (s.installed, s.pending) = (10, 0);
+        s.done(10, "reverted", false, "release 10 went back part way: putting back the old dryserver failed");
+    }
+    sw.until(5, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert_eq!((r.pause, r.pause_host), (Pause::Failed, 2), "{r:#?}");
+    assert!(r.paused.contains("update reverted") && r.paused.contains("putting back the old dryserver failed"), "{}", r.paused);
+    let l = Machine::new(&sw.server(2).node, false).load();
+    assert_eq!((l.pending, l.failed, l.installed, sw.installed(2)), (0, 10, 0, 0), "{l:?}");
+    assert!(!sw.server(2).node.path(STORE).join(INSTALLED).exists(), "kept as installed");
+    // Passed over, it does not count as done: it never ran release 10 well.
+    sw.skip();
+    sw.until(30, |s| s.installed(3) == 10);
+    sw.ticks(2);
+    assert!(!sw.rollout().done.contains(&2) && sw.rollout().skipped.iter().any(|s| s.host == 2), "{:#?}", sw.rollout());
+    // The update commands say so of a release with no record of its own.
+    let st = UpdateStatus {
+        installed: Installed { serial: 10 },
+        last: Some(Last { serial: 10, action: "reverted".into(), ..Last::default() }),
+        ..UpdateStatus::default()
+    };
+    assert_eq!(st.confirmed_serial(), 0);
+    let st = UpdateStatus { last: Some(Last { serial: 11, action: "reverted".into(), ..Last::default() }), ..st };
+    assert_eq!(st.confirmed_serial(), 10);
+
+    // Confirmed by hand meanwhile: that counts.
+    let mut sw = Swarm::new(1);
+    sw.server(2).fake.sim().broken = true;
+    sw.publish(10, true);
+    sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+    {
+        let mut s = sw.server(2).fake.sim();
+        (s.installed, s.pending) = (10, 0);
+        s.done(10, "confirmed", true, "release 10 (dryserver 0.2.0) is confirmed");
+    }
+    sw.until_unpaused(5, |s| s.everyone_on(10));
+    assert!(sw.server(2).node.path(STORE).join(INSTALLED).join(RELEASE_FILE).exists());
+}
