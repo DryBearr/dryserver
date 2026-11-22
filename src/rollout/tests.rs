@@ -3340,3 +3340,53 @@ fn root_signs_each_turn_and_signs_it_anew() {
     assert!(r.warnings.iter().any(|w| w.starts_with("cannot sign node-a's turn")), "{r:#?}");
     assert!(sw.brain.fake.sim().keygen.iter().all(|k| k.contains(crate::signed::NS_TURN)));
 }
+
+/// What the brain reads of `sshd -T`, with the real sshd where it is
+/// installed (OpenSSH 10 writes the keywords mixed case, older ones in
+/// lower case), on settings like the ones dryserver writes.
+#[test]
+fn the_brain_reads_what_the_real_sshd_says() {
+    if !crate::iso::in_path("sshd") || !crate::iso::in_path("ssh-keygen") {
+        eprintln!("the_brain_reads_what_the_real_sshd_says: no sshd here, skipped");
+        return;
+    }
+    struct Sshd(crate::runner::ExecRunner, PathBuf);
+    impl Runner for Sshd {
+        fn run(&self, ctx: &Ctx, c: &Cmd) -> (String, Result<()>) {
+            let f = self.1.display().to_string();
+            let mut args = vec!["-T".to_string(), "-f".into(), f];
+            args.extend(c.args.iter().skip(1).cloned());
+            let a: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.0.run(ctx, &Cmd::new(&c.name, &a).quiet().stdout_only())
+        }
+    }
+    let dir = TempDir::new();
+    let key = dir.join("hostkey");
+    assert!(Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", ""]).arg("-f").arg(&key).status().unwrap().success());
+    let force = crate::sysconf::registry_command(&crate::cidr::Cidr::parse("10.66.0.0/24").unwrap());
+    let conf = |admin: &str| {
+        let path = dir.join("sshd_config");
+        let text = format!(
+            "HostKey {}\nPasswordAuthentication no\nAuthenticationMethods publickey\nPermitRootLogin no\nAllowUsers admin dryreg\n{admin}\
+             Match User dryreg\n\tForceCommand {force}\n\tDisableForwarding yes\n\tPermitTTY no\n",
+            key.display()
+        );
+        std::fs::write(&path, text).unwrap();
+        path
+    };
+    let b = machine(1, "coord");
+    let node = |path: PathBuf| Node { run: Arc::new(Sshd(crate::runner::ExecRunner::silent(), path)), ..b.node.clone() };
+    let n = node(conf(""));
+    sshd_lets_in(&Ctx::new(), &n, "admin", "192.168.1.50", None).unwrap();
+    sshd_lets_in(&Ctx::new(), &n, "dryreg", "192.168.1.50", Some(&force)).unwrap();
+    assert!(sshd_lets_in(&Ctx::new(), &n, "admin", "192.168.1.50", Some(&force)).is_err());
+    for (bad, want) in [
+        ("Match User admin\n\tForceCommand /bin/false\n", "would force a command"),
+        ("Match User admin\n\tPubkeyAuthentication no\n", "no public key"),
+        ("Match User admin\n\tAuthorizedKeysFile none\n", "no authorized keys"),
+        ("DenyUsers admin\n", "would not let"),
+    ] {
+        let e = sshd_lets_in(&Ctx::new(), &node(conf(bad)), "admin", "192.168.1.50", None).unwrap_err();
+        assert!(e.contains(want), "{bad}: {e}");
+    }
+}
