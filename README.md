@@ -882,8 +882,9 @@ release that brings it. Step by step:
    cannot): once, with the update still waiting for its confirm, which
    then comes after the restart (the window grows by 15 minutes). Otherwise
    `dryserver update status` says `reboot needed`, `reboot by hand`, or
-   `do NOT reboot` (a package update that stopped part way: the next one
-   finishes it).
+   `do NOT reboot` (a package update that stopped part way, a power cut in
+   pacman among them: the next update runs pacman whatever day it brings,
+   also one that goes back to the day before, and finishes it).
 
 A machine whose kill switch has cut the coordinator off takes no update,
 and one whose cut lands during the update stops before the packages.

@@ -1503,6 +1503,15 @@ fn newer_here(pinned: &str, rel: &Release, installed: bool, since: i64) -> bool 
 /// Whether the packages have to be brought to date. The mirrorlist pins
 /// another day (or none), or the last run on that day did not finish.
 ///
+/// An install that was cut off (osupdate::INSTALLING is left, or the
+/// record of the run says it did not finish) is due whatever day it went
+/// to: a power cut in pacman, then the boot's revert, leaves the mirrorlist
+/// on the day before and the packages partly of the newer day, and a
+/// release on the day before (going back) must finish them. So is a run
+/// while the fallback kernel runs or the main kernel's image failed: it
+/// makes an image that was never made (a power cut before pacman's hook),
+/// and the main kernel comes back.
+///
 /// The fallback kernel waiting for its own run (one kernel at a time)
 /// makes a run due only once the main kernel has booted well: until then
 /// that run could not take it anyway, and a dryserver-only release must
@@ -1514,15 +1523,31 @@ fn newer_here(pinned: &str, rel: &Release, installed: bool, since: i64) -> bool 
 /// packages from mirrors of that day or newer, and a rollback asks for
 /// exactly that day's.
 fn arch_due(m: &Machine, date: &str, rollback: bool) -> bool {
+    if cut_off_install(m).is_some() {
+        return true;
+    }
     if osupdate::pinned_date(&fsx::read_or_empty(m.path(osupdate::MIRRORLIST))).as_deref() != Some(date) {
+        return true;
+    }
+    let host = host(m, &HostLog::default());
+    if host.boot_needs_look() {
         return true;
     }
     match read_json::<ArchState>(m, ARCH_STATE) {
         Ok(Some(s)) if !(s.date == date && s.done) => true,
-        Ok(Some(s)) => s.lts_waits && host(m, &HostLog::default()).main_booted_well(),
+        Ok(Some(s)) => s.lts_waits && host.main_booted_well(),
         Ok(None) => rollback,
         Err(_) => true,
     }
+}
+
+/// The day of an install pacman did not finish (osupdate::INSTALLING is
+/// there; "" when it names none). While an apply runs, it may be one that
+/// runs now.
+fn cut_off_install(m: &Machine) -> Option<String> {
+    fs::symlink_metadata(m.path(osupdate::INSTALLING)).ok()?;
+    let day = fsx::read_or_empty(m.path(osupdate::INSTALLING)).trim().to_string();
+    Some(if release::arch_day(&day).is_ok() { day } else { String::new() })
 }
 
 /// Why an apply did not get to change the machine. again: a problem that
@@ -2106,6 +2131,7 @@ fn install_work(
         refuse_if_cut(m)?;
         p.step = format!("installing the packages of Arch {}", o.date);
         save_pending(m, &p)?;
+        note_arch_start(m, o);
         host.arch_install(ctx, o);
         log.flush(m, out);
         save_arch_state(m, o);
@@ -2145,6 +2171,24 @@ fn applied(m: &Machine, ctx: &Ctx, serial: u64, arch: Option<&ArchOutcome>, rebo
         format!("release {serial} is applied. Confirm it before {} (dryserver update confirm), or it reverts by itself", when(deadline));
     record(m, out, m.now(), serial, "applied", true, &msg);
     reboot_after(m, ctx, arch, rebooting, id, out);
+}
+
+/// Before pacman installs: the run is recorded as not done, for the day it
+/// goes to, so a power cut in it (or right after, before save_arch_state)
+/// leaves a record that says so: the boot's revert puts the mirrorlist
+/// back on the day before, and the next release, on that day too, finishes
+/// the packages (arch_due) and says "do NOT reboot" until then.
+fn note_arch_start(m: &Machine, o: &ArchOutcome) {
+    let s = ArchState {
+        date: o.date.clone(),
+        done: false,
+        at: m.now(),
+        summary: format!("Arch {}: pacman installs the packages (if this stays, it stopped part way)", o.date),
+        ..ArchState::default()
+    };
+    if let Err(e) = save_json(m, ARCH_STATE, &s) {
+        note(m, m.now(), &format!("cannot keep {ARCH_STATE}: {e}"));
+    }
 }
 
 /// What the last run did to the packages, kept beside the update records:
@@ -2856,9 +2900,19 @@ fn boot_time(m: &Machine) -> i64 {
 }
 
 /// The reboot this machine is due, if any (see Status::reboot).
-fn reboot_state(m: &Machine, arch: Option<&ArchState>) -> String {
+fn reboot_state(m: &Machine, arch: Option<&ArchState>, busy: bool) -> String {
     let since_boot = arch.filter(|a| a.at >= boot_time(m));
+    if let Some(day) = cut_off_install(m) {
+        let day = if day.is_empty() { String::new() } else { format!(" to {day}") };
+        if busy {
+            return format!("do NOT reboot: pacman installs the package update{day}");
+        }
+        return format!("do NOT reboot: the package update{day} stopped part way; the next one finishes it");
+    }
     if let Some(a) = arch.filter(|a| !a.done && !a.untouched) {
+        if busy {
+            return format!("do NOT reboot: the package update to {} runs", a.date);
+        }
         return format!("do NOT reboot: the package update to {} stopped part way; the next one finishes it", a.date);
     }
     if let Some(a) = since_boot.filter(|a| !a.boot_problem.is_empty()) {
@@ -2933,7 +2987,7 @@ pub fn status(m: &Machine, now: i64) -> Status {
         problems,
         busy,
         arch_pinned: osupdate::pinned_date(&fsx::read_or_empty(m.path(osupdate::MIRRORLIST))).unwrap_or_default(),
-        reboot: reboot_state(m, arch.as_ref()),
+        reboot: reboot_state(m, arch.as_ref(), busy),
         arch,
     }
 }
@@ -4120,6 +4174,89 @@ mod tests {
         lab.write(osupdate::MIRRORLIST, b"Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n", 0o644);
         let _ = fs::remove_file(lab.p(ARCH_STATE));
         assert!(arch_due(&m, DAY, false));
+    }
+
+    #[test]
+    fn review_a_power_cut_in_pacman_then_a_rollback_to_the_day_before_runs_pacman() {
+        // The power goes while pacman installs NEXT_DAY; the boot's revert
+        // puts the mirrorlist back on DAY. The release that goes back to DAY
+        // must finish the packages, not take them for DAY's.
+        quiet_power_cuts();
+        // Right after pacman returned (before its run was recorded), and in
+        // the middle of it: then its marker stays, and arch.json may be the
+        // run before's (a dryserver before this one wrote it after pacman).
+        for cut in ["after pacman", "in pacman"] {
+            let lab = Lab::new();
+            lab.write(osupdate::MIRRORLIST, osupdate::mirrorlist("2026/11/18").unwrap().as_bytes(), 0o644);
+            lab.apply_os(&os_rel(7, K3S_OLD, DAY), None).unwrap();
+            confirm(&lab.m(), &Ctx::new(), Some(7), now(), &mut Vec::new()).unwrap();
+            assert!(lab.arch().unwrap().done);
+            lab.hook(Arc::new(|p| {
+                if p == "arch installed" {
+                    std::panic::panic_any(PowerCut);
+                }
+                Ok(())
+            }));
+            let a = lab.os_opts(&os_rel(8, K3S_OLD, NEXT_DAY), None);
+            assert!(catch_unwind(AssertUnwindSafe(|| apply(&lab.m(), &Ctx::new(), &a, now(), &mut Vec::new()))).is_err());
+            lab.hook(noop());
+            if cut == "in pacman" {
+                lab.write(osupdate::INSTALLING, format!("{NEXT_DAY}\n").as_bytes(), 0o600);
+                save_json(&lab.m(), ARCH_STATE, &ArchState { date: DAY.into(), done: true, ..ArchState::default() }).unwrap();
+            } else {
+                let a = lab.arch().unwrap();
+                assert!(a.date == NEXT_DAY && !a.done, "recorded before pacman starts: {a:?}");
+            }
+            guard_boot(&lab.m(), &Ctx::new(), now() + 30, &mut Vec::new()).unwrap();
+            assert_eq!(lab.pinned().as_deref(), Some(DAY));
+            let s = status(&lab.m(), now());
+            assert!(s.reboot.contains("do NOT reboot") && s.reboot.contains(NEXT_DAY), "{cut}: {}", s.reboot);
+            lab.fake.ran.lock().unwrap().clear();
+            lab.apply_os(&Release { rollback: true, ..os_rel(9, K3S_OLD, DAY) }, None).unwrap();
+            assert!(lab.fake.has("pacman -Suu"), "{cut}: the packages of NEXT_DAY stay: {:#?}", lab.fake.ran());
+            let a = lab.arch().unwrap();
+            assert!(a.date == DAY && a.done && !lab.p(osupdate::INSTALLING).exists(), "{cut}: {a:?}");
+            assert!(!status(&lab.m(), now()).reboot.contains("do NOT reboot"));
+        }
+    }
+
+    #[test]
+    fn review_a_cut_off_install_is_due_whatever_arch_json_says() {
+        let lab = Lab::new();
+        let m = lab.m();
+        save_json(&m, ARCH_STATE, &ArchState { date: DAY.into(), done: true, ..ArchState::default() }).unwrap();
+        assert!(!arch_due(&m, DAY, false));
+        lab.write(osupdate::INSTALLING, format!("{NEXT_DAY}\n").as_bytes(), 0o600);
+        assert!(arch_due(&m, DAY, false));
+        let s = status(&m, now());
+        assert!(s.reboot.contains("do NOT reboot") && s.reboot.contains("stopped part way"), "{}", s.reboot);
+        // While the apply runs, pacman is at it.
+        let lock = try_lock(&m).unwrap().unwrap();
+        assert!(status(&m, now()).reboot.contains("pacman installs the package update to 2026/11/20"));
+        drop(lock);
+        // A marker that names no day is still a cut-off install.
+        lab.write(osupdate::INSTALLING, b"", 0o600);
+        assert!(arch_due(&m, DAY, false) && status(&m, now()).reboot.contains("the package update stopped part way"));
+        let _ = fs::remove_file(lab.p(osupdate::INSTALLING));
+        assert!(!arch_due(&m, DAY, false) && status(&m, now()).reboot.is_empty());
+    }
+
+    #[test]
+    fn review_a_main_kernel_cut_off_before_its_image_is_due_on_the_same_day() {
+        // The fallback kernel runs, or the main image used up its tries: the
+        // next release on the same day runs pacman, which makes the image.
+        let lab = Lab::new();
+        let m = lab.m();
+        save_json(&m, ARCH_STATE, &ArchState { date: DAY.into(), done: true, ..ArchState::default() }).unwrap();
+        assert!(!arch_due(&m, DAY, false));
+        lab.write("/proc/sys/kernel/osrelease", b"6.6.60-1-lts\n", 0o644);
+        lab.write("/usr/lib/modules/6.6.60-1-lts/pkgbase", b"linux-lts\n", 0o644);
+        assert!(arch_due(&m, DAY, false), "the fallback kernel runs");
+        lab.write("/proc/sys/kernel/osrelease", b"6.12.1-arch1-1\n", 0o644);
+        assert!(!arch_due(&m, DAY, false));
+        let _ = fs::remove_file(lab.p("/boot/EFI/Linux/arch-linux.efi"));
+        lab.write("/boot/EFI/Linux/arch-linux+0-3.efi", b"image", 0o644);
+        assert!(arch_due(&m, DAY, false), "the main image failed its tries");
     }
 
     #[test]

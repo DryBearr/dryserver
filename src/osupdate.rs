@@ -810,6 +810,14 @@ impl Host<'_> {
         self.main_known_good()
     }
 
+    /// The fallback kernel runs, or the main kernel's image failed: a run
+    /// of arch_install looks at every kernel's image then, and makes one
+    /// that was never made (a run cut off before pacman's hook), whatever
+    /// it installs.
+    pub fn boot_needs_look(&self) -> bool {
+        self.fallback_runs() || self.main_image_bad()
+    }
+
     /// The main kernel runs, is the one on disk (not replaced), and booted
     /// well: on UEFI its newest image carries no boot counter any more
     /// (systemd-bless-boot drops it after a good boot).
