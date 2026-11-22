@@ -259,6 +259,10 @@ pub struct Pending {
     pub reboot: bool,
     #[serde(deserialize_with = "report::lenient")]
     pub boots: u32,
+    /// The update brought a new main kernel (or made its image again):
+    /// with boots > 0, a fallback kernel that runs is that kernel failing.
+    #[serde(deserialize_with = "report::lenient")]
+    pub kernel: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1563,11 +1567,13 @@ impl<'a> Machine<'a> {
                 Some((_, r)) if running_sha(&self.n.root).as_deref() != Some(r.dryserver.sha256.as_str()) => {
                     Some("the new dryserver does not run yet".to_string())
                 }
-                Some(_) => healthy(rep, self.brain || self.n.path(crate::sysconf::K3S_TOKEN).exists()).err().or_else(|| {
-                    // When the apply ended: its own record of it.
-                    let at = st.last.as_ref().filter(|x| x.serial == l.pending && x.action == "applied").map_or(0, |x| x.at);
-                    proof(ctx, at.max(l.applied)).err()
-                }),
+                Some(_) => healthy(rep, self.brain || self.n.path(crate::sysconf::K3S_TOKEN).exists(), p.kernel && p.boots > 0)
+                    .err()
+                    .or_else(|| {
+                        // When the apply ended: its own record of it.
+                        let at = st.last.as_ref().filter(|x| x.serial == l.pending && x.action == "applied").map_or(0, |x| x.at);
+                        proof(ctx, at.max(l.applied)).err()
+                    }),
             };
             if let Some(why) = wait {
                 // Not confirmed: if it stays like this, the machine goes back
@@ -1655,13 +1661,18 @@ impl<'a> Machine<'a> {
 /// Whether a machine's report says it is well enough to keep its update:
 /// its firewall is loaded and k3s runs. expect_k3s: k3s must run (the
 /// brain, a server in the cluster); otherwise it must only not be down.
-pub fn healthy(r: &Report, expect_k3s: bool) -> std::result::Result<(), String> {
+/// new_kernel: the update brought a new main kernel (or made its image
+/// again) and the machine started since (pending.kernel, boots): then its
+/// fallback kernel running means that kernel failed. A fallback kernel
+/// that ran before the update is not the update's doing, and does not
+/// keep it from being confirmed.
+pub fn healthy(r: &Report, expect_k3s: bool, new_kernel: bool) -> std::result::Result<(), String> {
     if r.firewall != Some(true) {
         return Err("its firewall is not loaded".into());
     }
-    if r.boot == "fallback" {
-        // The kernel the update brought did not boot (or someone picked the
-        // fallback): not the machine the update was to leave.
+    if new_kernel && r.boot == "fallback" {
+        // The kernel the update brought did not boot: not the machine the
+        // update was to leave.
         return Err("it runs its fallback kernel: the main kernel did not boot well (dryserver boot status)".into());
     }
     match r.k3s_active {
@@ -2563,9 +2574,10 @@ impl Brain<'_> {
     }
 
     /// A server's update is done when it runs the release, confirmed, and
-    /// is healthy.
+    /// is healthy. Its kernel is its own to judge: it did not confirm a
+    /// release whose new kernel left it on its fallback one.
     fn updated(r: &Report, target: u64) -> bool {
-        r.release >= target && !matches!(r.update.as_str(), "pending" | "fetching") && healthy(r, false).is_ok()
+        r.release >= target && !matches!(r.update.as_str(), "pending" | "fetching") && healthy(r, false, false).is_ok()
     }
 
     fn servers(&mut self) {
@@ -2894,11 +2906,14 @@ impl Brain<'_> {
             self.r.unpause();
             return;
         }
-        if cordoned && rep.release < target && rep.update != "pending" && healthy(rep, false).is_ok() {
+        if cordoned && rep.release < target && rep.update != "pending" && healthy(rep, false, false).is_ok() {
             self.uncordon(&name);
         }
     }
 
+    /// The canary, watched for SOAK after its update. One on its fallback
+    /// kernel counts as not well whatever the update brought: the brain
+    /// cannot tell from its report, and the admin who looks resumes.
     fn watch_canary(&mut self) {
         let host = self.r.canary;
         let Some(m) = self.member(host).cloned() else { return };
@@ -2909,7 +2924,7 @@ impl Brain<'_> {
             None => Some("it sends no report".to_string()),
             Some(r) if r.update_failed() => Some(format!("update {}", r.update)),
             Some(r) if r.release < self.r.serial => Some(format!("it runs release {} again", r.release)),
-            Some(r) => healthy(r, false).err(),
+            Some(r) => healthy(r, false, true).err(),
         };
         if let Some(why) = why {
             self.r.stop(Pause::Canary, host, &m.name, format!("the canary {} is not well after its update: {why}", m.name));

@@ -2655,11 +2655,12 @@ fn only_static_linux_programs_are_published() {
 fn update_status_is_read_leniently() {
     let s: UpdateStatus = serde_json::from_str(
         r#"{"running":"0.2.0","installed":{"serial":9,"version":"0.2.0","stale":false},
-            "pending":{"serial":10,"stage":"booted","deadline":77,"seconds_left":5,"boots":1,"files":["x"]},
+            "pending":{"serial":10,"stage":"booted","deadline":77,"seconds_left":5,"boots":1,"files":["x"],"kernel":true},
             "last":{"at":1,"serial":8,"action":"reverted","ok":true,"message":"selfcheck failed"},"problems":["x"]}"#,
     )
     .unwrap();
     assert_eq!((s.installed.serial, s.pending_serial(), s.pending.as_ref().unwrap().deadline), (9, 10, 77));
+    assert!(s.pending.as_ref().unwrap().kernel);
     assert_eq!(s.reverted(8).as_deref(), Some("selfcheck failed"));
     assert_eq!(s.reverted(9), None);
     // Nothing pending; fields of the wrong kind read as empty.
@@ -2777,16 +2778,32 @@ fn an_old_rollback_sent_again_does_not_move_a_fresh_machine_below_its_install() 
 
 #[test]
 fn a_machine_on_its_fallback_kernel_is_not_well() {
-    // After its update it booted the fallback kernel: the new main kernel
-    // did not work. Not confirmed, and the rollout stops there.
+    // Its update brought a new main kernel, and after the restart it runs
+    // the fallback one: that kernel did not work. Not confirmed, and the
+    // rollout stops there.
     let mut sw = Swarm::new(2);
     sw.fallback.push(2);
+    (sw.server(2).fake.sim().kernel, sw.server(2).fake.sim().boots) = (true, 1);
     sw.publish(10, true);
     sw.until(30, |s| s.server(2).fake.sim().pending == 10);
     sw.ticks(5);
     assert!(sw.server(2).fake.sim().confirmed.is_empty(), "confirmed on its fallback kernel");
     let r = sw.store.read().unwrap().members.iter().find(|m| m.host == 2).unwrap().report.clone().unwrap();
     assert!(r.update_note.contains("fallback kernel"), "{r:?}");
+    // On its fallback kernel already, by an update that brought no kernel,
+    // or with no restart since one that did: no reason to go back. It is
+    // kept; as the canary, the brain stops for the admin to look.
+    for (kernel, boots) in [(false, 1), (true, 0), (false, 0)] {
+        let mut sw = Swarm::new(2);
+        sw.fallback.push(2);
+        (sw.server(2).fake.sim().kernel, sw.server(2).fake.sim().boots) = (kernel, boots);
+        sw.publish(10, false);
+        sw.until(10, |s| s.installed(2) == 10);
+        sw.until(5, |s| s.rollout().pause == Pause::Canary);
+        sw.fallback.clear();
+        sw.resume();
+        sw.until_unpaused(30, |s| s.everyone_on(10));
+    }
     // The canary that falls back after its update stops the rollout.
     let mut sw = Swarm::new(2);
     sw.publish(10, false);
