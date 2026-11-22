@@ -667,6 +667,17 @@ table inet dryserver {{
 		reject with icmpx admin-prohibited
 	}}{to_mesh_chain}
 
+	# Mesh addresses only through WireGuard, from this machine, its pods
+	# and its containers, also on connections already open: with wg0
+	# down its route is gone, and the default route would carry k3s and
+	# the pod network there in the clear. Here, after every rewrite of an
+	# address, the interface is the one the packet leaves by.
+	chain postrouting {{
+		type filter hook postrouting priority filter; policy accept;
+		ip daddr {mesh} oifname != {{ "wg0", "lo" }} limit rate 10/minute log prefix "dryserver-out-drop: "
+		ip daddr {mesh} oifname != {{ "wg0", "lo" }} drop
+	}}
+
 	# Containers. Before Docker's own chains; a drop here is final.
 	chain forward {{
 		type filter hook forward priority filter - 5; policy accept;
@@ -731,6 +742,7 @@ table inet dryserver {{
 "#,
         include = quarantine::NFT_INCLUDE,
         coord_mesh = f.coord_mesh,
+        mesh = f.mesh.network_string(),
         pod_cidr = K3S_POD_CIDR,
         svc_cidr = K3S_SERVICE_CIDR,
         knocks = KNOCKS_PER_MINUTE,

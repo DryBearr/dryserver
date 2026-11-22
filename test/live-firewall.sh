@@ -365,5 +365,22 @@ else
     echo "  SKIP accounts other than root: this user has no subordinate ids (/etc/subuid, /etc/subgid, newuidmap)"
 fi
 
+echo "== wg0 down: what is for the mesh never leaves another way"
+# Its route goes with it; the default route would carry it to the home
+# network in the clear. Something there answers at a mesh address.
+in_ $LAN ip addr add 10.66.0.3/32 dev lo
+listen $LAN 10.66.0.3:10250 10.66.0.3:9999 10.66.0.3:443
+in_ $SRV ip link set wg0 down
+sleep 0.5
+want "(coordinator) root -> a server's kubelet" silent $SRV 10.66.0.3 10250
+want "(coordinator) a pod here -> a server's kubelet" silent $POD 10.66.0.3 10250
+in_ $SRV nft -f "$W/node/etc/nftables.conf" || { echo "the generated firewall does not load"; exit 1; }
+want "(server) root -> the mesh :443 (web may leave, the mesh not)" silent $SRV 10.66.0.3 443
+want "(server) root -> the mesh, any port" refused $SRV 10.66.0.3 9999
+want "(server) a container -> mesh :8080 (MESH_PORTS)" silent $CT 10.66.0.3 8080
+in_ $SRV nft delete table inet dryserver
+want "without the firewall it would have gone there (the check works)" open $SRV 10.66.0.3 9999
+in_ $SRV ip link set wg0 up
+
 echo "== $pass passed, $fail failed"
 [ "$fail" = 0 ]
