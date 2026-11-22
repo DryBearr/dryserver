@@ -1028,7 +1028,7 @@ fn changed_at(md: &fs::Metadata) -> SystemTime {
 /// the package that installed a newer kernel took the running one's
 /// directory (/usr/lib/modules/VERSION/vmlinuz) with it. Without any
 /// kernel there (a container) it was not.
-fn kernel_replaced(root: &Path) -> bool {
+pub fn kernel_replaced(root: &Path) -> bool {
     let running = fsx::read_or_empty(fsx::under(root, "/proc/sys/kernel/osrelease")).trim().to_string();
     if running.is_empty() || running.contains('/') {
         return false;

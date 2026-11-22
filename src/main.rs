@@ -19,9 +19,6 @@ mod install;
 mod iso;
 mod mesh;
 mod node;
-// Not called yet: `dryserver update apply` calls it for the k3s binary
-// and the Arch snapshot of a release once it is wired.
-#[allow(dead_code)]
 mod osupdate;
 mod owner;
 mod packages;
@@ -108,9 +105,11 @@ on servers:
                       (run by a timer)
   backup              coordinator: encrypted backup into /var/lib/dryserver-backup
                       (run by a timer every night)
-  update apply --release FILE --binary FILE [--brain-k3s V] [--window SECS]
-                      install a dryserver release the admin signed; it
-                      reverts by itself unless confirmed within the window
+  update apply --release FILE --binary FILE [--k3s FILE] [--brain-k3s V]
+               [--window SECS] [--reboot] [--detach]
+                      install a release the admin signed (dryserver, k3s,
+                      Arch packages); it reverts by itself unless confirmed
+                      within the window
   update confirm [--serial N] | revert | status [--json]
                       keep the applied release, undo it, or show the state
   selfcheck           check this binary, config.env, the firewall, SSH,
@@ -1130,8 +1129,11 @@ fn run_update(args: &[String]) -> Result<()> {
                 &[
                     ("release", "", "the signed release (JSON envelope)"),
                     ("binary", "", "the dryserver binary it names"),
+                    ("k3s", "", "the k3s binary it names (needed when this machine runs another k3s)"),
                     ("brain-k3s", "", "the k3s version the coordinator runs (default: this server's own)"),
-                    ("window", &window, "seconds until an unconfirmed update reverts by itself"),
+                    ("window", &window, "seconds from the end of the apply until an unconfirmed update reverts by itself"),
+                    ("reboot", "false", "reboot when the new packages need it and the machine can come back by itself"),
+                    ("detach", "false", "run in a service of its own and return at once (dryserver update status follows it)"),
                 ],
             );
             if f.get("release").is_empty() || f.get("binary").is_empty() {
@@ -1143,9 +1145,14 @@ fn run_update(args: &[String]) -> Result<()> {
             let a = update::Apply {
                 release: f.get("release").into(),
                 binary: f.get("binary").into(),
+                k3s: Some(f.get("k3s")).filter(|k| !k.is_empty()).map(PathBuf::from),
                 brain_k3s: f.get("brain-k3s").into(),
                 window,
+                reboot: f.on("reboot"),
             };
+            if f.on("detach") {
+                return update::start_detached(&m, &Ctx::new().with_timeout(Duration::from_secs(60)), &a, &mut out);
+            }
             update::apply(&m, &Ctx::on_signals(), &a, now, &mut out)
         }
         "confirm" => {
@@ -1179,13 +1186,17 @@ fn run_update(args: &[String]) -> Result<()> {
             let f = Flags::parse(
                 &name,
                 rest,
-                &[("id", "", "the update the timer was armed for"), ("boot", "false", "the machine just started")],
+                &[
+                    ("id", "", "the update the timer was armed for"),
+                    ("applying", "false", "the timer armed when the apply started"),
+                    ("boot", "false", "the machine just started"),
+                ],
             );
             let m = update_machine()?;
             keep_going_on_hangup();
             match (f.get("id"), f.on("boot")) {
                 ("", true) => update::guard_boot(&m, &Ctx::new(), now, &mut out),
-                (id, false) if !id.is_empty() => update::guard_timer(&m, &Ctx::new(), id, now, &mut out),
+                (id, false) if !id.is_empty() => update::guard_timer(&m, &Ctx::new(), id, f.on("applying"), now, &mut out),
                 _ => bail!("update guard: give --id or --boot"),
             }
         }
