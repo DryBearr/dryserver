@@ -665,6 +665,35 @@ impl Admin {
             }
             v.pending.push(r);
         }
+        // Requests the registry turned down because the name or the key is
+        // taken: a machine installed again under a member's name, or one
+        // whose name another request holds, waits there unseen otherwise.
+        // The registry's word: shown only with the stick's proof, and with
+        // the code computed here, which the machine's screen shows.
+        for f in st.refused {
+            let r = f.request;
+            if registry::validate_request(&r).is_err() || !registry::proof_ok(&secret, &r) || v.pending.iter().any(|p| p.wg_key == r.wg_key)
+            {
+                continue;
+            }
+            let code = registry::pairing_code(&r.wg_key, &r.ssh_host_key, &coord_key);
+            let (name, lan) = (&r.name, &r.lan_ip);
+            v.warnings.push(match self.base.members.iter().find(|e| e.name == r.name || e.wg_key == r.wg_key) {
+                Some(e) if e.wg_key == r.wg_key => format!(
+                    "{name} ({lan}) asks to join, but it is a member already: it lost its record of that \
+                     (/etc/dryserver/join.json on it). Put it back, or remove {} (d) and it asks again by itself.",
+                    e.name
+                ),
+                Some(_) => format!(
+                    "{name} ({lan}) asks to join with code {code}, but a member is called {name} already. If {name} was \
+                     installed again and its screen shows {code}, remove {name} (d): it then asks again by itself."
+                ),
+                None => format!(
+                    "{name} ({lan}) asks to join with code {code}, but another request waits under that name. If {name}'s \
+                     screen shows {code}, reject the other one (r): this one then asks again by itself."
+                ),
+            });
+        }
         if !dropped.is_empty() {
             v.warnings.push(format!(
                 "The coordinator lists more than one join request under the same id, name or WireGuard key ({}). None of them \
@@ -1238,6 +1267,51 @@ pub mod tests {
     /// when there is none).
     pub fn by_id(a: &Admin, id: &str) -> Request {
         a.pending.iter().find(|r| r.id == id).cloned().unwrap_or(Request { id: id.into(), ..Request::default() })
+    }
+
+    /// A machine installed again under a member's name, or one whose name
+    /// another request holds, is turned down by the registry; the approval
+    /// screen says so, with the code from its screen and what to do.
+    #[test]
+    fn requests_turned_down_are_shown_with_what_to_do() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        let id = ask(&store, "node-a", 2);
+        a.load().unwrap();
+        a.approve(&by_id(&a, &id)).unwrap();
+        let turned_down = |r: Request| store.update(|s| Ok(s.add_request_from(r, COORD_KEY, Time::now(), "192.168.1.24"))).unwrap();
+        // node-a installed again: new keys, the same name.
+        assert!(turned_down(request("node-a", 7)).is_err());
+        // Waiting as node-b, and another machine asks under node-b.
+        let idb = ask(&store, "node-b", 3);
+        assert!(turned_down(request("node-b", 8)).is_err());
+        // Without the stick's proof: the registry account's own word.
+        assert!(turned_down(Request { proof: String::new(), ..request("node-a", 10) }).is_err());
+        let v = a.load().unwrap();
+        let code = |seed: u8, name: &str| registry::pairing_code(&key32(seed), &request(name, seed).ssh_host_key, COORD_KEY);
+        let w = v.warnings.join("\n");
+        assert!(
+            w.contains(&format!(
+                "node-a (192.168.1.23) asks to join with code {}, but a member is called node-a already",
+                code(7, "node-a")
+            )) && w.contains("remove node-a (d)"),
+            "{w}"
+        );
+        assert!(
+            w.contains(&format!("node-b (192.168.1.23) asks to join with code {}, but another request waits", code(8, "node-b"))),
+            "{w}"
+        );
+        assert!(!w.contains(&code(10, "node-a")), "a refusal without proof is shown: {w}");
+        // The admin rejects the other node-b: the one turned down asks
+        // again and is a waiting request now, no longer a warning.
+        a.reject(&by_id(&a, &idb)).unwrap();
+        store.update(|s| s.add_request_from(request("node-b", 8), COORD_KEY, Time::now(), "192.168.1.25")).unwrap();
+        let v = a.load().unwrap();
+        assert!(
+            v.pending.iter().any(|r| r.wg_key == key32(8)) && !v.warnings.join("\n").contains("another request waits"),
+            "{:?}",
+            v.warnings
+        );
     }
 
     /// The review's case: the registry account lists, before the real

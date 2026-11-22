@@ -957,6 +957,14 @@ ended.
   and shows a new code on its screen, saying why. After approval, the
   member list is only served over the mesh. Removing a machine (`d` in
   `./dryserver approve`) drops it from all servers within a minute.
+  The approval screen signs exactly the request you chose (its keys, not
+  only its id), and shows none of the requests the coordinator lists more
+  than once under one id, name or key. A request the coordinator turns
+  down because its name is a member's, or another machine waits under it,
+  shows on the machine's screen with the reason and its code, and on the
+  approval screen with that code and what to do (remove the old member,
+  or reject the other request). One address may have three requests
+  waiting at most: every server holds the key that asks.
 - **Unknown devices**: the coordinator scans its networks every 15 minutes and
   lists unknown devices in `./dryserver approve` (report only). A server's
   own word about its address does not hide a device there: it counts only

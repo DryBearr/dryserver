@@ -75,6 +75,39 @@ pub const ISSUE_FILE: &str = "/etc/issue.d/50-dryserver.issue";
 /// of the real coordinator fails on the key.
 pub const HOST_KEY_TRIES: u32 = 5;
 
+/// How a join request the coordinator turned down starts (refusal).
+const REFUSED: &str = "the coordinator turned this machine's request down";
+
+/// What the registry's no to a join request (in e) means, with what the
+/// admin does about it; none for anything else. The registry's words,
+/// which a hacked registry account chooses: they only ever reach this
+/// machine's console.
+fn refusal(name: &str, e: &Error) -> Option<String> {
+    let msg = e.to_string();
+    Some(if msg.contains("is already a member; remove it first") {
+        format!(
+            "the name {name} is a member already. If this machine takes its place, remove {name} on your computer in \
+             ./dryserver approve (d); this machine then asks again by itself"
+        )
+    } else if msg.contains("WireGuard key already belongs to a member") {
+        format!(
+            "this machine is a member already, by its WireGuard key, but has no record of it ({JOIN_STATE}). Put that back, \
+             or remove it on your computer in ./dryserver approve (d): it then asks again by itself"
+        )
+    } else if msg.contains("another machine is already asking to join as") {
+        format!(
+            "another machine is asking to join as {name} already. If that one is not this machine (its code is not the one \
+             below), reject it on your computer in ./dryserver approve (r): this machine then asks again by itself"
+        )
+    } else if msg.contains("too many pending requests") || msg.contains("wait already; approve or reject") {
+        "too many machines are waiting to join. Approve or reject them on your computer in ./dryserver approve; this \
+         machine asks again by itself"
+            .into()
+    } else {
+        return None;
+    })
+}
+
 /// Whether ssh failed because the host has another key than the pinned
 /// one.
 fn host_key_failed(e: &Error) -> bool {
@@ -452,6 +485,17 @@ impl Node {
         let body = serde_json::to_string(&req)?;
         let (out, res) = self.ssh(ctx, &self.cfg.coord_lan_ip, "request", &body);
         if let Err(e) = res {
+            // The coordinator answered and said no: the reason first, and
+            // what to do. Its key is pinned by now, so the code is known.
+            if let Some(why) = refusal(&self.hostname, &e) {
+                let code = self.coordinator_key().map(|k| registry::pairing_code(&wg, &host_key, &k)).unwrap_or_default();
+                let code = if code.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nThis machine's code is {code}: the approval screen shows it with the request.")
+                };
+                return Err(errf!("{REFUSED}: {why}.{code}"));
+            }
             return Err(e.wrap(format!("cannot reach the coordinator at {} (is it installed and switched on?)", self.cfg.coord_lan_ip)));
         }
         #[derive(Deserialize)]
@@ -1798,7 +1842,11 @@ fn joining(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write, pace: &Pac
                         forgot = forget(n, &n.other_key())?;
                         continue;
                     }
-                    show(&format!("dryserver: cannot reach the coordinator at {} yet, retrying: {e}", n.cfg.coord_lan_ip));
+                    if e.to_string().starts_with(REFUSED) {
+                        show(&format!("dryserver: {e}"));
+                    } else {
+                        show(&format!("dryserver: cannot reach the coordinator at {} yet, retrying: {e}", n.cfg.coord_lan_ip));
+                    }
                     ctx.sleep(pace.retry)?;
                     continue;
                 }
@@ -2549,6 +2597,14 @@ mod tests {
             }
             if !kh.exists() {
                 std::fs::write(&kh, format!("{} {COORD_KEY}\n", host.trim_start_matches("dryreg@"))).unwrap();
+            }
+            // The registry says no: a member has the name, or another
+            // machine asks under it.
+            let no = |m: &str| (String::new(), Err(Error::new(format!("ssh failed: exit status 1: dryserver: {m}"))));
+            match next {
+                "member" if cmd == "request" => return no("node-a is already a member; remove it first to re-join"),
+                "squat" if cmd == "request" => return no("another machine is already asking to join as node-a"),
+                _ => {}
             }
             if cmd == "request" {
                 return match serde_json::from_str::<registry::Request>(&c.stdin) {
@@ -4464,6 +4520,29 @@ mod tests {
     /// A coordinator that does not answer for a while is no reason to
     /// forget its key, and neither are key failures with anything else
     /// between them.
+    /// The UX bug seen on the VM: a request the coordinator turned down
+    /// showed as "cannot reach the coordinator". The reason comes first,
+    /// with what to do and the code the approval screen shows.
+    #[test]
+    fn a_refused_request_says_why_first() {
+        for (script, want) in [("member", "the name node-a is a member already"), ("squat", "another machine is asking to join as node-a")]
+        {
+            let env = sign(&ADMIN, 3, vec![coord_entry(), node_entry(4)]);
+            let (_dir, n, fc) = setup(vec![approved(4, env)]);
+            *fc.script.lock().unwrap() = vec![script, script];
+            let mut log = Vec::new();
+            joining(&Ctx::new().with_timeout(Duration::from_secs(20)), &n, &join_params(&n), &mut log, &fast()).unwrap();
+            let log = String::from_utf8(log).unwrap();
+            let first = log.lines().next().unwrap();
+            assert!(first.starts_with("dryserver: the coordinator turned this machine's request down: ") && first.contains(want), "{log}");
+            let code = registry::pairing_code(WG_PUBKEY, NODE_KEY, COORD_KEY);
+            assert!(log.contains("./dryserver approve") && log.contains(&format!("This machine's code is {code}")), "{log}");
+            assert!(!log.contains("cannot reach"), "{log}");
+            // It asks again by itself, and joins once the name is free.
+            assert_eq!(n.load_state().host, 4, "{script}");
+        }
+    }
+
     #[test]
     fn a_coordinator_that_is_away_keeps_its_pin() {
         let tries = HOST_KEY_TRIES as usize;

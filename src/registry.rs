@@ -28,6 +28,11 @@ use crate::signed::{self, Envelope, List, Verifier};
 use crate::{errf, fsx};
 
 pub const MAX_PENDING: usize = 20;
+/// Waiting requests from one address at most: a hacked server holds the
+/// key that asks, and would fill MAX_PENDING alone.
+pub const MAX_PER_SOURCE: usize = 3;
+/// Refused requests kept for the admin's screen (State::refused).
+pub const MAX_REFUSED: usize = 8;
 
 pub fn request_ttl() -> TimeDelta {
     TimeDelta::hours(1)
@@ -122,6 +127,20 @@ pub struct Request {
     /// join_proof. The coordinator only carries it.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub proof: String,
+    /// The address it came from, as SSH saw it (not the machine's word).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub from: String,
+}
+
+/// A join request the registry turned down because its name or key is
+/// taken, kept for the admin's screen: a machine installed again under a
+/// member's name would otherwise wait unseen.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Refused {
+    pub request: Request,
+    /// Why, as the registry told the machine.
+    pub why: String,
 }
 
 /// A scan-report entry: something on the network that is not a member.
@@ -171,6 +190,10 @@ pub struct State {
     /// instead of making the registry unreadable.
     #[serde(deserialize_with = "report::lenient", skip_serializing_if = "Rollout::is_none")]
     pub rollout: Rollout,
+    /// Requests turned down because their name or key is taken, newest
+    /// last: at most MAX_REFUSED, for request_ttl.
+    #[serde(deserialize_with = "report::lenient", skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<Refused>,
 }
 
 /// The 6-digit code both sides show. It covers the new node's keys and the
@@ -353,33 +376,48 @@ pub fn validate_request(r: &Request) -> Result<()> {
 
 impl State {
     /// Validates and stores a join request, returning its ID.
-    pub fn add_request(&mut self, mut r: Request, coord_host_key: &str, now: Time) -> Result<String> {
+    #[cfg(test)]
+    pub fn add_request(&mut self, r: Request, coord_host_key: &str, now: Time) -> Result<String> {
+        self.add_request_from(r, coord_host_key, now, "")
+    }
+
+    /// add_request for a request that came from the address from ("":
+    /// unknown). A name or key that is taken is recorded for the admin's
+    /// screen (refused).
+    pub fn add_request_from(&mut self, mut r: Request, coord_host_key: &str, now: Time, from: &str) -> Result<String> {
         validate_request(&r)?;
         self.prune(now);
-        for m in &self.members {
+        r.from = from.to_string();
+        let member = self.members.iter().find_map(|m| {
             if m.name == r.name {
-                return Err(errf!("{} is already a member; remove it first to re-join", r.name));
+                Some(errf!("{} is already a member; remove it first to re-join", r.name))
+            } else if m.wg_key == r.wg_key {
+                Some(Error::new("this WireGuard key already belongs to a member"))
+            } else {
+                None
             }
-            if m.wg_key == r.wg_key {
-                return Err("this WireGuard key already belongs to a member".into());
-            }
+        });
+        if let Some(e) = member {
+            self.refuse(&r, &e.to_string(), now);
+            return Err(e);
         }
-        let mut pending = 0;
-        for q in &self.requests {
-            if q.status != Status::Pending {
-                continue;
-            }
-            // A retry from the same machine (same key) gets its existing request.
-            if q.wg_key == r.wg_key && q.name == r.name && q.ssh_host_key == r.ssh_host_key {
-                return Ok(q.id.clone());
-            }
-            if q.name == r.name {
-                return Err(errf!("another machine is already asking to join as {}", r.name));
-            }
-            pending += 1;
+        let waiting: Vec<&Request> = self.requests.iter().filter(|q| q.status == Status::Pending).collect();
+        // A retry from the same machine (same key) gets its existing request.
+        if let Some(q) = waiting.iter().find(|q| q.wg_key == r.wg_key && q.name == r.name && q.ssh_host_key == r.ssh_host_key) {
+            return Ok(q.id.clone());
         }
+        if waiting.iter().any(|q| q.name == r.name) {
+            let e = errf!("another machine is already asking to join as {}", r.name);
+            self.refuse(&r, &e.to_string(), now);
+            return Err(e);
+        }
+        let pending = waiting.len();
+        let mine = waiting.iter().filter(|q| !from.is_empty() && q.from == from).count();
         if pending >= MAX_PENDING {
             return Err("too many pending requests; approve or reject some first".into());
+        }
+        if mine >= MAX_PER_SOURCE {
+            return Err(errf!("too many requests from {from} wait already; approve or reject some first"));
         }
         r.id = fsx::hex(&fsx::random_bytes(8));
         r.code = pairing_code(&r.wg_key, &r.ssh_host_key, coord_host_key);
@@ -391,9 +429,21 @@ impl State {
         Ok(id)
     }
 
-    /// Drops requests older than request_ttl.
+    /// Drops requests and refusals older than request_ttl.
     fn prune(&mut self, now: Time) {
         self.requests.retain(|r| now.since(r.created) <= request_ttl());
+        self.refused.retain(|f| now.since(f.request.created) <= request_ttl());
+    }
+
+    /// Records r, turned down for why: once per machine, the newest
+    /// MAX_REFUSED.
+    fn refuse(&mut self, r: &Request, why: &str, now: Time) {
+        self.refused.retain(|f| !(f.request.name == r.name && f.request.wg_key == r.wg_key));
+        let request = Request { id: String::new(), code: String::new(), created: now, status: Status::None, host: 0, ..r.clone() };
+        self.refused.push(Refused { request, why: why.into() });
+        if self.refused.len() > MAX_REFUSED {
+            self.refused.remove(0);
+        }
     }
 
     fn request(&mut self, id: &str) -> Result<&mut Request> {
@@ -472,6 +522,9 @@ impl State {
                 q.status = Status::Rejected;
             }
         }
+        // Who asked under a name the admin has signed now is no longer
+        // waiting for it.
+        self.refused.retain(|f| !list.members.iter().any(|e| e.wg_key == f.request.wg_key));
         self.members = members;
         self.signed = env.clone();
         self.signed_version = list.version;
@@ -905,6 +958,9 @@ pub struct AdminState {
     /// The coordinator's clock, unix seconds: the update window and the
     /// expiry of releases go by it.
     pub now: i64,
+    /// Requests turned down because their name or key is taken.
+    #[serde(deserialize_with = "report::lenient", skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<Refused>,
 }
 
 /// Answers "status". When approved it carries what the node needs to bring
@@ -1086,7 +1142,10 @@ pub fn serve(
     match (f[0], f.len()) {
         ("request", 1) => {
             let r: Request = decode_first(input).ok_or_else(|| Error::new("bad request JSON"))?;
-            let id = st.update(|s| s.add_request(r, coord_host_key, now))?;
+            let from = client.split_whitespace().next().filter(|a| parse_ip4(a).is_some()).unwrap_or("");
+            // Kept also when turned down: the refusal is for the admin's
+            // screen.
+            let id = st.update(|s| Ok(s.add_request_from(r, coord_host_key, now, from)))??;
             send(out, &serde_json::json!({ "id": id }))
         }
         ("status", 2) if valid_id(f[1]) => {
@@ -1145,6 +1204,7 @@ pub fn serve(
                     release,
                     rollout: s.rollout.clone(),
                     now: now.0.timestamp(),
+                    refused: s.refused.clone(),
                 })
             })?;
             send(out, &reply)
@@ -2011,6 +2071,65 @@ mod tests {
         let list = List { version: 2, rejected: vec![key32(8)], ..list };
         publish(&st, &ADMIN, &list).unwrap();
         assert!(st.read().unwrap().pending().is_empty());
+    }
+
+    /// A request turned down because its name or key is taken is kept
+    /// for the admin's screen, and one address fills no more than a few
+    /// places.
+    #[test]
+    fn requests_turned_down_and_who_may_ask() {
+        let dir = TempDir::new();
+        let st = coordinator(&dir);
+        let now = t0().0.timestamp();
+        let state = || -> AdminState {
+            let ask = serde_json::to_string(&signed::seal_admin(&ADMIN, "state", now).unwrap()).unwrap();
+            serde_json::from_str(&call(&st, "admin", "192.168.1.9 5000 22", &ask).unwrap()).unwrap()
+        };
+        let ask = |name: &str, seed: u8, from: &str| {
+            let r = Request { wg_key: key32(seed), ..req(name) };
+            call(&st, "request", &format!("{from} 5000 22"), &serde_json::to_string(&r).unwrap())
+        };
+        // node-a waits already (coordinator()): another machine under its
+        // name, then the coordinator's own name.
+        let e = ask("node-a", 9, "192.168.1.31").unwrap_err().to_string();
+        assert!(e.contains("another machine is already asking to join as node-a"), "{e}");
+        assert!(ask("coord", 10, "192.168.1.32").unwrap_err().to_string().contains("already a member"));
+        let refused = state().refused;
+        assert_eq!(
+            refused.iter().map(|f| (f.request.name.as_str(), f.request.from.as_str())).collect::<Vec<_>>(),
+            vec![("node-a", "192.168.1.31"), ("coord", "192.168.1.32")]
+        );
+        assert!(refused.iter().all(|f| f.request.id.is_empty() && f.request.status == Status::None), "{refused:?}");
+        // Once per machine, and never more than MAX_REFUSED.
+        ask("node-a", 9, "192.168.1.31").unwrap_err();
+        assert_eq!(state().refused.len(), 2);
+        for i in 0..2 * MAX_REFUSED as u8 {
+            ask("coord", 100 + i, "192.168.1.40").unwrap_err();
+        }
+        let refused = state().refused;
+        assert_eq!(refused.len(), MAX_REFUSED);
+        assert_eq!(refused.last().unwrap().request.wg_key, key32(100 + 2 * MAX_REFUSED as u8 - 1), "the newest are kept");
+        // The address a machine claims is not where it comes from.
+        let r = Request { wg_key: key32(50), from: "10.0.0.1".into(), ..req("node-b") };
+        call(&st, "request", "192.168.1.33 5000 22", &serde_json::to_string(&r).unwrap()).unwrap();
+        assert!(st.read().unwrap().requests.iter().any(|q| q.name == "node-b" && q.from == "192.168.1.33"));
+        // One address fills MAX_PER_SOURCE places at most.
+        for i in 0..MAX_PER_SOURCE {
+            ask(&format!("n{i}"), 60 + i as u8, "192.168.1.66").unwrap();
+        }
+        let e = ask("n-more", 70, "192.168.1.66").unwrap_err().to_string();
+        assert!(e.contains("too many requests from 192.168.1.66"), "{e}");
+        ask("n-other", 71, "192.168.1.67").unwrap();
+        // The admin turns n0 down: a place is free again.
+        let me = st.read().unwrap().members[0].clone();
+        let list = List { version: 1, members: vec![signed::Entry::of(&me)], rejected: vec![key32(60)] };
+        publish(&st, &ADMIN, &list).unwrap();
+        ask("n-again", 72, "192.168.1.66").unwrap();
+        // A refusal goes once its machine is signed.
+        let c = Request { wg_key: key32(10), ..req("coord") };
+        let z = signed::Entry { host: 9, name: "node-z".into(), wg_key: c.wg_key, ssh_host_key: signed::key_body(&c.ssh_host_key) };
+        publish(&st, &ADMIN, &List { version: 2, members: vec![signed::Entry::of(&me), z], rejected: vec![] }).unwrap();
+        assert!(!state().refused.iter().any(|f| f.request.wg_key == key32(10)), "{:?}", state().refused);
     }
 
     #[test]
