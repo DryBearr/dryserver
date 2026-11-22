@@ -95,7 +95,7 @@ fn health(m: &Member, now: Time, target: u64) -> Doc {
         None => ("firewall ?".into(), false),
     });
     for (c, text) in &problems {
-        if matches!(c, Concern::Reboot | Concern::Clock | Concern::Upgrade | Concern::Peers) {
+        if matches!(c, Concern::Reboot | Concern::Clock | Concern::Upgrade | Concern::Peers | Concern::Boot) {
             items.push((text.clone(), true));
         }
     }
@@ -1133,6 +1133,7 @@ mod tests {
             k3s_active: Some(false),
             firewall: Some(false),
             peers: vec![report::Peer { host: 1, age: None }],
+            boot: "fallback".into(),
             ..healthy(now)
         };
         store
@@ -1147,7 +1148,8 @@ mod tests {
         let v = doc.plain();
         assert!(v.contains("Members, each with what it reports about itself"), "{v}");
         assert!(v.contains("    0.1.0  disk 40%  mem 25%  48°C  k3s on  firewall on\n"), "{v}");
-        for want in ["disk 95%", "k3s off", "firewall OFF", "reboot needed", "clock 10m behind", "1 silent peer"] {
+        for want in ["disk 95%", "k3s off", "firewall OFF", "reboot needed", "clock 10m behind", "1 silent peer", "running fallback kernel"]
+        {
             assert!(v.contains(want), "{want}: {v}");
             assert_eq!(styled(&doc, want), vec![crate::tui::err_style()], "{want} must be an alarm");
         }
