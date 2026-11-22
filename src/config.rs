@@ -240,10 +240,26 @@ pub fn valid_wifi_pass(s: &str) -> Result<()> {
 }
 
 pub fn valid_ipv4(s: &str) -> Result<()> {
-    match parse_ip4(s) {
+    match ipv4(s) {
         Some(_) => Ok(()),
         None => Err("must be an IPv4 address like 192.168.1.50".into()),
     }
+}
+
+/// An IPv4 address in its one plain form, "192.168.1.50". Other spellings
+/// (IPv6-mapped "::ffff:192.168.1.50") are refused: what the config holds
+/// ends up in the firewall, SSH and WireGuard files, and an nft file that
+/// does not load leaves the machine without a firewall.
+pub fn ipv4(s: &str) -> Option<std::net::Ipv4Addr> {
+    let ip: std::net::Ipv4Addr = s.parse().ok()?;
+    (ip.to_string() == s).then_some(ip)
+}
+
+/// A port in its one plain form: decimal digits without sign or leading
+/// zero, 1 to 65535 (not "+51820", which nft refuses).
+pub fn port_number(s: &str) -> Option<u16> {
+    let n: u16 = s.parse().ok()?;
+    (n > 0 && n.to_string() == s).then_some(n)
 }
 
 pub fn valid_subnet(s: &str) -> Result<()> {
@@ -362,9 +378,9 @@ pub fn valid_transport(s: &str) -> Result<()> {
 }
 
 pub fn valid_port(s: &str) -> Result<()> {
-    match go_atoi(s) {
-        Some(p) if (1..=65535).contains(&p) => Ok(()),
-        _ => Err("must be a number from 1 to 65535".into()),
+    match port_number(s) {
+        Some(_) => Ok(()),
+        None => Err("must be a number from 1 to 65535".into()),
     }
 }
 
@@ -617,6 +633,25 @@ mod tests {
         assert_eq!(got, want);
         for bad in ["0/tcp", "70000", "80/sctp", "http"] {
             assert!(parse_ports(bad).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    // What passes here is written into the firewall as it is: a spelling
+    // nft does not take leaves a machine without a firewall at boot.
+    #[test]
+    fn only_plain_ports_and_addresses() {
+        assert_eq!(port_number("51820"), Some(51820));
+        for bad in ["+51820", "051820", "-1", "0", "65536", " 51820", "51820 ", "", "5e4"] {
+            assert!(valid_port(bad).is_err(), "port {bad:?} accepted");
+        }
+        assert_eq!(ipv4("192.168.1.50"), Some(std::net::Ipv4Addr::new(192, 168, 1, 50)));
+        for bad in
+            ["::ffff:192.168.1.50", "::ffff:c0a8:132", "192.168.001.050", "192.168.1", "0x7f.0.0.1", " 192.168.1.50", "192.168.1.50/24"]
+        {
+            assert!(valid_ipv4(bad).is_err(), "address {bad:?} accepted");
+        }
+        for c in [Config { wg_port: "+51820".into(), ..valid() }, Config { coord_lan_ip: "::ffff:192.168.1.50".into(), ..valid() }] {
+            assert!(c.validate().is_err(), "{c:?}");
         }
     }
 

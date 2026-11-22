@@ -45,6 +45,27 @@ impl fmt::Display for Role {
 /// The locked account on the coordinator that runs the registry as an SSH
 /// forced command.
 pub const REGISTRY_USER: &str = "dryreg";
+/// Its home. It belongs to root: the account runs code that anyone with
+/// the USB stick's key reaches, and it must not be able to change what
+/// sshd reads for it.
+pub const REGISTRY_HOME: &str = "/var/lib/dryreg";
+/// Its SSH key, where only root may change it.
+pub const REGISTRY_KEYS: &str = "/etc/ssh/authorized_keys.d/dryreg";
+/// Makes the home root's on machines installed before (at boot).
+pub const REGISTRY_TMPFILES: &str = "/etc/tmpfiles.d/dryserver-registry.conf";
+const REGISTRY_TMPFILES_TEXT: &str = "# dryserver: the registry account's home and the SSH files in it belong to
+# root, so code running as the account cannot swap its key for one without
+# the forced command.
+d /var/lib/dryreg 0755 root root -
+z /var/lib/dryreg/.ssh 0755 root root -
+z /var/lib/dryreg/.ssh/authorized_keys 0644 root root -
+";
+
+/// What the registry account runs, for the subnet of the mesh: the forced
+/// command of its key and of sshd.
+pub fn registry_command(mesh: &Cidr) -> String {
+    format!("/usr/local/bin/dryserver registry --subnet {}", mesh.network_string())
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Params {
@@ -82,6 +103,18 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
     if c.wg_transport == config::TRANSPORT_AUTO && p.host_num > 0 {
         switch_addr = host_addr(&c.switch_subnet, p.host_num).wrap("switch address")?;
     }
+    // The firewall, SSH and the registry's command take the values as
+    // parsed, in their one plain form, never the config's text: a spelling
+    // nft does not take would leave the machine without a firewall.
+    let plain = |what: &str| errf!("{what} is not in its plain form; fix it in config.env");
+    let wg_port = config::port_number(&c.wg_port).ok_or_else(|| plain("WG_PORT"))?;
+    let coord_lan = config::ipv4(&c.coord_lan_ip).ok_or_else(|| plain("COORD_LAN_IP"))?;
+    let mesh = Cidr::parse(&c.wg_subnet).ok_or_else(|| plain("WG_SUBNET"))?;
+    let switch = match c.wg_transport == config::TRANSPORT_AUTO {
+        true => Some(Cidr::parse(&c.switch_subnet).ok_or_else(|| plain("SWITCH_SUBNET"))?),
+        false => None,
+    };
+    let coord_mesh = Ipv4Addr::from(mesh.network().wrapping_add(1));
 
     // The node keeps the settings it needs for sync, but not the WiFi
     // password: iwd has its own copy.
@@ -95,17 +128,17 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
             0o600,
             nftables(&Firewall {
                 role: p.role,
-                wg_port: c.wg_port.clone(),
-                switch: switch_subnet(c),
-                coord_mesh: host_addr(&c.wg_subnet, 1).map(|a| a.split('/').next().unwrap_or("").to_string()).unwrap_or_default(),
-                coord_lan: c.coord_lan_ip.clone(),
+                wg_port,
+                switch,
+                coord_mesh,
+                coord_lan,
                 mesh_tcp: ports_of(&mesh_ports, "tcp"),
                 mesh_udp: ports_of(&mesh_ports, "udp"),
                 out_tcp: ports_of(&egress_ports, "tcp"),
                 out_udp: ports_of(&egress_ports, "udp"),
             }),
         ),
-        file("/etc/ssh/sshd_config.d/10-dryserver.conf", 0o644, sshd(&c.username, p.role)),
+        file("/etc/ssh/sshd_config.d/10-dryserver.conf", 0o644, sshd(&c.username, p.role, &mesh)),
         file(
             format!("/home/{}/.ssh/authorized_keys", c.username),
             0o600,
@@ -140,7 +173,8 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
     ];
     if p.role == Role::Coordinator {
         files.push(file("/etc/cron.d/dryserver-scan", 0o644, SCAN_CRON));
-        let mesh1 = host_addr(&c.wg_subnet, 1).map(|a| a.split('/').next().unwrap_or("").to_string()).unwrap_or_default();
+        files.push(file(REGISTRY_TMPFILES, 0o644, REGISTRY_TMPFILES_TEXT));
+        let mesh1 = coord_mesh.to_string();
         // No secret in it, and kubectl (run by the admin) reads it too.
         files.push(file(K3S_CONFIG, 0o644, k3s_server_config(&mesh1)));
         files.push(file(K3S_INGRESS_CONFIG, 0o600, K3S_INGRESS));
@@ -171,10 +205,6 @@ pub fn host_addr(cidr: &str, n: u32) -> Result<String> {
         return Err(errf!("host {n} does not fit in {cidr}"));
     }
     Ok(format!("{}/{}", Ipv4Addr::from(c.network().wrapping_add(n)), c.prefix))
-}
-
-fn switch_subnet(c: &Config) -> String {
-    if c.wg_transport == config::TRANSPORT_AUTO { c.switch_subnet.clone() } else { String::new() }
 }
 
 fn ports_of(ports: &[Port], proto: &str) -> Vec<u16> {
@@ -357,12 +387,12 @@ flannel-iface: wg0
 /// What the firewall is rendered from.
 pub struct Firewall {
     pub role: Role,
-    pub wg_port: String,
-    /// The switch subnet in auto mode, else "".
-    pub switch: String,
+    pub wg_port: u16,
+    /// The switch subnet in auto mode.
+    pub switch: Option<Cidr>,
     /// The coordinator's mesh and LAN addresses.
-    pub coord_mesh: String,
-    pub coord_lan: String,
+    pub coord_mesh: Ipv4Addr,
+    pub coord_lan: Ipv4Addr,
     /// MESH_PORTS: open to every member over the mesh.
     pub mesh_tcp: Vec<u16>,
     pub mesh_udp: Vec<u16>,
@@ -394,11 +424,10 @@ pub const KNOCKS_PER_MINUTE: u32 = 30;
 pub const OFFENDERS_SET: &str = "offenders4";
 
 fn nftables(f: &Firewall) -> String {
-    let wg_port = &f.wg_port;
-    let switch_rule = if f.switch.is_empty() {
-        String::new()
-    } else {
-        format!("\n\n\t\t# Switch network: WireGuard only.\n\t\tip saddr {} drop", f.switch)
+    let wg_port = f.wg_port;
+    let switch_rule = match &f.switch {
+        None => String::new(),
+        Some(s) => format!("\n\n\t\t# Switch network: WireGuard only.\n\t\tip saddr {} drop", s.network_string()),
     };
     // SSH inside the mesh: on a server only from the coordinator (the path
     // of "ssh <server>" from the admin's desktop); on the coordinator from
@@ -412,7 +441,7 @@ fn nftables(f: &Firewall) -> String {
     // A server reaches the coordinator's registry over the LAN to join and
     // to check it again after a quarantine.
     let registry = match f.role {
-        Role::Node if !f.coord_lan.is_empty() => format!("\n\t\tip daddr {} tcp dport 22 accept", f.coord_lan),
+        Role::Node => format!("\n\t\tip daddr {} tcp dport 22 accept", f.coord_lan),
         _ => String::new(),
     };
     let out_tcp = port_set(&[53, 80, 443], &f.out_tcp);
@@ -630,19 +659,27 @@ MemoryMax=384M
 MemorySwapMax=0
 ";
 
-fn sshd(user: &str, role: Role) -> String {
+fn sshd(user: &str, role: Role, mesh: &Cidr) -> String {
     let users = if role == Role::Coordinator { format!("{user} {REGISTRY_USER}") } else { user.to_string() };
     // Last in the file: a Match block lasts to its end.
     let registry = if role == Role::Coordinator {
         format!(
             "
-# The registry account runs one short command per connection. A connection
-# with nothing running, or a command that says nothing for a minute, is
-# closed.
+# The registry account runs one short command per connection, whatever its
+# key says: nothing it can change gives it a shell, a terminal or a
+# forwarded port. Its key is in a file only root may change (machines
+# installed before keep it in the account's home, which belongs to root).
+# A connection with nothing running, or a command that says nothing for a
+# minute, is closed.
 Match User {REGISTRY_USER}
+	AuthorizedKeysFile {REGISTRY_KEYS} {REGISTRY_HOME}/.ssh/authorized_keys
+	ForceCommand {}
+	DisableForwarding yes
+	PermitTTY no
 	UnusedConnectionTimeout 30
 	ChannelTimeout session=60
-"
+",
+            registry_command(mesh)
         )
     } else {
         String::new()
@@ -1084,7 +1121,30 @@ mod tests {
         assert!(sshd_coord.contains("AllowUsers admin dryreg"));
         // Connections do not pile up: dead clients go, and the registry
         // account's idle ones too.
-        assert!(sshd_coord.ends_with("Match User dryreg\n\tUnusedConnectionTimeout 30\n\tChannelTimeout session=60\n"), "{sshd_coord}");
+        assert!(sshd_coord.ends_with("\tUnusedConnectionTimeout 30\n\tChannelTimeout session=60\n"), "{sshd_coord}");
+        // The registry account: whatever key it has, only the registry runs,
+        // with no terminal and nothing forwarded; its key is read from where
+        // only root writes (and, on machines installed before, from its
+        // home, which tmpfiles makes root's).
+        let block = &sshd_coord[sshd_coord.find("\nMatch User dryreg\n").expect("no Match block for dryreg")..];
+        for want in [
+            "\tAuthorizedKeysFile /etc/ssh/authorized_keys.d/dryreg /var/lib/dryreg/.ssh/authorized_keys\n",
+            "\tForceCommand /usr/local/bin/dryserver registry --subnet 10.66.0.0/24\n",
+            "\tDisableForwarding yes\n",
+            "\tPermitTTY no\n",
+        ] {
+            assert!(block.contains(want), "missing {want:?}:\n{block}");
+        }
+        let tmp = find(&coord, REGISTRY_TMPFILES);
+        for want in [
+            "d /var/lib/dryreg 0755 root root -\n",
+            "z /var/lib/dryreg/.ssh 0755 root root -\n",
+            "z /var/lib/dryreg/.ssh/authorized_keys 0644 root root -\n",
+        ] {
+            assert!(tmp.content.contains(want) && tmp.content.contains(REGISTRY_HOME), "{}", tmp.content);
+        }
+        assert!(crate::update::managed(REGISTRY_TMPFILES) && !has(&node, REGISTRY_TMPFILES));
+        assert_eq!(REGISTRY_KEYS, format!("/etc/ssh/authorized_keys.d/{REGISTRY_USER}"));
         let sshd_node = &find(&node, "/etc/ssh/sshd_config.d/10-dryserver.conf").content;
         assert!(sshd_node.contains("ClientAliveInterval 30\nClientAliveCountMax 3\n") && !sshd_node.contains("Match"), "{sshd_node}");
 

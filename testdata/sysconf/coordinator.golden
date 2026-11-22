@@ -196,10 +196,17 @@ AllowTcpForwarding yes
 ClientAliveInterval 30
 ClientAliveCountMax 3
 
-# The registry account runs one short command per connection. A connection
-# with nothing running, or a command that says nothing for a minute, is
-# closed.
+# The registry account runs one short command per connection, whatever its
+# key says: nothing it can change gives it a shell, a terminal or a
+# forwarded port. Its key is in a file only root may change (machines
+# installed before keep it in the account's home, which belongs to root).
+# A connection with nothing running, or a command that says nothing for a
+# minute, is closed.
 Match User dryreg
+	AuthorizedKeysFile /etc/ssh/authorized_keys.d/dryreg /var/lib/dryreg/.ssh/authorized_keys
+	ForceCommand /usr/local/bin/dryserver registry --subnet 10.66.0.0/24
+	DisableForwarding yes
+	PermitTTY no
 	UnusedConnectionTimeout 30
 	ChannelTimeout session=60
 ===== /home/admin/.ssh/authorized_keys (0600)
@@ -454,6 +461,13 @@ RuntimeWatchdogSec=1min
 ===== /etc/cron.d/dryserver-scan (0644)
 # dryserver: look for unknown devices on the network (report only).
 */15 * * * * root /usr/local/bin/dryserver scan >/dev/null 2>&1
+===== /etc/tmpfiles.d/dryserver-registry.conf (0644)
+# dryserver: the registry account's home and the SSH files in it belong to
+# root, so code running as the account cannot swap its key for one without
+# the forced command.
+d /var/lib/dryreg 0755 root root -
+z /var/lib/dryreg/.ssh 0755 root root -
+z /var/lib/dryreg/.ssh/authorized_keys 0644 root root -
 ===== /etc/rancher/k3s/config.yaml (0644)
 # dryserver: k3s control plane on the mesh.
 node-ip: 10.66.0.1

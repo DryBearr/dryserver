@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::real::InstallState;
 use super::*;
+use crate::cidr::Cidr;
 use crate::err::{Error, Kind};
 use crate::gotime::Time;
 use crate::iso;
@@ -251,6 +252,11 @@ impl Real {
         for f in files {
             self.write(&f.path, f.mode, &f.content)?;
         }
+        // The firewall loads at every boot from this file; one nft refuses
+        // would leave the machine open. Checked with the new system's nft
+        // (the setup checked it with the live system's before the disk was
+        // touched).
+        self.chroot(ctx, &["nft", "-c", "-f", "/etc/nftables.conf"]).map_err(|e| e.wrap("the firewall does not load"))?;
         // k3s keeps its server directory to root. Made here first (for the
         // ingress setting), it gets the same.
         if ch.role() == Role::Coordinator {
@@ -381,8 +387,13 @@ impl Real {
     /// command. Its authorized_keys is owned by root so the account cannot
     /// change it.
     fn setup_registry_user(&self, ctx: &Ctx) -> Result<()> {
-        let home = format!("/var/lib/{REGISTRY_USER}");
-        self.chroot(ctx, &["useradd", "--system", "-m", "-d", &home, "-s", "/bin/sh", REGISTRY_USER])?;
+        // Its home is root's (useradd makes none): the account runs code
+        // anyone with the stick's key reaches, and must not be able to
+        // change what sshd reads for it.
+        let home = sysconf::REGISTRY_HOME;
+        self.chroot(ctx, &["useradd", "--system", "-M", "-d", home, "-s", "/bin/sh", REGISTRY_USER])?;
+        fsx::mkdir_all(self.target(home), 0o755)?;
+        fsx::chmod(self.target(home), 0o755)?;
         self.chroot(ctx, &["passwd", "-l", REGISTRY_USER])?;
         // systemd names a user's slice by number.
         let passwd = fsx::read_string(self.target("/etc/passwd"))?;
@@ -393,11 +404,16 @@ impl Real {
             .and_then(|f| f[2].parse::<u32>().ok())
             .ok_or_else(|| errf!("the account {REGISTRY_USER} was not created"))?;
         self.write(&format!("/etc/systemd/system/user-{uid}.slice.d/50-dryserver.conf"), 0o644, sysconf::REGISTRY_SLICE)?;
+        // The key, where only root may change it; sshd forces the same
+        // command whatever the key says (see sysconf's sshd).
         let public = fsx::read_string(format!("{}.pub", self.registry_key.display()))?;
-        let line = format!("restrict,command=\"/usr/local/bin/dryserver registry --subnet {}\" {}\n", self.cfg.wg_subnet, public.trim());
-        self.write(&format!("{home}/.ssh/authorized_keys"), 0o644, line)?;
-        let _ = fsx::chmod(self.target(&format!("{home}/.ssh")), 0o755);
-        Ok(())
+        if !public.trim_start().starts_with("ssh-ed25519 ") || public.trim().lines().count() != 1 {
+            return Err(errf!("{}.pub is not one ed25519 public key; build the USB stick again", self.registry_key.display()));
+        }
+        let mesh = Cidr::parse(&self.cfg.wg_subnet).ok_or_else(|| errf!("WG_SUBNET {:?} is not a subnet", self.cfg.wg_subnet))?;
+        let line = format!("restrict,command=\"{}\" {}\n", sysconf::registry_command(&mesh), public.trim());
+        self.write(sysconf::REGISTRY_KEYS, 0o644, line)?;
+        fsx::chmod(fsx::dir(self.target(sysconf::REGISTRY_KEYS)), 0o755)
     }
 
     fn bootloader(&self, ctx: &Ctx, ch: &Choices) -> Result<()> {
@@ -816,6 +832,9 @@ mod tests {
         assert!(read(boot::COMPLETE_DROPIN).contains("Requires=dryserver-boot-check.service"));
         assert!(r.target("/boot/EFI/Linux/arch-linux+3.efi").is_file() && r.target("/boot/EFI/Linux/arch-linux-lts+3.efi").is_file());
         assert!(read("/usr/local/bin/dryserver") == "binary" && fr.index(&format!("arch-chroot {t} mkinitcpio -P")) > fr.index("genfstab"));
+        // The new system's nft took its firewall before anything was enabled.
+        let nft = fr.index(&format!("arch-chroot {t} nft -c -f /etc/nftables.conf"));
+        assert!(nft < fr.index(&format!("arch-chroot {t} systemctl enable k3s.service")));
         // pacman there reads the day the stick was built.
         let ml = read("/etc/pacman.d/mirrorlist");
         assert_eq!(crate::osupdate::pinned_date(&ml).as_deref(), Some("2026/11/20"), "{ml}");
@@ -893,7 +912,9 @@ mod tests {
         assert!(grub.starts_with("GRUB_TIMEOUT=1\n") && grub.ends_with(&grub_panic()), "{grub}");
         assert!(fr.index(&format!("arch-chroot {t} mkinitcpio -P")) < fr.index(&format!("arch-chroot {t} grub-mkconfig")));
         assert!(!r.target("/etc/mkinitcpio.d/linux.preset").exists() && !r.target("/etc/kernel/cmdline").exists());
-        fr.index(&format!("arch-chroot {t} useradd --system -m -d /var/lib/dryreg -s /bin/sh dryreg"));
+        // The registry account gets no home of its own: root's, made here.
+        fr.index(&format!("arch-chroot {t} useradd --system -M -d /var/lib/dryreg -s /bin/sh dryreg"));
+        assert!(!fr.strings().iter().any(|c| c.contains("chown") && c.contains("/var/lib/dryreg")), "{:?}", fr.strings());
         {
             use std::os::unix::fs::PermissionsExt;
             for d in ["/var/lib/rancher/k3s/server", "/var/lib/rancher/k3s/server/manifests"] {
@@ -935,11 +956,21 @@ mod tests {
         let slice = get(&r.target, "/etc/systemd/system/user-967.slice.d/50-dryserver.conf");
         assert!(slice.contains("[Slice]\nTasksMax=200\nMemoryMax=384M\n"), "the registry account has no ceiling: {slice}");
 
-        let ak = get(&r.target, "/var/lib/dryreg/.ssh/authorized_keys");
+        // Its key where only root may write, with the command sshd forces
+        // anyway; nothing in its home for sshd to read.
+        let ak = get(&r.target, sysconf::REGISTRY_KEYS);
         assert!(
             ak.starts_with(r#"restrict,command="/usr/local/bin/dryserver registry --subnet 10.66.0.0/24" ssh-ed25519 AAAAreg"#),
             "{ak}"
         );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &str| std::fs::metadata(r.target(p)).unwrap().permissions().mode() & 0o7777;
+            assert_eq!((mode(sysconf::REGISTRY_KEYS), mode("/etc/ssh/authorized_keys.d"), mode("/var/lib/dryreg")), (0o644, 0o755, 0o755));
+        }
+        assert!(!r.target("/var/lib/dryreg/.ssh").exists());
+        let sshd = get(&r.target, "/etc/ssh/sshd_config.d/10-dryserver.conf");
+        assert!(sshd.contains(&format!("\tForceCommand {}\n", ak.split('"').nth(1).unwrap())), "the key and sshd force different commands");
         assert!(get(&r.target, "/etc/ssh/sshd_config.d/10-dryserver.conf").contains("AllowUsers admin dryreg"));
         assert!(!r.target("/etc/crypttab").exists(), "unencrypted install must not write crypttab");
         // The signing public key, readable by root and the registry user.

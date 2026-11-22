@@ -11,8 +11,8 @@ use crate::ctx::Ctx;
 use crate::err::{Error, Result};
 use crate::gotime::duration_string;
 use crate::runner::Cmd;
-use crate::sysconf::Role;
-use crate::{errf, fsx, iso, osupdate, release};
+use crate::sysconf::{self, Params, Role};
+use crate::{errf, fsx, iso, osupdate, packages, release};
 
 const CLOCK_WAIT: Duration = Duration::from_secs(60);
 const MIRROR_TIMEOUT: Duration = Duration::from_secs(180);
@@ -57,6 +57,7 @@ impl Real {
             Ok(())
         };
 
+        step("Check the firewall", &mut || self.check_firewall(ctx, cfg, ch))?;
         step("Check the clock", &mut || self.sync_clock(ctx))?;
         step("Prepare package signing keys", &mut || self.wait_keyring(ctx))?;
         step("Pick package mirrors", &mut || self.trim_mirrors())?;
@@ -100,6 +101,24 @@ impl Real {
                 Ok(())
             });
         }
+        Ok(())
+    }
+
+    /// Renders this machine's firewall and lets the live system's nft check
+    /// it, before the disk is touched: a config whose firewall nft refuses
+    /// would leave the new machine without one at every boot.
+    fn check_firewall(&self, ctx: &Ctx, cfg: &Config, ch: &Choices) -> Result<()> {
+        let plan = packages::resolve(&cfg.tool_list(), &cfg.extra_list())?;
+        let host_num = if ch.role() == Role::Coordinator { 1 } else { 0 };
+        let params = Params { config: cfg.clone(), plan, hostname: "check".into(), role: ch.role(), host_num, switch_mac: String::new() };
+        let files = sysconf::render(&params).map_err(|e| e.wrap("fix config.env"))?;
+        let nft = files.iter().find(|f| f.path == "/etc/nftables.conf").ok_or_else(|| errf!("no firewall was made"))?;
+        let tmp = self.key_dir.join("dryserver-nftables-check.conf");
+        fsx::write_file(&tmp, &nft.content, 0o600)?;
+        let res = self.run.ok(ctx, &Cmd::new("nft", &["-c", "-f", &tmp.display().to_string()]));
+        let _ = std::fs::remove_file(&tmp);
+        res.map_err(|e| e.wrap("the firewall this config makes does not load; fix config.env"))?;
+        self.log("the firewall loads");
         Ok(())
     }
 
@@ -371,6 +390,8 @@ mod tests {
         cmds: Mutex<Vec<Cmd>>,
         /// A package pacman -Si does not know.
         missing: String,
+        /// nft refuses the firewall.
+        nft_fails: bool,
     }
 
     impl Runner for CheckRunner {
@@ -378,6 +399,9 @@ mod tests {
             self.cmds.lock().unwrap().push(c.clone());
             if c.name == "timedatectl" && c.args[0] == "show" {
                 return ("yes\n".into(), Ok(()));
+            }
+            if c.name == "nft" && self.nft_fails {
+                return ("/run/x.conf:12:2-5: Error: syntax error\n".into(), Err("exit status 1".into()));
             }
             if c.name == "pacman" && c.args[0] == "-Si" && !self.missing.is_empty() {
                 return (format!("error: package '{}' was not found\n", self.missing), Err("exit status 1".into()));
@@ -398,13 +422,20 @@ mod tests {
         let mut r = Real::new(Config::default(), Default::default(), "", "");
         r.run = cr.clone();
         r.mirror_list = ml;
+        r.key_dir = dir.path().to_path_buf();
         (dir, r, cr)
+    }
+
+    /// A config that renders: TEST-NET for the coordinator, which never
+    /// answers.
+    fn test_cfg() -> Config {
+        Config { coord_lan_ip: "192.0.2.1".into(), admin_ssh_pubkey: "ssh-ed25519 AAAAC3Nza admin".into(), ..Config::default() }
     }
 
     #[test]
     fn precheck_steps_and_logs() {
-        let (_dir, r, cr) = precheck_real("");
-        let cfg = Config { coord_lan_ip: "192.0.2.1".into(), extra_packages: "python".into(), ..Config::default() }; // TEST-NET: never answers
+        let (dir, r, cr) = precheck_real("");
+        let cfg = Config { extra_packages: "python".into(), ..test_cfg() };
         let seen: Arc<Mutex<(Vec<String>, Vec<String>)>> = Arc::default();
         let s = seen.clone();
         let progress: Progress = Arc::new(move |st: Step| {
@@ -419,10 +450,19 @@ mod tests {
         let (steps, logs) = seen.lock().unwrap().clone();
         assert_eq!(
             steps.join(","),
-            "Check the clock,Prepare package signing keys,Pick package mirrors,Update package lists,Check extra packages,Check the coordinator"
+            "Check the firewall,Check the clock,Prepare package signing keys,Pick package mirrors,Update package lists,Check extra packages,Check the coordinator"
         );
+        let nft = cr.cmds.lock().unwrap().iter().find(|c| c.name == "nft").cloned().unwrap();
+        assert_eq!(nft.args[..2], ["-c", "-f"]);
+        assert!(!std::path::Path::new(&nft.args[2]).exists() && nft.args[2].starts_with(&*dir.path().to_string_lossy()), "{nft:?}");
         let all = logs.join("\n");
-        for w in ["clock synced", "package signing keys ready", "using 10 mirrors", "warning: coordinator 192.0.2.1 does not answer"] {
+        for w in [
+            "the firewall loads",
+            "clock synced",
+            "package signing keys ready",
+            "using 10 mirrors",
+            "warning: coordinator 192.0.2.1 does not answer",
+        ] {
             assert!(all.contains(w), "log missing {w:?}:\n{all}");
         }
         let b = std::fs::read_to_string(&r.mirror_list).unwrap();
@@ -479,10 +519,26 @@ mod tests {
         assert_eq!(std::fs::metadata(dir.join("mnt/etc/pacman.d/mirrorlist")).unwrap().permissions().mode() & 0o777, 0o644);
     }
 
+    /// A firewall nft does not take, or a config that cannot make one,
+    /// stops the setup before the disk is touched.
+    #[test]
+    fn precheck_refuses_a_firewall_that_does_not_load() {
+        let (_dir, mut r, _) = precheck_real("");
+        r.run = Arc::new(CheckRunner { nft_fails: true, ..CheckRunner::default() });
+        let ch = Choices { role: Some(Role::Node), ..Choices::default() };
+        let err = r.precheck(&Ctx::new(), &test_cfg(), &ch, Arc::new(|_| {})).unwrap_err().to_string();
+        assert!(err.contains("Check the firewall") && err.contains("does not load"), "{err}");
+        let (_dir, r, cr) = precheck_real("");
+        let odd = Config { wg_port: "+51820".into(), ..test_cfg() };
+        let err = r.precheck(&Ctx::new(), &odd, &ch, Arc::new(|_| {})).unwrap_err().to_string();
+        assert!(err.contains("WireGuard port"), "{err}");
+        assert!(cr.cmds.lock().unwrap().is_empty(), "nothing ran after the firewall check failed");
+    }
+
     #[test]
     fn precheck_unknown_package() {
         let (_dir, r, _) = precheck_real("pyhton");
-        let cfg = Config { extra_packages: "pyhton".into(), ..Config::default() };
+        let cfg = Config { extra_packages: "pyhton".into(), ..test_cfg() };
         let err =
             r.precheck(&Ctx::new(), &cfg, &Choices { role: Some(Role::Coordinator), ..Choices::default() }, Arc::new(|_| {})).unwrap_err();
         assert!(err.to_string().contains("unknown extra packages: pyhton"), "{err}");
