@@ -305,6 +305,7 @@ out=$(upload "$K3S_SIZE" | reg release-put 2>&1)
 check "a release signed with another key is refused" grep -q "bad signature" <<<"$out"
 out=$(desk release status)
 check "release status shows the release and its notes" grep -q "Release $SER (urgent), made .*: live test" <<<"$out"
+check "release status has a line per machine" grep -Eq "^[ !] coord +coordinator +" <<<"$out"
 out=$(desk release resume)
 check "resume without a rollout is refused" grep -q "no rollout to resume" <<<"$out"
 out=$(reg "release-get $SER release" 2>&1)

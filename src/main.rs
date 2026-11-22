@@ -89,7 +89,7 @@ commands:
                       sign it and send it to the coordinator: it updates
                       itself, then one server at a time (-urgent: at once,
                       -notes TEXT, -rollback; release help for the rest)
-  release status      where the rollout stands
+  release status      the release, one line per machine, what to do
   release resume      let a stopped rollout go on
 
 on servers:
@@ -887,8 +887,9 @@ const RELEASE_USAGE: &str = r#"usage: dryserver release publish|status|resume [f
               -k3s FILE       the pinned k3s (default: out/pkgcache/k3s-VERSION,
                               from ./dryserver build)
               -yes            do not ask
-  status    where the rollout stands
-  resume    let a stopped rollout go on
+  status    the release, where its rollout stands, one line per machine,
+            and what to do when it stopped
+  resume    let a stopped rollout go on (it says what that does first)
 
   every command also takes -config FILE, -host ADDRESS and -port N
 "#;
@@ -917,9 +918,8 @@ fn run_release(args: &[String]) -> Result<()> {
         "resume" => {
             let f = Flags::parse("release resume", rest, DESKTOP_FLAGS);
             let (mut a, _) = release_admin(&f, "release resume")?;
-            a.load()?;
-            a.resume_release()?;
-            println!("The coordinator goes on at its next sync, within a minute.\n");
+            let what = publish::resume(&mut a).map_err(|e| e.wrap("not resumed"))?;
+            println!("Resumed: the coordinator {what}, at its next sync (within a minute).\n");
             print_rollout(&mut a)
         }
         other => {
@@ -943,17 +943,14 @@ fn release_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
     Ok(a)
 }
 
-/// The newest release and where its rollout stands.
+/// The newest release, where its rollout stands, one line per machine.
 fn print_rollout(a: &mut admin::Admin) -> Result<()> {
     let v = a.load()?;
     for w in &v.warnings {
         eprintln!("warning: {w}");
     }
-    if let Some(r) = &v.release {
-        println!("{}", rollout::release_line(r));
-    }
-    for (line, _) in rollout::lines(&v.rollout, &v.members.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(), v.coordinator_now) {
-        println!("  {line}");
+    for l in publish::status_lines(&v, Time::now().0.timestamp()) {
+        println!("{l}");
     }
     Ok(())
 }

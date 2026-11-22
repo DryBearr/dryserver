@@ -32,7 +32,7 @@ use crate::ctx::Ctx;
 use crate::err::Result;
 use crate::registry::Member;
 use crate::release::{self, K3sVersion, Release, Version};
-use crate::rollout;
+use crate::rollout::{self, Pause, Phase, Rollout};
 use crate::runner::{Cmd, ExecRunner, Runner};
 use crate::{bail, errf, fsx, iso, report};
 
@@ -632,6 +632,144 @@ pub fn publish(a: &mut Admin, p: &Plan) -> Result<Release> {
     }
     a.send_release(&p.release, &p.parts.binary, &p.parts.k3s)?;
     Ok(p.release.clone())
+}
+
+// ---- resuming ----
+
+/// Whether the rollout stopped and waits for the admin.
+pub fn stopped(r: &Rollout) -> bool {
+    r.serial != 0 && (r.phase == Phase::Failed || !r.paused.is_empty())
+}
+
+/// What a resume does now ("passes node-a over"), or why there is
+/// nothing to resume.
+pub fn resume_does(r: &Rollout) -> Result<String> {
+    if r.serial == 0 {
+        bail!("there is no rollout to resume (a new release starts its rollout within a minute of its publish)");
+    }
+    if r.phase == Phase::Failed {
+        return Ok("tries its own update again".into());
+    }
+    if r.paused.is_empty() {
+        bail!("the rollout of release {} is not stopped: there is nothing to resume", r.serial);
+    }
+    let name = if r.pause_name.is_empty() { "the server".to_string() } else { r.pause_name.clone() };
+    Ok(match r.pause {
+        Pause::Drain => format!("updates {name} without draining it"),
+        Pause::Canary => format!("goes on after the canary {name}"),
+        _ => format!("passes {name} over and goes on with the next server"),
+    })
+}
+
+/// Lets a stopped rollout go on, after a fresh look that it is stopped.
+/// Returns what the coordinator then does.
+pub fn resume(a: &mut Admin) -> Result<String> {
+    let v = a.load()?;
+    let what = resume_does(&v.rollout)?;
+    a.resume_release()?;
+    Ok(what)
+}
+
+// ---- where the rollout stands ----
+
+/// One machine's line in `release status`: its name, its part and where
+/// its update stands; true marks what needs the admin.
+fn machine_line(m: &Member, r: &Rollout, now: i64) -> (String, bool) {
+    let role = if m.host == 1 { "coordinator" } else { "server" };
+    let (state, alarm) = machine_state(m, r, now);
+    let version = m.report.as_ref().filter(|rep| !rep.dryserver.is_empty()).map(|rep| format!("  dryserver {}", rep.dryserver));
+    (format!("{:<14} {role:<11}  {state}{}", m.name, version.unwrap_or_default()), alarm)
+}
+
+fn machine_state(m: &Member, r: &Rollout, now: i64) -> (String, bool) {
+    let Some(rep) = &m.report else {
+        return ("no report: its dryserver is too old to update itself".into(), true);
+    };
+    let target = r.serial;
+    let quiet = if m.last_seen.is_zero() { i64::MAX } else { now - m.last_seen.0.timestamp() };
+    if quiet > rollout::OFFLINE {
+        let age = if quiet == i64::MAX { "a long time".to_string() } else { report::short_age(quiet as u64) };
+        return (format!("silent for {age}: updates when it is back"), false);
+    }
+    let about = if rep.update_serial != 0 { format!(" (release {})", rep.update_serial) } else { String::new() };
+    let note = if rep.update_note.is_empty() { String::new() } else { format!(": {}", rep.update_note) };
+    match rep.update.as_str() {
+        "" => {}
+        "fetching" => return (format!("loading the update{about}"), false),
+        "pending" => return (format!("installed{about}, checking it before keeping it"), false),
+        "held" => return ("held: its kill switch is on, it updates nothing until it is lifted".into(), true),
+        s if rep.update_failed() && (target == 0 || rep.update_serial >= target) => {
+            return (format!("update {s}{about}{note}"), true);
+        }
+        s if !rep.update_failed() => return (format!("{s}{about}{note}"), false),
+        _ => {}
+    }
+    if let Some(s) = r.skipped.iter().find(|s| s.host == m.host) {
+        return (format!("passed over: {}", s.why), true);
+    }
+    if r.turn.as_ref().is_some_and(|t| t.host == m.host) {
+        let ready = r.turn.as_ref().is_some_and(|t| t.ready);
+        return ((if ready { "its turn: updating" } else { "its turn: draining" }).into(), false);
+    }
+    if r.pause_host == m.host && !r.paused.is_empty() {
+        return ("the rollout stopped here".into(), true);
+    }
+    match (target, rep.release) {
+        (0, 0) => ("no release installed".into(), false),
+        (0, n) => (format!("on release {n}"), false),
+        (t, n) if n >= t => (format!("on release {n}"), false),
+        (_, 0) => ("no release yet, waits its turn".into(), false),
+        (_, n) => (format!("on release {n} (old), waits its turn"), false),
+    }
+}
+
+/// Where the rollout stands, one sentence per item, true for what needs
+/// the admin: rollout::lines, and a release the coordinator has but did
+/// not take up yet (it does at its next sync).
+pub fn rollout_lines(v: &View, now: i64) -> Vec<(String, bool)> {
+    let members: Vec<Member> = v.members.iter().map(|(m, _)| m.clone()).collect();
+    let mut lines = rollout::lines(&v.rollout, &members, now);
+    if v.rollout.serial == 0 && v.release.is_some() {
+        // Not "no release published yet": one was, a moment ago.
+        lines.retain(|(_, alarm)| *alarm);
+        lines.push(("Not started yet: the coordinator takes the release up at its next sync, within a minute.".into(), false));
+    }
+    lines
+}
+
+/// `release status`: the newest release first, then where its rollout
+/// stands, one line per machine, and what to do when it stopped.
+pub fn status_lines(v: &View, now: i64) -> Vec<String> {
+    let now = if v.coordinator_now > 0 { v.coordinator_now } else { now };
+    let mut out = Vec::new();
+    if let Some(r) = &v.release {
+        out.push(rollout::release_line(r));
+        out.push(format!("  dryserver {}, k3s {}, Arch snapshot {}", r.dryserver.version, r.k3s.version, r.arch_date));
+        out.push(String::new());
+    }
+    let members: Vec<Member> = v.members.iter().map(|(m, _)| m.clone()).collect();
+    out.push("Rollout:".into());
+    for (line, _) in rollout_lines(v, now) {
+        out.push(format!("  {line}"));
+    }
+    if !members.is_empty() {
+        out.push(String::new());
+        out.push("Machines:".into());
+        for m in &members {
+            let (line, alarm) = machine_line(m, &v.rollout, now);
+            out.push(format!("{} {line}", if alarm { "!" } else { " " }));
+        }
+    }
+    if let Ok(what) = resume_does(&v.rollout)
+        && stopped(&v.rollout)
+    {
+        out.push(String::new());
+        out.push("The rollout is stopped. Look at the machine first, then either".into());
+        out.push(format!("  ./dryserver release resume                       the coordinator {what}, or"));
+        out.push("  ./dryserver release publish -notes \"the fix\"    a fixed release: it gets a higher serial".into());
+        out.push("                                                   and replaces this rollout".into());
+    }
+    out
 }
 
 #[cfg(test)]

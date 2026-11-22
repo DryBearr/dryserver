@@ -5,6 +5,7 @@ use crate::err::Error;
 use crate::gotime::Time;
 use crate::registry::{Heartbeat, Store};
 use crate::report::Report;
+use crate::rollout::{Skip, Turn};
 use crate::signed::fake::Key;
 use crate::testutil::TempDir;
 use sha2::{Digest, Sha256};
@@ -607,4 +608,165 @@ fn a_missing_k3s_is_fine_when_the_coordinator_runs_it() {
         "{:?}",
         p.lines()
     );
+}
+
+// ---- resume ----
+
+#[test]
+fn resume_says_what_it_does_or_why_not() {
+    let base = Rollout { serial: 9, phase: Phase::Servers, pause_name: "node-a".into(), pause_host: 2, ..Rollout::default() };
+    assert!(resume_does(&Rollout::default()).unwrap_err().to_string().contains("there is no rollout to resume"));
+    let e = resume_does(&base).unwrap_err().to_string();
+    assert!(e.contains("release 9 is not stopped: there is nothing to resume"), "{e}");
+    assert!(!stopped(&base) && !stopped(&Rollout::default()));
+    let paused = |pause: Pause| Rollout { paused: "why".into(), pause, ..base.clone() };
+    for (pause, want) in [
+        (Pause::Failed, "passes node-a over and goes on with the next server"),
+        (Pause::Timeout, "passes node-a over"),
+        (Pause::Drain, "updates node-a without draining it"),
+        (Pause::Canary, "goes on after the canary node-a"),
+    ] {
+        assert!(stopped(&paused(pause)));
+        let does = resume_does(&paused(pause)).unwrap();
+        assert!(does.starts_with(want), "{pause:?}: {does}");
+    }
+    let failed = Rollout { phase: Phase::Failed, paused: "its update failed".into(), ..base.clone() };
+    assert_eq!(resume_does(&failed).unwrap(), "tries its own update again");
+}
+
+#[test]
+fn resume_asks_the_coordinator_only_when_it_stopped() {
+    let dir = TempDir::new();
+    let (mut a, store, _, _, _) = desk(&dir);
+    let e = resume(&mut a).unwrap_err().to_string();
+    assert!(e.contains("no rollout to resume"), "{e}");
+    store
+        .update(|s| {
+            s.rollout = Rollout { serial: 5, phase: Phase::Servers, ..Rollout::default() };
+            Ok(())
+        })
+        .unwrap();
+    assert!(resume(&mut a).unwrap_err().to_string().contains("not stopped"));
+    assert_eq!(store.read().unwrap().rollout.resume_asked, 0, "nothing was asked");
+    store
+        .update(|s| {
+            s.rollout.paused = "node-a: update failed".into();
+            s.rollout.pause = Pause::Failed;
+            s.rollout.pause_name = "node-a".into();
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(resume(&mut a).unwrap(), "passes node-a over and goes on with the next server");
+    assert_eq!(store.read().unwrap().rollout.resume_asked, 1);
+}
+
+// ---- status ----
+
+fn member(host: u32, name: &str, rep: Option<Report>, seen: i64) -> (Member, bool) {
+    let last_seen = Time(chrono::DateTime::from_timestamp(seen, 0).unwrap());
+    (Member { host, name: name.into(), last_seen, report: rep, ..Member::default() }, true)
+}
+
+fn rep(release: u64, update: &str, serial: u64, note: &str) -> Report {
+    Report {
+        dryserver: "0.2.0".into(),
+        release,
+        update: update.into(),
+        update_serial: serial,
+        update_note: note.into(),
+        ..Report::default()
+    }
+}
+
+#[test]
+fn status_is_one_line_per_machine_and_says_what_to_do() {
+    let now = 1_800_000_000;
+    let r = Release {
+        serial: 1_795_000_000,
+        created: now - 3600,
+        expires: now + release::LIFETIME,
+        dryserver: release::Binary { version: "0.2.0".into(), sha256: "a".repeat(64), size: 10 },
+        k3s: release::K3s { version: iso::K3S_VERSION.into(), sha256: iso::K3S_SHA256.into() },
+        arch_date: "2026/11/19".into(),
+        rollback: false,
+        urgent: true,
+        notes: "fixes X".into(),
+    };
+    let s = r.serial;
+    let v = View {
+        release: Some(r),
+        rollout: Rollout {
+            serial: s,
+            urgent: true,
+            phase: Phase::Servers,
+            done: vec![2],
+            paused: "node-b: update failed: no space left on device".into(),
+            pause: Pause::Failed,
+            pause_host: 3,
+            pause_name: "node-b".into(),
+            skipped: vec![Skip { host: 6, name: "node-e".into(), why: "it refused the release".into() }],
+            turn: None,
+            ..Rollout::default()
+        },
+        members: vec![
+            member(1, "coord", Some(rep(s, "", 0, "")), now - 20),
+            member(2, "node-a", Some(rep(s, "", 0, "")), now - 20),
+            member(3, "node-b", Some(rep(1, "failed", s, "no space left on device")), now - 20),
+            member(4, "node-c", Some(rep(1, "", 0, "")), now - 7200),
+            member(5, "node-d", None, now - 20),
+            member(6, "node-e", Some(rep(1, "", 0, "")), now - 20),
+            member(7, "node-f", Some(rep(1, "rebooting", s, "")), now - 20),
+            member(8, "node-g", Some(rep(1, "held", 0, "")), now - 20),
+        ],
+        coordinator_now: now,
+        ..View::default()
+    };
+    let text = status_lines(&v, 0).join("\n");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with(&format!("Release {s} (urgent), made")) && lines[0].ends_with(": fixes X"), "{text}");
+    assert_eq!(lines[1], format!("  dryserver 0.2.0, k3s {}, Arch snapshot 2026/11/19", iso::K3S_VERSION));
+    for want in [
+        "Rollout:\n  PAUSED: node-b: update failed",
+        "Machines:\n",
+        &format!("  coord          coordinator  on release {s}  dryserver 0.2.0"),
+        &format!("  node-a         server       on release {s}  dryserver 0.2.0"),
+        &format!("! node-b         server       update failed (release {s}): no space left on device  dryserver 0.2.0"),
+        "  node-c         server       silent for 2h: updates when it is back",
+        "! node-d         server       no report: its dryserver is too old to update itself",
+        "! node-e         server       passed over: it refused the release",
+        // A state this version does not know is shown as the machine says it.
+        &format!("  node-f         server       rebooting (release {s})"),
+        "! node-g         server       held: its kill switch is on",
+        "The rollout is stopped. Look at the machine first, then either",
+        "./dryserver release resume                       the coordinator passes node-b over",
+        "./dryserver release publish -notes \"the fix\"    a fixed release: it gets a higher serial",
+    ] {
+        assert!(text.contains(want), "{want}:\n{text}");
+    }
+
+    // Running: no advice. A server whose turn it is says so.
+    let mut running = v.clone();
+    running.rollout.paused.clear();
+    running.rollout.pause = Pause::None;
+    running.rollout.turn = Some(Turn { host: 4, name: "node-c".into(), since: now - 60, ready: true });
+    running.members[3].0.last_seen = Time(chrono::DateTime::from_timestamp(now - 10, 0).unwrap());
+    let text = status_lines(&running, 0).join("\n");
+    assert!(!text.contains("The rollout is stopped"), "{text}");
+    assert!(text.contains("  node-c         server       its turn: updating"), "{text}");
+
+    // Nothing published yet.
+    let none = View { members: vec![member(1, "coord", Some(rep(0, "", 0, "")), now - 5)], coordinator_now: now, ..View::default() };
+    let text = status_lines(&none, 0).join("\n");
+    assert!(text.starts_with("Rollout:\n  No release published yet: ./dryserver release publish"), "{text}");
+    assert!(text.contains("  coord          coordinator  no release installed  dryserver 0.2.0"), "{text}");
+
+    // Published a moment ago: the coordinator did not take it up yet.
+    let fresh = View { release: v.release.clone(), rollout: Rollout::default(), ..none.clone() };
+    let text = status_lines(&fresh, 0).join("\n");
+    assert!(text.contains("Rollout:\n  Not started yet: the coordinator takes the release up at its next sync"), "{text}");
+    assert!(!text.contains("No release published yet"), "{text}");
+    // A refused upload still shows.
+    let refused = View { rollout: Rollout { refused: "release 7 was refused: bad signature".into(), ..Rollout::default() }, ..fresh };
+    let lines = rollout_lines(&refused, now);
+    assert!(lines[0] == ("release 7 was refused: bad signature".to_string(), true) && lines.len() == 2, "{lines:?}");
 }
