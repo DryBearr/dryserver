@@ -1055,6 +1055,8 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     let mut me = SelfInfo { host: 0, switch: sw };
     let mut token = String::new();
     let mut offer = rollout::Offer::default();
+    // On the coordinator: its members are the admin's signed list.
+    let mut signed = false;
     // What this machine says about itself, its update included. Kept for
     // the update step after the mesh: it is this sync's health.
     let rep;
@@ -1062,23 +1064,49 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
         me.host = 1;
         rep = n.full_report(ctx, true);
         let hb = Heartbeat { lan_ip: n.cfg.coord_lan_ip.clone(), switch: sw, cuts, report: Some(rep.clone()) };
-        let (members, signed) = store.update(|s| {
+        let (members, env) = store.update(|s| {
             s.heartbeat(1, hb, Time::now())?;
-            Ok((s.members.clone(), s.signed_version > 0))
+            Ok((s.members.clone(), s.signed.clone()))
         })?;
-        // Signed by the admin: the code on the console has done its job.
-        if signed && n.path(ISSUE_FILE).exists() {
-            let _ = std::fs::remove_file(n.path(ISSUE_FILE));
-            let _ = n.cmd(ctx, "agetty", &["--reload"]);
-        }
         // The registry account writes that file: what it holds reaches the
         // mesh files and the cluster only checked, like a server checks
-        // what the coordinator sends.
+        // what the coordinator sends. Its fields first, then who is in:
+        // exactly the list the admin signed, no older than one this
+        // coordinator has seen. Its other entries are only taken for
+        // addresses. A registry account that lists a machine of its own,
+        // or drops members, changes neither the mesh nor the cluster.
         let (members, problems) = registry::check_members(members, |h| !mesh::ip(&n.cfg.wg_subnet, h).is_empty());
         for p in &problems {
             eprintln!("dryserver: sync: ignoring {p}");
         }
-        members
+        if env.is_empty() && std::fs::symlink_metadata(n.path(SIGNED_FILE)).is_err() {
+            // Nothing signed yet: nobody joins without the admin, so the
+            // coordinator is alone in its mesh, and in its cluster.
+            members.into_iter().filter(|m| m.host == 1).collect()
+        } else {
+            let checked = if env.is_empty() {
+                Err(errf!("the registry holds no signed member list, although this coordinator has seen one ({SIGNED_FILE})"))
+            } else {
+                n.signed_members(1, &members, &env)
+            };
+            match checked {
+                Ok((members, status)) => {
+                    n.note_signed(&status);
+                    signed = true;
+                    // Signed by the admin: the code on the console has done
+                    // its job.
+                    if n.path(ISSUE_FILE).exists() {
+                        let _ = std::fs::remove_file(n.path(ISSUE_FILE));
+                        let _ = n.cmd(ctx, "agetty", &["--reload"]);
+                    }
+                    members
+                }
+                Err(e) => {
+                    n.note_signed(&format!("REFUSED, mesh and cluster left as they are: {e}"));
+                    return Err(e.wrap("the registry's member list refused, mesh and cluster left as they are"));
+                }
+            }
+        }
     } else {
         me.host = host;
         if me.host == 0 {
@@ -1154,7 +1182,12 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     // The cluster follows the mesh: the coordinator shares the token and
     // drops machines that left; a server joins once it has the token.
     if coordinator {
-        n.k3s_share(ctx, store, &all);
+        // Only from a list the admin signed does a machine leave the
+        // cluster. Before the first one there is nobody but the
+        // coordinator, and nobody to share the token with.
+        if signed {
+            n.k3s_share(ctx, store, &all);
+        }
         // The rollout of the newest release: the coordinator first, then
         // one server at a time.
         let served = rollout::Served::beside(store, n.path(rollout::K3S_BIN));
@@ -2288,28 +2321,47 @@ mod tests {
         assert_eq!(store2.read().map(|s| s.k3s_token).unwrap_or_default(), "");
     }
 
-    #[test]
-    fn coordinator_code_leaves_the_console_once_signed() {
-        let (_dir, tmp, mut n, _) = joined();
-        n.tmp_dir = Some(tmp.path().to_path_buf());
+    /// A coordinator (its own WireGuard key is the one the admin signs as
+    /// host 1) with a registry in a directory of its own.
+    fn brain() -> (TempDir, TempDir, Node, Arc<FakeCoord>, TempDir, Store) {
+        let (dir, tmp, n, fc) = joined();
+        put(&n.root, WG_PUB, format!("{COORD_WG}\n"));
+        let n = Node { hostname: "coord".into(), ..n };
         let store_dir = TempDir::new();
         let store = Store::new(store_dir.join("registry.json"));
+        (dir, tmp, n, fc, store_dir, store)
+    }
+
+    fn registry(store: &Store, members: Vec<Member>, env: Envelope) {
         store
             .update(|s| {
-                s.members = vec![coord_member()];
+                s.members = members;
+                s.signed_version = env.list(&ADMIN, |_| true).map(|l| l.version).unwrap_or(0);
+                s.signed = env;
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn coordinator_code_leaves_the_console_once_signed() {
+        let (_dir, _tmp, n, _, _sd, store) = brain();
+        registry(&store, vec![coord_member()], Envelope::default());
         put(&n.root, ISSUE_FILE, coordinator_issue("123 456"));
         assert!(get(&n.root, ISSUE_FILE).contains("Sign only if it shows this code:  123 456"));
         sync(&Ctx::new(), &n, true, &store).unwrap();
         assert!(!get(&n.root, ISSUE_FILE).is_empty(), "the code must stay until a list is signed");
+        // A version number alone (the registry account can write one) is
+        // no signature.
         store
             .update(|s| {
                 s.signed_version = 9;
                 Ok(())
             })
             .unwrap();
+        sync(&Ctx::new(), &n, true, &store).unwrap();
+        assert!(!get(&n.root, ISSUE_FILE).is_empty(), "the code went without a signed list");
+        registry(&store, vec![coord_member()], sign(&ADMIN, 9, vec![coord_entry()]));
         sync(&Ctx::new(), &n, true, &store).unwrap();
         assert!(get(&n.root, ISSUE_FILE).is_empty(), "the code must go once the admin signed");
     }
@@ -2319,25 +2371,99 @@ mod tests {
     /// not add an SSH `Match exec` or anything else to root's files.
     #[test]
     fn coordinator_checks_the_registry_members() {
-        let (_dir, _tmp, n, _) = joined();
-        let store_dir = TempDir::new();
-        let store = Store::new(store_dir.join("registry.json"));
+        let (_dir, _tmp, n, _, _sd, store) = brain();
         let evil = Member { name: "node-b\nMatch exec \"touch /tmp/pwned\"".into(), ..node_member(2) };
         let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
-        let good = Member { name: "node-c".into(), wg_key: key, ..node_member(3) };
-        store
-            .update(|s| {
-                s.members = vec![coord_member(), evil, good];
-                Ok(())
-            })
-            .unwrap();
-        sync(&Ctx::new(), &Node { hostname: "coord".into(), ..n.clone() }, true, &store).unwrap();
+        let good = Member { name: "node-c".into(), wg_key: key.clone(), ..node_member(3) };
+        let signed = Entry { host: 3, name: "node-c".into(), wg_key: key, ssh_host_key: signed::key_body(NODE_KEY) };
+        registry(&store, vec![coord_member(), evil, good], sign(&ADMIN, 4, vec![coord_entry(), signed]));
+        sync(&Ctx::new(), &n, true, &store).unwrap();
         for f in ["/etc/ssh/ssh_config.d/20-dryserver.conf", "/etc/ssh/ssh_known_hosts", "/etc/hosts", WG_CONF] {
             let out = get(&n.root, f);
             assert!(!out.contains("Match") && !out.contains("pwned"), "{f}:\n{out}");
         }
         let cfg = get(&n.root, "/etc/ssh/ssh_config.d/20-dryserver.conf");
         assert!(cfg.contains("Host coord node-c\n") && !cfg.contains("node-b"), "{cfg}");
+    }
+
+    /// The registry account (every server reaches it) writes the
+    /// registry file. What root on the coordinator puts into the mesh and
+    /// the cluster from it is exactly what the admin signed.
+    #[test]
+    fn the_coordinator_uses_only_the_list_the_admin_signed() {
+        let (_dir, _tmp, n, fc, _sd, store) = brain();
+        put(&n.root, K3S_AGENT_TOKEN, "K10abc::node:secret\n");
+        let c = other_entry();
+        let node_c = Member {
+            host: 3,
+            name: c.name,
+            wg_key: c.wg_key,
+            ssh_host_key: c.ssh_host_key,
+            lan_ip: "192.168.1.30".into(),
+            ..Member::default()
+        };
+        let list = sign(&ADMIN, 5, vec![coord_entry(), node_entry(2), other_entry()]);
+        registry(&store, vec![coord_member(), Member { lan_ip: "192.168.1.20".into(), ..node_member(2) }, node_c.clone()], list.clone());
+        sync(&Ctx::new(), &n, true, &store).unwrap();
+        let wg = get(&n.root, WG_CONF);
+        assert!(wg.contains(WG_PUBKEY) && wg.contains(OTHER_WG) && wg.contains("Endpoint = 192.168.1.30:"), "{wg}");
+        assert!(get(&n.root, SIGNED_FILE).contains(&list.sig), "the version this coordinator has seen");
+
+        // A machine of its own beside them, and node-a gone: neither
+        // reaches the mesh files, and the cluster keeps node-a.
+        let rogue = Member {
+            host: 9,
+            name: "rogue".into(),
+            wg_key: EVIL_WG.into(),
+            ssh_host_key: "ssh-ed25519 AAAAevil".into(),
+            ..Member::default()
+        };
+        registry(&store, vec![coord_member(), node_c.clone(), rogue], list.clone());
+        fc.k3s.lock().unwrap().clear();
+        sync(&Ctx::new(), &n, true, &store).unwrap();
+        let wg = get(&n.root, WG_CONF);
+        assert!(!wg.contains(EVIL_WG) && wg.contains(WG_PUBKEY), "{wg}");
+        for f in ["/etc/hosts", "/etc/ssh/ssh_known_hosts"] {
+            assert!(!get(&n.root, f).contains("rogue") && get(&n.root, f).contains("node-a"), "{f}");
+        }
+        assert!(!fc.k3s.lock().unwrap().iter().any(|c| c.contains("delete node node-a")), "{:?}", fc.k3s.lock().unwrap());
+
+        // Unsigned lists change nothing: an older one (it would bring back
+        // a machine the admin removed), a forged one, one without this
+        // coordinator. The mesh and the cluster stay as they are.
+        let before = get(&n.root, WG_CONF);
+        let refused = [
+            (sign(&ADMIN, 4, vec![coord_entry(), other_entry()]), "older than version 5"),
+            (sign(&Key("thief"), 7, vec![coord_entry()]), "bad signature"),
+            // Another machine signed in this coordinator's place: it leaves
+            // nothing and stops nobody, it only refuses.
+            (sign(&ADMIN, 7, vec![Entry { wg_key: EVIL_WG.into(), ..coord_entry() }, node_entry(2)]), "removed this server"),
+        ];
+        for (env, want) in refused {
+            registry(&store, vec![coord_member()], env);
+            fc.k3s.lock().unwrap().clear();
+            let e = sync(&Ctx::new(), &n, true, &store).unwrap_err().to_string();
+            assert!(e.contains(want) && e.contains("left as they are"), "{want}: {e}");
+            assert_eq!(get(&n.root, WG_CONF), before, "{want}");
+            assert!(fc.k3s.lock().unwrap().is_empty(), "{want}: {:?}", fc.k3s.lock().unwrap());
+            assert!(get(&n.root, SIGNED_STATUS).contains("REFUSED"), "{want}");
+        }
+        // No signed list at all (the registry account dropped it) on a
+        // coordinator that has seen one: refused like the others.
+        registry(&store, vec![coord_member(), node_member(2)], Envelope::default());
+        fc.k3s.lock().unwrap().clear();
+        let e = sync(&Ctx::new(), &n, true, &store).unwrap_err().to_string();
+        assert!(e.contains("no signed member list"), "{e}");
+        assert_eq!(get(&n.root, WG_CONF), before);
+        assert!(fc.k3s.lock().unwrap().is_empty() && get(&n.root, SIGNED_FILE).contains(&list.sig));
+        // Before the first signature the coordinator is alone, and nobody
+        // leaves its cluster.
+        let (_dir, _tmp, n, fc, _sd, store) = brain();
+        put(&n.root, K3S_AGENT_TOKEN, "K10abc::node:secret\n");
+        registry(&store, vec![coord_member(), node_member(2)], Envelope::default());
+        sync(&Ctx::new(), &n, true, &store).unwrap();
+        assert!(!get(&n.root, WG_CONF).contains("[Peer]"), "{}", get(&n.root, WG_CONF));
+        assert!(fc.k3s.lock().unwrap().is_empty(), "{:?}", fc.k3s.lock().unwrap());
     }
 
     #[test]
