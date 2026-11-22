@@ -236,6 +236,12 @@ Servers refuse agent forwarding even if you ask for it with `ssh -A`.
 straight to the server's WiFi/router address, not through the coordinator,
 checked against the same pinned host key. The kill switch uses them.
 
+Host keys are checked against `~/.ssh/known_hosts.d/dryserver` alone, which
+holds the keys from the list you signed, and a server with any other key
+is refused. A key you once accepted in `~/.ssh/known_hosts` (say of an old
+coordinator at the same address) never counts. After a machine is
+reinstalled and approved, run `./dryserver ssh-config` again.
+
 ## Kill switch
 
 If you think the coordinator is hacked, cut it off from every server:

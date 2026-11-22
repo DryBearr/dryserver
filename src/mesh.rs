@@ -177,24 +177,33 @@ pub struct Server {
 /// ForwardAgent no is explicit so a "Host *" default in ~/.ssh/config cannot
 /// turn forwarding back on.
 ///
+/// Host keys are checked against known_hosts (from the signed list) alone,
+/// and an unknown or changed key is refused: an old key the user once
+/// accepted in ~/.ssh/known_hosts, say of a coordinator that was cut off
+/// and reinstalled at the same address, never passes for the server where
+/// the admin types the sudo password.
+///
 /// Each server with a known LAN address also gets "<name>.lan": straight to
 /// that address, never through the coordinator, checked against the same
 /// pinned host key (HostKeyAlias). The kill switch uses these when the
 /// coordinator cannot be trusted.
 pub fn desktop_ssh_config(user: &str, coord_name: &str, coord_lan_ip: &str, port: &str, known_hosts: &str, servers: &[Server]) -> String {
     let port_line = if !port.is_empty() && port != "22" { format!("    Port {port}\n") } else { String::new() };
+    let keys = format!("    StrictHostKeyChecking yes\n    UserKnownHostsFile {known_hosts}\n    GlobalKnownHostsFile /dev/null\n");
     let mut b = format!(
         "# dryserver servers, written by \"dryserver ssh-config\". Regenerate after\n\
          # adding machines. Your key stays on this desktop and is never forwarded.\n\
+         # Host keys come from the list you signed: a server with another key is\n\
+         # refused (after a reinstall, run ssh-config again).\n\
          \n\
-         Host {coord_name}\n    HostName {coord_lan_ip}\n{port_line}    User {user}\n    ForwardAgent no\n    UserKnownHostsFile ~/.ssh/known_hosts {known_hosts}\n"
+         Host {coord_name}\n    HostName {coord_lan_ip}\n{port_line}    User {user}\n    ForwardAgent no\n{keys}"
     );
     for s in servers {
         if s.name == coord_name {
             continue;
         }
         b += &format!(
-            "\nHost {}\n    HostName {}\n    User {user}\n    ProxyJump {coord_name}\n    ForwardAgent no\n    UserKnownHostsFile ~/.ssh/known_hosts {known_hosts}\n",
+            "\nHost {}\n    HostName {}\n    User {user}\n    ProxyJump {coord_name}\n    ForwardAgent no\n{keys}",
             s.name, s.mesh_ip
         );
     }
@@ -203,7 +212,7 @@ pub fn desktop_ssh_config(user: &str, coord_name: &str, coord_lan_ip: &str, port
             continue;
         }
         b += &format!(
-            "\nHost {}{LAN_SUFFIX}\n    HostName {}\n    HostKeyAlias {}\n    User {user}\n    ProxyJump none\n    ForwardAgent no\n    UserKnownHostsFile ~/.ssh/known_hosts {known_hosts}\n",
+            "\nHost {}{LAN_SUFFIX}\n    HostName {}\n    HostKeyAlias {}\n    User {user}\n    ProxyJump none\n    ForwardAgent no\n{keys}",
             s.name, s.lan_ip, s.name
         );
     }
@@ -358,6 +367,21 @@ mod tests {
             "LAN entry:\n{conf}"
         );
         assert!(!conf.contains("Host coord.lan"), "the coordinator is reached by LAN address already:\n{conf}");
+        // Each entry checks host keys against the signed ones alone, and
+        // refuses any other: an old key in ~/.ssh/known_hosts (the old
+        // coordinator's, at the same address) never passes.
+        let keys =
+            "    StrictHostKeyChecking yes\n    UserKnownHostsFile ~/.ssh/known_hosts.d/dryserver\n    GlobalKnownHostsFile /dev/null\n";
+        let entries: Vec<&str> = conf.split("\nHost ").skip(1).collect();
+        assert_eq!(entries.len(), 4, "{conf}");
+        for e in &entries {
+            assert!(e.ends_with(keys), "entry {e:?}");
+        }
+        assert!(!conf.contains("~/.ssh/known_hosts ") && !conf.contains("StrictHostKeyChecking ask"), "{conf}");
+        // The kill switch still finds every server that does not go
+        // through the coordinator.
+        let names: Vec<String> = crate::quarantine::remotes(&conf).into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["coord", "node-c"]);
         assert!(!conf.contains("Host node-b.lan"), "no LAN entry without a LAN address:\n{conf}");
         // A LAN address that is not an address never becomes an entry.
         let conf = desktop_ssh_config(
