@@ -115,6 +115,9 @@ on servers:
                       keep the applied release, undo it, or show the state
   selfcheck           check this binary, config.env, the firewall, SSH,
                       wg0.conf and the state files (no network needed)
+  boot status         which kernel runs, its boot images and whether the
+                      fallback kernel waits (boot place, mark and check run
+                      from mkinitcpio, pacman and systemd)
 "#;
 
 /// Where the ISO build puts the config.
@@ -161,6 +164,7 @@ fn main() -> ExitCode {
         "backup-pull" => run_backup_pull(rest),
         "update" => run_update(rest),
         "selfcheck" => run_selfcheck(rest),
+        "boot" => install::boot::cli(rest),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())

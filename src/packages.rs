@@ -30,6 +30,9 @@ pub const SYSTEM: Bundle = Bundle {
     packages: &[
         "base",
         "linux",
+        // The fallback kernel: its own image and modules, so a main kernel
+        // that does not boot leaves one that does (see install/boot.rs).
+        "linux-lts",
         "linux-firmware",
         "intel-ucode",
         "amd-ucode",
@@ -215,7 +218,7 @@ mod tests {
     #[test]
     fn resolve_merges_bundles() {
         let p = resolve(&v(&["docker", "rust"]), &v(&["python", "git"])).unwrap();
-        for want in ["base", "openssh", "age", "git", "cronie", "docker", "rustup", "python"] {
+        for want in ["base", "linux", "linux-lts", "openssh", "age", "git", "cronie", "docker", "rustup", "python"] {
             assert!(p.packages.iter().any(|x| x == want), "missing package {want}");
         }
         for not in ["go", "neovim", "clang"] {

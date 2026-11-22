@@ -145,7 +145,23 @@ pub struct Report {
     /// Why, in a few words: printable ASCII, at most MAX_NOTE characters.
     #[serde(deserialize_with = "lenient", skip_serializing_if = "String::is_empty")]
     pub update_note: String,
+    /// Which kernel runs and whether the other one waits: one of
+    /// BOOT_STATES, "" when the machine cannot tell.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "String::is_empty")]
+    pub boot: String,
 }
+
+/// How a machine boots (see install/boot.rs):
+/// - ready: the main kernel runs, the fallback kernel (linux-lts) waits;
+/// - fallback: the fallback kernel runs: the main one did not boot, or
+///   someone picked it;
+/// - no-fallback: there is no fallback kernel (installed before there was
+///   one): a kernel that does not boot leaves the machine down;
+/// - manual: a BIOS machine: the fallback kernel is in GRUB's menu, picked
+///   by hand only;
+/// - fallback-broken: the fallback kernel's image is missing or failed its
+///   tries.
+pub const BOOT_STATES: [&str; 5] = ["ready", "fallback", "no-fallback", "manual", "fallback-broken"];
 
 /// What a machine says about its update:
 /// - fetching: it has its turn and loads the release from the brain,
@@ -259,6 +275,7 @@ impl Report {
             update: if UPDATE_STATES.contains(&self.update.as_str()) { self.update } else { String::new() },
             update_serial: if self.update_serial <= crate::release::MAX_SERIAL { self.update_serial } else { 0 },
             update_note: note(&self.update_note),
+            boot: if BOOT_STATES.contains(&self.boot.as_str()) { self.boot } else { String::new() },
         }
     }
 
@@ -288,6 +305,12 @@ impl Report {
         let mut out = Vec::new();
         if self.reboot {
             out.push((Concern::Reboot, "reboot needed".to_string()));
+        }
+        match self.boot.as_str() {
+            "fallback" => out.push((Concern::Boot, "running fallback kernel".into())),
+            "no-fallback" => out.push((Concern::Boot, "no fallback kernel".into())),
+            "fallback-broken" => out.push((Concern::Boot, "fallback kernel broken".into())),
+            _ => {}
         }
         if let Some(p) = percent(self.disk_used, self.disk_total).filter(|p| *p >= DISK_FULL) {
             out.push((Concern::Disk, format!("disk {p}%")));
@@ -326,6 +349,8 @@ impl Report {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Concern {
     Reboot,
+    /// Which kernel runs, and whether a fallback waits.
+    Boot,
     Disk,
     Memory,
     Heat,
@@ -404,6 +429,7 @@ pub fn gather(ctx: &Ctx, run: &dyn Runner, root: &Path, wg_subnet: &str) -> Repo
         update: String::new(),
         update_serial: 0,
         update_note: String::new(),
+        boot: crate::install::boot::state(root).into(),
     };
     // What this machine sends is what every reader accepts, so nothing of
     // it is dropped on the way and it stays within the heartbeat's size.
@@ -684,6 +710,7 @@ mod tests {
         assert_eq!((r.mem_used, r.mem_total), (1_000_000 * 1024, 4_000_000 * 1024));
         assert!(r.disk_total > 0 && r.disk_used <= r.disk_total);
         assert_eq!(r.temp, Some(55), "the hottest real sensor");
+        assert_eq!(r.boot, "no-fallback", "installed before linux-lts");
         // Machines by number, never their keys; peers outside the mesh and
         // without an address are left out.
         assert_eq!(r.peers, vec![Peer { host: 1, age: Some(42) }, Peer { host: 3, age: None }]);
@@ -745,6 +772,30 @@ mod tests {
         assert_eq!((running.as_str(), installed.as_str(), due), ("6.12.1-arch1-1", "6.12.4-arch1-1", true));
         let r = Report { reboot: due, ..Report::default() };
         assert_eq!(r.problems(Time::now()), vec![(Concern::Reboot, "reboot needed".to_string())]);
+    }
+
+    #[test]
+    fn which_kernel_boots() {
+        for (state, want) in [
+            ("fallback", Some("running fallback kernel")),
+            ("no-fallback", Some("no fallback kernel")),
+            ("fallback-broken", Some("fallback kernel broken")),
+            ("ready", None),
+            ("manual", None),
+            ("", None),
+        ] {
+            let r = Report { boot: state.into(), ..Report::default() };
+            let p: Vec<String> = r.problems(Time::now()).into_iter().filter(|(c, _)| *c == Concern::Boot).map(|(_, t)| t).collect();
+            assert_eq!(p.first().map(String::as_str), want, "{state}");
+            assert_eq!(r.clone().sanitized(|_| true).boot, state);
+        }
+        // A machine's word: only the known states, anything else is none.
+        for junk in [serde_json::json!("fallback\u{1b}[2J"), serde_json::json!("FALLBACK"), serde_json::json!(5), serde_json::json!(null)] {
+            let r: Report = serde_json::from_value(serde_json::json!({ "boot": junk })).unwrap();
+            assert_eq!(r.sanitized(|_| true).boot, "", "{junk}");
+        }
+        // Not known: not sent.
+        assert!(!serde_json::to_string(&Report::default()).unwrap().contains("\"boot\""));
     }
 
     #[test]

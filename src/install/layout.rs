@@ -88,9 +88,21 @@ pub fn crypttab(root_uuid: &str, enc: Encryption, data_uuids: &[String]) -> Stri
     b
 }
 
-/// Embedded in the UKI (UEFI) or passed by GRUB (BIOS).
+/// Embedded in the UKIs (UEFI). A panic restarts the machine after
+/// PANIC_SECS, also before the root file system is up, so a kernel that
+/// does not boot uses up its tries without someone at the machine.
 pub fn kernel_cmdline(encrypted: bool, root_uuid: &str) -> String {
-    if encrypted { format!("root=/dev/mapper/{ROOT_MAPPER} rw quiet") } else { format!("root=UUID={root_uuid} rw quiet") }
+    let root = if encrypted { format!("/dev/mapper/{ROOT_MAPPER}") } else { format!("UUID={root_uuid}") };
+    format!("root={root} rw quiet panic={}", super::boot::PANIC_SECS)
+}
+
+/// Appended to /etc/default/grub (BIOS), which grub-mkconfig reads as a
+/// shell script: the same panic restart for every GRUB entry.
+pub fn grub_panic() -> String {
+    format!(
+        "\n# dryserver: restart by itself {0} seconds after a kernel panic.\nGRUB_CMDLINE_LINUX=\"${{GRUB_CMDLINE_LINUX}} panic={0}\"\n",
+        super::boot::PANIC_SECS
+    )
 }
 
 /// The systemd initramfs, which handles LUKS with TPM or passphrase
@@ -98,16 +110,35 @@ pub fn kernel_cmdline(encrypted: bool, root_uuid: &str) -> String {
 pub const MKINITCPIO_HOOKS: &str =
     "HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block sd-encrypt filesystems fsck)";
 
-/// Builds only the default UKI (no fallback image, keeps the ESP small)
-/// into the path systemd-boot finds on its own.
-pub const UKI_PRESET: &str = r#"# dryserver: build a signed unified kernel image for systemd-boot.
+/// The main kernel's mkinitcpio preset (UEFI): one signed unified kernel
+/// image, arch-linux.efi (with a boot counter in its name while it is
+/// new). mkinitcpio makes it under a staging name first: default_options
+/// come after default_uki on mkinitcpio's command line and win. Its post
+/// hook checks the image and puts it in place (see boot.rs). default_uki
+/// stays the image's own name: mkinitcpio removes it when the kernel goes.
+pub const UKI_PRESET: &str = r#"# dryserver: a signed unified kernel image for systemd-boot. It is made under a
+# name systemd-boot does not start; `dryserver boot place` (a mkinitcpio post
+# hook) checks it and renames it into place, with a boot counter while new.
 ALL_kver="/boot/vmlinuz-linux"
 PRESETS=('default')
 default_uki="/boot/EFI/Linux/arch-linux.efi"
+default_options="--uki /boot/EFI/Linux/arch-linux.efi.new"
+"#;
+
+/// The same for the fallback kernel, linux-lts.
+pub const LTS_PRESET: &str = r#"# dryserver: a signed unified kernel image for systemd-boot. It is made under a
+# name systemd-boot does not start; `dryserver boot place` (a mkinitcpio post
+# hook) checks it and renames it into place, with a boot counter while new.
+ALL_kver="/boot/vmlinuz-linux-lts"
+PRESETS=('default')
+default_uki="/boot/EFI/Linux/arch-linux-lts.efi"
+default_options="--uki /boot/EFI/Linux/arch-linux-lts.efi.new"
 "#;
 
 /// Makes ukify sign the expected PCR 11 values, so the TPM policy survives
-/// kernel updates without re-enrolling.
+/// kernel updates without re-enrolling. Shared by both kernels' presets
+/// (ukify reads it for every image), so the fallback kernel's image
+/// unlocks the disk too.
 pub const UKI_CONF: &str = "[UKI]
 
 [PCRSignature:initrd]
@@ -116,8 +147,11 @@ PCRPublicKey=/etc/systemd/tpm2-pcr-public-key.pem
 Phases=enter-initrd
 ";
 
-/// No menu delay, and no editing the kernel command line.
-pub const LOADER_CONF: &str = "timeout 0\neditor no\n";
+/// No menu delay, and no editing the kernel command line. No default
+/// entry on purpose: a default is started even after its boot counter ran
+/// out, while without one systemd-boot starts the first image in its
+/// order that has tries left (see boot.rs).
+pub const LOADER_CONF: &str = "# dryserver: no default entry, so an image that failed its tries is passed over.\ntimeout 0\neditor no\n";
 
 #[cfg(test)]
 mod tests {
@@ -161,7 +195,9 @@ mod tests {
 
     #[test]
     fn cmdlines() {
-        assert_eq!(kernel_cmdline(true, "x"), "root=/dev/mapper/root rw quiet");
-        assert_eq!(kernel_cmdline(false, "x"), "root=UUID=x rw quiet");
+        assert_eq!(kernel_cmdline(true, "x"), "root=/dev/mapper/root rw quiet panic=10");
+        assert_eq!(kernel_cmdline(false, "x"), "root=UUID=x rw quiet panic=10");
+        assert!(!LOADER_CONF.lines().any(|l| l.starts_with("default")), "a default entry is started even when it failed");
+        assert!(grub_panic().ends_with("GRUB_CMDLINE_LINUX=\"${GRUB_CMDLINE_LINUX} panic=10\"\n"), "{}", grub_panic());
     }
 }

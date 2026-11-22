@@ -220,6 +220,12 @@ kernel.yama.ptrace_scope = 1
 fs.protected_fifos = 2
 fs.protected_regular = 2
 
+# Restart 10 seconds after a kernel panic instead of hanging: a machine
+# without screen or keyboard comes back by itself, and a new kernel that
+# panics uses up its boot tries (the kernel command line says the same for
+# panics before this file is read).
+kernel.panic = 10
+
 # Loose reverse-path filter: strict mode breaks machines with WiFi and a
 # cable in the same network.
 net.ipv4.conf.all.rp_filter = 2
@@ -399,6 +405,56 @@ TimeoutStartSec=5min
 
 [Install]
 WantedBy=sysinit.target
+===== /etc/initcpio/post/dryserver-boot (0755)
+#!/bin/sh
+# dryserver: mkinitcpio runs this after it made a boot image. A unified
+# kernel image made under its staging name is checked, flushed to disk and
+# renamed into place, counted when a fallback kernel is installed. See
+# `dryserver boot status`.
+exec /usr/local/bin/dryserver boot place "$@"
+===== /etc/pacman.d/hooks/55-dryserver-boot-mark.hook (0644)
+# dryserver: a kernel is about to be replaced or removed, and with it its
+# modules. Its boot image gets one more try only, so a power cut before the
+# new image is made does not leave a kernel without modules as the one that
+# starts: it fails its boot check and the fallback kernel starts.
+[Trigger]
+Type = Path
+Operation = Remove
+Target = usr/lib/modules/*/vmlinuz
+
+[Action]
+Description = Giving the boot images of replaced kernels one more try...
+When = PreTransaction
+Exec = /usr/local/bin/dryserver boot mark
+NeedsTargets
+===== /etc/systemd/system/dryserver-boot-check.service (0644)
+[Unit]
+Description=Check that a newly installed kernel works
+Documentation=man:systemd-bless-boot.service(8)
+# Pulled in by boot-complete.target, which systemd-bless-boot pulls in only
+# when the boot loader counts this boot (a new kernel image). Only signs
+# from this machine itself count: a brain, mesh or internet that is down
+# must never make a good kernel bad. So nothing here waits for them, nor
+# for multi-user.target, which waits for k3s, which waits for the brain.
+After=local-fs.target sshd.service systemd-networkd.service
+Before=boot-complete.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/dryserver boot check
+StandardOutput=journal+console
+TimeoutStartSec=5min
+===== /etc/systemd/system/boot-complete.target.d/10-dryserver.conf (0644)
+# dryserver: a counted boot is good once dryserver's boot check passed.
+[Unit]
+Requires=dryserver-boot-check.service
+===== /etc/systemd/system.conf.d/10-dryserver-watchdog.conf (0644)
+# dryserver: a hardware watchdog, when the machine has one, restarts it when
+# the kernel or systemd hangs, so a new kernel that hangs uses up its tries
+# without someone at the machine.
+[Manager]
+RuntimeWatchdogSec=1min
 ===== /var/lib/iwd/=486f6d65204e657421.psk (0600)
 [Security]
 Passphrase=correct horse

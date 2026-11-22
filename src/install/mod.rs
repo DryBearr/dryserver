@@ -3,6 +3,7 @@
 //! installs; the demo backend only pretends, so the screens can be tried
 //! and tested anywhere.
 
+pub mod boot;
 mod demo;
 mod layout;
 mod precheck;

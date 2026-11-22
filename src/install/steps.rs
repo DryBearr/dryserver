@@ -194,7 +194,7 @@ impl Real {
     }
 
     /// Writes a file in the new system with exactly this mode.
-    fn write(&self, path: &str, mode: u32, content: impl AsRef<[u8]>) -> Result<()> {
+    pub(super) fn write(&self, path: &str, mode: u32, content: impl AsRef<[u8]>) -> Result<()> {
         let dst = self.target(path);
         fsx::mkdir_all(fsx::dir(&dst), 0o755)?;
         fsx::write_file(&dst, content, mode)?;
@@ -413,16 +413,27 @@ impl Real {
         self.write("/etc/mkinitcpio.conf", 0o644, lines.join("\n"))?;
 
         if !lay.uefi {
-            let grub = fsx::read_or_empty(self.target("/etc/default/grub"));
-            let _ = self.write("/etc/default/grub", 0o644, grub.replace("GRUB_TIMEOUT=5", "GRUB_TIMEOUT=1"));
+            // GRUB lists both kernels, the newest (linux) first and as the
+            // default; linux-lts is under "Advanced options", picked by
+            // hand only (no boot counting with GRUB here).
+            let mut grub = fsx::read_or_empty(self.target("/etc/default/grub")).replace("GRUB_TIMEOUT=5", "GRUB_TIMEOUT=1");
+            if !grub.contains("panic=") {
+                grub += &grub_panic();
+            }
+            self.write("/etc/default/grub", 0o644, grub)?;
             self.chroot(ctx, &["mkinitcpio", "-P"])?;
             self.chroot(ctx, &["grub-install", "--target=i386-pc", &ch.system_disk])?;
             return self.chroot(ctx, &["grub-mkconfig", "-o", "/boot/grub/grub.cfg"]);
         }
 
-        // UEFI: one unified kernel image, found by systemd-boot on its own.
+        // UEFI: a unified kernel image for each kernel, found by
+        // systemd-boot on its own. mkinitcpio makes them under staging
+        // names; its post hook (rendered with the system files) checks
+        // them and puts them in place, counted (see boot.rs).
         self.write("/etc/kernel/cmdline", 0o644, format!("{}\n", kernel_cmdline(enc, &root_uuid)))?;
-        self.write("/etc/mkinitcpio.d/linux.preset", 0o644, UKI_PRESET)?;
+        for k in boot::Kernel::ALL {
+            self.write(&format!("/etc/mkinitcpio.d/{}.preset", k.pkgbase()), 0o644, k.preset())?;
+        }
         if ch.enc() == Encryption::Tpm {
             self.write("/etc/kernel/uki.conf", 0o644, UKI_CONF)?;
             self.chroot(
@@ -438,10 +449,19 @@ impl Real {
         }
         let _ = fsx::mkdir_all(self.target("/boot/EFI/Linux"), 0o755);
         self.chroot(ctx, &["mkinitcpio", "-P"])?;
+        let made = boot::images(&self.target(boot::ESP_LINUX))?;
+        for k in boot::Kernel::ALL {
+            if !made.iter().any(|i| i.kernel == k) {
+                return Err(errf!("mkinitcpio made no boot image for {}; see the log", k.pkgbase()));
+            }
+        }
         self.chroot(ctx, &["bootctl", "install"])?;
-        // The default preset's plain initramfs files are not used with a UKI.
-        for f in ["/boot/initramfs-linux.img", "/boot/initramfs-linux-fallback.img"] {
-            let _ = std::fs::remove_file(self.target(f));
+        // The packages' own presets made plain initramfs files at pacstrap;
+        // the UKIs do not use them.
+        for k in boot::Kernel::ALL {
+            for f in [format!("/boot/initramfs-{}.img", k.pkgbase()), format!("/boot/initramfs-{}-fallback.img", k.pkgbase())] {
+                let _ = std::fs::remove_file(self.target(&f));
+            }
         }
         self.write("/boot/loader/loader.conf", 0o644, LOADER_CONF)
     }
@@ -571,6 +591,8 @@ mod tests {
         stuck: bool,
         /// pacstrap fails with these outputs first.
         failures: Mutex<Vec<String>>,
+        /// mkinitcpio -P "succeeds" without making the boot images.
+        no_images: bool,
     }
 
     impl Runner for FakeRunner {
@@ -616,6 +638,17 @@ mod tests {
                 ("pacstrap", _) => {
                     let mut f = self.failures.lock().unwrap();
                     if f.is_empty() { ok("") } else { (f.remove(0), Err("pacstrap failed: exit status 1".into())) }
+                }
+                // UEFI: mkinitcpio's post hook leaves a counted image for
+                // each kernel.
+                ("arch-chroot", _) if c.args.get(1..) == Some(&["mkinitcpio".to_string(), "-P".to_string()][..]) => {
+                    let esp = fsx::under(&c.args[0], boot::ESP_LINUX);
+                    if esp.is_dir() && !self.no_images {
+                        for k in boot::Kernel::ALL {
+                            let _ = std::fs::write(esp.join(k.counted(boot::TRIES, 0)), "uki");
+                        }
+                    }
+                    ok("")
                 }
                 ("blkid", _) => ok("1111-uuid\n"),
                 ("wg", Some("genkey")) => ok("PRIVATEKEY=\n"),
@@ -760,6 +793,23 @@ mod tests {
         assert!(read("/etc/mkinitcpio.conf").contains("sd-encrypt"), "mkinitcpio hooks not replaced");
         assert!(read("/etc/kernel/uki.conf").contains("PCRPrivateKey"), "UKI not signed for TPM");
         assert_eq!(read("/boot/loader/loader.conf"), LOADER_CONF);
+        // Two kernels, each with its own image; both signed through the one
+        // uki.conf (no preset names its own), so both unlock the disk.
+        assert!(pac.iter().any(|a| a == "linux") && pac.iter().any(|a| a == "linux-lts"), "{pac:?}");
+        assert_eq!(read("/etc/mkinitcpio.d/linux.preset"), UKI_PRESET);
+        assert_eq!(read("/etc/mkinitcpio.d/linux-lts.preset"), LTS_PRESET);
+        for p in [UKI_PRESET, LTS_PRESET] {
+            assert!(!p.contains("ukiconfig") && !p.contains("_config"), "{p}");
+        }
+        assert_eq!(read("/etc/kernel/cmdline"), "root=/dev/mapper/root rw quiet panic=10\n");
+        // What makes and checks the images came with the system files: the
+        // post hook ran inside mkinitcpio -P and left both, counted.
+        assert_eq!(mode(r.target(boot::POST_HOOK)).0, 0o755);
+        assert!(read(boot::MARK_HOOK).contains("Exec = /usr/local/bin/dryserver boot mark"));
+        assert!(read(boot::CHECK_UNIT_PATH).contains("ExecStart=/usr/local/bin/dryserver boot check"));
+        assert!(read(boot::COMPLETE_DROPIN).contains("Requires=dryserver-boot-check.service"));
+        assert!(r.target("/boot/EFI/Linux/arch-linux+3.efi").is_file() && r.target("/boot/EFI/Linux/arch-linux-lts+3.efi").is_file());
+        assert!(read("/usr/local/bin/dryserver") == "binary" && fr.index(&format!("arch-chroot {t} mkinitcpio -P")) > fr.index("genfstab"));
         assert_eq!(mode(r.target("/etc/cryptsetup-keys.d/data0.key")), (0o400, 512), "data keyfile");
         assert!(read("/etc/crypttab").contains("data0 UUID=1111-uuid /etc/cryptsetup-keys.d/data0.key"), "{}", read("/etc/crypttab"));
         assert_eq!(read("/usr/local/bin/k3s"), "k3s binary");
@@ -825,6 +875,14 @@ mod tests {
         let t = r.target.display().to_string();
         fr.index(&format!("arch-chroot {t} grub-install --target=i386-pc /dev/sda"));
         fr.index("mkfs.ext4 -F -q -L boot /dev/sda1");
+        // BIOS: both kernels in GRUB's menu (linux first), a panic restarts
+        // the machine, and no UKI presets: the packages' own make GRUB's
+        // initramfs files.
+        assert!(fr.find("pacstrap").args.iter().any(|a| a == "linux-lts"));
+        let grub = get(&r.target, "/etc/default/grub");
+        assert!(grub.starts_with("GRUB_TIMEOUT=1\n") && grub.ends_with(&grub_panic()), "{grub}");
+        assert!(fr.index(&format!("arch-chroot {t} mkinitcpio -P")) < fr.index(&format!("arch-chroot {t} grub-mkconfig")));
+        assert!(!r.target("/etc/mkinitcpio.d/linux.preset").exists() && !r.target("/etc/kernel/cmdline").exists());
         fr.index(&format!("arch-chroot {t} useradd --system -m -d /var/lib/dryreg -s /bin/sh dryreg"));
         {
             use std::os::unix::fs::PermissionsExt;
@@ -961,6 +1019,28 @@ mod tests {
             let i = cmds[from..].iter().position(|c| c.starts_with(prefix)).unwrap_or_else(|| panic!("{prefix:?} missing or out of order"));
             from += i + 1;
         }
+    }
+
+    #[test]
+    fn install_stops_without_both_boot_images() {
+        let (_dir, r, fr) = test_real(true, FakeRunner { no_images: true, ..FakeRunner::default() });
+        let ch = Choices {
+            role: Some(Role::Node),
+            hostname: "node-x".into(),
+            system_disk: "/dev/sda".into(),
+            encryption: Some(Encryption::None),
+            user_password: USER_PASS.into(),
+            ..Choices::default()
+        };
+        let err = r.install(&Ctx::new(), &r.cfg, &ch, Arc::new(|_| {})).unwrap_err().to_string();
+        assert!(err.contains("mkinitcpio made no boot image for linux"), "{err}");
+        assert!(!fr.strings().iter().any(|c| c.contains("bootctl install")), "a boot loader with nothing to start");
+        // One kernel's image alone is not enough either.
+        let (_dir, r, _) = test_real(true, FakeRunner { no_images: true, ..FakeRunner::default() });
+        std::fs::create_dir_all(r.target(boot::ESP_LINUX)).unwrap();
+        std::fs::write(r.target("/boot/EFI/Linux/arch-linux+3.efi"), "uki").unwrap();
+        let err = r.install(&Ctx::new(), &r.cfg, &ch, Arc::new(|_| {})).unwrap_err().to_string();
+        assert!(err.contains("no boot image for linux-lts"), "{err}");
     }
 
     #[test]

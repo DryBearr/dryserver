@@ -9,6 +9,7 @@ use std::net::Ipv4Addr;
 use crate::cidr::Cidr;
 use crate::config::{self, Config, Port};
 use crate::err::{Context, Result};
+use crate::install::boot;
 use crate::{backup, coredns, errf, fsx, packages, quarantine};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -128,6 +129,14 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
         // Reverts an update that was not confirmed in time, also after a
         // reboot in the middle of one (see src/update.rs).
         file(crate::update::GUARD_UNIT_PATH, 0o644, crate::update::GUARD_UNIT_TEXT),
+        // A kernel update that does not boot falls back to the other
+        // kernel (see src/install/boot.rs). Harmless where nothing is
+        // counted: BIOS machines, and ones installed without linux-lts.
+        file(boot::POST_HOOK, 0o755, boot::POST_HOOK_TEXT),
+        file(boot::MARK_HOOK, 0o644, boot::MARK_HOOK_TEXT),
+        file(boot::CHECK_UNIT_PATH, 0o644, boot::CHECK_UNIT_TEXT),
+        file(boot::COMPLETE_DROPIN, 0o644, boot::COMPLETE_DROPIN_TEXT),
+        file(boot::WATCHDOG_DROPIN, 0o644, boot::WATCHDOG_TEXT),
     ];
     if p.role == Role::Coordinator {
         files.push(file("/etc/cron.d/dryserver-scan", 0o644, SCAN_CRON));
@@ -672,6 +681,12 @@ kernel.yama.ptrace_scope = 1
 fs.protected_fifos = 2
 fs.protected_regular = 2
 
+# Restart 10 seconds after a kernel panic instead of hanging: a machine
+# without screen or keyboard comes back by itself, and a new kernel that
+# panics uses up its boot tries (the kernel command line says the same for
+# panics before this file is read).
+kernel.panic = 10
+
 # Loose reverse-path filter: strict mode breaks machines with WiFi and a
 # cable in the same network.
 net.ipv4.conf.all.rp_filter = 2
@@ -1118,6 +1133,27 @@ mod tests {
             before("pods", "udp dport { 53, 123 } accept", "ip daddr { 10.0.0.0/8");
             before("pods", "tcp dport 53 accept", "ip daddr { 10.0.0.0/8");
             before("pods", "oifname \"wg0\" ip daddr 10.66.0.1 tcp dport 6443 accept", "oifname \"wg0\" drop");
+        }
+    }
+
+    /// What makes a kernel update fall back reaches every machine, also
+    /// ones installed before: updates write these files again.
+    #[test]
+    fn every_machine_gets_the_boot_fallback() {
+        for (name, p) in cases() {
+            let files = render(&p).unwrap();
+            for (path, mode) in [
+                (boot::POST_HOOK, 0o755),
+                (boot::MARK_HOOK, 0o644),
+                (boot::CHECK_UNIT_PATH, 0o644),
+                (boot::COMPLETE_DROPIN, 0o644),
+                (boot::WATCHDOG_DROPIN, 0o644),
+            ] {
+                assert_eq!(find(&files, path).mode, mode, "{name}: {path}");
+                assert!(crate::update::managed(path), "{path} would not reach machines installed before");
+            }
+            let sysctl = &find(&files, "/etc/sysctl.d/90-dryserver.conf").content;
+            assert!(sysctl.contains(&format!("\nkernel.panic = {}\n", boot::PANIC_SECS)), "{name}: {sysctl}");
         }
     }
 
