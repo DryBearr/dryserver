@@ -2117,6 +2117,11 @@ pub struct Rollout {
     /// from before: its start).
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub wait_since: i64,
+    /// When the brain's own update began (its apply), on its clock, while
+    /// it runs or waits for its confirm; 0: none. One that takes longer
+    /// than TURN_TIMEOUT is shown as needing the admin.
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub brain_since: i64,
     /// Root's last tick on the brain's clock (not handed to the registry),
     /// and when its ticks went on after a gap or a jump of its clock.
     #[serde(skip_serializing_if = "is_zero_i64")]
@@ -2607,6 +2612,10 @@ impl Brain<'_> {
         // The brain's own k3s is the control plane's.
         let offer = Offer { serial: self.r.serial, turn: true, brain_k3s: self.rep.k3s.clone(), ..Offer::default() };
         self.own_step(&offer);
+        // For status: how long its own update runs (a hung one would
+        // otherwise only say that the coordinator updates itself, for ever).
+        let l = m.load();
+        self.r.brain_since = if l.pending != 0 { l.applied.max(1) } else { 0 };
         if m.installed_serial() >= self.r.serial {
             if let Some(why) = self.served_k3s_problem() {
                 // Every server that runs another k3s would refuse it, one
@@ -3156,6 +3165,29 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
         }
         Phase::Brain if r.wait_for != 0 => {
             out.push((format!("The coordinator updates itself first, once {} finished the update it is in.", name(r.wait_for)), false))
+        }
+        Phase::Brain if r.brain_since != 0 => {
+            let age = (now - r.brain_since).max(0);
+            let says = members
+                .iter()
+                .find(|m| m.host == 1)
+                .and_then(|m| m.report.as_ref())
+                .map(|rep| if rep.update_note.is_empty() { rep.update.clone() } else { format!("{}: {}", rep.update, rep.update_note) })
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(", its update says {}", shown(&s, 200)))
+                .unwrap_or_default();
+            let ran = report::short_age(age as u64);
+            if age > TURN_TIMEOUT {
+                out.push((
+                    format!(
+                        "The coordinator's own update runs for {ran}, longer than {}{says}: look at it there (sudo dryserver update status).",
+                        report::short_age(TURN_TIMEOUT as u64)
+                    ),
+                    true,
+                ));
+            } else {
+                out.push((format!("The coordinator updates itself first ({ran}{says})."), false));
+            }
         }
         Phase::Brain => out.push(("The coordinator updates itself first.".into(), false)),
         Phase::Failed => {

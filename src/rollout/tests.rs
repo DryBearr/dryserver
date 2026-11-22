@@ -965,6 +965,33 @@ fn a_swarm_of_one_brain() {
 
 // ---- the brain ----
 
+/// The brain's own update had no time limit: a hung apply showed "The
+/// coordinator updates itself first." for ever. Now status says how long
+/// it runs and what it says, and past TURN_TIMEOUT that it needs a look.
+#[test]
+fn review_a_brain_update_that_hangs_is_shown_to_need_a_look() {
+    let mut sw = Swarm::new(1);
+    sw.brain.fake.sim().slow = 100_000;
+    sw.publish(10, true);
+    sw.until(3, |s| s.brain.fake.sim().pending == 10);
+    sw.tick();
+    let flagged = |sw: &Swarm| {
+        let s = sw.store.read().unwrap();
+        lines(&s.rollout, &s.members, sw.now).into_iter().find(|(l, _)| l.contains("coordinator")).unwrap()
+    };
+    let (line, admin) = flagged(&sw);
+    assert!(line.starts_with("The coordinator updates itself first (") && line.contains("its update says pending") && !admin, "{line}");
+    sw.ticks(TURN_TIMEOUT as usize / 60 + 1);
+    let (line, admin) = flagged(&sw);
+    assert!(line.contains("own update runs for 1h") && line.contains("sudo dryserver update status") && admin, "{line}");
+    assert!(sw.servers.iter().all(|m| m.fake.sim().applied.is_empty()), "nothing else moves");
+    // Done after all: on it goes.
+    sw.brain.fake.sim().busy = 0;
+    sw.until(5, |s| s.installed(1) == 10);
+    sw.tick();
+    assert_eq!(sw.rollout().brain_since, 0);
+}
+
 #[test]
 fn a_brain_whose_update_fails_touches_no_server() {
     let mut sw = Swarm::new(2);
