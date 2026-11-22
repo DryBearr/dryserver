@@ -236,6 +236,8 @@ fn last_line(s: &str, quiet: bool) -> String {
 /// The most output kept from one command (the rest is still logged line
 /// by line).
 pub const MAX_KEPT: usize = 32 << 20;
+/// The longest line logged in one piece.
+pub const MAX_LINE: usize = 64 << 10;
 
 pub struct Lines {
     emit: LogFn,
@@ -260,6 +262,11 @@ impl Lines {
                 (self.emit)(&line);
             }
             self.pending.drain(..=i);
+        }
+        // A line that never ends (one more way to fill this one's memory)
+        // is logged in pieces.
+        if self.pending.len() > MAX_LINE {
+            self.flush();
         }
     }
 
@@ -311,6 +318,14 @@ mod tests {
             l.write(b"\n");
         }
         assert_eq!(l.all.len(), MAX_KEPT, "a command that prints for ever must not fill the memory");
+        // Nor one line that never ends.
+        let (emit, got) = collect();
+        let mut l = Lines::new(emit);
+        for _ in 0..40 {
+            l.write(&chunk);
+        }
+        assert!(l.pending.len() <= MAX_LINE + chunk.len(), "{}", l.pending.len());
+        assert!(got.lock().unwrap().len() >= 39 && l.all.len() == MAX_KEPT);
     }
 
     fn collect() -> (LogFn, Arc<Mutex<Vec<String>>>) {
