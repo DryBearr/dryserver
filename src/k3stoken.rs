@@ -35,15 +35,27 @@
 //!
 //! Limit: the registry account can send a server a token the coordinator
 //! sealed for it before: an older one, which no longer works there.
+//!
+//! A bootstrap token itself registers any node name. What ties a name to
+//! one server is its node password: k3s keeps a hash of it per name in the
+//! cluster (the secret `<name>.node-password.k3s`, see password_hash) and
+//! gives a kubelet certificate for that name only to an agent that shows
+//! it (`/etc/rancher/node/password` on the agent). Root makes a password
+//! for each server, puts its hash in the cluster before it hands out the
+//! server's token, and seals the password together with the token: a
+//! server holding a token, even before it joined, cannot take another
+//! server's name, as it does not know that server's password.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use base64::Engine;
+
 use crate::ctx::Ctx;
 use crate::err::Result;
 use crate::runner::{Cmd, Runner};
-use crate::{bail, fsx};
+use crate::{bail, fsx, registry};
 
 /// What the coordinator's host key signs sealed tokens as.
 pub const NAMESPACE: &str = "dryserver-k3s-token";
@@ -58,6 +70,22 @@ pub const MAX_TOKEN: usize = 512;
 const MAX_KEY: usize = 128;
 const AGE_BEGIN: &str = "-----BEGIN AGE ENCRYPTED FILE-----";
 const SIG_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
+/// The line after the token that carries the node password.
+const PASSWORD_LINE: &str = "node-password ";
+/// The suffix of the secret in which k3s keeps a node name's password
+/// hash (namespace kube-system).
+pub const PASSWORD_SECRET: &str = ".node-password.k3s";
+/// The secret type k3s gives those secrets.
+pub const PASSWORD_TYPE: &str = "k3s.cattle.io/node-password";
+/// k3s's scrypt parameters (pkg/authenticator/hash): N = 2^15, r 8, p 1,
+/// 64 bytes, 8 bytes of salt. Lower in tests, which hash a lot.
+#[cfg(not(test))]
+const HASH_LOG_N: u32 = 15;
+#[cfg(test)]
+const HASH_LOG_N: u32 = 4;
+const HASH_R: usize = 8;
+const HASH_P: usize = 1;
+const HASH_LEN: usize = 64;
 
 /// The token for one member, as root on the coordinator made it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -148,17 +176,161 @@ pub fn signed_text(host: u32, key: &str, age: &str) -> String {
     format!("dryserver-k3s-token-v1\nhost {host}\nkey {key}\n{age}")
 }
 
-/// Seals token for the member host with SSH host key key, signed with
-/// the coordinator's private host key at host_key.
-pub fn seal(ctx: &Ctx, run: &dyn Runner, token: &str, host: u32, key: &str, host_key: &Path) -> Result<Sealed> {
+/// What a sealed token holds, opened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Opened {
+    pub token: String,
+    /// The node password for the agent; none from a coordinator of an
+    /// older version, which bound no name (the agent makes its own then).
+    pub password: Option<String>,
+}
+
+/// What is wrong with a node password, if anything: k3s makes 32 hex
+/// characters, and so does new_password.
+pub fn password_problem(p: &str) -> Option<&'static str> {
+    if !(16..=64).contains(&p.len()) || !p.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Some("not a node password");
+    }
+    None
+}
+
+/// A new node password, as k3s makes one: 16 random bytes in hex.
+pub fn new_password() -> String {
+    fsx::hex(&fsx::random_bytes(16))
+}
+
+/// The name of the secret in kube-system that holds the password hash of
+/// node name (k3s's nodepassword.getSecretName).
+pub fn password_secret(name: &str) -> String {
+    format!("{name}{PASSWORD_SECRET}").to_lowercase()
+}
+
+/// The hash k3s keeps of a node password and checks an agent's against:
+/// "$1:<salt hex>:<log2 N>:<r>:<p>:<key, base64 without padding>", scrypt
+/// with a new salt (k3s's hash.SCrypt, CreateHash).
+pub fn password_hash(password: &str) -> String {
+    hash_with(password, &fsx::random_bytes(8), HASH_LOG_N, HASH_R, HASH_P)
+}
+
+fn hash_with(password: &str, salt: &[u8], log_n: u32, r: usize, p: usize) -> String {
+    let key = scrypt(password.as_bytes(), salt, log_n, r, p, HASH_LEN);
+    let enc = base64::engine::general_purpose::STANDARD_NO_PAD.encode(key);
+    format!("$1:{}:{log_n}:{r}:{p}:{enc}", fsx::hex(salt))
+}
+
+/// Whether hash (password_hash's form) is of password, as k3s checks it.
+#[cfg(test)]
+pub fn hash_matches(hash: &str, password: &str) -> bool {
+    let f: Vec<&str> = hash.split(':').collect();
+    let [v, salt, n, r, p, enc] = f.as_slice() else { return false };
+    let salt: Option<Vec<u8>> =
+        (0..salt.len() / 2).map(|i| salt.get(2 * i..2 * i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect();
+    let (Some(salt), Ok(n), Ok(r), Ok(p)) = (salt, n.parse::<u32>(), r.parse::<usize>(), p.parse::<usize>()) else {
+        return false;
+    };
+    let Ok(want) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(enc) else { return false };
+    *v == "$1" && n < 20 && scrypt(password.as_bytes(), &salt, n, r, p, want.len()) == want
+}
+
+/// scrypt (RFC 7914) with HMAC-SHA256.
+fn scrypt(password: &[u8], salt: &[u8], log_n: u32, r: usize, p: usize, len: usize) -> Vec<u8> {
+    let block = 128 * r;
+    let words = block / 4;
+    let n = 1usize << log_n;
+    let mut b = pbkdf2_sha256(password, salt, p * block);
+    let mut v = vec![0u32; n * words];
+    let (mut x, mut y) = (vec![0u32; words], vec![0u32; words]);
+    for chunk in b.chunks_mut(block) {
+        for (w, c) in x.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *w = u32::from_le_bytes(*c);
+        }
+        for i in 0..n {
+            v[i * words..(i + 1) * words].copy_from_slice(&x);
+            block_mix(&x, &mut y, r);
+            std::mem::swap(&mut x, &mut y);
+        }
+        for _ in 0..n {
+            let j = (x[words - 16] as usize) & (n - 1);
+            for (a, b) in x.iter_mut().zip(&v[j * words..(j + 1) * words]) {
+                *a ^= b;
+            }
+            block_mix(&x, &mut y, r);
+            std::mem::swap(&mut x, &mut y);
+        }
+        for (c, w) in chunk.as_chunks_mut::<4>().0.iter_mut().zip(&x) {
+            c.copy_from_slice(&w.to_le_bytes());
+        }
+    }
+    pbkdf2_sha256(password, &b, len)
+}
+
+/// PBKDF2-HMAC-SHA256 with one iteration, as scrypt uses it.
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 32);
+    let mut i = 1u32;
+    while out.len() < len {
+        let mut msg = salt.to_vec();
+        msg.extend_from_slice(&i.to_be_bytes());
+        out.extend_from_slice(&registry::hmac_sha256(password, &msg));
+        i += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+/// scrypt's BlockMix with Salsa20/8 over 2r blocks of 16 words.
+fn block_mix(input: &[u32], out: &mut [u32], r: usize) {
+    let mut t = [0u32; 16];
+    t.copy_from_slice(&input[(2 * r - 1) * 16..2 * r * 16]);
+    for i in 0..2 * r {
+        for (a, b) in t.iter_mut().zip(&input[i * 16..(i + 1) * 16]) {
+            *a ^= b;
+        }
+        salsa20_8(&mut t);
+        let at = if i % 2 == 0 { i / 2 } else { r + i / 2 } * 16;
+        out[at..at + 16].copy_from_slice(&t);
+    }
+}
+
+fn salsa20_8(b: &mut [u32; 16]) {
+    let mut x = *b;
+    let qr = |x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize| {
+        x[b] ^= x[a].wrapping_add(x[d]).rotate_left(7);
+        x[c] ^= x[b].wrapping_add(x[a]).rotate_left(9);
+        x[d] ^= x[c].wrapping_add(x[b]).rotate_left(13);
+        x[a] ^= x[d].wrapping_add(x[c]).rotate_left(18);
+    };
+    for _ in 0..4 {
+        qr(&mut x, 0, 4, 8, 12);
+        qr(&mut x, 5, 9, 13, 1);
+        qr(&mut x, 10, 14, 2, 6);
+        qr(&mut x, 15, 3, 7, 11);
+        qr(&mut x, 0, 1, 2, 3);
+        qr(&mut x, 5, 6, 7, 4);
+        qr(&mut x, 10, 11, 8, 9);
+        qr(&mut x, 15, 12, 13, 14);
+    }
+    for (a, b) in b.iter_mut().zip(x) {
+        *a = a.wrapping_add(b);
+    }
+}
+
+/// Seals token and the agent's node password for the member host with
+/// SSH host key key, signed with the coordinator's private host key at
+/// host_key.
+pub fn seal(ctx: &Ctx, run: &dyn Runner, token: &str, password: &str, host: u32, key: &str, host_key: &Path) -> Result<Sealed> {
     if let Some(p) = problem(token) {
         bail!("the cluster token is {p}");
+    }
+    if let Some(p) = password_problem(password) {
+        bail!("the node password is {p}");
     }
     if !is_ed25519(key) {
         bail!("{key:?} is not one ssh-ed25519 key");
     }
+    let plain = format!("{token}\n{PASSWORD_LINE}{password}\n");
     let age = run
-        .output(ctx, &Cmd::new("age", &["--encrypt", "--armor", "--recipient", key]).stdin(token).quiet().stdout_only())
+        .output(ctx, &Cmd::new("age", &["--encrypt", "--armor", "--recipient", key]).stdin(plain).quiet().stdout_only())
         .map_err(|e| e.wrap("encrypt the cluster token (is age installed?)"))?;
     let k = host_key.display().to_string();
     let sig = run
@@ -174,10 +346,11 @@ pub fn seal(ctx: &Ctx, run: &dyn Runner, token: &str, host: u32, key: &str, host
     Ok(s)
 }
 
-/// The token in s, for the member me whose SSH host key is my_key and
-/// whose private host key is at identity. coord_key is the coordinator's
-/// host key as the admin signed it. tmp_dir takes the two small files
-/// ssh-keygen needs for the check, removed after it.
+/// The token in s, and the node password with it, for the member me
+/// whose SSH host key is my_key and whose private host key is at
+/// identity. coord_key is the coordinator's host key as the admin signed
+/// it. tmp_dir takes the two small files ssh-keygen needs for the check,
+/// removed after it.
 #[allow(clippy::too_many_arguments)]
 pub fn open(
     ctx: &Ctx,
@@ -188,7 +361,7 @@ pub fn open(
     coord_key: &str,
     identity: &Path,
     tmp_dir: &Path,
-) -> Result<String> {
+) -> Result<Opened> {
     if let Some(p) = s.problem() {
         bail!("the coordinator sent a cluster token that is {p}");
     }
@@ -207,11 +380,19 @@ pub fn open(
     let out = run
         .output(ctx, &Cmd::new("age", &["--decrypt", "--identity", &id]).stdin(s.age.clone()).quiet().stdout_only())
         .map_err(|e| e.wrap("cannot decrypt the cluster token with this machine's host key"))?;
-    let token = out.trim();
+    // The token alone (a coordinator of an older version), or with the
+    // node password on the next line.
+    let (token, password) = match out.trim().split_once('\n') {
+        None => (out.trim(), None),
+        Some((token, rest)) => match rest.strip_prefix(PASSWORD_LINE) {
+            Some(p) if password_problem(p).is_none() => (token, Some(p.to_string())),
+            _ => bail!("the coordinator sent a cluster token that is not a k3s token"),
+        },
+    };
     if let Some(p) = problem(token) {
         bail!("the coordinator sent a cluster token that is {p}");
     }
-    Ok(token.to_string())
+    Ok(Opened { token: token.to_string(), password })
 }
 
 /// Checks an SSH signature by key over text, through ssh-keygen.
@@ -352,6 +533,54 @@ mod tests {
         dir.join(name)
     }
 
+    /// A node password as new_password makes one.
+    const PW: &str = "00112233445566778899aabbccddeeff";
+
+    fn opened() -> Opened {
+        Opened { token: TOKEN.into(), password: Some(PW.into()) }
+    }
+
+    /// scrypt against RFC 7914 and Python's hashlib.scrypt, and the hash
+    /// in the form k3s reads (pkg/authenticator/hash, VerifyHash).
+    #[test]
+    fn the_node_password_hash_is_the_one_k3s_checks() {
+        let hex = |b: &[u8]| fsx::hex(b);
+        assert_eq!(
+            hex(&pbkdf2_sha256(b"passwd", b"salt", 64)),
+            "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
+        );
+        assert_eq!(
+            hex(&scrypt(b"", b"", 4, 1, 1, 64)),
+            "77d6576238657b203b19ca42c18a0497f16b4844e3074ae8dfdffa3fede21442fcd0069ded0948f8326a753a0fc81f17e8d3e0fb2e0d3628cf35e20c38d18906"
+        );
+        assert_eq!(
+            hex(&scrypt(b"password", b"NaCl", 10, 8, 16, 64)),
+            "fdbabe1c9d3472007856e7190d01e9fe7c6ad7cbc8237830e77376634b3731622eaf30d92e22a3886ff109279d9830dac727afb94a83ee6d8360cbdfa2cc0640"
+        );
+        let salt = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(
+            hex(&scrypt(b"0123456789abcdef0123456789abcdef", &salt, 10, 8, 1, 64)),
+            "291e12ade72f35114dc29b530fe3d933a26d19fe28155a963e4e490023e5b514e8b14dadf74c9f94aa1f20f717cee9fd46d16e16e7d26ccfb042f1feb32caf8d"
+        );
+        assert_eq!(
+            hash_with("0123456789abcdef0123456789abcdef", &salt, 4, 8, 1),
+            "$1:0102030405060708:4:8:1:pGr++1yswNxP08QKoNdGOoQl9n1Yw1CunqkLx3ZhzCpNZbUD4OILJxfY6XM9spDDfRbKRNqbREEGOTK/TVlStw"
+        );
+        // A new salt every time, and only the password matches.
+        let (a, b) = (password_hash(PW), password_hash(PW));
+        assert_ne!(a, b);
+        assert!(a.starts_with("$1:") && a.contains(&format!(":{HASH_LOG_N}:8:1:")), "{a}");
+        assert!(hash_matches(&a, PW) && hash_matches(&b, PW) && !hash_matches(&a, &PW.replace('0', "1")));
+        // The form k3s makes.
+        let pw = new_password();
+        assert_eq!((pw.len(), password_problem(&pw)), (32, None));
+        assert_ne!(pw, new_password());
+        for bad in ["", "short", &"a".repeat(65), "0123456789ABCDEF0123", "0123456789abcdef\n0123", "0123456789abcdef 0123"] {
+            assert!(password_problem(bad).is_some(), "{bad:?}");
+        }
+        assert_eq!(password_secret("node-c"), "node-c.node-password.k3s");
+    }
+
     #[test]
     fn the_form_of_a_token_for_agents() {
         assert_eq!(problem(TOKEN), None);
@@ -383,7 +612,7 @@ mod tests {
         let (coord_key, node_key) = (host_key(&dir, "coord", COORD), host_key(&dir, "node", NODE));
         let tools = Tools(Mutex::new(Vec::new()));
         let ctx = Ctx::new();
-        let s = seal(&ctx, &tools, TOKEN, 2, NODE, &coord_key).unwrap();
+        let s = seal(&ctx, &tools, TOKEN, PW, 2, NODE, &coord_key).unwrap();
         assert_eq!(s.problem(), None);
         assert!(!format!("{s:?}").contains("0123456789abcdef"), "the token itself is in the sealed one: {s:?}");
         // On stdin only, and nothing logged of what carries it.
@@ -392,7 +621,7 @@ mod tests {
             assert!(c.quiet, "{c} logs its output");
         }
         let open = |s: &Sealed, me: u32, my: &str, coord: &str| open(&ctx, &tools, s, me, my, coord, &node_key, dir.path());
-        assert_eq!(open(&s, 2, NODE, COORD).unwrap(), TOKEN);
+        assert_eq!(open(&s, 2, NODE, COORD).unwrap(), opened());
         let left: Vec<_> =
             std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("k3s")).collect();
         assert!(left.is_empty(), "the check left files behind: {left:?}");
@@ -404,7 +633,7 @@ mod tests {
             (Sealed { host: 3, ..s.clone() }, "made for another machine"),
             (Sealed { key: other.into(), ..s.clone() }, "another SSH host key"),
             // Its host number changed to this machine's: the signature says no.
-            (Sealed { host: 2, ..seal(&ctx, &tools, TOKEN, 3, NODE, &coord_key).unwrap() }, "not signed by the coordinator"),
+            (Sealed { host: 2, ..seal(&ctx, &tools, TOKEN, PW, 3, NODE, &coord_key).unwrap() }, "not signed by the coordinator"),
             (forged, "not signed by the coordinator"),
             (Sealed { sig: s.sig.replacen(SIG_BEGIN, &format!("{SIG_BEGIN}\n00"), 1), ..s.clone() }, "not signed by the coordinator"),
             // Signed by the coordinator, encrypted to another key.
@@ -431,14 +660,29 @@ mod tests {
         // Signed by the coordinator, but junk inside: never a token.
         let junk = seal_any(&tools, &ctx, "K10abc::node:x", &coord_key);
         assert!(open(&junk, 2, NODE, COORD).unwrap_err().to_string().contains("without the hash"));
+        for junk in [
+            format!("{TOKEN}\nnode-password short\n"),
+            format!("{TOKEN}\nserver: https://evil\n"),
+            format!("{TOKEN}\nnode-password {PW}\nmore\n"),
+            format!("node-password {PW}\n{TOKEN}\n"),
+        ] {
+            let s = seal_any(&tools, &ctx, &junk, &coord_key);
+            assert!(open(&s, 2, NODE, COORD).unwrap_err().to_string().contains("not a k3s token"), "{junk:?}");
+        }
+        // A coordinator of an older version sealed the token alone: the
+        // agent makes its own password then.
+        let old = seal_any(&tools, &ctx, &format!("{TOKEN}\n"), &coord_key);
+        assert_eq!(open(&old, 2, NODE, COORD).unwrap(), Opened { token: TOKEN.into(), password: None });
+        assert!(seal(&ctx, &tools, TOKEN, "not hex", 2, NODE, &coord_key).unwrap_err().to_string().contains("node password"));
+        assert!(!format!("{s:?}").contains(PW) && !tools.0.lock().unwrap().iter().any(|c| c.args.join(" ").contains(PW)));
         // The coordinator's key from the signed list is not an ed25519 key.
         assert!(open(&s, 2, NODE, "").unwrap_err().to_string().contains("no ssh-ed25519 key"));
         assert!(open(&s, 2, NODE, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIother").unwrap_err().to_string().contains("not signed"));
         // Nothing is sealed from a token that is not one, or for a key
         // that is not one.
-        assert!(seal(&ctx, &tools, "K10abc::server:x", 2, NODE, &coord_key).is_err());
-        assert!(seal(&ctx, &tools, TOKEN, 2, "ssh-rsa AAAAB3NzaC1yc2E", &coord_key).is_err());
-        assert!(seal(&ctx, &tools, TOKEN, 2, NODE, &dir.join("missing")).unwrap_err().to_string().contains("sign the cluster token"));
+        assert!(seal(&ctx, &tools, "K10abc::server:x", PW, 2, NODE, &coord_key).is_err());
+        assert!(seal(&ctx, &tools, TOKEN, PW, 2, "ssh-rsa AAAAB3NzaC1yc2E", &coord_key).is_err());
+        assert!(seal(&ctx, &tools, TOKEN, PW, 2, NODE, &dir.join("missing")).unwrap_err().to_string().contains("sign the cluster token"));
     }
 
     /// Seals whatever text, as a coordinator gone wrong would.
@@ -497,12 +741,12 @@ mod tests {
         };
         let ((coord, coord_pub), (node, node_pub), (other, _)) = (make("coord"), make("node"), make("other"));
         let (run, ctx) = (Half(ExecRunner::silent()), Ctx::new());
-        let s = seal(&ctx, &run, TOKEN, 2, &node_pub, &coord).unwrap();
+        let s = seal(&ctx, &run, TOKEN, PW, 2, &node_pub, &coord).unwrap();
         assert!(s.sig.starts_with(SIG_BEGIN) && s.sig.len() < 1000, "{}", s.sig);
-        assert_eq!(open(&ctx, &run, &s, 2, &node_pub, &coord_pub, &node, dir.path()).unwrap(), TOKEN);
+        assert_eq!(open(&ctx, &run, &s, 2, &node_pub, &coord_pub, &node, dir.path()).unwrap(), opened());
         for (bad, why) in [
-            (seal(&ctx, &run, TOKEN, 2, &node_pub, &other).unwrap(), "signed by another key"),
-            (Sealed { host: 2, ..seal(&ctx, &run, TOKEN, 3, &node_pub, &coord).unwrap() }, "made for host 3"),
+            (seal(&ctx, &run, TOKEN, PW, 2, &node_pub, &other).unwrap(), "signed by another key"),
+            (Sealed { host: 2, ..seal(&ctx, &run, TOKEN, PW, 3, &node_pub, &coord).unwrap() }, "made for host 3"),
             (Sealed { age: fake::encrypt(&node_pub, TOKEN2), ..s.clone() }, "another token under its signature"),
         ] {
             let e = open(&ctx, &run, &bad, 2, &node_pub, &coord_pub, &node, dir.path()).unwrap_err().to_string();
@@ -538,9 +782,9 @@ mod tests {
         };
         let ((coord, coord_pub), (node, node_pub), (other, other_pub)) = (make("coord"), make("node"), make("other"));
         let (run, ctx) = (ExecRunner::silent(), Ctx::new());
-        let s = seal(&ctx, &run, TOKEN, 2, &node_pub, &coord).unwrap();
+        let s = seal(&ctx, &run, TOKEN, PW, 2, &node_pub, &coord).unwrap();
         assert!(!s.age.contains("0123456789abcdef") && s.age.len() < 1500 && s.sig.len() < 1000, "{s:?}");
-        assert_eq!(open(&ctx, &run, &s, 2, &node_pub, &coord_pub, &node, dir.path()).unwrap(), TOKEN);
+        assert_eq!(open(&ctx, &run, &s, 2, &node_pub, &coord_pub, &node, dir.path()).unwrap(), opened());
         // Signed by the coordinator for another machine, but encrypted to
         // this one: that machine's key opens nothing.
         let k = coord.display().to_string();
@@ -550,9 +794,9 @@ mod tests {
         let e = open(&ctx, &run, &moved, 2, &other_pub, &coord_pub, &other, dir.path()).unwrap_err().to_string();
         assert!(e.contains("cannot decrypt"), "{e}");
         // Another key signs nothing that passes.
-        let forged = seal(&ctx, &run, TOKEN, 2, &node_pub, &other).unwrap();
+        let forged = seal(&ctx, &run, TOKEN, PW, 2, &node_pub, &other).unwrap();
         assert!(open(&ctx, &run, &forged, 2, &node_pub, &coord_pub, &node, dir.path()).unwrap_err().to_string().contains("not signed"));
-        let s3 = seal(&ctx, &run, TOKEN, 3, &node_pub, &coord).unwrap();
+        let s3 = seal(&ctx, &run, TOKEN, PW, 3, &node_pub, &coord).unwrap();
         assert!(open(&ctx, &run, &Sealed { host: 2, ..s3 }, 2, &node_pub, &coord_pub, &node, dir.path()).is_err());
         let left: Vec<_> =
             std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("k3s")).collect();

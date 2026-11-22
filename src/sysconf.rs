@@ -227,6 +227,10 @@ pub const K3S_CONFIG: &str = "/etc/rancher/k3s/config.yaml";
 /// A server's token for joining the cluster, handed out by the coordinator
 /// to members over the mesh.
 pub const K3S_TOKEN: &str = "/etc/rancher/k3s/token";
+/// A server's node password, which k3s takes as proof that the server is
+/// the one its node name belongs to; root on the coordinator makes it and
+/// seals it with the token (k3stoken.rs).
+pub const K3S_NODE_PASSWORD: &str = "/etc/rancher/node/password";
 /// On the coordinator: the secret agents join with, made at install. With
 /// none of its own, k3s hands agents the server's token, and that one
 /// opens the control plane's own doors (its certificate authority).

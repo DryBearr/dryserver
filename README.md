@@ -556,9 +556,27 @@ mesh, so it no longer reaches the cluster.
 Each server joins with a token of its own (`k3s token create`, good for a
 day): the coordinator's sync makes one for every server the admin signed
 that is not in the cluster yet, seals it for that server and deletes it
-once the server's node is there. A server whose node is deleted by hand
-(`k3s kubectl delete node NAME`) gets a new one within a minute; that is
-also the way back for a server whose certificate is gone or ran out.
+once the server's node is there. With the token goes a node password made
+for that server's name: k3s gives a certificate for a name only to the
+machine with its password, so no token takes another server's name.
+
+A server that was in the cluster never gets a token again, also when its
+node is gone (`k3s kubectl delete node NAME`, or the server deleted it
+itself): with one, a hacked server could leave the cluster and take the
+name of a server that has not joined yet. The coordinator's console says
+so. Its node comes back when k3s starts again on it (`sudo systemctl
+restart k3s` there), with its certificate. A server whose certificate is
+gone or ran out: remove it in `./dryserver approve`, run `sudo dryserver
+join` on it and approve it again.
+
+A name that a machine registered in the cluster without that name's
+password (a server that held a token before it joined, or one of an older
+dryserver with the shared token) is taken: k3s gave that machine a
+certificate for the name, good for a year. The coordinator deletes a node
+under it at every sync, gives no server a token for it, and its console
+shows an alarm (`/etc/dryserver/k3s-taken.json` holds when and how). Find
+the server that did it; to have a server under that name in the cluster,
+install it again under another name.
 
 Older versions handed every server one shared token, made from the secret
 in `/etc/rancher/k3s/agent-token` on the coordinator. With it, any of those
@@ -988,9 +1006,21 @@ ended.
   k3s takes for its own name only. One token for all servers would let a
   hacked server register a node under the name of a server you just
   approved, before that one does: k3s would then turn the real one away
-  and send that server's pods and their secrets to the hacked one. A server
-  takes only a token made for its own key and signed by the coordinator in
-  the signed list. Anything else changes nothing (nothing written, k3s not
+  and send that server's pods and their secrets to the hacked one. A token
+  of its own alone is not enough either, as a bootstrap token registers
+  any name: a server holding one before it joined could take another
+  name with it. So each token comes with a node password made for that
+  server's name, sealed with it; root puts the password's hash into the
+  cluster (k3s's secret `NAME.node-password.k3s`, marked as root's and
+  kept until the server leaves) before it hands out the token, and k3s
+  gives a certificate for the name only to the machine that shows the
+  password. A node under a server's name counts as that server's only
+  with that password; a name a machine took without it is kept from every
+  server for a year (see [A new cluster token](#a-new-cluster-token)). A
+  server that was in the cluster never gets a token again, so leaving the
+  cluster on purpose gets a hacked server nothing. A server takes only a
+  token made for its own key and signed by the coordinator in the signed
+  list. Anything else changes nothing (nothing written, k3s not
   restarted) and is logged once. Encrypting alone would not do: anyone can
   encrypt to a public key, and a token carrying the hash of another
   certificate authority would have the server trust whoever answers on the
@@ -1004,7 +1034,11 @@ ended.
     token](#a-new-cluster-token)); the coordinator says so until you do. A
     server on an older dryserver that has not joined yet joins once it is
     updated (a rollout updates the coordinator first); an updated server
-    never takes a token from an older coordinator.
+    never takes a token from an older coordinator. Servers in the cluster
+    keep the node passwords k3s made for them.
+  - Limit: a machine that got a certificate for a name while the
+    coordinator's sync did not run for ten minutes (k3s forgets the
+    password of a name without a node then) is not seen.
   - Limit: the registry account can send a server an older token the
     coordinator sealed for it, which then fails; the next one arrives at
     the next sync the account lets through.
