@@ -503,15 +503,28 @@ impl State {
 /// registry user, which runs serve.
 pub const DEFAULT_PATH: &str = "/var/lib/dryserver/registry.json";
 
+/// The most the registry file may hold. Its largest honest content (254
+/// members with their reports, the signed list, the waiting requests, the
+/// scan report) is a few MiB; whoever writes more is not read.
+pub const MAX_FILE: u64 = 16 << 20;
+/// How long a caller waits for the registry file's lock. Each holder keeps
+/// it for one read and one write. The registry account owns the lock file
+/// and could hold it for ever: then the caller gives up and fails (root's
+/// sync fails for that minute, after the automatic cut, and leaves the
+/// mesh, the cluster and the rollout as they are; the next sync tries
+/// again).
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The registry file, guarded by an exclusive lock.
 #[derive(Debug, Clone)]
 pub struct Store {
     pub path: PathBuf,
+    pub lock_wait: std::time::Duration,
 }
 
 impl Store {
     pub fn new(path: impl Into<PathBuf>) -> Store {
-        Store { path: path.into() }
+        Store { path: path.into(), lock_wait: LOCK_WAIT }
     }
 
     pub fn default_path() -> Store {
@@ -540,17 +553,42 @@ impl Store {
         fsx::mkdir_all(&parent, 0o700)?;
         let dir = Dir::open(&parent)?;
         let name = self.name()?;
-        let lock = dir.open_regular(&format!("{name}.lock"), libc::O_RDONLY | libc::O_CREAT)?;
+        let lock_name = format!("{name}.lock");
+        let lock = dir.open_regular(&lock_name, libc::O_RDONLY | libc::O_CREAT)?;
         dir.give(&lock);
-        // SAFETY: flock on a valid open descriptor; the lock is released when
-        // `lock` is closed at the end of this function.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
+        // Not waited for without end: see LOCK_WAIT.
+        let end = std::time::Instant::now() + self.lock_wait;
+        loop {
+            // SAFETY: flock on a valid open descriptor; the lock is released
+            // when `lock` is closed at the end of this function.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(Error::from(e).wrap(format!("lock {}", dir.path.join(&lock_name).display())));
+            }
+            if std::time::Instant::now() >= end {
+                return Err(errf!(
+                    "{} is held by another process for more than {}s: nothing read or written",
+                    dir.path.join(&lock_name).display(),
+                    self.lock_wait.as_secs_f32()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let mut s = match dir.open_regular(&name, libc::O_RDONLY) {
-            Ok(mut file) => {
+            Ok(file) => {
+                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
                 let mut b = Vec::new();
-                file.read_to_end(&mut b).map_err(|e| Error::from(e).wrap(format!("read {}", self.path.display())))?;
+                if len <= MAX_FILE {
+                    file.take(MAX_FILE + 1)
+                        .read_to_end(&mut b)
+                        .map_err(|e| Error::from(e).wrap(format!("read {}", self.path.display())))?;
+                }
+                if len > MAX_FILE || b.len() as u64 > MAX_FILE {
+                    return Err(errf!("{} is larger than {MAX_FILE} bytes: not read", self.path.display()));
+                }
                 serde_json::from_slice(&b)?
             }
             Err(e) if e.is_not_found() => State::default(),
@@ -703,17 +741,32 @@ fn fstat(fd: RawFd) -> std::io::Result<libc::stat> {
 
 // ---- scan report ----
 
-/// Reads `arp-scan --plain` output: "IP<tab>MAC<tab>vendor".
+/// The most devices a scan report keeps. A device on the network may answer
+/// for every address of a large network (ARP replies cost it nothing): the
+/// report, and the registry file it is kept in, must not grow with it.
+pub const MAX_UNKNOWN: usize = 256;
+/// A MAC address and a vendor name as kept, at most.
+const MAX_MAC: usize = 32;
+const MAX_VENDOR: usize = 64;
+/// The most devices read from one scan: every member's three addresses
+/// and MAX_UNKNOWN others fit.
+const MAX_FOUND: usize = 3 * 254 + MAX_UNKNOWN;
+
+/// Reads `arp-scan --plain` output: "IP<tab>MAC<tab>vendor". MAX_FOUND
+/// devices at most.
 pub fn parse_arp_scan(out: &str) -> Vec<Device> {
     let mut devs: Vec<Device> = Vec::new();
     for line in out.lines() {
+        if devs.len() >= MAX_FOUND {
+            break;
+        }
         let f: Vec<&str> = line.splitn(3, '\t').collect();
         if f.len() < 2 || f[0].parse::<std::net::IpAddr>().is_err() {
             continue;
         }
-        let mut d = Device { ip: f[0].to_string(), mac: f[1].to_lowercase(), ..Device::default() };
+        let mut d = Device { ip: f[0].to_string(), mac: f[1].to_lowercase().chars().take(MAX_MAC).collect(), ..Device::default() };
         if f.len() == 3 {
-            d.vendor = f[2].trim().to_string();
+            d.vendor = f[2].trim().chars().take(MAX_VENDOR).collect();
         }
         if !devs.iter().any(|x| x.ip == d.ip) {
             devs.push(d);
@@ -722,10 +775,10 @@ pub fn parse_arp_scan(out: &str) -> Vec<Device> {
     devs
 }
 
-/// Keeps the devices whose address belongs to no member. known holds every
-/// member address (LAN and switch).
+/// Keeps the devices whose address belongs to no member, MAX_UNKNOWN at
+/// most. known holds every member address (LAN and switch).
 pub fn unknown(found: &[Device], known: &[String], now: Time) -> Vec<Device> {
-    found.iter().filter(|d| !known.contains(&d.ip)).map(|d| Device { seen: now, ..d.clone() }).collect()
+    found.iter().filter(|d| !known.contains(&d.ip)).take(MAX_UNKNOWN).map(|d| Device { seen: now, ..d.clone() }).collect()
 }
 
 // ---- the SSH forced command ----
@@ -1565,6 +1618,60 @@ mod tests {
         assert_eq!(unknown.len(), 1);
         assert_eq!(unknown[0].ip, "192.168.1.1");
         assert_eq!(unknown[0].seen, t0());
+    }
+
+    /// One device answering for every address of a /16, with long names:
+    /// the report keeps MAX_UNKNOWN of them, each short.
+    #[test]
+    fn a_flood_of_devices_is_cut_short() {
+        let mut out = String::new();
+        for i in 0..65_000u32 {
+            out += &format!("10.1.{}.{}\t{}\t{}\n", i / 256, i % 256, "a".repeat(100), "V".repeat(1000));
+        }
+        let start = std::time::Instant::now();
+        let found = parse_arp_scan(&out);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+        assert_eq!(found.len(), MAX_FOUND);
+        assert!(found.iter().all(|d| d.mac.len() == MAX_MAC && d.vendor.len() == MAX_VENDOR));
+        assert_eq!(unknown(&found, &[], t0()).len(), MAX_UNKNOWN);
+    }
+
+    /// The registry account owns the lock file and may hold its lock for
+    /// ever: root waits a while, then fails instead of hanging its sync.
+    /// And a registry file larger than MAX_FILE is not read.
+    #[test]
+    fn store_neither_waits_for_ever_nor_reads_without_end() {
+        let dir = TempDir::new();
+        let path = dir.join("registry.json");
+        let mut st = Store::new(&path);
+        st.lock_wait = std::time::Duration::from_millis(300);
+        st.update(|s| s.add_request(req("node-a"), COORD_KEY, Time::now())).unwrap();
+        // Someone else holds it (another open file: flock is per open file).
+        let held = std::fs::File::open(dir.join("registry.json.lock")).unwrap();
+        // SAFETY: flock on a valid open descriptor.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let start = std::time::Instant::now();
+        let e = st.read().unwrap_err().to_string();
+        assert!(e.contains("held by another process") && e.contains("nothing read or written"), "{e}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        drop(held);
+        assert_eq!(st.read().unwrap().requests.len(), 1);
+        // Let go within the wait: taken.
+        let held = std::fs::File::open(dir.join("registry.json.lock")).unwrap();
+        // SAFETY: flock on a valid open descriptor.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                drop(held);
+            });
+            assert!(st.read().is_ok());
+        });
+
+        let big = format!("{{\"requests\":[],\"pad\":\"{}\"}}", "x".repeat(MAX_FILE as usize));
+        std::fs::write(&path, big).unwrap();
+        let e = st.read().unwrap_err().to_string();
+        assert!(e.contains("larger than"), "{e}");
     }
 
     #[test]
