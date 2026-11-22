@@ -472,7 +472,12 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
     let brain = v.members.iter().find(|(m, _)| m.host == 1).map(|(m, _)| m);
     let brain_k3s = brain.and_then(|m| m.report.as_ref()).map(|r| r.k3s.as_str());
     let k3s = check_k3s(&parts.k3s, &parts.k3s_version, &parts.k3s_sha256, brain_k3s)?;
-    let day = pick_day(ctx, days, &given, current_day, c.rollback, today)?;
+    let day = match current_day {
+        // An urgent fix is not held up by a package update on every
+        // machine: it keeps the swarm's day, already on every machine.
+        Some(d) if c.urgent && given.is_empty() => Day { day: d.to_string(), how: URGENT_DAY.into() },
+        _ => pick_day(ctx, days, &given, current_day, c.rollback, today)?,
+    };
     let r = draft(&day.day)?;
     let last = a.last_release().map(|l| l.serial);
     let members: Vec<&Member> = v.members.iter().map(|(m, _)| m).collect();
@@ -489,6 +494,9 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
         reported_k3s: distinct(members.iter().filter_map(|m| m.report.as_ref()).map(|r| r.k3s.clone())),
     })
 }
+
+/// How the preview says an urgent release keeps the Arch day.
+pub const URGENT_DAY: &str = "urgent releases keep the day; give -arch-date to move it";
 
 /// "old -> new", or "same (new)".
 fn change(old: &str, new: &str) -> String {

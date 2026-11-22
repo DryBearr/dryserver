@@ -637,7 +637,9 @@ summary, `y` sends it.
 - **Urgent** (`-urgent`): the rollout starts at once instead of in the
   update window 03:00-05:00 on the coordinator's clock. It is still the
   coordinator first and one server at a time; the canary is watched for a
-  minute instead of five. For security fixes.
+  minute instead of five. It keeps the swarm's Arch day (no package update
+  on any machine, so the fix is not held up by pacman) unless you name one
+  with `-arch-date`. For security fixes.
 - **When it stops**: a rollout stops by itself at a server whose update
   fails. `release status` says where and what to do: look at the machine,
   then `./dryserver release resume` (it says what that does first: the

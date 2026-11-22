@@ -930,3 +930,45 @@ fn no_release_yet_the_same_version_is_not_called_the_same() {
     assert_eq!(lines[2], format!("  k3s        same ({})", iso::K3S_VERSION), "a k3s version is one pinned binary");
     assert!(!lines.join("\n").contains("same (0.1.0)"), "{lines:?}");
 }
+
+/// An urgent release keeps the swarm's Arch day unless one is named: no
+/// machine runs pacman for it, and the archive is not even asked.
+#[test]
+fn an_urgent_release_keeps_the_arch_day() {
+    let dir = TempDir::new();
+    let (mut a, _, _, _, parts) = desk(&dir);
+    let days = FakeDays::with(&[days_ago(2)]);
+    let ctx = Ctx::new();
+    let urgent = Choice { urgent: true, ..Choice::default() };
+    // No release yet: the swarm's day is not known here; the newest.
+    let v = a.load().unwrap();
+    let p = plan(&ctx, &a, &v, &days, &parts, &urgent, today()).unwrap();
+    assert_eq!(p.release.arch_date, days_ago(2));
+    assert!(!days.asked().is_empty());
+    publish(&mut a, &p).unwrap();
+
+    days.have.lock().unwrap().push(days_ago(0));
+    let v = a.load().unwrap();
+    let asked = days.asked().len();
+    let p = plan(&ctx, &a, &v, &days, &parts, &urgent, today()).unwrap();
+    assert_eq!(p.release.arch_date, days_ago(2));
+    assert_eq!(days.asked().len(), asked, "the archive is not asked");
+    let text = p.lines().join("\n");
+    assert!(
+        text.contains(&format!("  Arch       same ({}) (urgent releases keep the day; give -arch-date to move it)", days_ago(2))),
+        "{text}"
+    );
+    // Urgent and rollback: the day stays too.
+    let back = Choice { rollback: true, ..urgent.clone() };
+    assert_eq!(plan(&ctx, &a, &v, &days, &parts, &back, today()).unwrap().release.arch_date, days_ago(2));
+    assert_eq!(days.asked().len(), asked);
+    // Not urgent: the newest day, as before.
+    assert_eq!(plan(&ctx, &a, &v, &days, &parts, &Choice::default(), today()).unwrap().release.arch_date, days_ago(0));
+    // Urgent with a day named: that day, checked on the archive.
+    let named = Choice { arch_date: days_ago(0), ..urgent.clone() };
+    let asked = days.asked().len();
+    let p = plan(&ctx, &a, &v, &days, &parts, &named, today()).unwrap();
+    assert_eq!(p.release.arch_date, days_ago(0));
+    assert_eq!(days.asked(), [days.asked()[..asked].to_vec(), vec![days_ago(0)]].concat());
+    assert!(p.lines().join("\n").contains(&format!("  Arch       {} -> {} (checked", days_ago(2), days_ago(0))));
+}
