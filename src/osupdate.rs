@@ -1377,11 +1377,20 @@ impl Host<'_> {
         let args = ["--what=shutdown:sleep:idle:handle-power-key", "--who=dryserver", &why, "--mode=block", "sleep", "infinity"];
         let cmd = Cmd::new("systemd-inhibit", &args).quiet();
         let (tx, rx) = std::sync::mpsc::channel();
+        /// Lets the inhibitor go also when f panics: the scope waits for
+        /// its thread, which would otherwise hold the update for ever.
+        struct LetGo<'a>(&'a Ctx);
+        impl Drop for LetGo<'_> {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
         std::thread::scope(|s| {
             s.spawn(|| {
                 let (_, res) = self.run.run(&ictx, &cmd);
                 let _ = tx.send(res);
             });
+            let _let_go = LetGo(&ictx);
             // It ends before it is let go only when it failed.
             let early = rx.recv_timeout(self.limits.inhibit_wait).ok();
             let out = f();
@@ -3143,6 +3152,23 @@ mod tests {
         let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
         assert!(out.ok(), "{}", out.summary());
         assert!(out.warnings.iter().any(|w| w.contains("not held off") && w.contains("not found")), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn review_a_panic_while_pacman_installs_lets_the_inhibitor_go() {
+        // The inhibitor runs in a thread the install's scope waits for: a
+        // panic in the install left it, and the update, waiting for ever.
+        quiet_power_cuts();
+        let dir = machine();
+        let fake = Fake::with_pacman(dir.path(), |_, _, c| {
+            if c.args[0] == "-Su" {
+                std::panic::panic_any(PowerCut);
+            }
+            (String::new(), Ok(()))
+        });
+        let (h, _) = host(dir.path(), &fake);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.arch_update(&Ctx::new(), "2026/11/20", false)));
+        assert!(res.is_err() && !*fake.inhibiting.lock().unwrap());
     }
 
     #[test]
