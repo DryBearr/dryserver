@@ -1237,10 +1237,15 @@ fn run_update(args: &[String]) -> Result<()> {
                     ("id", "", "the update the timer was armed for"),
                     ("applying", "false", "the timer armed when the apply started"),
                     ("boot", "false", "the machine just started"),
+                    ("started-it", "false", "go on only as the binary that started the update"),
                 ],
             );
             let m = update_machine()?;
             keep_going_on_hangup();
+            if f.on("started-it") {
+                // The running program, also when its name was taken since.
+                update::started_it(&m, Path::new("/proc/self/exe"))?;
+            }
             match (f.get("id"), f.on("boot")) {
                 ("", true) => update::guard_boot(&m, &Ctx::new(), now, &mut out),
                 (id, false) if !id.is_empty() => update::guard_timer(&m, &Ctx::new(), id, f.on("applying"), now, &mut out),

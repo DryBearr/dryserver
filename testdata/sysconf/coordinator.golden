@@ -453,7 +453,7 @@ ConditionPathExists=/var/lib/dryserver-update/pending.json
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c '/usr/local/bin/dryserver.prev update guard --boot || /usr/local/bin/dryserver update guard --boot'
+ExecStart=/bin/sh -c '/usr/local/bin/.dryserver.guard update guard --boot --started-it || /usr/local/bin/dryserver.prev update guard --boot || /usr/local/bin/dryserver update guard --boot'
 TimeoutStartSec=5min
 
 [Install]

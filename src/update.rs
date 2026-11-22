@@ -105,8 +105,10 @@
 //! the timer reverts: old binary, old files (the mirrorlist among them),
 //! the k3s that ran before when this update swapped it, reloads. The
 //! packages stay as they are: going back on them is a signed release with
-//! rollback (pacman -Suu to the older day). The timer runs the previous
-//! binary first, since the new one may be what is broken. A timer does not
+//! rollback (pacman -Suu to the older day). The timer runs the binary that
+//! started the update first (GUARD_BIN: dryserver.prev is that one only
+//! once the new one took its place), then the previous one, since the new
+//! one may be what is broken. A timer does not
 //! survive a reboot, so a boot unit (GUARD_UNIT_TEXT) reverts an update
 //! whose deadline passed, or that never finished applying, before the
 //! firewall, the network, SSH and k3s start, and arms the timer again for
@@ -176,6 +178,16 @@ pub const SERVER_BIN: &str = quarantine::SERVER_BIN;
 /// The binary that ran before the last update. The revert timer and the
 /// boot unit run it first.
 pub const PREV_BIN: &str = "/usr/local/bin/dryserver.prev";
+/// The binary that started the update that waits, under a name of its own
+/// (a hard link, made as the apply starts, gone when the update ends): the
+/// revert timers and the boot unit run it first (`update guard
+/// --started-it`, which steps aside for any other binary). PREV_BIN is that
+/// binary only once the new one took its place; before, it is the one of
+/// the update before, which may not know this update's record (an old one
+/// took a power cut while the packages loaded for a failed update instead
+/// of one to try again).
+pub const GUARD_BIN: &str = "/usr/local/bin/.dryserver.guard";
+const GUARD_TMP: &str = "/usr/local/bin/.dryserver.guard.new";
 /// Temporary names in the same directory, so renames are atomic.
 const NEW_BIN: &str = "/usr/local/bin/.dryserver.new";
 const PREV_TMP: &str = "/usr/local/bin/.dryserver.prev.new";
@@ -267,7 +279,8 @@ pub const STAGE_REVERTING: &str = "reverting";
 
 /// The boot half of the revert guard. It runs before the firewall, the
 /// network and SSH, so they start with the files of the release that is
-/// kept. The previous binary goes first: the new one may be what is broken.
+/// kept. The binary that started the update goes first (GUARD_BIN), then
+/// the previous one: the new one may be what is broken.
 ///
 /// It runs before systemd-sysctl.service too: that one applies
 /// /etc/sysctl.d once at boot, and a revert at boot reloads nothing, so
@@ -289,7 +302,7 @@ ConditionPathExists=/var/lib/dryserver-update/pending.json
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c '/usr/local/bin/dryserver.prev update guard --boot || /usr/local/bin/dryserver update guard --boot'
+ExecStart=/bin/sh -c '/usr/local/bin/.dryserver.guard update guard --boot --started-it || /usr/local/bin/dryserver.prev update guard --boot || /usr/local/bin/dryserver update guard --boot'
 TimeoutStartSec=5min
 
 [Install]
@@ -572,11 +585,39 @@ fn save_pending(m: &Machine, p: &Pending) -> Result<()> {
     save_json(m, PENDING, p)
 }
 
-/// The end of an update, either way: the record goes, flushed to disk.
+/// The end of an update, either way: the record goes, flushed to disk, and
+/// with it the name of the binary that started it.
 fn clear_pending(m: &Machine) -> Result<()> {
     remove_if_exists(&m.path(PENDING))?;
     let _ = remove_if_exists(&tmp_of(&m.path(PENDING)));
-    sync_dir(&m.path(DIR))
+    sync_dir(&m.path(DIR))?;
+    let _ = remove_if_exists(&m.path(GUARD_BIN));
+    Ok(())
+}
+
+/// Keeps the binary that starts this update (the installed one) under
+/// GUARD_BIN, a hard link: one inode, whatever names it gets later. Best
+/// effort: without it the guard starts with PREV_BIN, as before.
+fn keep_guard_bin(m: &Machine) -> Result<()> {
+    let (bin, tmp, guard) = (m.path(SERVER_BIN), m.path(GUARD_TMP), m.path(GUARD_BIN));
+    remove_if_exists(&tmp)?;
+    fs::hard_link(&bin, &tmp).map_err(|e| Error::from(e).wrap(format!("link {} {}", bin.display(), tmp.display())))?;
+    fsx::rename(&tmp, &guard)?;
+    sync_dir(&fsx::dir(&bin))
+}
+
+/// `update guard --started-it`, run as GUARD_BIN: goes on only when this
+/// binary (own, the running program) is the one that started the update
+/// that waits (its record's prev_sha256), or when none waits. Err, and the
+/// next binary in line runs the guard: a GUARD_BIN left from an update
+/// before, started by another binary, never decides for this one.
+pub fn started_it(m: &Machine, own: &Path) -> Result<()> {
+    let Ok(Some(p)) = load_pending(m) else { return Ok(()) };
+    let (sha, _) = release::hash_file(own, release::MAX_BINARY)?;
+    if sha != p.prev_sha256 {
+        bail!("this dryserver did not start the update to release {}: the next one in line goes", p.serial);
+    }
+    Ok(())
 }
 
 /// The release this machine runs: the envelope and what it says.
@@ -1283,7 +1324,7 @@ fn arm(m: &Machine, ctx: &Ctx, t: Timer, id: &str, serial: u64, secs: i64, boot:
 }
 
 fn arm_args(m: &Machine, t: Timer, id: &str, serial: u64, secs: i64, boot: bool) -> Vec<String> {
-    let (prev, bin) = (m.shown(PREV_BIN), m.shown(SERVER_BIN));
+    let (guard, prev, bin) = (m.shown(GUARD_BIN), m.shown(PREV_BIN), m.shown(SERVER_BIN));
     let mut args = vec![format!("--unit={}", timer_unit(id, t)), format!("--on-active={secs}s")];
     if boot {
         args.push("--no-block".into());
@@ -1296,7 +1337,11 @@ fn arm_args(m: &Machine, t: Timer, id: &str, serial: u64, secs: i64, boot: bool)
         Timer::Apply => ("its apply finishes", " --applying"),
     };
     args.push(format!("--description=Revert dryserver release {serial} unless {what}"));
-    args.extend(["/bin/sh".into(), "-c".into(), format!("{prev} update guard --id {id}{flag} || {bin} update guard --id {id}{flag}")]);
+    // The binary that started the update first (GUARD_BIN), then the one
+    // before the new one, then the new one.
+    let guard_cmd = |b: &str, own: &str| format!("{b} update guard --id {id}{flag}{own}");
+    let chain = [guard_cmd(&guard, " --started-it"), guard_cmd(&prev, ""), guard_cmd(&bin, "")].join(" || ");
+    args.extend(["/bin/sh".into(), "-c".into(), chain]);
     args
 }
 
@@ -1839,6 +1884,14 @@ pub fn apply(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, out: &mut dyn Write) -
         may_reboot: a.reboot,
         ..Pending::default()
     };
+    if let Err(e) = keep_guard_bin(m) {
+        tell(
+            m,
+            out,
+            now,
+            &format!("warning: the binary that starts the update is not kept as {GUARD_BIN} ({e}); {PREV_BIN} guards it first"),
+        );
+    }
     let armed = save_pending(m, &p).and_then(|_| arm(m, ctx, Timer::Apply, &p.id, serial, APPLY_TIME, false));
     if let Err(e) = armed {
         let _ = clear_pending(m);
@@ -2563,7 +2616,7 @@ fn revert(m: &Machine, ctx: &Ctx, mut p: Pending, why: &str, boot: bool, now: i6
             problems.push(format!("{}: {e}", f.path));
         }
     }
-    for t in [NEW_BIN, PREV_TMP, RESTORE_TMP] {
+    for t in [NEW_BIN, PREV_TMP, RESTORE_TMP, GUARD_TMP] {
         let _ = remove_if_exists(&m.path(t));
     }
     let _ = m.at("files restored");
@@ -3815,16 +3868,18 @@ mod tests {
             assert!(!timer.contains("--no-block"), "{timer}");
             assert!(timer.contains("--timer-property=DefaultDependencies=no"), "{timer}");
             assert!(
-                timer.contains("/bin/sh -c /usr/local/bin/dryserver.prev update guard --id "),
-                "the timer must run the previous binary first: {timer}"
+                timer.contains("/bin/sh -c /usr/local/bin/.dryserver.guard update guard --id "),
+                "the timer must run the binary that started the update first: {timer}"
             );
         }
         assert!(
             window.ends_with(&format!(
-                "/bin/sh -c /usr/local/bin/dryserver.prev update guard --id {id} || /usr/local/bin/dryserver update guard --id {id}"
+                "/bin/sh -c /usr/local/bin/.dryserver.guard update guard --id {id} --started-it || \
+                 /usr/local/bin/dryserver.prev update guard --id {id} || /usr/local/bin/dryserver update guard --id {id}"
             )),
             "{window}"
         );
+        assert_eq!(lab.bytes(GUARD_BIN), OLD, "the binary that started it, under a name of its own");
         assert!(!f.ran().iter().any(|c| c.contains("restart sshd") || c.contains("stop sshd")), "sshd must only reload");
         assert!(!f.has("systemd-analyze"), "no unit changed, nothing to verify");
         assert_eq!(lab.get(GUARD_UNIT_PATH), GUARD_UNIT_TEXT, "the boot half of the guard is installed");
@@ -3842,6 +3897,7 @@ mod tests {
         }
         assert_eq!(load_installed(&lab.m()).unwrap().unwrap().1.serial, 7);
         assert_eq!((lab.last().action.as_str(), lab.last().ok), ("confirmed", true));
+        assert!(!lab.p(GUARD_BIN).exists(), "it goes with the record");
         lab.assert_tidy("confirmed");
 
         // The same release again does nothing; so does confirming it again.
@@ -4984,7 +5040,9 @@ mod tests {
             "After=local-fs.target\n",
             "Before=sysinit.target shutdown.target systemd-sysctl.service nftables.service systemd-networkd.service sshd.service wg-quick@wg0.service",
             &format!("ConditionPathExists={DIR}/pending.json\n"),
-            &format!("ExecStart=/bin/sh -c '{PREV_BIN} update guard --boot || {SERVER_BIN} update guard --boot'\n"),
+            &format!(
+                "ExecStart=/bin/sh -c '{GUARD_BIN} update guard --boot --started-it || {PREV_BIN} update guard --boot || {SERVER_BIN} update guard --boot'\n"
+            ),
             "Type=oneshot\n",
             "WantedBy=sysinit.target\n",
         ] {
@@ -5731,6 +5789,37 @@ mod tests {
         // Started by hand, or by anything but an apply: refused.
         let e = prepare(&lab.m(), &Ctx::new(), "0123456789abcdef", &mut Vec::new()).unwrap_err().to_string();
         assert!(e.contains("runs only inside it"), "{e}");
+    }
+
+    #[test]
+    fn review_the_binary_that_started_an_update_guards_it_before_the_switch() {
+        // Before the new binary takes the old one's place, dryserver.prev is
+        // the binary of the update before, which the timers and the boot
+        // unit ran first on this update's record. Now the binary that
+        // started it goes first, under a name of its own.
+        quiet_power_cuts();
+        const B0: &[u8] = b"\x7fELF dryserver 0.0.9, of the update before";
+        let lab = Lab::new();
+        lab.write(PREV_BIN, B0, 0o755);
+        lab.hook(Arc::new(|p| {
+            if p == "binary checked" {
+                std::panic::panic_any(PowerCut);
+            }
+            Ok(())
+        }));
+        assert!(catch_unwind(AssertUnwindSafe(|| lab.apply(&rel(7, NEW)))).is_err());
+        lab.hook(noop());
+        assert_eq!((lab.bytes(SERVER_BIN), lab.bytes(GUARD_BIN)), (OLD.to_vec(), OLD.to_vec()));
+        let m = lab.m();
+        started_it(&m, &lab.p(GUARD_BIN)).unwrap();
+        let e = started_it(&m, &lab.p(PREV_BIN)).unwrap_err().to_string();
+        assert!(e.contains("did not start the update to release 7"), "{e}");
+        // The restart: postponed (it was loading), and the name goes.
+        guard_boot(&m, &Ctx::new(), now() + 30, &mut Vec::new()).unwrap();
+        assert!(lab.pending().is_none() && !lab.p(GUARD_BIN).exists());
+        assert_eq!(lab.last().action, POSTPONED);
+        // With no update waiting, any binary may run the guard.
+        started_it(&m, &lab.p(PREV_BIN)).unwrap();
     }
 
     #[test]
