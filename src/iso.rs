@@ -91,6 +91,9 @@ pub fn run(ctx: &Ctx, o: &Options, log: &mut (dyn Write + Send)) -> Result<()> {
     let out_dir = std::path::absolute(&o.out_dir)?;
     let cache = out_dir.join("pkgcache");
     fsx::mkdir_all(&cache, 0o755)?;
+    // The image holds the WiFi password, the join secret and the
+    // registry key: out/ is the user's alone, also while it is written.
+    fsx::chmod(&out_dir, 0o700)?;
     let fix_paths = [out_dir.clone(), o.secrets_dir.clone()];
     let _fix = Defer(|| owner::fix(&fix_paths));
 
@@ -139,6 +142,7 @@ pub fn run(ctx: &Ctx, o: &Options, log: &mut (dyn Write + Send)) -> Result<()> {
     if !iso_path(&out_dir).exists() {
         return Err(errf!("build finished but {} is missing", iso_path(&o.out_dir).display()));
     }
+    fsx::chmod(iso_path(&out_dir), 0o600)?;
     let secs = round_ms(start.elapsed().as_millis() as i64, 1000) / 1000;
     let _ = writeln!(tee, "==> Done in {}", duration_string(secs));
     Ok(())
