@@ -1247,6 +1247,9 @@ pub struct Pulled {
     pub fetched: Vec<String>,
     pub removed: Vec<String>,
     pub problems: Vec<String>,
+    /// Backups the plan would keep that are dated before the newest copy
+    /// here: not copied.
+    pub late: Vec<String>,
 }
 
 /// Parses the coordinator's listing: backups that have a signature, with
@@ -1280,6 +1283,17 @@ pub fn parse_listing(text: &str) -> Vec<(String, u64)> {
 /// coordinator that lists names it cannot deliver removes nothing here.
 /// Names dated more than MAX_AHEAD after now (this computer's clock) and
 /// sizes above MAX_FILE are refused before anything is fetched.
+///
+/// A hacked coordinator still has its host key, so it can sign anything
+/// it likes, and the public key backups are encrypted to, so it can even
+/// make backups that open. What it cannot do is move this computer's
+/// clock. So only backups dated after the newest copy here are taken,
+/// oldest first (a pull cut off half way goes on from there next time):
+/// a copy here is pushed out only by backups dated after every copy here,
+/// as time would push it out anyway, never by one dated back into its day
+/// or week. And the weekly copies that were here before a pull stay for
+/// that pull: one pull never removes every copy here, however many weeks
+/// it brings.
 pub fn pull(brain: &dyn Brain, verifier: &dyn Verifier, dir: &Path, now: DateTime<Utc>, out: &mut dyn Write) -> Result<Pulled> {
     fsx::mkdir_all(dir, 0o700)?;
     let listing = brain.list()?;
@@ -1308,13 +1322,28 @@ pub fn pull(brain: &dyn Brain, verifier: &dyn Verifier, dir: &Path, now: DateTim
             parse_name(&n).map(|t| (t, n))
         })
         .collect();
+    let before: Vec<DateTime<Utc>> = local.iter().map(|(t, _)| *t).collect();
+    // The newest copy here; one dated too far ahead (copied in by hand, or
+    // pulled before that was refused) would stop every pull.
+    let newest = before.iter().copied().filter(|t| *t <= now + MAX_AHEAD).max();
+    let here = |name: &str| local.iter().any(|(_, n)| n == name);
+    let (late, remote): (Vec<_>, Vec<_>) = remote.into_iter().partition(|(t, name, _)| !here(name) && newest.is_some_and(|n| *t <= n));
     // What to fetch: the coordinator's that the plan over ours and theirs
-    // keeps.
-    let mut stamps: Vec<DateTime<Utc>> = local.iter().map(|(t, _)| *t).collect();
+    // keeps, oldest first.
+    let mut stamps = before.clone();
     stamps.extend(remote.iter().map(|(t, _, _)| *t));
     let plan = keep(&stamps, KEEP_DAILY, KEEP_WEEKLY);
+    stamps.extend(late.iter().map(|(t, _, _)| *t));
+    let would = keep(&stamps, KEEP_DAILY, KEEP_WEEKLY);
+    for (t, name, _) in &late {
+        if would.contains(t) {
+            let newest = newest.map(name_of).unwrap_or_default();
+            let _ = writeln!(out, "not copied: {name}, dated before {newest}, the newest backup here");
+            res.late.push(name.clone());
+        }
+    }
     let mut wanted: Vec<&(DateTime<Utc>, String, u64)> = remote.iter().filter(|(t, _, _)| plan.contains(t)).collect();
-    wanted.sort_by(|a, b| b.1.cmp(&a.1));
+    wanted.sort_by(|a, b| a.1.cmp(&b.1));
     let mut checked: Vec<DateTime<Utc>> = Vec::new();
     for (t, name, size) in wanted {
         let path = dir.join(name);
@@ -1333,10 +1362,12 @@ pub fn pull(brain: &dyn Brain, verifier: &dyn Verifier, dir: &Path, now: DateTim
             Err(e) => res.problems.push(format!("{name}: {e}")),
         }
     }
-    // What to keep here: planned from the files here, never from a name.
-    let mut stamps: Vec<DateTime<Utc>> = local.iter().map(|(t, _)| *t).collect();
+    // What to keep here: planned from the files here, never from a name,
+    // and the weekly copies that were here before this pull.
+    let mut stamps = before.clone();
     stamps.extend(&checked);
-    let kept = keep(&stamps, KEEP_DAILY, KEEP_WEEKLY);
+    let mut kept = keep(&stamps, KEEP_DAILY, KEEP_WEEKLY);
+    kept.extend(keep(&before, 0, KEEP_WEEKLY));
     for (t, name) in &local {
         if !kept.contains(t) {
             for f in [name.clone(), format!("{name}.sig")] {
@@ -2479,6 +2510,8 @@ mod tests {
         /// Sends the whole file whatever the limit (a hacked brain that
         /// does not stop).
         ignores_limit: bool,
+        /// Every fetch after this many fails (a connection that broke).
+        fails_after: Option<usize>,
     }
 
     impl FakeBrain {
@@ -2493,7 +2526,7 @@ mod tests {
                 files.insert(format!("{n}.sig"), sig.into_bytes());
                 files.insert(n, data);
             }
-            FakeBrain { files, listed: BTreeMap::new(), fetched: Mutex::default(), ignores_limit: false }
+            FakeBrain { files, listed: BTreeMap::new(), fetched: Mutex::default(), ignores_limit: false, fails_after: None }
         }
     }
 
@@ -2503,7 +2536,12 @@ mod tests {
         }
 
         fn fetch(&self, name: &str, limit: u64, w: &mut dyn Write) -> Result<u64> {
-            self.fetched.lock().unwrap().push(name.to_string());
+            let mut fetched = self.fetched.lock().unwrap();
+            fetched.push(name.to_string());
+            if self.fails_after.is_some_and(|n| fetched.len() > n) {
+                bail!("cannot reach the coordinator: Connection closed");
+            }
+            drop(fetched);
             let d = self.files.get(name).ok_or_else(|| errf!("no such file"))?;
             if self.ignores_limit {
                 w.write_all(d)?;
@@ -2696,9 +2734,9 @@ mod tests {
         let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
         assert!(r.fetched.is_empty(), "{r:?}");
         assert_eq!(r.problems.len(), 3, "{:?}", r.problems);
-        assert!(r.problems[0].contains("not signed by the coordinator"), "{:?}", r.problems);
+        assert!(r.problems[2].contains("not signed by the coordinator"), "{:?}", r.problems);
         assert!(r.problems[1].contains("bytes, the coordinator listed"), "{:?}", r.problems);
-        assert!(r.problems[2].contains("more than"), "{:?}", r.problems);
+        assert!(r.problems[0].contains("more than"), "{:?}", r.problems);
         for n in &names {
             assert!(!local.join(n).exists());
         }
@@ -2711,13 +2749,132 @@ mod tests {
         let local = dir.join("backups");
         let times = nights(2);
         let brain = FakeBrain::new(&times);
-        let n = name_of(times[0]);
+        let n = name_of(times[1]);
         put(&local, &n, "my own copy, different");
         let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
         assert_eq!(get(&local, &n), "my own copy, different");
         assert!(r.problems.iter().any(|p| p.contains("yours is kept")), "{:?}", r.problems);
-        assert_eq!(r.fetched, vec![name_of(times[1])]);
+        assert_eq!(r.fetched, vec![name_of(times[0])]);
         assert!(!brain.fetched.lock().unwrap().contains(&n), "not even fetched");
+    }
+
+    fn backups_here(d: &Path) -> BTreeSet<String> {
+        local_names(d).into_iter().filter(|n| parse_name(n).is_some()).collect()
+    }
+
+    /// The review's attack: a coordinator hacked as root has its host key,
+    /// so what it signs checks out. It serves nine junk backups: seven
+    /// later in the days after the copies here, and two later in the
+    /// same weeks as the oldest ones (none more than a day ahead). Before,
+    /// they took every day and every week of the plan, and every genuine
+    /// copy here was removed. Now the two dated before the newest copy
+    /// here are not taken, the seven push out what a week of time would,
+    /// and the weekly copies that were here stay.
+    #[test]
+    fn review_a_hacked_brain_cannot_wipe_every_backup_here() {
+        let dir = TempDir::new();
+        let local = dir.join("backups");
+        pull(&FakeBrain::new(&nights(9)), &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        let before: BTreeSet<String> = local_names(&local).into_iter().filter(|n| parse_name(n).is_some()).collect();
+        let mut junk: Vec<DateTime<Utc>> = (0..7).map(|i| t(2026, 11, 28, 11) - chrono::TimeDelta::days(i)).collect();
+        junk.extend([t(2026, 11, 15, 23), t(2026, 11, 8, 23)]);
+        let r = pull(&FakeBrain::new(&junk), &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        let left: BTreeSet<String> = local_names(&local).into_iter().filter(|n| parse_name(n).is_some()).collect();
+        assert!(before.iter().any(|n| left.contains(n)), "removed: {:?}", r.removed);
+
+        // What came of it, exactly.
+        let dir = TempDir::new();
+        let local = dir.join("backups");
+        pull(&FakeBrain::new(&nights(9)), &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        let brain = FakeBrain::new(&junk);
+        let mut out = Vec::new();
+        let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let backdated = [name_of(t(2026, 11, 8, 23)), name_of(t(2026, 11, 15, 23))];
+        assert_eq!(r.late, backdated, "{out}");
+        assert!(!brain.fetched.lock().unwrap().iter().any(|n| backdated.iter().any(|b| n.starts_with(b.as_str()))), "not even fetched");
+        let said = format!("not copied: {}, dated before {}, the newest backup here", backdated[1], name_of(t(2026, 11, 20, 2)));
+        assert!(out.contains(&said), "{out}");
+        assert_eq!(r.fetched.len(), 7, "{r:?}");
+        assert_eq!(r.fetched[0], name_of(t(2026, 11, 22, 11)), "oldest first");
+        // Nov 15 is the newest of its week; Nov 20 was the newest of its own
+        // and stays for this pull.
+        let genuine = [name_of(t(2026, 11, 15, 2)), name_of(t(2026, 11, 20, 2))];
+        for g in &genuine {
+            assert!(local.join(g).exists() && local.join(format!("{g}.sig")).exists(), "{g}: {r:?}");
+        }
+        assert_eq!(r.removed.len(), 5, "{r:?}");
+        // Pulled again: nothing new comes, and the week Nov 15 stands for
+        // stays until newer weeks push it out.
+        let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        assert!(r.fetched.is_empty(), "{r:?}");
+        assert!(local.join(&genuine[0]).exists(), "{r:?}");
+    }
+
+    /// However many newer weeks one pull brings (the desktop did not pull
+    /// for six weeks, and the coordinator was hacked meanwhile), the
+    /// weekly copies that were here stay for that pull; the next one goes
+    /// by the plan.
+    #[test]
+    fn one_pull_never_removes_every_copy_here() {
+        let dir = TempDir::new();
+        let local = dir.join("backups");
+        pull(&FakeBrain::new(&nights(9)), &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        let before = backups_here(&local);
+        let later = t(2027, 1, 5, 12);
+        let weeks: Vec<DateTime<Utc>> = (0..45).map(|i| t(2027, 1, 4, 2) - chrono::TimeDelta::days(i)).collect();
+        let brain = FakeBrain::new(&weeks);
+        let r = pull(&brain, &fake::Key("coord"), &local, later, &mut Vec::new()).unwrap();
+        let weekly: BTreeSet<String> = [name_of(t(2026, 11, 15, 2)), name_of(t(2026, 11, 20, 2))].into();
+        let stayed: BTreeSet<String> = before.intersection(&backups_here(&local)).cloned().collect();
+        assert_eq!(stayed, weekly, "{r:?}");
+        let r = pull(&brain, &fake::Key("coord"), &local, later, &mut Vec::new()).unwrap();
+        assert_eq!(r.removed.into_iter().collect::<BTreeSet<String>>(), weekly);
+        assert_eq!(backups_here(&local), keep(&weeks, KEEP_DAILY, KEEP_WEEKLY).into_iter().map(name_of).collect());
+    }
+
+    /// Only backups dated after the newest copy here are taken. A pull cut
+    /// off half way goes on where it ended (oldest first, so what is
+    /// missing is newer); a copy here dated far ahead does not stop the
+    /// pulls; an older backup that is missing here is said, not copied.
+    #[test]
+    fn only_backups_after_the_newest_here_are_taken() {
+        let dir = TempDir::new();
+        let local = dir.join("backups");
+        let mut cut = FakeBrain::new(&nights(9));
+        cut.fails_after = Some(6);
+        let r = pull(&cut, &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        let first: Vec<String> = (14..=16).map(|d| name_of(t(2026, 11, d, 2))).collect();
+        assert_eq!(r.fetched, first, "{r:?}");
+        assert_eq!(r.problems.len(), 4, "{:?}", r.problems);
+        let r = pull(&FakeBrain::new(&nights(9)), &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        assert_eq!(r.fetched, (17..=20).map(|d| name_of(t(2026, 11, d, 2))).collect::<Vec<_>>(), "{r:?}");
+        assert!(r.problems.is_empty() && r.late.is_empty() && r.removed.is_empty(), "{r:?}");
+        assert_eq!(backups_here(&local), keep(&nights(9), KEEP_DAILY, KEEP_WEEKLY).into_iter().map(name_of).collect());
+
+        // A copy here from 2030 (put there by hand): the newest one that
+        // counts is Nov 20, and Nov 21 still comes.
+        let ahead = name_of(t(2030, 1, 1, 2));
+        put(&local, &ahead, "from a clock far ahead");
+        put(&local, &format!("{ahead}.sig"), "sig");
+        let mut next = nights(9);
+        next.insert(0, t(2026, 11, 21, 2));
+        let r = pull(&FakeBrain::new(&next), &fake::Key("coord"), &local, desk(), &mut Vec::new()).unwrap();
+        assert_eq!(r.fetched, vec![name_of(t(2026, 11, 21, 2))], "{r:?}");
+
+        // Only the newest night here (copied in by hand): the night
+        // before it is said, not copied.
+        let dir = TempDir::new();
+        let local = dir.join("backups");
+        let brain = FakeBrain::new(&nights(2));
+        let n = name_of(nights(2)[0]);
+        put(&local, &n, "encrypted backup 0");
+        let mut out = Vec::new();
+        let r = pull(&brain, &fake::Key("coord"), &local, desk(), &mut out).unwrap();
+        assert!(r.fetched.is_empty() && r.problems.is_empty() && r.removed.is_empty(), "{r:?}");
+        assert_eq!(r.late, vec![name_of(nights(2)[1])]);
+        assert!(String::from_utf8(out).unwrap().contains(&format!("not copied: {}, dated before {n}", r.late[0])));
+        assert!(brain.fetched.lock().unwrap().is_empty());
     }
 
     /// The coordinator signs with ssh-keygen and its host key exactly as

@@ -560,6 +560,18 @@ removes nothing. Names dated more than a day after your computer's clock,
 and files listed above 4 GiB, are not copied. Pull now and then: if the
 coordinator's disk dies, the backups on it die with it.
 
+A coordinator hacked as root can sign anything with its host key and make
+backups that open (it has the public key they are encrypted to), so a
+backup that checks out is no proof that it is a good one. What it cannot
+change is your computer's clock. So a pull takes only backups dated after
+the newest copy you have, oldest first, and says which older ones it did
+not copy: your copies are pushed out only by newer days and weeks, as time
+would push them out anyway, never by backups dated back into their days.
+And the weekly copies you had before a pull stay through that pull
+(they go at the next one when newer weeks took their place): one pull
+never removes every copy you have. The copies from before a break-in are
+the ones you need, so pull often and look at what each pull says.
+
 On the coordinator, the backups are in `/var/lib/dryserver-backup` (root's,
 readable by your login; not inside `/var/lib/dryserver`, which belongs to
 the account every server reaches), `sudo dryserver backup` makes one now,
