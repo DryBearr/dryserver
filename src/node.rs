@@ -189,7 +189,7 @@ impl Node {
     }
 
     /// Whether leave's marker is there.
-    fn has_left(&self) -> bool {
+    pub(crate) fn has_left(&self) -> bool {
         std::fs::symlink_metadata(self.path(LEFT)).is_ok()
     }
 
@@ -955,8 +955,17 @@ fn populated(dir: &Path) -> bool {
 /// join request, shows the pairing code on the console and waits. On
 /// approval it brings up the mesh and disables itself.
 pub fn join_loop(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write) -> Result<()> {
-    if n.load_state().host > 0 {
-        return n.cmd(ctx, "systemctl", &["disable", "dryserver-join.service"]);
+    match n.read_state() {
+        Ok(Some(s)) if s.host > 0 => return n.cmd(ctx, "systemctl", &["disable", "dryserver-join.service"]),
+        Ok(_) => {}
+        // A damaged join.json may belong to a member: a new request would
+        // write over the one record of its mesh number.
+        Err(e) => {
+            return Err(errf!(
+                "{e}: not asking to join, it may hold this server's mesh number. Put it back ({{\"host\": N}}), \
+                 or remove it to ask to join as a new machine"
+            ));
+        }
     }
     let mut show = |msg: &str| {
         let _ = writeln!(log, "{msg}");
@@ -2340,6 +2349,18 @@ mod tests {
         join_loop(&Ctx::new(), &n, &params, &mut Vec::new()).unwrap();
         assert!(fc.calls.lock().unwrap().is_empty(), "join asked a cut coordinator");
         assert!(get(&n.root, ISSUE_FILE).contains("quarantined"));
+    }
+
+    #[test]
+    fn join_never_writes_over_a_damaged_join_state() {
+        let (_dir, n, fc) = setup(vec![StatusReply { status: Status::Pending, ..StatusReply::default() }]);
+        put(&n.root, JOIN_STATE, "{\"host\": 4,");
+        let plan = packages::resolve(&[], &[]).unwrap();
+        let params = Params { config: n.cfg.clone(), plan, hostname: "node-a".into(), ..Params::default() };
+        let e = join_loop(&Ctx::new(), &n, &params, &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("damaged") && e.contains("not asking to join"), "{e}");
+        assert!(fc.calls.lock().unwrap().is_empty(), "a request was sent");
+        assert_eq!(get(&n.root, JOIN_STATE), "{\"host\": 4,", "the one record of its mesh number was written over");
     }
 
     #[test]

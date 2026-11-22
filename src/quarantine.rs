@@ -469,8 +469,84 @@ fn save(n: &Node, st: &State) -> Result<()> {
     n.write(STATE_FILE, 0o600, &(serde_json::to_string_pretty(st)? + "\n"))
 }
 
-fn joined(n: &Node, coordinator: bool) -> bool {
-    coordinator || n.load_state().host > 0
+/// Whether this server is a member of the mesh, as far as join.json tells.
+/// A join.json that is damaged, or gone from a machine that was approved,
+/// says nothing about the admin's decision: such a machine is not taken
+/// for one that never joined (see node::LEFT for the same rule at leave).
+#[derive(Debug)]
+enum Membership {
+    /// join.json names this mesh host number (1: the coordinator).
+    Member(u32),
+    /// Positively no member: join.json says host 0 (waiting for approval,
+    /// or removed: leave writes that), the leave marker is there, or there
+    /// is no join.json on a machine that was never approved.
+    NoMember,
+    /// It cannot tell.
+    Unknown(Error),
+}
+
+impl Membership {
+    /// The host number for what only needs this server's own address
+    /// (cuts leave it out); 0 when it is not known.
+    fn host(&self) -> u32 {
+        match self {
+            Membership::Member(h) => *h,
+            _ => 0,
+        }
+    }
+}
+
+fn membership(n: &Node, coordinator: bool) -> Membership {
+    if coordinator {
+        return Membership::Member(1);
+    }
+    match n.read_state() {
+        Ok(Some(s)) if s.host > 0 => Membership::Member(s.host),
+        Ok(Some(_)) => Membership::NoMember,
+        Ok(None) if n.has_left() || std::fs::symlink_metadata(n.path(node::SIGNED_FILE)).is_err() => Membership::NoMember,
+        Ok(None) => Membership::Unknown(errf!(
+            "there is no {}, although this server was approved before ({} is there)",
+            node::JOIN_STATE,
+            node::SIGNED_FILE
+        )),
+        Err(e) => Membership::Unknown(e),
+    }
+}
+
+/// The cuts a damaged STATE_FILE can still be told from: the addresses the
+/// firewall file blocks (it is written from the state and kept apart from
+/// it), and the k3s hold that only a cut of the coordinator leaves. Each
+/// blocked address stays blocked; the WireGuard peers that were removed
+/// are lost with the file.
+fn recover(n: &Node) -> State {
+    let mut st = State::default();
+    let lan = parse_ip4(&n.cfg.coord_lan_ip);
+    let host = |ip: Ipv4Addr| {
+        if Some(ip) == lan {
+            return 1;
+        }
+        match mesh::host_of(&n.cfg.wg_subnet, ip) {
+            0 => mesh::host_of(&n.cfg.switch_subnet, ip),
+            h => h,
+        }
+    };
+    let now = Time::now();
+    for ip in blocked(&fsx::read_or_empty(n.path(NFT_FILE))) {
+        let h = host(ip);
+        st.add(Cut { hosts: if h > 0 { vec![h] } else { Vec::new() }, ips: vec![ip.to_string()], since: now, ..Cut::default() });
+    }
+    if std::fs::symlink_metadata(n.path(crate::sysconf::K3S_HOLD)).is_ok() && !st.coordinator_cut() {
+        let ips = [mesh::ip(&n.cfg.wg_subnet, 1), mesh::ip(&n.cfg.switch_subnet, 1)].into_iter().filter(|i| !i.is_empty()).collect();
+        st.add(Cut { hosts: vec![1], ips, since: now, ..Cut::default() });
+    }
+    st
+}
+
+/// The addresses in the cut4 set of a firewall file nft_rules wrote.
+fn blocked(rules: &str) -> Vec<Ipv4Addr> {
+    let Some((_, rest)) = rules.split_once("elements = {") else { return Vec::new() };
+    let set = rest.split_once('}').map_or("", |(s, _)| s);
+    set.split(',').filter_map(|s| parse_ip4(s.trim())).collect()
 }
 
 /// Where automatic cuts are written down.
@@ -499,7 +575,7 @@ pub fn auto_cut(ctx: &Ctx, n: &Node, coordinator: bool) -> Result<()> {
     if offenders.is_empty() {
         return Ok(());
     }
-    let me = if coordinator { 1 } else { n.load_state().host };
+    let me = membership(n, coordinator).host();
     let st = load(n)?;
     let peers = parse_peers(&fsx::read_or_empty(n.path(node::WG_CONF)));
     for ip in offenders {
@@ -539,14 +615,23 @@ pub fn cut(ctx: &Ctx, n: &Node, coordinator: bool, names: &[String], out: &mut d
 }
 
 fn cut_as(ctx: &Ctx, n: &Node, coordinator: bool, names: &[String], auto: bool, out: &mut dyn Write) -> Result<()> {
-    let me = if coordinator { 1 } else { n.load_state().host };
+    // Unknown counts as 0 here: the own address is only left out of the
+    // cut, and a cut never takes anything from this server.
+    let me = membership(n, coordinator).host();
     let _lock = fsx::lock(n.path(MESH_LOCK))?;
     let mut st = match load(n) {
         Ok(s) => s,
         Err(e) => {
-            let _ = writeln!(out, "warning: {e}\n  keeping it as {STATE_FILE}.damaged and starting over");
+            // What it cut stays cut: starting from nothing would unblock
+            // the coordinator if the damaged file had cut it.
+            let st = recover(n);
+            let _ = writeln!(
+                out,
+                "warning: {e}\n  keeping it as {STATE_FILE}.damaged; what the firewall still blocks stays cut{}",
+                if st.coordinator_cut() { ", the coordinator among it" } else { "" }
+            );
             let _ = fsx::rename(n.path(STATE_FILE), n.path(&format!("{STATE_FILE}.damaged")));
-            State::default()
+            st
         }
     };
     let conf = fsx::read_or_empty(n.path(node::WG_CONF));
@@ -648,8 +733,10 @@ enum Coordinator {
 /// than what this server has seen, and it must hold this server. When its
 /// coordinator has other keys than the one pinned here (it was reinstalled),
 /// this server takes those keys from the signed list: the pinned SSH host
-/// key, the WireGuard peer and the trust files.
-fn adopt(ctx: &Ctx, n: &Node, me: u32) -> Result<Coordinator> {
+/// key, the WireGuard peer and the trust files. rewrite writes the mesh
+/// files from the signed list also for the same coordinator: the peers the
+/// cut removed are lost with a damaged STATE_FILE.
+fn adopt(ctx: &Ctx, n: &Node, me: u32, rewrite: bool) -> Result<Coordinator> {
     let ip = &n.cfg.coord_lan_ip;
     let env =
         n.fetch_signed_unpinned(ctx).map_err(|e| e.wrap(format!("cannot read the signed member list from the coordinator at {ip}")))?;
@@ -686,7 +773,7 @@ fn adopt(ctx: &Ctx, n: &Node, me: u32) -> Result<Coordinator> {
         if known.is_some_and(|k| k.doc != env.doc) {
             bail!("the coordinator at {ip} serves a different signed list under the same version {seen}");
         }
-        if n.coordinator_key().ok().as_deref() == Some(key.as_str()) {
+        if !rewrite && n.coordinator_key().ok().as_deref() == Some(key.as_str()) {
             return Ok(Coordinator::Same);
         }
     }
@@ -729,21 +816,33 @@ fn signed_keys(n: &Node) -> Option<Vec<String>> {
 /// sync and join run again.
 pub fn lift(ctx: &Ctx, n: &Node, coordinator: bool, out: &mut dyn Write) -> Result<()> {
     let lock = fsx::lock(n.path(MESH_LOCK))?;
-    let st = match load(n) {
-        Ok(s) => s,
+    let (st, damaged) = match load(n) {
+        Ok(s) => (s, false),
         Err(e) => {
-            let _ = writeln!(out, "warning: {e}; the removed peers cannot be put back from it");
-            State::default()
+            // What it cut is told from the firewall file and the k3s hold:
+            // a coordinator it cut is trusted again only like any other.
+            let st = recover(n);
+            let _ = writeln!(
+                out,
+                "warning: {e}; the removed peers cannot be put back from it{}",
+                if st.coordinator_cut() && !coordinator {
+                    ". It had cut off the coordinator, which is trusted again only with a member list you signed"
+                } else {
+                    ""
+                }
+            );
+            (st, true)
         }
     };
-    let me = if coordinator { 1 } else { n.load_state().host };
+    let member = membership(n, coordinator);
+    let me = member.host();
     let any = !st.is_empty() || fsx::exists(n.path(STATE_FILE)) || fsx::exists(n.path(NFT_FILE));
     if !any {
         // Not cut off, but maybe left behind: a server that was switched
         // off while the coordinator was replaced still pins the old one.
         if !coordinator
             && me > 0
-            && let Ok(Coordinator::New) = adopt(ctx, n, me)
+            && let Ok(Coordinator::New) = adopt(ctx, n, me, false)
         {
             let _ = n.reload_wg(ctx);
             drop(lock);
@@ -763,17 +862,29 @@ pub fn lift(ctx: &Ctx, n: &Node, coordinator: bool, out: &mut dyn Write) -> Resu
     let conf = fsx::read_or_empty(n.path(node::WG_CONF));
     let mut found = None;
     if st.coordinator_cut() && !coordinator {
+        // Which way the coordinator is trusted again depends on whether
+        // this server is a member. When it cannot tell, it changes
+        // nothing: forgetting the pinned coordinator of a member would let
+        // whatever answers at its address be pinned next.
+        if let Membership::Unknown(e) = &member {
+            return Err(errf!(
+                "not lifted, the quarantine stays: this server cannot tell whether it is a member of the swarm ({e}). \
+                 Put back {} (it holds {{\"host\": N}}, N its mesh number) and run this again",
+                node::JOIN_STATE
+            ));
+        }
         // The block has to go before the coordinator can be asked; it comes
         // straight back if the answer is not good enough.
         unload(&mut errs);
         if me == 0 {
-            // Not joined yet: forget the coordinator this machine saw. It
-            // asks again and shows a new code, made with whatever
-            // coordinator answers now, for the admin to compare.
+            // Not joined yet (or removed): forget the coordinator this
+            // machine saw. It asks again and shows a new code, made with
+            // whatever coordinator answers now, for the admin to compare.
+            // join.json stays, saying host 0: no member, no request.
             let _ = std::fs::remove_file(n.path(node::KNOWN_HOSTS));
-            let _ = std::fs::remove_file(n.path(node::JOIN_STATE));
+            let _ = n.save_state(&node::State::default());
         } else {
-            match adopt(ctx, n, me) {
+            match adopt(ctx, n, me, damaged) {
                 Ok(c) => found = Some(c),
                 Err(e) => {
                     let back = n.run.ok(ctx, &Cmd::new("nft", &["-f", &n.path(NFT_FILE).display().to_string()]));
@@ -838,10 +949,15 @@ pub fn lift(ctx: &Ctx, n: &Node, coordinator: bool, out: &mut dyn Write) -> Resu
     // k3s may run again; the next sync starts it.
     let _ = std::fs::remove_file(n.path(crate::sysconf::K3S_HOLD));
     drop(lock);
-    if joined(n, coordinator) {
-        let _ = n.run.ok(ctx, &Cmd::new("systemctl", &["start", "--no-block", "dryserver-sync.service"]));
-    } else {
+    // A machine that cannot tell whether it is a member does not ask to
+    // join again: its sync changes nothing and says why.
+    if matches!(member, Membership::NoMember) {
         let _ = n.run.ok(ctx, &Cmd::new("systemctl", &["restart", "--no-block", "dryserver-join.service"]));
+    } else {
+        let _ = n.run.ok(ctx, &Cmd::new("systemctl", &["start", "--no-block", "dryserver-sync.service"]));
+    }
+    if let Membership::Unknown(e) = &member {
+        let _ = writeln!(out, "note: this server cannot tell whether it is a member of the swarm: {e}");
     }
     match found {
         Some(Coordinator::New) => {
@@ -1605,9 +1721,131 @@ PersistentKeepalive = 25
         cut(&Ctx::new(), &n, false, &[], &mut Vec::new()).unwrap();
         lift(&Ctx::new(), &n, false, &mut Vec::new()).unwrap();
         assert!(get(dir.path(), node::KNOWN_HOSTS).is_empty(), "the old pin must go, so the next code is made with what answers now");
-        assert!(get(dir.path(), node::JOIN_STATE).is_empty());
+        assert_eq!(n.read_state().unwrap(), Some(node::State::default()), "the request is forgotten, host 0 stays written");
         let calls = fake.calls.lock().unwrap().join("\n");
         assert!(calls.contains("systemctl restart --no-block dryserver-join.service"), "{calls}");
+        // Cut and lifted again: still a machine that has not joined.
+        cut(&Ctx::new(), &n, false, &[], &mut Vec::new()).unwrap();
+        lift(&Ctx::new(), &n, false, &mut Vec::new()).unwrap();
+        assert!(load(&n).unwrap().is_empty());
+    }
+
+    /// The cut of the coordinator is in place, as cut() leaves it.
+    fn still_cut(dir: &Path, n: &Node, kh: &str, join: &str, why: &str) {
+        assert!(load(n).unwrap().coordinator_cut(), "the cut was dropped ({why})");
+        assert!(get(dir, NFT_FILE).contains("10.66.0.1"), "the rules file changed ({why})");
+        assert!(!get(dir, node::WG_CONF).contains(&wg(1)), "the coordinator's peer came back ({why})");
+        assert_eq!(get(dir, node::KNOWN_HOSTS), kh, "the pin changed ({why})");
+        assert_eq!(get(dir, node::JOIN_STATE), join, "join.json changed ({why})");
+        assert!(n.path(crate::sysconf::K3S_HOLD).exists(), "k3s may start again ({why})");
+    }
+
+    #[test]
+    fn a_server_that_cannot_tell_whether_it_is_a_member_keeps_the_cut() {
+        for (join, why) in [(Some("{\"host\": 2,"), "damaged join.json"), (None, "join.json gone from an approved server")] {
+            let dir = TempDir::new();
+            let fake = Arc::new(Fake::default());
+            let n = server(dir.path(), fake.clone());
+            let ctx = Ctx::new();
+            cut(&ctx, &n, false, &[], &mut Vec::new()).unwrap();
+            match join {
+                Some(text) => put(dir.path(), node::JOIN_STATE, text),
+                None => std::fs::remove_file(n.path(node::JOIN_STATE)).unwrap(),
+            }
+            let (kh, js) = (get(dir.path(), node::KNOWN_HOSTS), get(dir.path(), node::JOIN_STATE));
+            let before = fake.calls.lock().unwrap().len();
+            let e = lift(&ctx, &n, false, &mut Vec::new()).unwrap_err().to_string();
+            assert!(e.contains("cannot tell whether it is a member") && e.contains("the quarantine stays"), "{why}: {e}");
+            still_cut(dir.path(), &n, &kh, &js, why);
+            let calls = fake.calls.lock().unwrap()[before..].join("\n");
+            assert!(!calls.contains("nft destroy") && !calls.contains("dryserver-join") && !calls.contains("ssh"), "{why}: {calls}");
+            // join.json back in place: the lift goes on as usual.
+            put(dir.path(), node::JOIN_STATE, r#"{"host":2}"#);
+            lift(&ctx, &n, false, &mut Vec::new()).unwrap();
+            assert!(load(&n).unwrap().is_empty() && get(dir.path(), node::WG_CONF).contains(&wg(1)), "{why}");
+        }
+
+        // Only another member cut: that lift takes nothing from this
+        // server, so it goes ahead, keeps the pin and join.json, and runs
+        // sync (which changes nothing and says why), never join.
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        let ctx = Ctx::new();
+        cut(&ctx, &n, false, &["node-c".into()], &mut Vec::new()).unwrap();
+        put(dir.path(), node::JOIN_STATE, "garbage");
+        let mut out = Vec::new();
+        lift(&ctx, &n, false, &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("cannot tell whether it is a member"), "{}", String::from_utf8_lossy(&out));
+        assert!(load(&n).unwrap().is_empty() && get(dir.path(), node::WG_CONF).contains(&wg(3)));
+        assert!(get(dir.path(), node::KNOWN_HOSTS).contains(COORD_SSH) && get(dir.path(), node::JOIN_STATE) == "garbage");
+        let calls = fake.calls.lock().unwrap().join("\n");
+        assert!(calls.contains("systemctl start --no-block dryserver-sync.service") && !calls.contains("dryserver-join"), "{calls}");
+
+        // Never approved (no signed list here) and no join.json: it has not
+        // joined, and forgets the coordinator it saw, as before.
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake::default());
+        let n = server(dir.path(), fake.clone());
+        for f in [node::JOIN_STATE, node::SIGNED_FILE, node::WG_CONF] {
+            std::fs::remove_file(n.path(f)).unwrap();
+        }
+        cut(&ctx, &n, false, &[], &mut Vec::new()).unwrap();
+        lift(&ctx, &n, false, &mut Vec::new()).unwrap();
+        assert!(load(&n).unwrap().is_empty() && get(dir.path(), node::KNOWN_HOSTS).is_empty());
+        assert!(fake.calls.lock().unwrap().join("\n").contains("systemctl restart --no-block dryserver-join.service"));
+    }
+
+    #[test]
+    fn a_damaged_cut_file_never_unblocks_the_coordinator() {
+        let dir = TempDir::new();
+        let fake = Arc::new(Fake { gateway: "192.168.1.1".into(), ..Fake::default() });
+        let n = server(dir.path(), fake.clone());
+        let ctx = Ctx::new();
+        cut(&ctx, &n, false, &[], &mut Vec::new()).unwrap();
+        // The admin cuts node-c too; the saved cut has been damaged.
+        put(dir.path(), STATE_FILE, "{\"cuts\": [");
+        let mut out = Vec::new();
+        cut(&ctx, &n, false, &["node-c".into()], &mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("the coordinator among it"), "{text}");
+        let st = load(&n).unwrap();
+        assert!(st.coordinator_cut() && st.cuts.iter().any(|c| c.name == "node-c"), "{st:?}");
+        let rules = get(dir.path(), NFT_FILE);
+        for ip in ["10.66.0.1", "172.16.66.1", "192.168.1.50", "10.66.0.3"] {
+            assert!(rules.contains(ip), "{ip} unblocked:\n{rules}");
+        }
+        assert!(n.path(crate::sysconf::K3S_HOLD).exists());
+
+        // Damaged again, and lifted: the coordinator it cut is trusted
+        // again only with a list the admin signed, like any other.
+        put(dir.path(), STATE_FILE, "nonsense");
+        *fake.signed.lock().unwrap() = Some(signed_reply(&crate::signed::fake::Key("thief"), 9, old_list()).0);
+        let mut out = Vec::new();
+        let e = lift(&ctx, &n, false, &mut out).unwrap_err().to_string();
+        assert!(e.contains("bad signature") && e.contains("the quarantine stays"), "{e}");
+        assert!(String::from_utf8_lossy(&out).contains("It had cut off the coordinator"), "{}", String::from_utf8_lossy(&out));
+        assert!(get(dir.path(), NFT_FILE).contains("10.66.0.1") && n.path(crate::sysconf::K3S_HOLD).exists());
+        // The same coordinator with the list this server knows: lifted, and
+        // its peer, lost with the file, is written from the signed list.
+        let (reply, _) = signed_reply(&ADMIN, 5, old_list());
+        *fake.signed.lock().unwrap() = Some(reply);
+        lift(&ctx, &n, false, &mut Vec::new()).unwrap();
+        let conf = get(dir.path(), node::WG_CONF);
+        assert!(conf.contains(&wg(1)) && conf.contains("Endpoint = 192.168.1.50:51820"), "{conf}");
+        assert!(!n.path(STATE_FILE).exists() && !n.path(NFT_FILE).exists() && !n.path(crate::sysconf::K3S_HOLD).exists());
+
+        // Only the k3s hold left to tell: the coordinator's mesh addresses
+        // stay blocked.
+        put(dir.path(), crate::sysconf::K3S_HOLD, "x\n");
+        put(dir.path(), STATE_FILE, "nonsense");
+        let st = recover(&n);
+        assert!(st.coordinator_cut() && st.cuts[0].ips == vec!["10.66.0.1".to_string(), "172.16.66.1".into()], "{st:?}");
+        // Nothing to tell from: nothing is made up.
+        std::fs::remove_file(n.path(crate::sysconf::K3S_HOLD)).unwrap();
+        assert!(recover(&n).is_empty());
+        assert_eq!(blocked("elements = { 10.66.0.1, 192.168.1.50 }\n}"), vec![Ipv4Addr::new(10, 66, 0, 1), Ipv4Addr::new(192, 168, 1, 50)]);
+        assert!(blocked("# Cut off: elements.\nset cut4 {\n\t\ttype ipv4_addr\n\t}").is_empty());
     }
 
     #[test]
