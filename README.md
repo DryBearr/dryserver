@@ -400,9 +400,12 @@ What dryserver sets up around every app (namespace `apps`):
   not a door from the mesh or the home network,
 - no machine is a router into the cluster: what arrives from the home
   network, the switch or the mesh is never passed on to pods elsewhere,
-- servers join the cluster with a token that is for agents only. It does
-  not open the control plane, and only the server it was sealed for can
-  read it (see [Security](#security)).
+- each server joins the cluster with a token of its own, made for it
+  alone and deleted once it is in. From then on it shows its own
+  certificate, which k3s takes for its own name only: no server can
+  register a machine under the name of another, also not one you just
+  approved. The token does not open the control plane, and the registry
+  account cannot read it (see [Security](#security)).
 
 k3s is one pinned release, downloaded from its GitHub releases when the USB
 stick is built and checked against the checksum dryserver was built with.
@@ -544,30 +547,35 @@ keeps its apps running. To bring a removed server back, run
 installed again under a name the cluster knows takes that name over: the
 coordinator forgets the old machine first.
 
-A removed server still knows the cluster token it joined with. If you do
-not trust it, make a new token (below).
+A removed server holds no token: its own was deleted when it joined. Its
+certificate is good for its own name only, and that machine is out of the
+mesh, so it no longer reaches the cluster.
 
 ### A new cluster token
 
-The token servers join the cluster with is made from the secret in
-`/etc/rancher/k3s/agent-token` on the coordinator. Make a new one when you
-removed a server you do not trust, or when your cluster is older than
-sealed tokens (the registry account could read the token then, see
-[Security](#security)). On the coordinator:
+Each server joins with a token of its own (`k3s token create`, good for a
+day): the coordinator's sync makes one for every server the admin signed
+that is not in the cluster yet, seals it for that server and deletes it
+once the server's node is there. A server whose node is deleted by hand
+(`k3s kubectl delete node NAME`) gets a new one within a minute; that is
+also the way back for a server whose certificate is gone or ran out.
+
+Older versions handed every server one shared token, made from the secret
+in `/etc/rancher/k3s/agent-token` on the coordinator. With it, any of those
+servers could register a machine under the name of a server you approve
+next, before that server does. Until you make a new secret, the
+coordinator's sync says so (`journalctl -u dryserver-sync`) and its console
+shows it. On the coordinator:
 
 ```sh
 sudo sh -c 'umask 077; head -c 32 /dev/urandom | sha256sum | cut -d" " -f1 > /etc/rancher/k3s/agent-token'
 sudo systemctl restart k3s
 ```
 
-k3s writes the new token to `/var/lib/rancher/k3s/server/agent-token`;
-within a minute the coordinator's sync seals it for every server, and each
-server writes it and restarts its k3s (apps keep running while k3s
-restarts). The old token joins nothing from then on. Machines the cluster
-knows already stay in it, but one that is no member is removed by the
-coordinator's sync within a minute anyway. k3s's documentation allows
-changing the agent token of a running cluster this way; it is not tested on
-real machines yet.
+Nobody gets the new one: servers in the cluster go on with their own
+certificates, and k3s's own documentation allows changing the agent token
+of a running cluster. Apps keep running while k3s restarts. This is not
+tested on real machines yet.
 
 ## Backups
 
@@ -955,33 +963,40 @@ ended.
   coordinator can hold back a newer list from servers that have not seen it
   yet, so a removal may not arrive; cut the machine off with
   `./dryserver quarantine-all -name NAME` then.
-- **The cluster token never reaches the registry.** Servers get the member
-  list from an account on the coordinator that every server reaches over
-  SSH, so whatever that account can read counts as known. The token k3s
-  agents join with is not among it: with it, the account could join a
-  machine of its own to the cluster and draw apps and their secrets there.
-  Root on the coordinator encrypts the token with `age` for each server in
-  the signed list, to that server's SSH host key, and signs it with the
-  coordinator's host key; the account only passes on what it cannot read.
-  A server takes only a token made for its own key and signed by the
-  coordinator in the signed list. Anything else changes nothing (nothing
-  written, k3s not restarted) and is logged once. Encrypting alone would
-  not do: anyone can encrypt to a public key, and a token carrying the hash
-  of another certificate authority would have the server trust whoever
-  answers on the coordinator's k3s port. A token without that hash is
-  refused for the same reason. A server whose SSH host key is not
-  ssh-ed25519 gets no token, and the coordinator logs why.
-  - Coming from an older dryserver, which kept the token in the registry in
-    plain text: the updated coordinator's first sync removes it. Servers
-    that joined keep the token they hold. A server on an older dryserver
-    that has not joined the cluster yet joins once it is updated (a rollout
-    updates the coordinator first); an updated server never takes a token
-    from an older coordinator. The registry account could read the old
-    token: make a new one ([A new cluster token](#a-new-cluster-token)).
-  - Limit: the registry account can send a server a token the coordinator
-    sealed for it earlier. Until the token is changed that is the same
-    token; after a change it is the old one, and that server's k3s stops
-    working until it gets the new one again.
+- **Each server joins the cluster with a token of its own, and the
+  registry never holds one.** Servers get the member list from an account
+  on the coordinator that every server reaches over SSH, so whatever that
+  account can read counts as known. The tokens k3s agents join with are not
+  among it: with one, the account could join a machine of its own to the
+  cluster and draw apps and their secrets there. Root on the coordinator
+  makes a token for each server in the signed list that is not in the
+  cluster yet, encrypts it with `age` to that server's SSH host key, and
+  signs it with the coordinator's host key; the account only passes on
+  what it cannot read. Once the server's node is in the cluster the token
+  is deleted, and the server goes on with its kubelet certificate, which
+  k3s takes for its own name only. One token for all servers would let a
+  hacked server register a node under the name of a server you just
+  approved, before that one does: k3s would then turn the real one away
+  and send that server's pods and their secrets to the hacked one. A server
+  takes only a token made for its own key and signed by the coordinator in
+  the signed list. Anything else changes nothing (nothing written, k3s not
+  restarted) and is logged once. Encrypting alone would not do: anyone can
+  encrypt to a public key, and a token carrying the hash of another
+  certificate authority would have the server trust whoever answers on the
+  coordinator's k3s port. A token without that hash is refused for the
+  same reason. A server whose SSH host key is not ssh-ed25519 gets no
+  token, and the coordinator logs why.
+  - Coming from an older dryserver: servers that joined stay in the cluster
+    and need nothing new. They hold the token older versions shared among
+    all servers (once in the registry in plain text, so the registry
+    account could read it too): make a new one ([A new cluster
+    token](#a-new-cluster-token)); the coordinator says so until you do. A
+    server on an older dryserver that has not joined yet joins once it is
+    updated (a rollout updates the coordinator first); an updated server
+    never takes a token from an older coordinator.
+  - Limit: the registry account can send a server an older token the
+    coordinator sealed for it, which then fails; the next one arrives at
+    the next sync the account lets through.
 - **The USB stick** holds the WiFi password, the key that lets machines ask
   to join and the join secret. Whoever has it can make a join request that
   looks installed from your stick; it still needs your approval and a

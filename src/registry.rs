@@ -155,10 +155,11 @@ pub struct State {
     /// admin's USB stick (see join_proof). The coordinator cannot make one.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub coordinator_proof: String,
-    /// The cluster's token for joining as a k3s agent, sealed by the
-    /// coordinator's sync for each member the admin signed (k3stoken.rs):
-    /// this file, which the registry account writes, never holds the token
-    /// itself. Each member gets its own with the member list; nobody gets
+    /// The token for joining the cluster as a k3s agent of each server the
+    /// admin signed that is not in the cluster yet, one of its own, sealed
+    /// by the coordinator's sync (k3stoken.rs, node.rs k3s_share): this
+    /// file, which the registry account writes, never holds a token itself.
+    /// Each member gets its own with the member list; nobody gets
     /// another's. Older versions kept the token here in plain text as
     /// "k3s_token", a field this version does not know: the first write
     /// after the update leaves it out. A form this version cannot read

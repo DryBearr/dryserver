@@ -1,16 +1,24 @@
-//! The cluster's join token on its way from the coordinator to the
-//! servers.
+//! A server's token for joining the cluster, on its way from the
+//! coordinator to that server.
 //!
-//! k3s agents join the cluster with one token. On the coordinator it is in
-//! a file only root reads; the way to the servers is the registry
-//! (registry.rs), whose account every server reaches over SSH. Whatever
-//! that account can read is as good as known: a bug in its forced command
-//! is enough. With the token it could join a machine of its own to the
-//! cluster through the coordinator's own k3s, and pods with their secrets
-//! would go there.
+//! Each server joins with a token of its own: a k3s bootstrap token that
+//! root on the coordinator makes for it (`k3s token create`) and deletes
+//! once the server is in the cluster, from then on the server proves
+//! itself with its kubelet certificate. One token shared by all servers
+//! would let any of them, hacked, register a k3s node under the name of a
+//! server the admin just approved before that server does: k3s then turns
+//! the real one away, and that server's pods and their secrets go to the
+//! hacked one. A server that has joined holds no token that registers
+//! any other name (node.rs, k3s_share).
 //!
-//! So the registry account never holds the token itself. Root's sync on
-//! the coordinator seals it for each member the admin signed:
+//! The way to the servers is the registry (registry.rs), whose account
+//! every server reaches over SSH. Whatever that account can read is as good
+//! as known: a bug in its forced command is enough. With a token it could
+//! join a machine of its own to the cluster through the coordinator's own
+//! k3s, and pods with their secrets would go there.
+//!
+//! So the registry account never holds a token itself. Root's sync on the
+//! coordinator seals each one for the member it is for:
 //!
 //! - encrypted with `age` to the member's SSH host key (ssh-ed25519, from
 //!   the signed list): only root on that member can read it;
@@ -26,13 +34,11 @@
 //! commands that see it log nothing.
 //!
 //! Limit: the registry account can send a server a token the coordinator
-//! sealed for it before. Until the token is changed it is the same one;
-//! after a change it is the old one, which no longer works there.
+//! sealed for it before: an older one, which no longer works there.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::ctx::Ctx;
 use crate::err::Result;
@@ -100,11 +106,14 @@ pub fn is_ed25519(key: &str) -> bool {
 
 /// What is wrong with a token for agents, if anything. Its form is
 /// "K10" + the SHA-256 (hex) of the cluster's certificate authority +
-/// "::node:" + the secret. Without the hash a k3s agent trusts whichever
-/// certificate authority the server it reaches shows; the control plane's
-/// own token ("::server:") opens more than an agent needs.
+/// "::" + the credentials: a bootstrap token "<id>.<secret>" (6 and 16
+/// characters a-z, 0-9) as `k3s token create` makes one, or "node:" + the
+/// secret, the one token for every agent older versions handed out.
+/// Without the hash a k3s agent trusts whichever certificate authority the
+/// server it reaches shows; the control plane's own token ("::server:")
+/// opens more than an agent needs.
 pub fn problem(token: &str) -> Option<&'static str> {
-    if token.is_empty() || token.len() > MAX_TOKEN || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b':') {
+    if token.is_empty() || token.len() > MAX_TOKEN || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b':' || b == b'.') {
         return Some("not a k3s token");
     }
     let Some((hash, cred)) = token.strip_prefix("K10").and_then(|t| t.split_once("::")) else {
@@ -113,28 +122,30 @@ pub fn problem(token: &str) -> Option<&'static str> {
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Some("without the hash of the cluster's certificate authority");
     }
-    match cred.strip_prefix("node:") {
-        Some(secret) if !secret.is_empty() && !secret.contains(':') => None,
-        Some(_) => Some("not a k3s token"),
-        None => Some("not for agents"),
+    if bootstrap_id(token).is_some() {
+        return None;
     }
+    match cred.strip_prefix("node:") {
+        Some(secret) if !secret.is_empty() && !secret.contains([':', '.']) => None,
+        Some(_) => Some("not a k3s token"),
+        None if cred.contains(':') => Some("not for agents"),
+        None => Some("not a k3s token"),
+    }
+}
+
+/// The id of a bootstrap token ("K10<hash>::<id>.<secret>"), which `k3s
+/// token delete` takes; none for any other form.
+pub fn bootstrap_id(token: &str) -> Option<&str> {
+    let (_, cred) = token.split_once("::")?;
+    let (id, secret) = cred.split_once('.')?;
+    let plain = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    (plain(id, 6) && plain(secret, 16)).then_some(id)
 }
 
 /// What the coordinator signs: the member it is for and the encrypted
 /// token, so it cannot pass for another member's.
 pub fn signed_text(host: u32, key: &str, age: &str) -> String {
     format!("dryserver-k3s-token-v1\nhost {host}\nkey {key}\n{age}")
-}
-
-/// What root on the coordinator remembers of a sealed token it made, in a
-/// file of its own: it makes the token again only when the token, the
-/// coordinator's key or the member's key changed, or the registry holds
-/// something else. age output is new every time; made every minute, it
-/// would change the registry every minute. It covers the token, so it
-/// stays root's: in the registry it would be a check for guesses.
-pub fn digest(token: &str, coord_key: &str, s: &Sealed) -> String {
-    let text = ["dryserver-k3s-sealed-v1", token, coord_key, &s.host.to_string(), &s.key, &s.age, &s.sig].join("\n");
-    fsx::hex(&Sha256::digest(text.as_bytes()))
 }
 
 /// Seals token for the member host with SSH host key key, signed with
@@ -230,6 +241,10 @@ fn verify(ctx: &Ctx, run: &dyn Runner, tmp_dir: &Path, key: &str, text: &str, si
 pub mod fake {
     use super::*;
     use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    /// A bootstrap token as `k3s token create` prints it.
+    pub const BOOTSTRAP: &str = "K10f3a1c0d9e8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1::tok001.0123456789abcdef";
 
     /// A token for agents as k3s writes it.
     pub const TOKEN: &str = "K10f3a1c0d9e8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1::node:0123456789abcdef0123456789abcdef";
@@ -436,20 +451,27 @@ mod tests {
         Sealed { host: 2, key: NODE.into(), age, sig }
     }
 
+    /// What `k3s token create` prints, and nothing near it.
     #[test]
-    fn the_digest_follows_what_it_was_made_from() {
-        let s = fake::sealed(COORD, 2, NODE, TOKEN);
-        let d = digest(TOKEN, COORD, &s);
-        assert_eq!(d, digest(TOKEN, COORD, &s.clone()));
-        assert!(!d.contains("0123456789abcdef"));
-        for (token, coord, other) in [
-            (&format!("{}0", &TOKEN[..TOKEN.len() - 1]) as &str, COORD, s.clone()),
-            (TOKEN, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIcoord2", s.clone()),
-            (TOKEN, COORD, Sealed { host: 3, ..s.clone() }),
-            (TOKEN, COORD, Sealed { age: fake::encrypt(NODE, TOKEN).replace('A', "B"), ..s.clone() }),
-            (TOKEN, COORD, Sealed { sig: fake::sign(COORD, "x"), ..s.clone() }),
+    fn a_bootstrap_token() {
+        let hash = &TOKEN[3..67];
+        let good = format!("K10{hash}::abc123.0123456789abcdef");
+        assert_eq!((problem(&good), bootstrap_id(&good)), (None, Some("abc123")));
+        assert_eq!(problem(fake::BOOTSTRAP), None);
+        assert_eq!(bootstrap_id(TOKEN), None, "the token shared by all agents has no id");
+        for bad in [
+            "K10::abc123.0123456789abcdef".to_string(),
+            format!("K10{hash}::ABC123.0123456789abcdef"),
+            format!("K10{hash}::abc12.0123456789abcdef"),
+            format!("K10{hash}::abc123.0123456789abcde"),
+            format!("K10{hash}::abc123.0123456789abcdef0"),
+            format!("K10{hash}::abc123.01234567.9abcdef"),
+            format!("K10{hash}::abc123:0123456789abcdef"),
+            format!("K10{hash}::node:abc123.0123456789abcdef"),
+            format!("K10{hash}::abc123.0123456789abcdef\n"),
         ] {
-            assert_ne!(digest(token, coord, &other), d);
+            assert!(problem(&bad).is_some(), "{bad:?}");
+            assert!(bootstrap_id(&bad).is_none() || problem(&bad).is_some(), "{bad:?}");
         }
     }
 

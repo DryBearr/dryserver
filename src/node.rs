@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 use crate::config::{self, Config};
 use crate::ctx::Ctx;
@@ -132,10 +133,66 @@ pub const K3S_CGROUPS: [&str; 2] = ["/sys/fs/cgroup/system.slice/k3s.service", "
 pub const K3S_NODES: &str = "/etc/dryserver/k3s-nodes.json";
 /// Where pods have things mounted, their secrets among them.
 const POD_MOUNTS: [&str; 3] = ["/var/lib/kubelet/pods/", "/run/k3s/", "/run/netns/cni-"];
-/// On the coordinator: what root remembers of each server's sealed token
-/// (k3stoken::digest), by host number. Root's alone, as it covers the
-/// token; lost, every token is sealed once more.
+/// Where the coordinator of an older version remembered the one token it
+/// sealed for every server: there, that token reached servers.
 pub const K3S_SEALED: &str = "/etc/dryserver/k3s-sealed.json";
+/// On the coordinator: the join token root made for each server that has
+/// not joined the cluster yet (Joins). Root's alone. Lost, each such
+/// server gets a new one.
+pub const K3S_JOIN: &str = "/etc/dryserver/k3s-join.json";
+/// On the coordinator: the SHA-256 of the cluster's shared agent token
+/// (K3S_AGENT_TOKEN) while servers hold it, because an older version
+/// handed it out or a server joined without a token of its own. Any of
+/// them could register a node under another server's name with it, until
+/// the admin makes a new one (README, A new cluster token).
+pub const K3S_SHARED: &str = "/etc/dryserver/k3s-shared-token";
+/// On the coordinator's console while K3S_SHARED holds the current token.
+pub const SHARED_ISSUE: &str = "/etc/issue.d/41-dryserver-k3s-token.issue";
+/// How long a join token lasts (k3s deletes it then), and how long before
+/// that the next sync makes a new one.
+pub const JOIN_TOKEN_TTL: i64 = 24 * 3600;
+pub const JOIN_TOKEN_RENEW: i64 = 3600;
+
+/// What root on the coordinator keeps of the join tokens it made
+/// (K3S_JOIN).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct Joins {
+    /// By host number: the token of each server that has not joined yet.
+    tokens: BTreeMap<u32, Join>,
+    /// Tokens no longer handed out that k3s did not delete when asked:
+    /// asked again at every sync until they expire.
+    stale: Vec<Join>,
+}
+
+/// One join token root made.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct Join {
+    /// The server it is for, as the admin signed it.
+    name: String,
+    wg_key: String,
+    /// The coordinator's host key it was signed with.
+    coord: String,
+    /// Its id, which `k3s token delete` takes.
+    id: String,
+    /// When k3s deletes it, Unix seconds by this machine's clock.
+    expires: i64,
+    /// What root leaves in the registry for the server.
+    sealed: Sealed,
+}
+
+impl Join {
+    /// Whether it is the token of this member as the admin signed it now,
+    /// sealed by this coordinator.
+    fn of(&self, m: &Member, coord: &str) -> bool {
+        self.sealed.host == m.host
+            && self.name == m.name
+            && self.wg_key == m.wg_key
+            && self.sealed.key == signed::key_body(&m.ssh_host_key)
+            && self.coord == coord
+    }
+}
 /// What the coordinator's last sync could not seal; a change is logged.
 pub const K3S_SHARE_STATUS: &str = "/run/dryserver-k3s-share.status";
 /// What a server made of the token the coordinator sent at the last sync;
@@ -648,44 +705,47 @@ impl Node {
         }
     }
 
-    /// On the coordinator: seals the cluster's agent token for every
-    /// member the admin signed (members), and takes out of the cluster what
-    /// is no longer there: a machine that left the swarm, and the old
-    /// machine behind a name that was installed again (the cluster would
-    /// turn the new one away).
-    pub fn k3s_share(&self, ctx: &Ctx, store: &Store, members: &[Member]) {
-        let token = fsx::read_or_empty(self.path(K3S_AGENT_TOKEN)).trim().to_string();
-        if token.is_empty() {
-            // k3s is not up yet; the next sync tries again.
-            return;
-        }
-        match k3stoken::problem(&token) {
-            None => self.k3s_seal(ctx, store, &token, members),
-            Some(p) => {
-                // Without a secret of its own for agents, k3s gives them the
-                // server's token. That one is never handed out.
-                let status = format!("the cluster's token for agents is {p} ({} missing?); servers get none", sysconf::K3S_AGENT_SECRET);
-                self.note(K3S_SHARE_STATUS, &format!("k3s: {status}"), &status);
-                let _ = store.update(|s| {
-                    s.k3s_tokens.clear();
-                    Ok(())
-                });
-            }
-        }
+    /// On the coordinator, at every sync with a list the admin signed
+    /// (members): the cluster follows it.
+    ///
+    /// - Out of the cluster goes what is no longer there: a machine that
+    ///   left the swarm, and the old machine behind a name that was
+    ///   installed again (the cluster would turn the new one away).
+    /// - Each server that is not in the cluster yet gets a join token of its
+    ///   own (`k3s token create`, for a day, made again before it ends),
+    ///   sealed for it (k3stoken.rs). The registry holds exactly those.
+    /// - Once its node is there the token is deleted: the server goes on
+    ///   with its kubelet certificate, which k3s takes for its own name
+    ///   only. So no server holds anything that registers a node under
+    ///   another server's name, and the first node under a member's name
+    ///   (K3S_NODES) is that member's.
+    ///
+    /// store None: the registry cannot be used (see sync); what it holds
+    /// stays as it is, and no token is made, as none would arrive.
+    pub fn k3s_share(&self, ctx: &Ctx, store: Option<&Store>, members: &[Member], now: i64) {
         let Ok(out) = self.run.output(ctx, &Cmd::new("k3s", &["kubectl", "get", "nodes", "-o", "name"]).quiet().stdout_only()) else {
+            // k3s is not up (yet): the next sync tries again.
             return;
         };
         let names: Vec<&str> =
             out.lines().filter_map(|l| l.trim().strip_prefix("node/")).filter(|n| *n != self.hostname && registry::valid_name(n)).collect();
-        let was: std::collections::BTreeMap<String, String> =
-            serde_json::from_str(&fsx::read_or_empty(self.path(K3S_NODES))).unwrap_or_default();
+        let coord = members.iter().find(|m| m.host == 1).map(|m| signed::key_body(&m.ssh_host_key)).unwrap_or_default();
+        let first = std::fs::symlink_metadata(self.path(K3S_JOIN)).is_err();
+        let was_joins: Joins = serde_json::from_str(&fsx::read_or_empty(self.path(K3S_JOIN))).unwrap_or_default();
+        let mut joins = was_joins.clone();
+        // Servers that joined with a token root did not make for them hold
+        // the shared one: an older version handed it out.
+        let mut shared = std::fs::symlink_metadata(self.path(K3S_SEALED)).is_ok()
+            || (first && names.iter().any(|n| members.iter().any(|m| m.host >= 2 && m.name == *n)));
+        let was: BTreeMap<String, String> = serde_json::from_str(&fsx::read_or_empty(self.path(K3S_NODES))).unwrap_or_default();
         let mut known = was.clone();
         known.retain(|name, _| names.contains(&name.as_str()));
-        for name in names {
-            let why = match (members.iter().find(|m| m.name == name), known.get(name)) {
+        for name in &names {
+            let why = match (members.iter().find(|m| m.name == *name), known.get(*name)) {
                 (None, _) => "is no longer a member",
                 (Some(m), Some(key)) if *key != m.wg_key => "was installed again",
                 (Some(m), None) => {
+                    shared |= !joins.tokens.get(&m.host).is_some_and(|j| j.of(m, &coord));
                     known.insert(name.to_string(), m.wg_key.clone());
                     continue;
                 }
@@ -693,7 +753,7 @@ impl Node {
             };
             eprintln!("dryserver: {name} {why}: removing the old machine from the cluster");
             if self.cmd(ctx, "k3s", &["kubectl", "delete", "node", name, "--timeout=20s"]).is_ok() {
-                known.remove(name);
+                known.remove(*name);
             }
         }
         if known != was
@@ -701,72 +761,152 @@ impl Node {
         {
             let _ = self.write(K3S_NODES, 0o600, &(text + "\n"));
         }
-    }
-
-    /// On the coordinator: leaves in the registry exactly one sealed
-    /// token for each server in members (see k3stoken), and none for
-    /// anyone else. One is made again only when the token, the
-    /// coordinator's key or the server's key changed, or the registry holds
-    /// something other than what root left there (K3S_SEALED tells).
-    /// A server without an ssh-ed25519 host key gets none; one whose
-    /// sealing failed keeps what it had, and the next sync tries again.
-    fn k3s_seal(&self, ctx: &Ctx, store: &Store, token: &str, members: &[Member]) {
-        let old = match store.read() {
-            Ok(s) => s.k3s_tokens,
-            Err(e) => {
-                eprintln!("dryserver: k3s: cannot read the registry ({e}); the servers' cluster tokens are left as they are");
-                return;
-            }
-        };
-        let coord_key = members.iter().find(|m| m.host == 1).map(|m| signed::key_body(&m.ssh_host_key)).unwrap_or_default();
-        let was: std::collections::BTreeMap<u32, String> =
-            serde_json::from_str(&fsx::read_or_empty(self.path(K3S_SEALED))).unwrap_or_default();
-        let mut known = std::collections::BTreeMap::new();
-        let mut made = Vec::new();
+        // A token for another machine than the member under its number now
+        // (removed, installed again, another key) is never handed out again.
+        let stale: Vec<u32> =
+            joins.tokens.iter().filter(|(h, j)| !members.iter().any(|m| m.host == **h && j.of(m, &coord))).map(|(h, _)| *h).collect();
+        for h in stale {
+            joins.stale.extend(joins.tokens.remove(&h));
+        }
         let mut problems = Vec::new();
         for m in members.iter().filter(|m| m.host >= 2) {
+            if names.contains(&m.name.as_str()) && known.get(&m.name) == Some(&m.wg_key) {
+                // In the cluster: its token has done its job.
+                joins.stale.extend(joins.tokens.remove(&m.host));
+                continue;
+            }
             let key = signed::key_body(&m.ssh_host_key);
             if !k3stoken::is_ed25519(&key) {
                 let why = if key.is_empty() { "it has no SSH host key in the signed list" } else { "its SSH host key is not ssh-ed25519" };
-                problems.push(format!("no cluster token for {}: {why}", m.name));
+                problems.push(format!("no join token for {}: {why}", m.name));
                 continue;
             }
-            let theirs = old.iter().find(|s| s.host == m.host && s.key == key && s.problem().is_none());
-            if let Some(s) = theirs
-                && let Some(d) = was.get(&m.host).filter(|d| **d == k3stoken::digest(token, &coord_key, s))
-            {
-                known.insert(m.host, d.clone());
-                made.push(s.clone());
+            if joins.tokens.get(&m.host).is_some_and(|j| j.expires - now > JOIN_TOKEN_RENEW) || store.is_none() {
                 continue;
             }
-            match k3stoken::seal(ctx, self.run.as_ref(), token, m.host, &key, &self.path(HOST_KEY)) {
-                Ok(s) => {
-                    known.insert(m.host, k3stoken::digest(token, &coord_key, &s));
-                    made.push(s);
-                }
-                Err(e) => {
-                    problems.push(format!("no new cluster token for {}: {e}", m.name));
-                    made.extend(theirs.cloned());
-                }
+            match self.k3s_mint(ctx, m, &key, &coord, now) {
+                Ok(j) => joins.stale.extend(joins.tokens.insert(m.host, j)),
+                // One it has keeps working while it lasts.
+                Err(e) => problems.push(format!("no new join token for {}: {e}", m.name)),
             }
         }
-        let stored = made == old
-            || store
-                .update(|s| {
-                    s.k3s_tokens = made.clone();
-                    Ok(())
-                })
-                .map_err(|e| problems.push(format!("cannot leave the servers' cluster tokens in the registry: {e}")))
-                .is_ok();
-        if stored
-            && known != was
-            && let Ok(text) = serde_json::to_string(&known)
+        // k3s deletes a token when it ends; one asked to go earlier that did
+        // not is asked again until then.
+        let mut left = Vec::new();
+        for j in std::mem::take(&mut joins.stale) {
+            if j.expires > now && !self.k3s_unmint(ctx, &j.id) {
+                left.push(j);
+            }
+        }
+        joins.stale = left;
+        if (first || joins != was_joins)
+            && let Ok(text) = serde_json::to_string(&joins)
+            && let Err(e) = self.write(K3S_JOIN, 0o600, &(text + "\n"))
         {
-            let _ = self.write(K3S_SEALED, 0o600, &(text + "\n"));
+            problems.push(format!("cannot keep the join tokens in {K3S_JOIN} ({e})"));
         }
-        let status =
-            if problems.is_empty() { format!("the cluster token is sealed for {} servers", made.len()) } else { problems.join("; ") };
+        if let Some(store) = store {
+            let sealed: Vec<Sealed> = joins.tokens.values().map(|j| j.sealed.clone()).collect();
+            let res = store.update(|s| {
+                s.k3s_tokens = sealed;
+                Ok(())
+            });
+            if let Err(e) = res {
+                problems.push(format!("cannot leave the join tokens in the registry: {e}"));
+            }
+        }
+        if let Some(warning) = self.k3s_shared(ctx, shared) {
+            problems.insert(0, warning);
+        }
+        let status = if problems.is_empty() {
+            format!("{} servers wait to join the cluster, each with a token of its own", joins.tokens.len())
+        } else {
+            problems.join("; ")
+        };
         self.note(K3S_SHARE_STATUS, &format!("k3s: {status}"), &status);
+    }
+
+    /// Makes a join token for member m (SSH host key key) and seals it.
+    fn k3s_mint(&self, ctx: &Ctx, m: &Member, key: &str, coord: &str, now: i64) -> Result<Join> {
+        let ttl = format!("{JOIN_TOKEN_TTL}s");
+        let what = format!("dryserver: {} joins the cluster", m.name);
+        // Its output is the token: never logged.
+        let cmd = Cmd::new("k3s", &["token", "create", "--ttl", &ttl, "--description", &what]).quiet().stdout_only();
+        let out = self.run.output(ctx, &cmd).map_err(|e| e.wrap("k3s token create"))?;
+        let token = out.trim();
+        let Some(id) = k3stoken::bootstrap_id(token).filter(|_| k3stoken::problem(token).is_none()).map(str::to_string) else {
+            return Err("k3s token create made no bootstrap token this version takes".into());
+        };
+        match k3stoken::seal(ctx, self.run.as_ref(), token, m.host, key, &self.path(HOST_KEY)) {
+            Ok(sealed) => {
+                Ok(Join { name: m.name.clone(), wg_key: m.wg_key.clone(), coord: coord.into(), id, expires: now + JOIN_TOKEN_TTL, sealed })
+            }
+            Err(e) => {
+                self.k3s_unmint(ctx, &id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Deletes the join token id; whether it is gone.
+    fn k3s_unmint(&self, ctx: &Ctx, id: &str) -> bool {
+        match self.run.run(ctx, &Cmd::new("k3s", &["token", "delete", id]).quiet()) {
+            (_, Ok(())) => true,
+            (out, Err(e)) => out.contains("not found") || e.to_string().contains("not found"),
+        }
+    }
+
+    /// Whether servers hold the cluster's shared agent token (K3S_SHARED),
+    /// as a warning for the status line and the console, none when they do
+    /// not. shared: this sync found that some do. Making a new token
+    /// (README) ends it.
+    fn k3s_shared(&self, ctx: &Ctx, shared: bool) -> Option<String> {
+        let token = fsx::read_or_empty(self.path(K3S_AGENT_TOKEN)).trim().to_string();
+        let digest = (!token.is_empty()).then(|| fsx::hex(&sha2::Sha256::digest(token.as_bytes())));
+        let mut recorded = fsx::read_or_empty(self.path(K3S_SHARED)).trim().to_string();
+        if shared
+            && let Some(d) = &digest
+            && *d != recorded
+            && self.write(K3S_SHARED, 0o600, &format!("{d}\n")).is_ok()
+        {
+            recorded = d.clone();
+        }
+        if !recorded.is_empty() {
+            // What the older version left is in K3S_SHARED now.
+            let _ = std::fs::remove_file(self.path(K3S_SEALED));
+        }
+        let warning = match &digest {
+            Some(d) if *d == recorded => Some(
+                "WARNING: servers that joined the cluster before hold its shared agent token (an older dryserver handed it out): \
+                 any of them could register a node under the name of a server you approve next. Make a new one \
+                 (README: A new cluster token)"
+                    .to_string(),
+            ),
+            _ => {
+                if !recorded.is_empty() {
+                    let _ = std::fs::remove_file(self.path(K3S_SHARED));
+                }
+                None
+            }
+        };
+        self.alarm(ctx, SHARED_ISSUE, warning.as_deref());
+        warning
+    }
+
+    /// Shows text on this machine's console login screen in its own file,
+    /// or takes it away (None). On the coordinator, for what the admin must
+    /// see even when the registry account hides it from the approval
+    /// screen.
+    fn alarm(&self, ctx: &Ctx, file: &str, text: Option<&str>) {
+        let want = text.map(|t| format!("\ndryserver: {t}\n\n")).unwrap_or_default();
+        if fsx::read_or_empty(self.path(file)) == want {
+            return;
+        }
+        let _ = match text {
+            Some(_) => self.write(file, 0o644, &want),
+            None => std::fs::remove_file(self.path(file)).map_err(Error::from),
+        };
+        let _ = self.cmd(ctx, "agetty", &["--reload"]);
     }
 
     /// The newest signed list this machine has verified, with its version;
@@ -1445,7 +1585,7 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
         // cluster. Before the first one there is nobody but the
         // coordinator, and nobody to share the token with.
         if signed {
-            n.k3s_share(ctx, store, &all);
+            n.k3s_share(ctx, Some(store), &all, Time::now().0.timestamp());
         }
         // The rollout of the newest release: the coordinator first, then
         // one server at a time, among the members the admin signed.
@@ -1654,6 +1794,37 @@ mod tests {
         /// How the next registry calls fail: "down" times out, "key" meets
         /// another host key.
         script: Mutex<Vec<&'static str>>,
+        /// The coordinator's k3s.
+        cluster: Mutex<Cluster>,
+    }
+
+    /// What k3s on the coordinator answers.
+    struct Cluster {
+        /// `kubectl get nodes -o name`; by default the coordinator, one
+        /// machine that is no longer a member, and junk.
+        nodes: String,
+        /// k3s does not answer.
+        down: bool,
+        create_fails: bool,
+        delete_fails: bool,
+        /// Join tokens made so far; the deleted and the not deleted ids.
+        made: u32,
+        deleted: Vec<String>,
+        failed: Vec<String>,
+    }
+
+    impl Default for Cluster {
+        fn default() -> Cluster {
+            Cluster {
+                nodes: "node/coord\nnode/ghost\nnode/bad name\n".into(),
+                down: false,
+                create_fails: false,
+                delete_fails: false,
+                made: 0,
+                deleted: Vec::new(),
+                failed: Vec::new(),
+            }
+        }
     }
 
     impl FakeCoord {
@@ -1677,6 +1848,7 @@ mod tests {
                 live: Mutex::new((String::new(), String::new())),
                 answers: Mutex::new(None),
                 script: Mutex::new(Vec::new()),
+                cluster: Mutex::new(Cluster::default()),
             })
         }
 
@@ -1732,12 +1904,32 @@ mod tests {
                 "ip" | "agetty" | "networkctl" => return (String::new(), Ok(())),
                 // No blocked members in the firewall's set.
                 "nft" => return (String::new(), Err("no such set".into())),
-                // The cluster knows the coordinator, this node and one
-                // machine that is no longer a member.
                 "k3s" => {
                     self.k3s.lock().unwrap().push(c.args.join(" "));
-                    let out = if c.args.contains(&"get".to_string()) { "node/coord\nnode/node-a\nnode/ghost\nnode/bad name\n" } else { "" };
-                    return (out.into(), Ok(()));
+                    let k = self.cluster.lock().unwrap();
+                    if k.down {
+                        return (String::new(), Err("k3s failed: exit status 1: The connection to the server was refused".into()));
+                    }
+                    drop(k);
+                    let args: Vec<&str> = c.args.iter().map(String::as_str).collect();
+                    let mut k = self.cluster.lock().unwrap();
+                    return match args.as_slice() {
+                        ["kubectl", "get", ..] => (k.nodes.clone(), Ok(())),
+                        ["token", "create", ..] if k.create_fails => (String::new(), Err("k3s failed: exit status 1".into())),
+                        ["token", "create", ..] => {
+                            k.made += 1;
+                            (format!("{}::tok{:03}.0123456789abcdef\n", &TOKEN[..67], k.made), Ok(()))
+                        }
+                        ["token", "delete", id] if k.delete_fails => {
+                            k.failed.push(id.to_string());
+                            (String::new(), Err("k3s failed: exit status 1: etcdserver: request timed out".into()))
+                        }
+                        ["token", "delete", id] => {
+                            k.deleted.push(id.to_string());
+                            (format!("bootstrap token {id:?} deleted\n"), Ok(()))
+                        }
+                        _ => (String::new(), Ok(())),
+                    };
                 }
                 "age" | "ssh-keygen" => {
                     self.crypto.lock().unwrap().push(c.clone());
@@ -2814,66 +3006,123 @@ mod tests {
         }
     }
 
-    #[test]
-    fn coordinator_shares_the_token_and_drops_left_machines() {
-        let (_dir, _tmp, coord, fc, _sd, store) = brain();
-        let members = vec![coord_member(), node_member(2)];
-        // k3s not up yet: nothing to share, nobody dropped.
-        coord.k3s_share(&Ctx::new(), &store, &members);
-        assert!(fc.k3s.lock().unwrap().is_empty() && store.read().unwrap().k3s_tokens.is_empty() && fc.ages() == 0);
-        put(&coord.root, K3S_AGENT_TOKEN, format!("{TOKEN}\n"));
-        coord.k3s_share(&Ctx::new(), &store, &members);
-        // Sealed for node-a alone, and the registry's file holds nothing of
-        // the token itself.
-        assert_eq!(store.read().unwrap().k3s_tokens, vec![sealed_for(2, TOKEN)]);
-        let file = std::fs::read_to_string(&store.path).unwrap();
-        assert!(!file.contains(&TOKEN[67..]) && !file.contains("k3s_token\""), "{file}");
-        for c in fc.crypto.lock().unwrap().iter() {
-            assert!(c.quiet && !c.args.join(" ").contains(&TOKEN[70..]), "the token on a command line: {c}");
-        }
-        assert!(get(&coord.root, K3S_SEALED).contains("\"2\""), "{}", get(&coord.root, K3S_SEALED));
-        assert_eq!(
-            std::fs::metadata(coord.path(K3S_SEALED)).map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777).unwrap(),
-            0o600
-        );
-        let calls = fc.k3s.lock().unwrap().clone();
-        assert_eq!(
-            calls,
-            vec!["kubectl get nodes -o name".to_string(), "kubectl delete node ghost --timeout=20s".into()],
-            "only the machine that left goes"
-        );
-        assert_eq!(get(&coord.root, K3S_NODES).trim(), format!(r#"{{"node-a":"{WG_PUBKEY}"}}"#), "which machine holds the name node-a");
-        // node-a was installed again: same name, another machine. The
-        // cluster forgets the old one, or it would turn the new one away.
-        fc.k3s.lock().unwrap().clear();
-        let again = vec![coord_member(), Member { wg_key: OTHER_WG.into(), ..node_member(2) }];
-        coord.k3s_share(&Ctx::new(), &store, &again);
-        assert!(fc.k3s.lock().unwrap().contains(&"kubectl delete node node-a --timeout=20s".to_string()), "{:?}", fc.k3s.lock().unwrap());
-        assert_eq!(get(&coord.root, K3S_NODES).trim(), "{}", "the name is free for the new machine");
-        // k3s without a token of its own for agents: the server's token
-        // is never handed out, and what was sealed before goes.
-        for bad in [TOKEN.replace("::node:", "::server:"), "K10::node:short".into()] {
-            put(&coord.root, K3S_AGENT_TOKEN, format!("{bad}\n"));
-            fc.ages();
-            coord.k3s_share(&Ctx::new(), &store, &members);
-            assert!(store.read().unwrap().k3s_tokens.is_empty() && fc.ages() == 0, "{bad}");
-            assert!(get(&coord.root, K3S_SHARE_STATUS).contains("servers get none"), "{bad}");
-            put(&coord.root, K3S_AGENT_TOKEN, format!("{TOKEN}\n"));
-            coord.k3s_share(&Ctx::new(), &store, &members);
-            assert_eq!(store.read().unwrap().k3s_tokens.len(), 1);
-        }
+    /// The token inside a sealed one (k3stoken::fake's age).
+    fn inside(s: &Sealed) -> String {
+        let body: String = s.age.lines().filter(|l| !l.starts_with("-----")).collect();
+        let plain = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body).unwrap();
+        String::from_utf8(plain).unwrap().split_once('\n').unwrap().1.to_string()
     }
 
-    /// The token from the coordinator's file to a server's, sealed all the
-    /// way: the registry holds nothing it could join with.
+    /// The n-th join token the fake k3s made.
+    fn join_token(n: u32) -> String {
+        format!("{}::tok{n:03}.0123456789abcdef", &TOKEN[..67])
+    }
+
+    fn node_c() -> Member {
+        let c = other_entry();
+        Member { host: 3, name: c.name, wg_key: c.wg_key, ssh_host_key: c.ssh_host_key, ..Member::default() }
+    }
+
+    const NOW: i64 = 1_800_000_000;
+
+    /// Each server joins with a token of its own, made for it alone, and
+    /// deleted once it is in the cluster.
+    #[test]
+    fn each_server_joins_with_a_token_of_its_own() {
+        let (_dir, _tmp, coord, fc, _sd, store) = brain();
+        let members = vec![coord_member(), node_member(2)];
+        let ctx = Ctx::new();
+        put(&coord.root, K3S_AGENT_TOKEN, format!("{TOKEN}\n"));
+        let calls = |fc: &FakeCoord| fc.k3s.lock().unwrap().drain(..).collect::<Vec<_>>();
+        // k3s is not up: nothing made, nobody dropped.
+        fc.cluster.lock().unwrap().down = true;
+        coord.k3s_share(&ctx, Some(&store), &members, NOW);
+        assert!(store.read().unwrap().k3s_tokens.is_empty() && fc.ages() == 0 && !coord.path(K3S_JOIN).exists());
+        fc.cluster.lock().unwrap().down = false;
+        calls(&fc);
+        coord.k3s_share(&ctx, Some(&store), &members, NOW);
+        assert_eq!(
+            calls(&fc),
+            vec![
+                "kubectl get nodes -o name".to_string(),
+                "kubectl delete node ghost --timeout=20s".into(),
+                "token create --ttl 86400s --description dryserver: node-a joins the cluster".into(),
+            ],
+            "only the machine that left goes"
+        );
+        let sealed = store.read().unwrap().k3s_tokens;
+        assert_eq!(sealed.len(), 1);
+        assert_eq!((sealed[0].host, sealed[0].key.as_str(), inside(&sealed[0])), (2, signed::key_body(NODE_KEY).as_str(), join_token(1)));
+        // The registry's file holds nothing of a token itself, and the one
+        // token all agents shared is never handed out.
+        let file = std::fs::read_to_string(&store.path).unwrap();
+        assert!(!file.contains("tok001") && !file.contains(&TOKEN[67..]), "{file}");
+        for c in fc.crypto.lock().unwrap().iter() {
+            assert!(c.quiet && !c.args.join(" ").contains("tok001"), "the token on a command line: {c}");
+        }
+        assert!(get(&coord.root, K3S_JOIN).contains("\"tok001\""));
+        let mode = |p: &str| std::fs::metadata(coord.path(p)).map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777);
+        assert_eq!(mode(K3S_JOIN).unwrap(), 0o600);
+        // Nothing changed: nothing made again.
+        fc.ages();
+        coord.k3s_share(&ctx, Some(&store), &members, NOW + 60);
+        assert!(!calls(&fc).iter().any(|c| c.starts_with("token")) && fc.ages() == 0);
+        assert_eq!(store.read().unwrap().k3s_tokens, sealed);
+        // node-a is in the cluster: its token goes, and the registry holds
+        // none for it any more.
+        fc.cluster.lock().unwrap().nodes = "node/coord\nnode/node-a\n".into();
+        coord.k3s_share(&ctx, Some(&store), &members, NOW + 120);
+        assert_eq!(fc.cluster.lock().unwrap().deleted, vec!["tok001".to_string()]);
+        assert!(store.read().unwrap().k3s_tokens.is_empty());
+        assert_eq!(get(&coord.root, K3S_NODES).trim(), format!(r#"{{"node-a":"{WG_PUBKEY}"}}"#), "which machine holds the name node-a");
+        assert!(get(&coord.root, K3S_SHARE_STATUS).starts_with("0 servers wait"), "{}", get(&coord.root, K3S_SHARE_STATUS));
+        assert!(!coord.path(SHARED_ISSUE).exists() && !coord.path(K3S_SHARED).exists());
+        calls(&fc);
+        coord.k3s_share(&ctx, Some(&store), &members, NOW + 180);
+        assert_eq!(calls(&fc), vec!["kubectl get nodes -o name".to_string()]);
+        // node-a was installed again: same name, another machine. The
+        // cluster forgets the old one, or it would turn the new one away,
+        // and the new one gets a token of its own.
+        let again = vec![coord_member(), Member { wg_key: OTHER_WG.into(), ..node_member(2) }];
+        coord.k3s_share(&ctx, Some(&store), &again, NOW + 240);
+        let made = calls(&fc);
+        assert!(
+            made.contains(&"kubectl delete node node-a --timeout=20s".to_string()) && made.iter().any(|c| c.starts_with("token create"))
+        );
+        assert_eq!(get(&coord.root, K3S_NODES).trim(), "{}", "the name is free for the new machine");
+        assert_eq!(store.read().unwrap().k3s_tokens.iter().map(inside).collect::<Vec<_>>(), vec![join_token(2)]);
+    }
+
+    /// The review's case: node-a, hacked, holds no token that registers a
+    /// node under the name of node-c, which the admin just approved. Its
+    /// own was deleted when it joined, and node-c's is sealed for node-c.
+    #[test]
+    fn a_server_in_the_cluster_holds_no_token_for_another_name() {
+        let (_dir, _tmp, coord, fc, _sd, store) = brain();
+        put(&coord.root, K3S_AGENT_TOKEN, format!("{TOKEN}\n"));
+        let ctx = Ctx::new();
+        coord.k3s_share(&ctx, Some(&store), &[coord_member(), node_member(2)], NOW);
+        fc.cluster.lock().unwrap().nodes = "node/coord\nnode/node-a\n".into();
+        coord.k3s_share(&ctx, Some(&store), &[coord_member(), node_member(2)], NOW + 60);
+        coord.k3s_share(&ctx, Some(&store), &[coord_member(), node_member(2), node_c()], NOW + 120);
+        let sealed = store.read().unwrap().k3s_tokens;
+        assert_eq!(sealed.len(), 1, "{sealed:?}");
+        assert_eq!((sealed[0].host, sealed[0].key.as_str(), inside(&sealed[0])), (3, node_c().ssh_host_key.as_str(), join_token(2)));
+        assert_eq!(fc.cluster.lock().unwrap().deleted, vec!["tok001".to_string()], "node-a's own token is gone");
+        // What a server takes is only what was sealed for its own key.
+        let (_d2, _t2, n, sfc) = joined();
+        *sfc.peers.lock().unwrap() = Some(peers_sealed(2, 5, Some(&sealed[0])));
+        assert!(sync(&ctx, &n, false, &Store::new("/nonexistent")).unwrap());
+        assert!(get(&n.root, sysconf::K3S_TOKEN).is_empty() && sfc.k3s_moves().is_empty());
+    }
+
+    /// The token from the coordinator to a server, sealed all the way: the
+    /// registry holds nothing it could join with.
     #[test]
     fn the_token_reaches_a_server_sealed() {
         let (_dir, _tmp, b, bfc, _sd, store) = brain();
-        put(&b.root, K3S_AGENT_TOKEN, format!("{TOKEN}\n"));
         registry(&store, vec![coord_member(), node_member(2)], sign(&ADMIN, 5, vec![coord_entry(), node_entry(2)]));
         sync(&Ctx::new(), &b, true, &store).unwrap();
-        let file = std::fs::read_to_string(&store.path).unwrap();
-        assert!(!file.contains(&TOKEN[67..]), "{file}");
         let mine = store.read().unwrap().k3s_tokens.into_iter().find(|t| t.host == 2).expect("nothing sealed for node-a");
         // Nothing changed: nothing is made again, the registry stays as it is.
         bfc.ages();
@@ -2885,32 +3134,25 @@ mod tests {
         let (_d2, _t2, n, fc) = joined();
         *fc.peers.lock().unwrap() = Some(peers_sealed(2, 5, Some(&mine)));
         assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
-        assert_eq!(get(&n.root, sysconf::K3S_TOKEN), format!("{TOKEN}\n"));
+        assert_eq!(get(&n.root, sysconf::K3S_TOKEN), format!("{}\n", join_token(1)));
         assert_eq!(fc.k3s_moves(), vec!["systemctl start --no-block k3s.service"]);
     }
 
-    /// Who gets a sealed token from the coordinator, and when one is made
-    /// again.
+    /// Who gets a join token, and when one is made again or deleted.
     #[test]
-    fn the_coordinator_seals_for_the_signed_servers_only() {
+    fn who_gets_a_join_token_and_when() {
         let (_dir, _tmp, n, fc, _sd, store) = brain();
         let ctx = Ctx::new();
-        put(&n.root, K3S_AGENT_TOKEN, format!("{TOKEN}\n"));
-        let c = other_entry();
-        let node_c =
-            Member { host: 3, name: c.name.clone(), wg_key: c.wg_key.clone(), ssh_host_key: c.ssh_host_key.clone(), ..Member::default() };
         let tokens = || store.read().unwrap().k3s_tokens;
-        let hosts = || tokens().iter().map(|t| (t.host, t.key.clone())).collect::<Vec<_>>();
+        let hosts = || tokens().iter().map(|t| (t.host, t.key.clone(), inside(t))).collect::<Vec<_>>();
         let node_a = signed::key_body(NODE_KEY);
-        registry(
-            &store,
-            vec![coord_member(), node_member(2), node_c.clone()],
-            sign(&ADMIN, 5, vec![coord_entry(), node_entry(2), c.clone()]),
-        );
-        sync(&ctx, &n, true, &store).unwrap();
-        assert_eq!(hosts(), vec![(2, node_a.clone()), (3, c.ssh_host_key.clone())], "none for the coordinator itself");
+        let c_key = node_c().ssh_host_key;
+        let both = vec![coord_member(), node_member(2), node_c()];
+        let share = |members: &[Member], now: i64| n.k3s_share(&ctx, Some(&store), members, now);
+        let deleted = || std::mem::take(&mut fc.cluster.lock().unwrap().deleted);
+        share(&both, NOW);
+        assert_eq!(hosts(), vec![(2, node_a.clone(), join_token(1)), (3, c_key.clone(), join_token(2))], "none for the coordinator");
         assert_eq!(fc.ages(), 2);
-        assert!(get(&n.root, K3S_SHARE_STATUS).contains("sealed for 2 servers"));
         let first = tokens();
 
         // The registry account changes one, drops one and adds one for a
@@ -2923,63 +3165,122 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        sync(&ctx, &n, true, &store).unwrap();
-        assert_eq!((tokens(), fc.ages()), (first.clone(), 2));
-        // What root remembers is lost (a restore without it): each is made
-        // once more, and holds the same token for the servers.
-        std::fs::remove_file(n.path(K3S_SEALED)).unwrap();
-        sync(&ctx, &n, true, &store).unwrap();
-        assert_eq!((tokens(), fc.ages()), (first.clone(), 2));
-        sync(&ctx, &n, true, &store).unwrap();
-        assert_eq!(fc.ages(), 0);
+        share(&both, NOW + 60);
+        assert_eq!((tokens(), fc.ages(), fc.cluster.lock().unwrap().made), (first.clone(), 0, 2));
+        // What root keeps is lost (a restore without it): each server gets
+        // a new one. The old ones end by themselves within a day.
+        std::fs::remove_file(n.path(K3S_JOIN)).unwrap();
+        share(&both, NOW + 120);
+        assert_eq!((hosts().iter().map(|h| h.2.clone()).collect::<Vec<_>>(), fc.ages()), (vec![join_token(3), join_token(4)], 2));
+        assert!(!get(&n.root, K3S_SHARE_STATUS).contains("WARNING"), "{}", get(&n.root, K3S_SHARE_STATUS));
+        // A token about to end is made again, and the old one deleted.
+        share(&both, NOW + 120 + JOIN_TOKEN_TTL - JOIN_TOKEN_RENEW + 1);
+        assert_eq!(hosts().iter().map(|h| h.2.clone()).collect::<Vec<_>>(), vec![join_token(5), join_token(6)]);
+        assert_eq!(deleted(), vec!["tok003".to_string(), "tok004".into()]);
+        let later = NOW + 200 + JOIN_TOKEN_TTL - JOIN_TOKEN_RENEW;
 
         // A newer list: node-c removed, node-a installed again with a new
-        // host key, two servers with keys it cannot seal for.
+        // host key, two servers with keys nothing can be sealed for.
         let new_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInewnode";
-        let ecdsa = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY";
-        let entries = vec![
-            coord_entry(),
-            Entry { ssh_host_key: new_key.into(), ..node_entry(2) },
-            Entry { host: 4, name: "node-d".into(), wg_key: EVIL_WG.into(), ssh_host_key: ecdsa.into() },
-            Entry { host: 5, name: "node-e".into(), wg_key: OTHER_WG.into(), ssh_host_key: String::new() },
-        ];
-        let members: Vec<Member> = std::iter::once(coord_member())
-            .chain(entries[1..].iter().map(|e| Member {
-                host: e.host,
-                name: e.name.clone(),
-                wg_key: e.wg_key.clone(),
-                ssh_host_key: e.ssh_host_key.clone(),
+        let members = vec![
+            coord_member(),
+            Member { ssh_host_key: new_key.into(), ..node_member(2) },
+            Member {
+                host: 4,
+                name: "node-d".into(),
+                wg_key: EVIL_WG.into(),
+                ssh_host_key: "ecdsa-sha2-nistp256 AAAAE2Vj".into(),
                 ..Member::default()
-            }))
-            .collect();
-        registry(&store, members, sign(&ADMIN, 6, entries));
-        sync(&ctx, &n, true, &store).unwrap();
-        assert_eq!((hosts(), fc.ages()), (vec![(2, new_key.to_string())], 1));
-        assert_eq!(tokens(), vec![k3stoken::fake::sealed(COORD_KEY, 2, new_key, TOKEN)]);
+            },
+            Member { host: 5, name: "node-e".into(), wg_key: OTHER_WG.into(), ..Member::default() },
+        ];
+        share(&members, later);
+        assert_eq!(hosts(), vec![(2, new_key.to_string(), join_token(7))]);
+        assert_eq!(deleted(), vec!["tok005".to_string(), "tok006".into()], "node-a's old key and node-c lose theirs");
         let status = get(&n.root, K3S_SHARE_STATUS);
         assert!(
-            status.contains("no cluster token for node-d: its SSH host key is not ssh-ed25519")
-                && status.contains("no cluster token for node-e: it has no SSH host key"),
+            status.contains("no join token for node-d: its SSH host key is not ssh-ed25519")
+                && status.contains("no join token for node-e: it has no SSH host key"),
             "{status}"
         );
-        assert!(!get(&n.root, K3S_SEALED).contains("\"3\""), "what root remembers of node-c stays");
 
-        // The token is rotated while age is missing: node-a keeps the one
-        // it has, and the line says why. Then age is back.
-        put(&n.root, K3S_AGENT_TOKEN, format!("{TOKEN2}\n"));
+        // k3s cannot make one, then age is missing, then the coordinator's
+        // own key: node-a keeps the one it has while it lasts, a token made
+        // but not sealed is deleted again, and the line says why.
+        let end = later + JOIN_TOKEN_TTL;
+        fc.cluster.lock().unwrap().create_fails = true;
+        share(&members, end - 10);
+        assert!(get(&n.root, K3S_SHARE_STATUS).contains("no new join token for node-a: k3s token create"));
+        assert_eq!(hosts()[0].2, join_token(7));
+        fc.cluster.lock().unwrap().create_fails = false;
         *fc.no_age.lock().unwrap() = true;
-        sync(&ctx, &n, true, &store).unwrap();
-        assert_eq!(tokens(), vec![k3stoken::fake::sealed(COORD_KEY, 2, new_key, TOKEN)]);
-        assert!(get(&n.root, K3S_SHARE_STATUS).contains("no new cluster token for node-a: encrypt the cluster token (is age installed?)"));
+        share(&members, end - 10);
+        assert!(get(&n.root, K3S_SHARE_STATUS).contains("no new join token for node-a: encrypt the cluster token (is age installed?)"));
+        assert_eq!((hosts()[0].2.clone(), deleted()), (join_token(7), vec!["tok008".to_string()]));
         *fc.no_age.lock().unwrap() = false;
-        // Nor without its own host key to sign with.
         std::fs::remove_file(n.path(HOST_KEY)).unwrap();
-        sync(&ctx, &n, true, &store).unwrap();
-        assert_eq!(tokens(), vec![k3stoken::fake::sealed(COORD_KEY, 2, new_key, TOKEN)]);
+        share(&members, end - 10);
         assert!(get(&n.root, K3S_SHARE_STATUS).contains("sign the cluster token with the host key"));
         put(&n.root, HOST_KEY, "coord private\n");
-        sync(&ctx, &n, true, &store).unwrap();
-        assert_eq!(tokens(), vec![k3stoken::fake::sealed(COORD_KEY, 2, new_key, TOKEN2)]);
+        // A token k3s does not delete when asked is asked again until it
+        // would have ended anyway.
+        fc.cluster.lock().unwrap().delete_fails = true;
+        share(&members, end - 10);
+        assert_eq!(hosts()[0].2, join_token(10));
+        share(&members, end - 5);
+        assert_eq!(std::mem::take(&mut fc.cluster.lock().unwrap().failed), vec!["tok007".to_string(), "tok007".into()]);
+        share(&members, end + 1);
+        assert!(fc.cluster.lock().unwrap().failed.is_empty(), "asked again after it ended");
+        assert!(!get(&n.root, K3S_JOIN).contains("tok007"));
+    }
+
+    /// Servers that joined before this version hold the one token an older
+    /// version handed every agent: any of them could register a node under
+    /// a new server's name. The coordinator says so until a new one is
+    /// made.
+    #[test]
+    fn the_shared_token_is_named_until_a_new_one_is_made() {
+        let warned =
+            |n: &Node| get(&n.root, K3S_SHARE_STATUS).starts_with("WARNING") && get(&n.root, SHARED_ISSUE).contains("A new cluster token");
+        let members = vec![coord_member(), node_member(2)];
+        let ctx = Ctx::new();
+        // Updated from a version that sealed the shared token for servers,
+        // or one that served it plainly: node-a is in the cluster already.
+        for sealed_before in [true, false] {
+            let (_dir, _tmp, n, fc, _sd, store) = brain();
+            put(&n.root, K3S_AGENT_TOKEN, format!("{TOKEN}\n"));
+            put(&n.root, K3S_NODES, format!(r#"{{"node-a":"{WG_PUBKEY}"}}"#));
+            if sealed_before {
+                put(&n.root, K3S_SEALED, r#"{"2":"abc"}"#);
+            }
+            fc.cluster.lock().unwrap().nodes = "node/coord\nnode/node-a\n".into();
+            n.k3s_share(&ctx, Some(&store), &members, NOW);
+            assert!(warned(&n), "{}", get(&n.root, K3S_SHARE_STATUS));
+            assert!(!n.path(K3S_SEALED).exists() && get(&n.root, K3S_SHARED).trim() == fsx::hex(&sha2::Sha256::digest(TOKEN)));
+            n.k3s_share(&ctx, Some(&store), &members, NOW + 60);
+            assert!(warned(&n));
+            // The admin made a new one.
+            put(&n.root, K3S_AGENT_TOKEN, format!("{TOKEN2}\n"));
+            n.k3s_share(&ctx, Some(&store), &members, NOW + 120);
+            assert!(!warned(&n) && !n.path(SHARED_ISSUE).exists() && !n.path(K3S_SHARED).exists(), "{}", get(&n.root, K3S_SHARE_STATUS));
+            n.k3s_share(&ctx, Some(&store), &members, NOW + 180);
+            assert!(!n.path(SHARED_ISSUE).exists());
+        }
+        // A new cluster: node-a joins with its own token, nothing to say.
+        let (_dir, _tmp, n, fc, _sd, store) = brain();
+        put(&n.root, K3S_AGENT_TOKEN, format!("{TOKEN}\n"));
+        n.k3s_share(&ctx, Some(&store), &members, NOW);
+        fc.cluster.lock().unwrap().nodes = "node/coord\nnode/node-a\n".into();
+        n.k3s_share(&ctx, Some(&store), &members, NOW + 60);
+        assert!(!warned(&n) && !n.path(K3S_SHARED).exists(), "{}", get(&n.root, K3S_SHARE_STATUS));
+        // A node under a member's name that came without the token root
+        // made for it: someone holds the shared one.
+        n.k3s_share(&ctx, Some(&store), &[coord_member(), node_member(2), node_c()], NOW + 120);
+        fc.cluster.lock().unwrap().nodes = "node/coord\nnode/node-a\nnode/node-c\n".into();
+        std::fs::remove_file(n.path(K3S_JOIN)).unwrap();
+        put(&n.root, K3S_JOIN, "{}\n");
+        n.k3s_share(&ctx, Some(&store), &[coord_member(), node_member(2), node_c()], NOW + 180);
+        assert!(warned(&n), "{}", get(&n.root, K3S_SHARE_STATUS));
     }
 
     /// A coordinator (its own WireGuard key is the one the admin signs as
@@ -3056,6 +3357,7 @@ mod tests {
     fn the_coordinator_uses_only_the_list_the_admin_signed() {
         let (_dir, _tmp, n, fc, _sd, store) = brain();
         put(&n.root, K3S_AGENT_TOKEN, format!("{TOKEN}\n"));
+        fc.cluster.lock().unwrap().nodes = "node/coord\nnode/node-a\nnode/ghost\n".into();
         let c = other_entry();
         let node_c = Member {
             host: 3,
