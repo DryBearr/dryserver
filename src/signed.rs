@@ -15,8 +15,10 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ctx::Ctx;
 use crate::err::{Error, Result};
 use crate::registry::{self, Member};
+use crate::runner::{Cmd, Runner};
 use crate::{bail, errf, fsx};
 
 /// SSH signature namespaces: a signature made for one use never passes
@@ -195,6 +197,56 @@ pub fn open_request(v: &dyn Verifier, e: &Envelope, op: &str, now_unix: i64) -> 
     Ok(r)
 }
 
+// ---- a machine's own SSH host key ----
+
+/// What root on the coordinator signs a server's turn as, with the
+/// coordinator's SSH host key (rollout::Grant).
+pub const NS_TURN: &str = "dryserver-rollout-turn";
+/// The signer name in the allowed-signers file of a host key check.
+const HOST_SIGNER: &str = "dryserver-host";
+
+/// Signs text with the SSH private key at key (a machine's host key,
+/// readable by root only), through run: `ssh-keygen -Y sign`.
+pub fn host_sign(ctx: &Ctx, run: &dyn Runner, key: &Path, namespace: &str, text: &str) -> Result<String> {
+    let k = key.display().to_string();
+    let sig = run
+        .output(ctx, &Cmd::new("ssh-keygen", &["-Y", "sign", "-f", &k, "-n", namespace]).stdin(text).quiet().stdout_only())
+        .map_err(|e| e.wrap("sign with the host key"))?;
+    if !sig.contains("BEGIN SSH SIGNATURE") {
+        bail!("ssh-keygen made no signature with {k}");
+    }
+    Ok(sig)
+}
+
+/// Checks sig over text by the public key "ssh-ed25519 BASE64" (another
+/// machine's host key, from the list the admin signed), through run.
+/// tmp_dir takes the two small files ssh-keygen needs, removed after it.
+pub fn host_verify(ctx: &Ctx, run: &dyn Runner, tmp_dir: &Path, key: &str, namespace: &str, text: &str, sig: &str) -> Result<()> {
+    let key = key_body(key);
+    if !key.starts_with("ssh-ed25519 ") || key.split_whitespace().count() != 2 {
+        bail!("no ssh-ed25519 key to check the signature with");
+    }
+    if !sig.contains("BEGIN SSH SIGNATURE") || sig.len() > 4096 {
+        bail!("not signed");
+    }
+    let id = fsx::hex(&fsx::random_bytes(8));
+    let allowed = tmp_dir.join(format!("dryserver-host-signers-{id}"));
+    let sig_file = tmp_dir.join(format!("dryserver-host-sig-{id}"));
+    struct Remove<'a>(&'a Path, &'a Path);
+    impl Drop for Remove<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+            let _ = std::fs::remove_file(self.1);
+        }
+    }
+    let _rm = Remove(&allowed, &sig_file);
+    fsx::create_file(&allowed, format!("{HOST_SIGNER} namespaces=\"{namespace}\" {key}\n"), 0o600)?;
+    fsx::create_file(&sig_file, sig, 0o600)?;
+    let (a, s) = (allowed.display().to_string(), sig_file.display().to_string());
+    run.ok(ctx, &Cmd::new("ssh-keygen", &["-Y", "verify", "-f", &a, "-I", HOST_SIGNER, "-n", namespace, "-s", &s]).stdin(text).quiet())
+        .map_err(|e| e.wrap("bad signature"))
+}
+
 pub trait Signer {
     fn sign(&self, namespace: &str, doc: &str) -> Result<String>;
 }
@@ -313,6 +365,42 @@ pub mod fake {
             if sig == mac(self.0, namespace, doc) { Ok(()) } else { Err("bad signature".into()) }
         }
     }
+
+    /// What `ssh-keygen -Y sign` makes with the host key whose public half
+    /// is key, in namespace, of text.
+    pub fn host_sig(key: &str, namespace: &str, text: &str) -> String {
+        format!("-----BEGIN SSH SIGNATURE-----\n{}\n-----END SSH SIGNATURE-----\n", mac(&key_body(key), namespace, text))
+    }
+
+    fn arg<'a>(c: &'a Cmd, flag: &str) -> Option<&'a str> {
+        c.args.iter().position(|a| a == flag).and_then(|i| c.args.get(i + 1)).map(String::as_str)
+    }
+
+    /// Answers c if it is `ssh-keygen -Y sign` or `-Y verify` as host_sign
+    /// and host_verify use it: only the holder of the private key file
+    /// (its .pub beside it says whose) makes a signature, in any namespace.
+    pub fn host_run(c: &Cmd) -> Option<(String, Result<()>)> {
+        if c.name != "ssh-keygen" {
+            return None;
+        }
+        let has = |a: &str| c.args.iter().any(|x| x == a);
+        let fail = || (String::new(), Err(Error::new("ssh-keygen failed: exit status 255")));
+        let ns = arg(c, "-n").unwrap_or_default();
+        Some(if has("sign") {
+            match arg(c, "-f").filter(|p| std::fs::metadata(p).is_ok()).and_then(|p| std::fs::read_to_string(format!("{p}.pub")).ok()) {
+                Some(public) => (host_sig(&public, ns, &c.stdin), Ok(())),
+                None => fail(),
+            }
+        } else if has("verify") {
+            let allowed = arg(c, "-f").and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+            let sig = arg(c, "-s").and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+            let key = allowed.split_whitespace().skip(2).collect::<Vec<_>>().join(" ");
+            let ns_ok = allowed.contains(&format!("namespaces=\"{ns}\""));
+            if ns_ok && !key.is_empty() && sig == host_sig(&key, ns, &c.stdin) { (String::new(), Ok(())) } else { fail() }
+        } else {
+            return None;
+        })
+    }
 }
 
 #[cfg(test)]
@@ -418,6 +506,38 @@ mod tests {
         // A member-list signature is not an admin request.
         let as_list = Envelope { doc: e.doc.clone(), sig: key.sign(NS_MEMBERS, &e.doc).unwrap() };
         assert!(open_admin(&key, &as_list, "state", 1000).is_err());
+    }
+
+    /// A machine's host key signs, another machine checks against its
+    /// public half: with real OpenSSH, and the fakes the tests use agree.
+    #[test]
+    fn host_key_signatures() {
+        let dir = TempDir::new();
+        let run = crate::runner::ExecRunner::silent();
+        let ctx = Ctx::new();
+        let text = r#"{"host":2,"serial":9}"#;
+        if crate::iso::in_path("ssh-keygen") {
+            let make = |name: &str| {
+                let key = dir.join(name);
+                let st = Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).status().unwrap();
+                assert!(st.success());
+                (key.clone(), key_body(&std::fs::read_to_string(dir.join(format!("{name}.pub"))).unwrap()))
+            };
+            let ((coord, coord_pub), (_, other_pub)) = (make("coord"), make("other"));
+            let sig = host_sign(&ctx, &run, &coord, NS_TURN, text).unwrap();
+            host_verify(&ctx, &run, dir.path(), &coord_pub, NS_TURN, text, &sig).unwrap();
+            assert!(host_verify(&ctx, &run, dir.path(), &other_pub, NS_TURN, text, &sig).is_err(), "another key");
+            assert!(host_verify(&ctx, &run, dir.path(), &coord_pub, NS_ADMIN, text, &sig).is_err(), "another namespace");
+            assert!(host_verify(&ctx, &run, dir.path(), &coord_pub, NS_TURN, "{}", &sig).is_err(), "another text");
+            assert!(host_sign(&ctx, &run, &dir.join("missing"), NS_TURN, text).is_err());
+        }
+        assert!(host_verify(&ctx, &run, dir.path(), "ssh-rsa AAAA", NS_TURN, text, "x").unwrap_err().to_string().contains("ssh-ed25519"));
+        assert!(
+            host_verify(&ctx, &run, dir.path(), "ssh-ed25519 AAAA", NS_TURN, text, "x").unwrap_err().to_string().contains("not signed")
+        );
+        let left: Vec<_> =
+            std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("host-")).collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     /// The same with real OpenSSH keys.

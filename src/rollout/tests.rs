@@ -88,6 +88,8 @@ struct Sim {
     sshd_admin: Option<String>,
     /// sshd calls: ssh to the registry, sshd -T.
     sshd: Vec<String>,
+    /// ssh-keygen calls (signing a turn, checking one).
+    keygen: Vec<String>,
 }
 
 /// What `sshd -T -C user=...` says on a machine set up as dryserver does.
@@ -132,6 +134,10 @@ impl Sim {
 
 impl Runner for Fake {
     fn run(&self, _: &Ctx, c: &Cmd) -> (String, Result<()>) {
+        if let Some(out) = crate::signed::fake::host_run(c) {
+            self.sim().keygen.push(c.args.join(" "));
+            return out;
+        }
         let mut s = self.sim();
         let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
         match (c.name.as_str(), a.as_slice()) {
@@ -278,6 +284,14 @@ fn machine(host: u32, name: &str) -> Box_ {
     put(dir.path(), K3S_BIN, K3S);
     put(dir.path(), crate::node::HOST_KEY, format!("{name} private\n"));
     put(dir.path(), crate::node::HOST_KEY_PUB, format!("{} root@{name}\n", host_key(name)));
+    // What node.rs keeps: this machine's host number and the newest list
+    // the admin signed, which names the coordinator's host key.
+    put(dir.path(), crate::node::JOIN_STATE, format!("{{\"host\":{host}}}"));
+    let coord =
+        crate::signed::Entry { host: 1, name: "coord".into(), wg_key: crate::admin::tests::key32(1), ssh_host_key: host_key("coord") };
+    let list = crate::signed::List { version: 1, members: vec![coord], rejected: vec![] };
+    put(dir.path(), crate::node::SIGNED_FILE, serde_json::to_string(&crate::signed::seal(&ADMIN, &list).unwrap()).unwrap());
+    put(dir.path(), "/tmp/.keep", "");
     let fake = Arc::new(Fake(Mutex::new(Sim { root: dir.path().to_path_buf(), ..Sim::default() })));
     let node = Node {
         cfg: Config {
@@ -289,7 +303,7 @@ fn machine(host: u32, name: &str) -> Box_ {
         hostname: name.into(),
         root: dir.path().to_path_buf(),
         run: fake.clone(),
-        tmp_dir: None,
+        tmp_dir: Some(dir.path().join("tmp")),
         verifier: Arc::new(ADMIN),
     };
     Box_ { _dir: dir, node, fake, host, name: name.into() }
@@ -360,6 +374,9 @@ struct Swarm {
     signed: Vec<(u32, String)>,
     /// The size of k3s the registry tells the servers, instead of its own.
     k3s_size_lie: Option<u64>,
+    /// A hacked registry account's offer to each server, instead of what
+    /// the registry would offer it.
+    forge: Option<fn(&registry::State, u32) -> Offer>,
 }
 
 impl Swarm {
@@ -403,6 +420,7 @@ impl Swarm {
             full_disk: vec![],
             signed,
             k3s_size_lie: None,
+            forge: None,
         };
         sw.brain_sync();
         for i in 0..sw.servers.len() {
@@ -504,7 +522,7 @@ impl Swarm {
         if self.ignore_turn.contains(&m.host) {
             return Ok(());
         }
-        let o = offer(&self.store.read()?, m.host);
+        let o = self.forge.unwrap_or(offer)(&self.store.read()?, m.host);
         mach.step(&Ctx::new(), &Reg { sw: self, host: m.host }, &o, &rep, self.now)
     }
 
@@ -646,6 +664,17 @@ impl Swarm {
         self.call(op, 0, serde_json::to_string(&self.signed_ask(op, self.now)).unwrap().as_bytes())
     }
 
+    /// An offer of the turn for host as root on the brain signs it, made
+    /// now (g changes the grant before it is signed).
+    fn granted(&self, host: u32, serial: u64, g: impl FnOnce(&mut Grant)) -> Offer {
+        let mut grant =
+            Grant { host, serial, brain_k3s: K3S_VERSION.into(), issued: self.now, expires: self.now + GRANT_LIFE, ..Grant::default() };
+        g(&mut grant);
+        let doc = serde_json::to_string(&grant).unwrap();
+        let sig = crate::signed::fake::host_sig(&host_key("coord"), crate::signed::NS_TURN, &doc);
+        Offer { serial, turn: true, brain_k3s: K3S_VERSION.into(), retry: grant.retry, grant: Envelope { doc, sig } }
+    }
+
     /// The admin's ask for op at time, for the stop the registry shows.
     fn signed_ask(&self, op: &str, time: i64) -> Envelope {
         let r = self.rollout();
@@ -681,7 +710,11 @@ struct Reg<'a> {
 }
 
 impl Source for Reg<'_> {
-    fn offered(&self, _: &Ctx, serial: u64) -> Result<Offered> {
+    fn offered(&self, ctx: &Ctx, serial: u64) -> Result<Offered> {
+        if self.sw.forge.is_some() {
+            // A hacked registry account hands the release to anyone.
+            return LocalSource(&self.sw.served).offered(ctx, serial);
+        }
         let out = self.sw.call(&format!("release-get {serial} release"), self.host, b"")?;
         let mut o: Offered = serde_json::from_slice(&out)?;
         if let Some(n) = self.sw.k3s_size_lie {
@@ -690,8 +723,12 @@ impl Source for Reg<'_> {
         Ok(o)
     }
 
-    fn chunk(&self, _: &Ctx, serial: u64, name: &str, offset: u64, _len: u64, dst: &Path) -> Result<()> {
+    fn chunk(&self, ctx: &Ctx, serial: u64, name: &str, offset: u64, len: u64, dst: &Path) -> Result<()> {
         self.sw.pieces.lock().unwrap().push((self.host, name.into(), offset));
+        if self.sw.forge.is_some() {
+            let len = len.min(file_len(&self.sw.served.path(serial, name)).saturating_sub(offset));
+            return LocalSource(&self.sw.served).chunk(ctx, serial, name, offset, len, dst);
+        }
         let fault = {
             let mut f = self.sw.faults.lock().unwrap();
             f.iter().position(|(h, _)| *h == self.host).map(|i| f.remove(i).1)
@@ -996,7 +1033,7 @@ fn a_server_with_its_kill_switch_on_is_held() {
     assert!(sw.lines().contains("Held, kill switch on: node-b."), "{}", sw.lines());
     // Even handed a turn, it does nothing.
     let m = Machine { n: &sw.server(3).node, brain: false, free: plenty };
-    let o = Offer { serial: 10, turn: true, brain_k3s: K3S_VERSION.into(), retry: 0 };
+    let o = sw.granted(3, 10, |_| {});
     m.step(&Ctx::new(), &Reg { sw: &sw, host: 3 }, &o, &sw.healthy(3), sw.now).unwrap();
     assert!(sw.server(3).fake.sim().applied.is_empty());
     // Lifted: it updates.
@@ -2087,7 +2124,7 @@ fn a_release_that_went_back_is_not_sent_again_by_itself() {
     // install the release that went back: the update commands would.
     std::fs::remove_file(sw.server(2).node.path(STORE).join(STATE_FILE)).unwrap();
     let m = Machine { n: &sw.server(2).node, brain: false, free: plenty };
-    let o = Offer { serial: 10, turn: true, brain_k3s: K3S_VERSION.into(), retry: 0 };
+    let o = sw.granted(2, 10, |_| {});
     let e = m.step(&Ctx::new(), &Reg { sw: &sw, host: 2 }, &o, &sw.healthy(2), sw.now).unwrap_err().to_string();
     assert!(e.contains("release 10 reverted"), "{e}");
     assert_eq!(sw.server(2).fake.sim().applied.len(), 1);
@@ -3190,4 +3227,116 @@ fn review_the_registry_alone_cannot_pass_a_failed_canary_over() {
     sw.skip();
     sw.until_unpaused(30, |s| s.installed(3) == 10 && s.installed(4) == 10);
     assert!(sw.rollout().skipped.iter().any(|s| s.host == 2));
+}
+
+/// The offer is made by the registry account, and servers took its turn,
+/// retry and brain_k3s as they came: it could give every server the turn
+/// at once (no drain, no canary), make up a resume, or lie about the
+/// brain's k3s. Now root on the brain signs each turn with the brain's
+/// host key, and a server takes only one signed for itself, for this
+/// release, while it is fresh, with the retry and the k3s it names.
+#[test]
+fn review_the_registry_alone_cannot_hand_out_turns() {
+    let mut sw = Swarm::new(3);
+    // Every server gets the turn, with the one turn root signed, a made-up
+    // resume and an older k3s for the brain's.
+    sw.forge = Some(|s, host| {
+        let mut o = offer(s, host);
+        o.grant = s.rollout.turn.as_ref().map(|t| t.grant.clone()).unwrap_or_default();
+        (o.turn, o.retry, o.brain_k3s) = (s.rollout.phase == Phase::Servers, 7, "v1.36.1+k3s1".into());
+        o
+    });
+    sw.publish(10, true);
+    sw.until(10, |s| s.installed(2) == 10); // tick() asserts one_at_a_time
+    assert!(sw.servers[1..].iter().all(|m| m.fake.sim().applied.is_empty()), "updated out of turn");
+    let l = Machine::new(&sw.server(3).node, false).load();
+    assert!(l.note.contains("does not check out: it is host 2's, and this machine is host 3"), "{l:?}");
+    // node-a's own update went by what root signed: its k3s, no retry.
+    assert!(sw.server(2).fake.sim().applied[0].ends_with(&["--brain-k3s".to_string(), K3S_VERSION.to_string()]));
+    assert_eq!(Machine::new(&sw.server(2).node, false).load().retried, 0);
+    sw.forge = None;
+    sw.until_unpaused(30, |s| s.everyone_on(10));
+
+    // Turns that do not check out, handed to node-a: nothing happens.
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().apply_fails = Some("dryserver failed: exit status 1: broken disk".into());
+    sw.publish(10, true);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    let n = sw.now;
+    let m = Machine { n: &sw.server(2).node, brain: false, free: plenty };
+    let other = |g: &mut Grant| g.host = 3;
+    let mut tampered = sw.granted(2, 10, |g| g.retry = 1);
+    tampered.grant.doc = tampered.grant.doc.replace("\"retry\":1", "\"retry\":2");
+    let mut foreign = sw.granted(2, 10, |g| g.retry = 1);
+    foreign.grant.sig = crate::signed::fake::host_sig(&host_key("node-b"), crate::signed::NS_TURN, &foreign.grant.doc);
+    let mut wrong_ns = sw.granted(2, 10, |g| g.retry = 1);
+    wrong_ns.grant.sig = crate::signed::fake::host_sig(&host_key("coord"), crate::k3stoken::NAMESPACE, &wrong_ns.grant.doc);
+    for (o, want) in [
+        (Offer { grant: Envelope::default(), ..sw.granted(2, 10, |g| g.retry = 1) }, "it is not signed"),
+        (sw.granted(2, 10, |g| (g.retry, g.host) = (1, 3)), "it is host 3's"),
+        // Without a resume a server it failed on does nothing at all.
+        (sw.granted(2, 10, other), ""),
+        (Offer { serial: 10, ..sw.granted(2, 9, |g| g.retry = 1) }, "it is for release 9"),
+        (sw.granted(2, 10, |g| (g.retry, g.issued, g.expires) = (1, n - 3600, n - 1800)), "it expired"),
+        (sw.granted(2, 10, |g| (g.retry, g.issued, g.expires) = (1, n + 3600, n + 4200)), "ahead of this machine's clock"),
+        (tampered, "not signed by the coordinator the admin signed"),
+        (foreign, "not signed by the coordinator the admin signed"),
+        (wrong_ns, "not signed by the coordinator the admin signed"),
+        // A retry the registry account made up beside a turn root signed
+        // without one.
+        (Offer { retry: 5, ..sw.granted(2, 10, |_| {}) }, ""),
+    ] {
+        let e = m.step(&Ctx::new(), &Reg { sw: &sw, host: 2 }, &o, &sw.healthy(2), n).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains(want), "{want}: {e}");
+        let l = m.load();
+        assert!(l.failed == 10 && l.retried == 0, "{want}: {l:?}");
+    }
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 1, "installed again on a turn root did not sign");
+    // Signed for it, with the admin's resume: it tries once more.
+    sw.server(2).fake.sim().apply_fails = None;
+    let o = sw.granted(2, 10, |g| g.retry = 1);
+    m.step(&Ctx::new(), &Reg { sw: &sw, host: 2 }, &o, &sw.healthy(2), n).unwrap();
+    assert_eq!((m.load().failed, m.load().retried), (0, 1));
+
+    // A server of the version before reads the offer as it always did.
+    #[derive(Deserialize)]
+    struct Before {
+        serial: u64,
+        turn: bool,
+        brain_k3s: String,
+        retry: u64,
+    }
+    let old: Before = serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
+    assert!(old.serial == 10 && old.turn && old.brain_k3s == K3S_VERSION && old.retry == 1);
+}
+
+/// What root signs: the turn of a drained server, anew before it expires
+/// and when it changes, never the brain's own; one that cannot be signed
+/// gives no turn.
+#[test]
+fn root_signs_each_turn_and_signs_it_anew() {
+    let mut sw = Swarm::new(2);
+    sw.ignore_turn.push(2);
+    sw.publish(10, true);
+    sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.ready));
+    let grant = |sw: &Swarm| serde_json::from_str::<Grant>(&sw.rollout().turn.unwrap().grant.doc).unwrap();
+    let g = grant(&sw);
+    assert_eq!((g.host, g.serial, g.retry, g.brain_k3s.as_str(), g.expires - g.issued), (2, 10, 0, K3S_VERSION, GRANT_LIFE));
+    assert!(offer(&sw.store.read().unwrap(), 2).grant == sw.rollout().turn.unwrap().grant);
+    assert!(offer(&sw.store.read().unwrap(), 3).grant.is_empty(), "another server's turn handed to node-b");
+    sw.ticks(2);
+    assert_eq!(grant(&sw), g, "signed anew while it was fresh");
+    sw.ticks(((GRANT_LIFE - GRANT_RENEW) / 60) as usize);
+    assert!(grant(&sw).issued > g.issued && grant(&sw).expires > g.expires, "not signed anew before it expired");
+    // The brain's k3s changed: signed anew at once.
+    sw.brain_k3s = "v1.37.3+k3s1".into();
+    sw.tick();
+    assert_eq!(grant(&sw).brain_k3s, "v1.37.3+k3s1");
+    // Its host key cannot sign: no turn, and the admin is told.
+    std::fs::remove_file(sw.brain.node.path(crate::node::HOST_KEY)).unwrap();
+    sw.ticks(GRANT_RENEW as usize / 60 + 1);
+    let r = sw.rollout();
+    assert!(r.turn.as_ref().is_some_and(|t| t.grant.is_empty()) && !offer(&sw.store.read().unwrap(), 2).turn, "{r:#?}");
+    assert!(r.warnings.iter().any(|w| w.starts_with("cannot sign node-a's turn")), "{r:#?}");
+    assert!(sw.brain.fake.sim().keygen.iter().all(|k| k.contains(crate::signed::NS_TURN)));
 }

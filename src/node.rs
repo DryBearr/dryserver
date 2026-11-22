@@ -2046,6 +2046,10 @@ mod tests {
                     if c.name == "age" && *self.no_age.lock().unwrap() {
                         return (String::new(), Err("exec: \"age\": executable file not found in $PATH".into()));
                     }
+                    // A turn root on the coordinator signed (rollout::Grant).
+                    if c.args.iter().any(|a| a == crate::signed::NS_TURN) {
+                        return crate::signed::fake::host_run(c).unwrap_or_else(|| (String::new(), Err("unknown".into())));
+                    }
                     return k3stoken::fake::run(c).unwrap_or_else(|| (String::new(), Err("unknown".into())));
                 }
                 "wg-quick" => return ("[Interface]\nListenPort = 51820\n".into(), Ok(())),
@@ -2552,9 +2556,15 @@ mod tests {
         with(serde_json::json!("junk"));
         assert!(sync(&ctx, &n, false, &store).unwrap());
         assert!(!fc.calls.lock().unwrap().iter().any(|c| c.contains("status")), "{:?}", fc.calls.lock().unwrap());
-        // Its turn: the update commands are asked (and here they are not
-        // there). The mesh is synced all the same.
-        with(serde_json::json!({"serial": 9, "turn": true, "brain_k3s": "v1.37.2+k3s1"}));
+        // Its turn, as root on the coordinator signed it: the update
+        // commands are asked (and here they are not there). The mesh is
+        // synced all the same.
+        let now = Time::now().0.timestamp();
+        let grant =
+            rollout::Grant { host: 2, serial: 9, brain_k3s: "v1.37.2+k3s1".into(), issued: now, expires: now + 600, ..Default::default() };
+        let doc = serde_json::to_string(&grant).unwrap();
+        let sig = crate::signed::fake::host_sig(COORD_KEY, crate::signed::NS_TURN, &doc);
+        with(serde_json::json!({"serial": 9, "turn": true, "brain_k3s": "v1.37.2+k3s1", "grant": {"doc": doc, "sig": sig}}));
         assert!(sync(&ctx, &n, false, &store).unwrap(), "an update problem must not fail the sync");
         assert!(get(&n.root, WG_CONF).contains(COORD_WG));
         let status = get(&n.root, UPDATE_STATUS);

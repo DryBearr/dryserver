@@ -2137,7 +2137,18 @@ mod tests {
     fn members_get_their_turn_and_the_admin_the_rollout() {
         let dir = TempDir::new();
         let st = coordinator(&dir);
-        let turn = |ready: bool| rollout::Turn { host: 2, name: "node-a".into(), since: 1, ready, ..rollout::Turn::default() };
+        // Root signs a drained server's turn (rollout::Grant); the registry
+        // hands it on.
+        let grant = Envelope { doc: r#"{"host":2,"serial":9}"#.into(), sig: "SIG".into() };
+        let turn = |ready: bool| rollout::Turn {
+            host: 2,
+            name: "node-a".into(),
+            since: 1,
+            ready,
+            grant: if ready { grant.clone() } else { Envelope::default() },
+            ..rollout::Turn::default()
+        };
+        let signed = serde_json::json!({"doc": grant.doc, "sig": "SIG"});
         let set = |r: Rollout| {
             st.update(|s| {
                 s.rollout = r;
@@ -2160,16 +2171,18 @@ mod tests {
         // Before any release: nothing offered.
         assert_eq!(offer(&st), serde_json::json!({"serial": 0, "turn": false, "brain_k3s": "v1.37.2+k3s1"}));
         set(running.clone());
-        assert_eq!(offer(&st), serde_json::json!({"serial": 9, "turn": true, "brain_k3s": "v1.37.2+k3s1"}));
+        assert_eq!(offer(&st), serde_json::json!({"serial": 9, "turn": true, "brain_k3s": "v1.37.2+k3s1", "grant": signed}));
         // A try again the admin asked for goes with the turn, never without.
         set(Rollout { turn: Some(rollout::Turn { retry: 3, ..turn(true) }), ..running.clone() });
-        assert_eq!(offer(&st), serde_json::json!({"serial": 9, "turn": true, "brain_k3s": "v1.37.2+k3s1", "retry": 3}));
+        assert_eq!(offer(&st), serde_json::json!({"serial": 9, "turn": true, "brain_k3s": "v1.37.2+k3s1", "retry": 3, "grant": signed}));
         set(Rollout { turn: Some(rollout::Turn { retry: 3, ..turn(false) }), ..running.clone() });
         assert_eq!(offer(&st), serde_json::json!({"serial": 9, "turn": false, "brain_k3s": "v1.37.2+k3s1"}));
         set(running.clone());
-        // Not drained yet, stopped, or the brain's own phase: no turn.
+        // Not drained yet, not signed by root, stopped, or the brain's own
+        // phase: no turn.
         for r in [
             Rollout { turn: Some(turn(false)), ..running.clone() },
+            Rollout { turn: Some(rollout::Turn { grant: Envelope::default(), ..turn(true) }), ..running.clone() },
             Rollout { paused: "node-x: update failed".into(), ..running.clone() },
             Rollout { phase: rollout::Phase::Brain, ..running.clone() },
             Rollout { turn: Some(rollout::Turn { host: 3, ..turn(true) }), ..running.clone() },

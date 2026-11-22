@@ -12,14 +12,21 @@
 //!    `update confirm` at a later sync, once the new binary is the one that
 //!    runs and the brain is healthy. If that does not work, the rollout
 //!    stops there and no server is touched.
+//!    Before it confirms, the brain proves the ways in still work: a call
+//!    through sshd reaches the registry, sshd lets the admin in, and a
+//!    server synced through the new release (brain_paths).
 //! 3. Then the servers, one at a time. The brain cordons and drains a
-//!    server and gives it the turn. The server sees that in its sync reply,
+//!    server and gives it the turn, signed by root with the brain's SSH
+//!    host key (Grant). The server sees that in its sync reply, checks the
+//!    turn against the coordinator's key in the list the admin signed,
 //!    loads the release from the registry in pieces, checks it itself (a
 //!    server never takes the brain's word that a release is good), installs
 //!    it, and confirms it at a later sync once the new binary runs, the
 //!    server is healthy and it reached the brain. Its report then carries
 //!    the new serial; the brain uncordons it and moves on. The first server
 //!    is the canary: the brain watches it for a while before the next one.
+//!    Nothing starts, the brain's own update included, while a server says
+//!    it is in the middle of an update.
 //!
 //! A bad update must not take the swarm down. Each machine goes back by
 //! itself when its update is not confirmed in time (lane 5's revert
@@ -34,7 +41,10 @@
 //! signature and the checksums decide, and a server can only speak for
 //! itself. A hacked server can fail or stall only its own turn, and a
 //! stalled turn ends after TURN_TIMEOUT; but the rollout then stops there
-//! until the admin passes it over.
+//! until the admin passes it over. The registry account hands on what root
+//! decides and signs: turns (signed by the brain's host key) and the
+//! admin's resumes and skips (signed by the admin, checked by root, each
+//! carried out once); it can withhold them, or stall, not make them up.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -889,21 +899,65 @@ pub struct Offer {
     /// resume has its own number; 0: none.
     #[serde(skip_serializing_if = "is_zero")]
     pub retry: u64,
+    /// With the turn: the turn as root on the brain signed it (Grant). A
+    /// server of this version takes the turn, its release, retry and the
+    /// brain's k3s only from it; the fields above are the registry
+    /// account's word, for servers from before.
+    #[serde(skip_serializing_if = "Envelope::is_empty")]
+    pub grant: Envelope,
 }
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
+/// A server's turn, signed by root on the brain with the brain's SSH host
+/// key (signed::NS_TURN), as k3stoken.rs signs the cluster token: the
+/// registry account hands it on and cannot make one. A server checks it
+/// against the coordinator's key in the list the admin signed, and takes
+/// a turn only for itself, for this release and while it is fresh: the
+/// registry account cannot give every server the turn at once (no drain,
+/// no canary), make up a resume, or lie about the brain's k3s.
+///
+/// Limit: the registry account can hand a server a turn root signed for
+/// it, again, until it expires: GRANT_LIFE after root last signed it, and
+/// GRANT_SKEW more for the clocks.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Grant {
+    pub host: u32,
+    pub serial: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retry: u64,
+    pub brain_k3s: String,
+    /// When root signed it and until when it holds, on the brain's clock.
+    pub issued: i64,
+    pub expires: i64,
+}
+
+/// How long a turn root signed holds; root signs it anew when less than
+/// GRANT_RENEW is left, at the sync after (a minute apart).
+pub const GRANT_LIFE: i64 = 10 * 60;
+const GRANT_RENEW: i64 = 5 * 60;
+/// How far a server's clock may be from the brain's for a turn.
+pub const GRANT_SKEW: i64 = 5 * 60;
+
 /// What the registry tells member host in its sync reply. The turn holds
-/// only while the rollout runs and the server is drained.
+/// only while the rollout runs, the server is drained and root signed
+/// it.
 pub fn offer(s: &registry::State, host: u32) -> Offer {
     let r = &s.rollout;
-    let mine = r.turn.as_ref().filter(|t| t.host == host && t.ready);
+    let mine = r.turn.as_ref().filter(|t| t.host == host && t.ready && !t.grant.is_empty());
     let turn = host != 1 && r.paused.is_empty() && r.phase == Phase::Servers && mine.is_some();
     let brain_k3s = s.members.iter().find(|m| m.host == 1).and_then(|m| m.report.as_ref()).map(|r| r.k3s.clone()).unwrap_or_default();
-    let retry = if turn { mine.map_or(0, |t| t.retry) } else { 0 };
-    Offer { serial: r.serial, turn, brain_k3s, retry }
+    let mine = mine.filter(|_| turn);
+    Offer {
+        serial: r.serial,
+        turn,
+        brain_k3s,
+        retry: mine.map_or(0, |t| t.retry),
+        grant: mine.map(|t| t.grant.clone()).unwrap_or_default(),
+    }
 }
 
 /// What a machine keeps about its update, in STORE/state.json.
@@ -1105,6 +1159,15 @@ impl<'a> Machine<'a> {
         if !offer.turn || offer.serial == 0 || self.installed_serial() >= offer.serial {
             return Ok(());
         }
+        if self.hold().is_some() || (l.failed == offer.serial && offer.retry == 0) {
+            return Ok(());
+        }
+        // On a server: the turn as root on the brain signed it, never the
+        // registry account's word.
+        let offer = &match self.granted(ctx, offer, now) {
+            Ok(o) => o,
+            Err(why) => return self.later(&mut l, offer.serial, &why),
+        };
         if offer.retry != 0 && (l.retry != offer.serial || l.retried != offer.retry) {
             // The admin resumed the rollout here: the release is tried once
             // more, even one that went back (ready).
@@ -1127,9 +1190,6 @@ impl<'a> Machine<'a> {
         if l.failed == offer.serial {
             return Ok(());
         }
-        if self.hold().is_some() {
-            return Ok(());
-        }
         let res = self.ready(ctx, offer, now, &mut l).and_then(|go| if go { self.advance(ctx, src, offer, now, &mut l) } else { Ok(()) });
         let (outcome, why) = match res {
             Ok(()) => return Ok(()),
@@ -1146,6 +1206,54 @@ impl<'a> Machine<'a> {
             Err(Stop::Reverted(why)) => ("reverted", why),
         };
         self.fail(&mut l, offer.serial, outcome, &why)
+    }
+
+    /// The offer as root on the brain signed it (Grant): on the brain
+    /// itself the offer as it is. Why not, when the turn does not check
+    /// out: a problem that may pass (an older coordinator, the clocks),
+    /// tried MAX_TRIES syncs, then the update failed here and the rollout
+    /// stops at this machine with the reason.
+    fn granted(&self, ctx: &Ctx, offer: &Offer, now: i64) -> std::result::Result<Offer, String> {
+        if self.brain {
+            return Ok(offer.clone());
+        }
+        let bad = |why: String| format!("the coordinator's turn for this machine does not check out: {why}");
+        if offer.grant.is_empty() {
+            return Err(bad("it is not signed (a coordinator before signed turns: it updates first)".into()));
+        }
+        let coord = self.coordinator_key().map_err(|e| bad(e.to_string()))?;
+        let tmp = self.n.tmp_dir.clone().unwrap_or_else(|| PathBuf::from("/run"));
+        let (doc, sig) = (&offer.grant.doc, &offer.grant.sig);
+        crate::signed::host_verify(ctx, self.n.run.as_ref(), &tmp, &coord, crate::signed::NS_TURN, doc, sig)
+            .map_err(|e| bad(format!("not signed by the coordinator the admin signed ({e})")))?;
+        let g: Grant = serde_json::from_str(doc).map_err(|e| bad(format!("signed, but not a turn ({e})")))?;
+        let me = self.n.load_state().host;
+        if me == 0 || g.host != me {
+            return Err(bad(format!("it is host {}'s, and this machine is host {me}", g.host)));
+        }
+        if g.serial != offer.serial {
+            return Err(bad(format!("it is for release {}, the offer for release {}", g.serial, offer.serial)));
+        }
+        let at = |t: i64| chrono::DateTime::from_timestamp(t, 0).map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default();
+        if now > g.expires.saturating_add(GRANT_SKEW) {
+            return Err(bad(format!("it expired at {} by this machine's clock ({}): check the clocks", at(g.expires), at(now))));
+        }
+        if g.issued > now.saturating_add(GRANT_SKEW) {
+            return Err(bad(format!("it was made at {}, ahead of this machine's clock ({}): check the clocks", at(g.issued), at(now))));
+        }
+        Ok(Offer { serial: g.serial, turn: true, brain_k3s: g.brain_k3s, retry: g.retry, grant: offer.grant.clone() })
+    }
+
+    /// The coordinator's SSH host key, from the newest list the admin
+    /// signed this machine has seen (checked when it was kept).
+    fn coordinator_key(&self) -> Result<String> {
+        let (_, env) = self.n.seen_list()?.ok_or_else(|| errf!("this machine has no member list the admin signed"))?;
+        let list: crate::signed::List = serde_json::from_str(&env.doc)?;
+        let key = list.members.iter().find(|e| e.host == 1).map(|e| crate::signed::key_body(&e.ssh_host_key)).unwrap_or_default();
+        if !key.starts_with("ssh-ed25519 ") {
+            bail!("the signed member list holds no ssh-ed25519 key for the coordinator");
+        }
+        Ok(key)
     }
 
     /// A problem that may pass held release serial up: it is tried again
@@ -1737,6 +1845,9 @@ pub struct Turn {
     pub retry: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub cleared: bool,
+    /// The turn as root signed it once the server was drained (Grant).
+    #[serde(skip_serializing_if = "Envelope::is_empty")]
+    pub grant: Envelope,
 }
 
 /// A server passed over, and why.
@@ -2568,7 +2679,7 @@ impl Brain<'_> {
         }
         self.r.deferred.retain(|d| *d != host);
         self.r.turns.push(host);
-        self.r.turn = Some(Turn { host, name: name.clone(), since: self.now.unix, ready: false, retry, cleared: false });
+        self.r.turn = Some(Turn { host, name: name.clone(), since: self.now.unix, ready: false, retry, ..Turn::default() });
         if let Err(e) = self.machine().save_rollout(&self.r) {
             eprintln!("dryserver: rollout: cannot save its state, so {name} gets no turn yet: {e}");
             self.r = before;
@@ -2641,6 +2752,7 @@ impl Brain<'_> {
                 }
                 Err(_) => {}
             }
+            self.sign_turn(&mut t);
             self.r.turn = Some(t);
             return;
         }
@@ -2699,7 +2811,45 @@ impl Brain<'_> {
             }
             return;
         }
+        self.sign_turn(&mut t);
         self.r.turn = Some(t);
+    }
+
+    /// Signs the turn of a drained server with the brain's SSH host key
+    /// (Grant), or signs it anew when it is about to expire or says
+    /// another thing than the turn now does. Until it is signed the
+    /// server has no turn: the registry offers none without it.
+    fn sign_turn(&mut self, t: &mut Turn) {
+        if !t.ready {
+            return;
+        }
+        let now = self.now.unix;
+        let want = Grant { host: t.host, serial: self.r.serial, retry: t.retry, brain_k3s: self.rep.k3s.clone(), issued: 0, expires: 0 };
+        let fresh = serde_json::from_str::<Grant>(&t.grant.doc).is_ok_and(|g| {
+            Grant { issued: 0, expires: 0, ..g.clone() } == want && g.issued <= now && g.expires.saturating_sub(now) > GRANT_RENEW
+        });
+        if fresh {
+            return;
+        }
+        let g = Grant { issued: now, expires: now.saturating_add(GRANT_LIFE), ..want };
+        let signed = serde_json::to_string(&g).map_err(Error::from).and_then(|doc| {
+            let key = self.n.path(crate::node::HOST_KEY);
+            let sig = crate::signed::host_sign(
+                &self.ctx.with_timeout(Duration::from_secs(20)),
+                self.n.run.as_ref(),
+                &key,
+                crate::signed::NS_TURN,
+                &doc,
+            )?;
+            Ok(Envelope { doc, sig })
+        });
+        match signed {
+            Ok(e) => t.grant = e,
+            Err(e) => {
+                t.grant = Envelope::default();
+                self.r.warn(format!("cannot sign {}'s turn ({e}); trying again", t.name));
+            }
+        }
     }
 
     /// While stopped at a server: it stays cordoned while it is up and not
