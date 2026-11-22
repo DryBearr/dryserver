@@ -590,7 +590,10 @@ Then the coordinator rolls it out:
 Normal releases update machines only from 03:00 to 05:00 on the
 coordinator's clock; urgent ones start at once. Both go one machine at a
 time. A newer release replaces a rollout that runs: machines go straight
-to the newest.
+to the newest (a server in the middle of the old one finishes first).
+Time the coordinator was down, or a jump of its clock, does not count
+against a server's turn or the canary's watch. A server that joins
+during a rollout, or after it, gets the release too.
 
 The rollout **stops** at a server whose update fails, goes back, is
 refused by its own checks, or does not finish in 20 minutes, and at a
@@ -613,7 +616,10 @@ it, then publish a fixed release, or:
 Passed over without stopping, and shown: a server that is switched off
 (it updates when it is back, still one at a time), one whose kill switch
 is on (it updates nothing until it is lifted), and one with an older
-dryserver that cannot update itself.
+dryserver that cannot update itself. A server removed from the swarm
+while the rollout is stopped at it lets the rollout go on. The rollout
+also stops before the first server when the coordinator's copy of the
+release's k3s is gone or damaged.
 
 A hacked coordinator cannot change a release, make a server install an
 older one, or hand it a binary other than the signed one: each server

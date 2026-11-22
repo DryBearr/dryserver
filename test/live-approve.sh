@@ -315,6 +315,10 @@ out=$(screen "$S/desk" "u publish an update" "u" "esc cancel" $'\r' "nothing was
 check "u on the screen checks the release and says why not" grep -q "nothing was signed" <<<"$out"
 check "R on the screen with nothing stopped resumes nothing" grep -q "no rollout to resume" <<<"$out"
 check_not "nothing was signed from the screen" test -e "$S/desk/secrets/release.signed.json"
+out=$(desk release resume -skip)
+check "resume -skip without a rollout is refused" grep -q "no rollout to resume" <<<"$out"
+out=$(echo x | reg release-skip 2>&1)
+check "release-skip needs the admin's signature" grep -q "bad admin request" <<<"$out"
 out=$(reg "release-get $SER release" 2>&1)
 check "release-get is not answered outside the mesh" grep -q "only answered over the mesh" <<<"$out"
 
