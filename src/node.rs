@@ -146,6 +146,9 @@ pub const K3S_JOIN: &str = "/etc/dryserver/k3s-join.json";
 /// them could register a node under another server's name with it, until
 /// the admin makes a new one (README, A new cluster token).
 pub const K3S_SHARED: &str = "/etc/dryserver/k3s-shared-token";
+/// On the coordinator's console while its registry cannot be used and the
+/// mesh and the cluster follow its own newest list (Node::own_list).
+pub const REGISTRY_ISSUE: &str = "/etc/issue.d/40-dryserver-registry.issue";
 /// On the coordinator's console while K3S_SHARED holds the current token.
 pub const SHARED_ISSUE: &str = "/etc/issue.d/41-dryserver-k3s-token.issue";
 /// How long a join token lasts (k3s deletes it then), and how long before
@@ -1002,6 +1005,69 @@ impl Node {
         Ok((members, status))
     }
 
+    /// On the coordinator, when the registry cannot be used (why): the
+    /// members of the newest list it has seen (SIGNED_FILE), with an alarm
+    /// on its console.
+    ///
+    /// The registry account owns the registry file and its lock: it can
+    /// hold the lock, write more than is ever read, drop the signed list or
+    /// put back an older one. That stalls what goes through the registry
+    /// (servers get no newer list, no new join token, the rollout waits),
+    /// not the admin's decisions root already has: a server the admin
+    /// removed stays out of this coordinator's mesh and out of the cluster.
+    /// Its own file only ever holds a list checked when it was saved, and is
+    /// checked again here.
+    ///
+    /// The error returned with the members says what happened, for the
+    /// sync's exit. With no list of its own that holds this coordinator,
+    /// or one it cannot read, nothing is applied: Err.
+    fn own_list(&self, ctx: &Ctx, why: Error) -> Result<(Vec<Member>, Error)> {
+        let own = self.seen_list().and_then(|seen| {
+            let (ver, env) = seen.ok_or_else(|| Error::new("this coordinator has seen no signed list"))?;
+            let list = env.list(self.verifier.as_ref(), |h| self.fits(h))?;
+            if !list.members.iter().any(|e| self.is_me(1, e)) {
+                return Err(errf!("its list (version {ver}) does not hold this coordinator"));
+            }
+            Ok((ver, list))
+        });
+        let (ver, list) = match own {
+            Ok(own) => own,
+            Err(e) => {
+                self.note_signed(&format!("REFUSED, mesh and cluster left as they are: {why} ({e})"));
+                self.alarm(ctx, REGISTRY_ISSUE, Some(&format!("ALARM: {why}. The mesh and the cluster are left as they are ({e}).")));
+                return Err(why.wrap("the registry's member list refused, mesh and cluster left as they are"));
+            }
+        };
+        self.note_signed(&format!(
+            "REFUSED, the mesh and the cluster follow the newest list this coordinator has seen (version {ver}) instead: {why}"
+        ));
+        self.alarm(
+            ctx,
+            REGISTRY_ISSUE,
+            Some(&format!(
+                "ALARM: {why}.\nThe mesh and the cluster follow the newest member list this coordinator has seen (version \
+                 {ver}). Servers get no newer list and no new join tokens, and updates wait. The registry account ({}) may be \
+                 broken into; if you removed a server and it still runs: ./dryserver quarantine-all -name NAME",
+                sysconf::REGISTRY_USER
+            )),
+        );
+        let members = list
+            .members
+            .iter()
+            .map(|e| Member {
+                host: e.host,
+                name: e.name.clone(),
+                wg_key: e.wg_key.clone(),
+                ssh_host_key: e.ssh_host_key.clone(),
+                ..Member::default()
+            })
+            .collect();
+        Ok((
+            members,
+            why.wrap(format!("the registry's member list refused; the mesh and the cluster follow version {ver} from {SIGNED_FILE}")),
+        ))
+    }
+
     /// Whether a signed entry is this machine: its number and its
     /// WireGuard key. The number alone is not enough; after a removal the
     /// admin's next approval hands it to another machine.
@@ -1457,14 +1523,17 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     // What this machine says about itself, its update included. Kept for
     // the update step after the mesh: it is this sync's health.
     let rep;
+    // On the coordinator: why the registry could not be used this time;
+    // then the mesh and the cluster follow its own newest list.
+    let mut alone: Option<Error> = None;
     let members = if coordinator {
         me.host = 1;
         rep = n.full_report(ctx, true);
         let hb = Heartbeat { lan_ip: n.cfg.coord_lan_ip.clone(), switch: sw, cuts, report: Some(rep.clone()) };
-        let (members, env) = store.update(|s| {
+        let read = store.update(|s| {
             s.heartbeat(1, hb, Time::now())?;
             Ok((s.members.clone(), s.signed.clone()))
-        })?;
+        });
         // The registry account writes that file: what it holds reaches the
         // mesh files and the cluster only checked, like a server checks
         // what the coordinator sends. Its fields first, then who is in:
@@ -1472,36 +1541,44 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
         // coordinator has seen. Its other entries are only taken for
         // addresses. A registry account that lists a machine of its own,
         // or drops members, changes neither the mesh nor the cluster.
-        let (members, problems) = registry::check_members(members, |h| !mesh::ip(&n.cfg.wg_subnet, h).is_empty());
-        for p in &problems {
-            eprintln!("dryserver: sync: ignoring {p}");
-        }
-        if env.is_empty() && std::fs::symlink_metadata(n.path(SIGNED_FILE)).is_err() {
-            // Nothing signed yet: nobody joins without the admin, so the
-            // coordinator is alone in its mesh, and in its cluster.
-            members.into_iter().filter(|m| m.host == 1).collect()
-        } else {
-            let checked = if env.is_empty() {
-                Err(errf!("the registry holds no signed member list, although this coordinator has seen one ({SIGNED_FILE})"))
-            } else {
-                n.signed_members(1, &members, &env)
-            };
-            match checked {
-                Ok((members, status)) => {
-                    n.note_signed(&status);
-                    signed = true;
-                    // Signed by the admin: the code on the console has done
-                    // its job.
-                    if n.path(ISSUE_FILE).exists() {
-                        let _ = std::fs::remove_file(n.path(ISSUE_FILE));
-                        let _ = n.cmd(ctx, "agetty", &["--reload"]);
-                    }
-                    members
+        let checked = match read {
+            Err(e) => Err(e.wrap(format!("cannot use the registry {}", store.path.display()))),
+            Ok((members, env)) => {
+                let (members, problems) = registry::check_members(members, |h| !mesh::ip(&n.cfg.wg_subnet, h).is_empty());
+                for p in &problems {
+                    eprintln!("dryserver: sync: ignoring {p}");
                 }
-                Err(e) => {
-                    n.note_signed(&format!("REFUSED, mesh and cluster left as they are: {e}"));
-                    return Err(e.wrap("the registry's member list refused, mesh and cluster left as they are"));
+                if env.is_empty() && std::fs::symlink_metadata(n.path(SIGNED_FILE)).is_err() {
+                    // Nothing signed yet: nobody joins without the admin, so
+                    // the coordinator is alone in its mesh, and in its
+                    // cluster.
+                    Ok((members.into_iter().filter(|m| m.host == 1).collect(), None))
+                } else if env.is_empty() {
+                    Err(errf!("the registry holds no signed member list, although this coordinator has seen one ({SIGNED_FILE})"))
+                } else {
+                    n.signed_members(1, &members, &env).map(|(m, status)| (m, Some(status)))
                 }
+            }
+        };
+        match checked {
+            Ok((members, None)) => members,
+            Ok((members, Some(status))) => {
+                n.note_signed(&status);
+                signed = true;
+                n.alarm(ctx, REGISTRY_ISSUE, None);
+                // Signed by the admin: the code on the console has done
+                // its job.
+                if n.path(ISSUE_FILE).exists() {
+                    let _ = std::fs::remove_file(n.path(ISSUE_FILE));
+                    let _ = n.cmd(ctx, "agetty", &["--reload"]);
+                }
+                members
+            }
+            Err(e) => {
+                let (members, why) = n.own_list(ctx, e)?;
+                signed = true;
+                alone = Some(why);
+                members
             }
         }
     } else {
@@ -1585,7 +1662,11 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
         // cluster. Before the first one there is nobody but the
         // coordinator, and nobody to share the token with.
         if signed {
-            n.k3s_share(ctx, Some(store), &all, Time::now().0.timestamp());
+            n.k3s_share(ctx, alone.is_none().then_some(store), &all, Time::now().0.timestamp());
+        }
+        if let Some(why) = alone {
+            // The rollout lives in the registry: it waits.
+            return Err(why);
         }
         // The rollout of the newest release: the coordinator first, then
         // one server at a time, among the members the admin signed.
@@ -3395,7 +3476,9 @@ mod tests {
 
         // Unsigned lists change nothing: an older one (it would bring back
         // a machine the admin removed), a forged one, one without this
-        // coordinator. The mesh and the cluster stay as they are.
+        // coordinator, none at all (the registry account dropped it). The
+        // mesh and the cluster follow the newest list this coordinator has
+        // seen, and nothing new goes through the registry.
         let before = get(&n.root, WG_CONF);
         let refused = [
             (sign(&ADMIN, 4, vec![coord_entry(), other_entry()]), "older than version 5"),
@@ -3403,24 +3486,23 @@ mod tests {
             // Another machine signed in this coordinator's place: it leaves
             // nothing and stops nobody, it only refuses.
             (sign(&ADMIN, 7, vec![Entry { wg_key: EVIL_WG.into(), ..coord_entry() }, node_entry(2)]), "removed this server"),
+            (Envelope::default(), "no signed member list"),
         ];
         for (env, want) in refused {
             registry(&store, vec![coord_member()], env);
             fc.k3s.lock().unwrap().clear();
             let e = sync(&Ctx::new(), &n, true, &store).unwrap_err().to_string();
-            assert!(e.contains(want) && e.contains("left as they are"), "{want}: {e}");
+            assert!(e.contains(want) && e.contains("follow version 5"), "{want}: {e}");
             assert_eq!(get(&n.root, WG_CONF), before, "{want}");
-            assert!(fc.k3s.lock().unwrap().is_empty(), "{want}: {:?}", fc.k3s.lock().unwrap());
-            assert!(get(&n.root, SIGNED_STATUS).contains("REFUSED"), "{want}");
+            let calls = fc.k3s.lock().unwrap().clone();
+            assert!(!calls.iter().any(|c| c.contains("node-a") || c.starts_with("token")), "{want}: {calls:?}");
+            assert!(get(&n.root, SIGNED_STATUS).contains("REFUSED") && get(&n.root, REGISTRY_ISSUE).contains("ALARM"), "{want}");
+            assert!(get(&n.root, SIGNED_FILE).contains(&list.sig), "{want}");
         }
-        // No signed list at all (the registry account dropped it) on a
-        // coordinator that has seen one: refused like the others.
-        registry(&store, vec![coord_member(), node_member(2)], Envelope::default());
-        fc.k3s.lock().unwrap().clear();
-        let e = sync(&Ctx::new(), &n, true, &store).unwrap_err().to_string();
-        assert!(e.contains("no signed member list"), "{e}");
-        assert_eq!(get(&n.root, WG_CONF), before);
-        assert!(fc.k3s.lock().unwrap().is_empty() && get(&n.root, SIGNED_FILE).contains(&list.sig));
+        // The registry is right again: the alarm goes.
+        registry(&store, vec![coord_member(), node_member(2), node_c.clone()], list.clone());
+        sync(&Ctx::new(), &n, true, &store).unwrap();
+        assert!(!n.path(REGISTRY_ISSUE).exists() && get(&n.root, SIGNED_STATUS).starts_with("ok"));
         // Before the first signature the coordinator is alone, and nobody
         // leaves its cluster.
         let (_dir, _tmp, n, fc, _sd, store) = brain();
@@ -3429,6 +3511,74 @@ mod tests {
         sync(&Ctx::new(), &n, true, &store).unwrap();
         assert!(!get(&n.root, WG_CONF).contains("[Peer]"), "{}", get(&n.root, WG_CONF));
         assert!(fc.k3s.lock().unwrap().is_empty(), "{:?}", fc.k3s.lock().unwrap());
+    }
+
+    /// The registry account can stall the registry: hold its lock, write
+    /// more than is read, junk, or an older list. Root's sync then follows
+    /// the newest list it has seen: a server the admin removed stays out of
+    /// the mesh and the cluster, and the console says what happened.
+    #[test]
+    fn a_stalled_registry_stalls_no_removal() {
+        let (_dir, _tmp, n, fc, sd, store) = brain();
+        let c = other_entry();
+        let node_c = Member { lan_ip: "192.168.1.30".into(), ..node_c() };
+        let v5 = sign(&ADMIN, 5, vec![coord_entry(), node_entry(2), c.clone()]);
+        fc.cluster.lock().unwrap().nodes = "node/coord\nnode/node-a\nnode/node-c\n".into();
+        registry(&store, vec![coord_member(), node_member(2), node_c.clone()], v5.clone());
+        sync(&Ctx::new(), &n, true, &store).unwrap();
+        assert!(get(&n.root, WG_CONF).contains(OTHER_WG));
+        // The admin removes node-c.
+        let v6 = sign(&ADMIN, 6, vec![coord_entry(), node_entry(2)]);
+        registry(&store, vec![coord_member(), node_member(2)], v6.clone());
+        sync(&Ctx::new(), &n, true, &store).unwrap();
+        let kept = get(&n.root, WG_CONF);
+        assert!(!kept.contains(OTHER_WG) && kept.contains(WG_PUBKEY), "{kept}");
+        let lock = std::fs::File::open(sd.join("registry.json.lock")).unwrap();
+        let quick = Store { lock_wait: Duration::from_millis(50), ..store.clone() };
+        type Stall<'a> = Box<dyn Fn() + 'a>;
+        let stalls: Vec<(&str, Stall)> = vec![
+            ("older than version 6", Box::new(|| registry(&store, vec![coord_member(), node_member(2), node_c.clone()], v5.clone()))),
+            (
+                "held by another process",
+                Box::new(|| {
+                    // SAFETY: flock on a file this test holds open.
+                    assert_eq!(unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) }, 0);
+                }),
+            ),
+            (
+                "larger than",
+                Box::new(|| {
+                    // SAFETY: as above; the lock goes, the file grows.
+                    unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_UN) };
+                    std::fs::File::create(&store.path).unwrap().set_len(registry::MAX_FILE + 1).unwrap();
+                }),
+            ),
+            ("cannot use the registry", Box::new(|| std::fs::write(&store.path, "{\"members\": [").unwrap())),
+        ];
+        for (want, stall) in stalls {
+            stall();
+            // node-c's kubelet registers its node again: it goes again.
+            fc.k3s.lock().unwrap().clear();
+            let e = sync(&Ctx::new(), &n, true, &quick).unwrap_err().to_string();
+            assert!(e.contains(want) && e.contains("follow version 6"), "{want}: {e}");
+            assert_eq!(get(&n.root, WG_CONF), kept, "{want}");
+            let calls = fc.k3s.lock().unwrap().clone();
+            assert!(calls.contains(&"kubectl delete node node-c --timeout=20s".to_string()), "{want}: {calls:?}");
+            assert!(!calls.iter().any(|c| c.starts_with("token")), "{want}: {calls:?}");
+            let alarm = get(&n.root, REGISTRY_ISSUE);
+            assert!(alarm.contains("ALARM") && alarm.contains("version 6") && alarm.contains("quarantine-all"), "{want}: {alarm}");
+        }
+        // Its own list damaged too: nothing is applied.
+        put(&n.root, SIGNED_FILE, "{\"doc\": ");
+        let e = sync(&Ctx::new(), &n, true, &quick).unwrap_err().to_string();
+        assert!(e.contains("left as they are"), "{e}");
+        assert_eq!(get(&n.root, WG_CONF), kept);
+        // Before the first signed list, an unreadable registry applies
+        // nothing either.
+        let (_dir, _tmp, n, fc, _sd, store) = brain();
+        std::fs::write(&store.path, "{\"members\": [").unwrap();
+        assert!(sync(&Ctx::new(), &n, true, &store).is_err());
+        assert!(get(&n.root, WG_CONF).is_empty() && fc.k3s.lock().unwrap().is_empty());
     }
 
     #[test]

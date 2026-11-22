@@ -959,9 +959,14 @@ ended.
   member. Nobody can approve on a server, the coordinator
   included, and a machine that shows up on the coordinator without a join
   request cannot be signed at all. `./dryserver ssh-config` takes server
-  names and SSH host keys from the signed list too. Limit: a hacked
-  coordinator can hold back a newer list from servers that have not seen it
-  yet, so a removal may not arrive; cut the machine off with
+  names and SSH host keys from the signed list too. The registry account
+  can stall the registry (hold its lock, fill it, drop or roll back the
+  list): the coordinator's own sync then keeps to the newest list it has
+  seen, so a server you removed stays out of its mesh and out of the
+  cluster, and its console shows an alarm until the registry is right
+  again (servers get no newer list meanwhile, and updates wait). Limit: a
+  hacked coordinator can hold back a newer list from servers that have not
+  seen it yet, so a removal may not arrive; cut the machine off with
   `./dryserver quarantine-all -name NAME` then.
 - **Each server joins the cluster with a token of its own, and the
   registry never holds one.** Servers get the member list from an account

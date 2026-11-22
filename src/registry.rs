@@ -518,9 +518,9 @@ pub const MAX_FILE: u64 = 16 << 20;
 /// How long a caller waits for the registry file's lock. Each holder keeps
 /// it for one read and one write. The registry account owns the lock file
 /// and could hold it for ever: then the caller gives up and fails (root's
-/// sync fails for that minute, after the automatic cut, and leaves the
-/// mesh, the cluster and the rollout as they are; the next sync tries
-/// again).
+/// sync then applies the newest signed list it has seen to the mesh and
+/// the cluster, raises an alarm on the console and leaves the rollout as
+/// it is; the next sync tries again).
 pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The registry file, guarded by an exclusive lock.
