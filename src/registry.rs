@@ -1136,7 +1136,15 @@ pub fn serve(
             send(out, &serde_json::json!({ "version": list.version }))
         }
         ("release-put", 1) => {
-            let serial = served.receive(verifier, input, now.0.timestamp())?;
+            // After a newest that went back on the coordinator, a release
+            // between what the machines run and it may follow it.
+            let back = served.current().filter(|n| {
+                st.read().is_ok_and(|s| {
+                    let brain = s.members.iter().find(|m| m.host == 1).and_then(|m| m.report.as_ref());
+                    rollout::went_back(&s.rollout, brain, *n).is_some()
+                })
+            });
+            let serial = served.receive(verifier, input, now.0.timestamp(), back)?;
             send(out, &serde_json::json!({ "serial": serial }))
         }
         ("release-resume", 1) => {

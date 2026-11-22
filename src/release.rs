@@ -512,9 +512,16 @@ impl Default for Draft<'_> {
 /// it knows it: the new one must pass a brain that runs prev, so the
 /// desktop never signs what machines would refuse.
 pub fn build(d: &Draft, prev: Option<&Release>, now: i64) -> Result<Release> {
+    build_after(d, prev.map(|p| p.serial), prev, now)
+}
+
+/// Like build, with the serial after after (the last one signed) and the
+/// versions checked against base: the release the machines run, older
+/// than the last one signed when that one failed and went back.
+pub fn build_after(d: &Draft, after: Option<u64>, base: Option<&Release>, now: i64) -> Result<Release> {
     let (sha256, size) = hash_file(d.binary, MAX_BINARY)?;
     let r = Release {
-        serial: next_serial(prev.map(|p| p.serial), now)?,
+        serial: next_serial(after.max(base.map(|b| b.serial)), now)?,
         created: now,
         expires: now.saturating_add(LIFETIME),
         dryserver: Binary { version: d.version.into(), sha256, size },
@@ -525,7 +532,7 @@ pub fn build(d: &Draft, prev: Option<&Release>, now: i64) -> Result<Release> {
         notes: d.notes.into(),
     };
     r.validate(now)?;
-    decide(&r, prev, Place::Brain, now)?;
+    decide(&r, base, Place::Brain, now)?;
     Ok(r)
 }
 

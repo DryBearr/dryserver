@@ -2974,3 +2974,37 @@ fn review_a_confirmed_server_is_not_shown_updating_again() {
     sw.tick();
     assert!(sw.lines().contains("Watching the canary node-a"), "{}", sw.lines());
 }
+
+/// Release 11 failed on the coordinator and went back: the swarm runs 10.
+/// The registry refused a release between them without rollback, as it
+/// compared with 11. Now only the serial rule holds after a newest that
+/// went back; the brain and the servers check the versions themselves.
+#[test]
+fn after_a_newest_that_went_back_a_release_between_is_taken() {
+    let mut sw = Swarm::new(1);
+    sw.publish(10, true);
+    sw.until(30, |s| s.everyone_on(10));
+    let (env, bin) = sw.release(11, "0.4.0", true);
+    sw.upload(&env, &bin, None).unwrap();
+    let (between, between_bin) = sw.release(12, "0.3.0", true);
+    let e = sw.upload(&between, &between_bin, None).unwrap_err().to_string();
+    assert!(e.contains("older than"), "{e}");
+    sw.brain.fake.sim().apply_fails = Some("dryserver failed: exit status 1: cannot install".into());
+    sw.until(5, |s| s.rollout().phase == Phase::Failed);
+    // Still refused: the same serial again. One below what the machines
+    // run gets past the registry, and the brain refuses it itself.
+    let (twin, twin_bin) = sw.release(11, "0.3.0", true);
+    assert!(sw.upload(&twin, &twin_bin, None).unwrap_err().to_string().contains("signed twice"));
+    let (below, below_bin) = sw.release(12, "0.1.0", true);
+    sw.upload(&below, &below_bin, None).unwrap();
+    sw.tick();
+    let r = sw.rollout();
+    assert!(r.serial == 11 && r.refused_serial == 12 && r.refused.contains("older than the installed"), "{r:#?}");
+    let (between, between_bin) = sw.release(13, "0.3.0", true);
+    sw.upload(&between, &between_bin, None).unwrap();
+    sw.brain.fake.sim().apply_fails = None;
+    sw.until_unpaused(30, |s| s.everyone_on(13));
+    let (below, below_bin) = sw.release(14, "0.1.0", true);
+    let e = sw.upload(&below, &below_bin, None).unwrap_err().to_string();
+    assert!(e.contains("older than"), "{e}");
+}

@@ -588,11 +588,16 @@ impl Served {
         serde_json::from_str(&env.doc).ok()
     }
 
-    /// Refuses r unless it may follow the newest upload.
-    fn after_newest(&self, r: &Release, now: i64) -> Result<()> {
-        if let Some(old) = self.newest()
-            && !release::decide(r, Some(&old), Place::Brain, now)?.install
-        {
+    /// Refuses r unless it may follow the newest upload. back: the serial
+    /// of the newest when it failed on the coordinator and went back
+    /// (went_back). Then only its serial counts: the machines run an
+    /// older release, and each checks the versions against its own.
+    fn after_newest(&self, r: &Release, now: i64, back: Option<u64>) -> Result<()> {
+        let Some(old) = self.newest() else { return Ok(()) };
+        if back == Some(old.serial) && r.serial > old.serial {
+            return Ok(());
+        }
+        if !release::decide(r, Some(&old), Place::Brain, now)?.install {
             bail!("release {} is on the coordinator already", r.serial);
         }
         Ok(())
@@ -607,8 +612,8 @@ impl Served {
     /// The admin's signature on the release is the only authority: the
     /// key that reaches the registry is on every machine. And nothing large
     /// is read before the signature is checked and the release found newer
-    /// than the one here.
-    pub fn receive(&self, v: &dyn Verifier, input: &mut dyn Read, now: i64) -> Result<u64> {
+    /// than the one here. back: see after_newest.
+    pub fn receive(&self, v: &dyn Verifier, input: &mut dyn Read, now: i64, back: Option<u64>) -> Result<u64> {
         let mut input = BufReader::new(input);
         let mut line = Vec::new();
         (&mut input).take(MAX_HEADER).read_until(b'\n', &mut line).map_err(|e| Error::from(e).wrap("read the upload"))?;
@@ -624,7 +629,7 @@ impl Served {
             bail!("the upload's k3s is {} bytes, more than {MAX_K3S}", head.k3s_size);
         }
         fsx::mkdir_all(&self.dir, 0o700)?;
-        self.after_newest(&r, now)?;
+        self.after_newest(&r, now, back)?;
         let k3s_len = if head.k3s_size > 0 { head.k3s_size } else { file_len(&self.k3s) };
         room(self.free, &self.dir, r.dryserver.size.saturating_add(k3s_len), "the coordinator")?;
         let stage = self.dir.join(format!("staging-{}", fsx::hex(&fsx::random_bytes(6))));
@@ -649,7 +654,7 @@ impl Served {
                 bail!("the upload carries more than the release says");
             }
             fsx::write_file(stage.join(RELEASE_FILE), serde_json::to_string(&head.release)? + "\n", 0o600)?;
-            self.commit(&r, &stage, now)
+            self.commit(&r, &stage, now, back)
         })();
         if res.is_err() {
             let _ = remove_dir(&stage);
@@ -659,9 +664,9 @@ impl Served {
 
     /// Makes a checked upload the newest, under a lock: two uploads at the
     /// same time end with the newer one, never with a mix.
-    fn commit(&self, r: &Release, stage: &Path, now: i64) -> Result<()> {
+    fn commit(&self, r: &Release, stage: &Path, now: i64, back: Option<u64>) -> Result<()> {
         let _lock = fsx::lock(self.dir.join(".lock"))?;
-        self.after_newest(r, now)?;
+        self.after_newest(r, now, back)?;
         let prev = self.current();
         let dst = self.release_dir(r.serial);
         remove_dir(&dst)?;
@@ -2721,6 +2726,21 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
         out.push((format!("! {}", shown(w, 300)), true));
     }
     out
+}
+
+/// When the newest release failed on the coordinator and went back (its
+/// own update failed, so no server took it): the release the machines
+/// run, by the coordinator's report (0: none, or not known). r is the
+/// rollout and brain the coordinator's report, as the registry has them.
+/// Their word only chooses what a new release is compared with; the serial
+/// rule stays, and every machine checks the versions against what it runs.
+pub fn went_back(r: &Rollout, brain: Option<&Report>, newest: u64) -> Option<u64> {
+    if newest == 0 || brain.is_some_and(|b| b.release >= newest) {
+        return None;
+    }
+    let failed = r.serial == newest && r.phase == Phase::Failed;
+    let reverted = brain.is_some_and(|b| b.update_failed() && b.update_serial == newest);
+    (failed || reverted).then(|| brain.map_or(0, |b| b.release))
 }
 
 /// What a member's report says about its release, for its line on the

@@ -451,7 +451,9 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
         [current.as_ref(), runs.as_ref()].into_iter().flatten().map(|r| r.arch_date.clone()).max_by_key(|d| release::arch_day(d).ok());
     let current_day = swarm_day.as_deref();
     day_rules(&given, current_day, c.rollback, today)?;
-    if let Some(cur) = &current
+    // The versions go by what the machines run: after a newest that went
+    // back, a release between it and that one needs no rollback.
+    if let Some(cur) = &runs
         && !c.rollback
     {
         if let (Ok(new), Ok(old)) = (Version::parse(&parts.version), Version::parse(&cur.dryserver.version))

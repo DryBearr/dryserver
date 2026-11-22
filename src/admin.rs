@@ -447,6 +447,9 @@ pub struct Admin {
     coordinator_proved: bool,
     /// The newest release on the coordinator, verified, as last loaded.
     release: Option<Release>,
+    /// When that one failed on the coordinator and went back, the release
+    /// the machines run instead (rollout::went_back), as last loaded.
+    went_back: Option<u64>,
 }
 
 impl Admin {
@@ -464,6 +467,7 @@ impl Admin {
             unproved: Vec::new(),
             coordinator_proved: false,
             release: None,
+            went_back: None,
         }
     }
 
@@ -639,6 +643,9 @@ impl Admin {
             }
             v.pending.push(r);
         }
+        let newest = self.release.as_ref().map_or(0, |r| r.serial);
+        let brain = members.iter().find(|m| m.host == 1).and_then(|m| m.report.as_ref());
+        self.went_back = rollout::went_back(&v.rollout, brain, newest);
         self.members = members;
         self.pending = v.pending.clone();
         self.unproved = v.unproved.clone();
@@ -884,13 +891,28 @@ impl Admin {
         }
     }
 
+    /// What a new release's versions are compared with: the last one
+    /// signed, or, when that is the coordinator's newest and it failed
+    /// there and went back, the release the machines run instead (this
+    /// computer's signed copy of it; none without one, or when they ran
+    /// none before: each machine checks against what it runs). The serial
+    /// always comes after the last one signed (last_release).
+    pub fn release_base(&self) -> Option<Release> {
+        let last = self.last_release();
+        match (self.went_back, &last, &self.release) {
+            (Some(m), Some(l), Some(newest)) if l.serial == newest.serial => crate::publish::signed_copy(self, m),
+            _ => last,
+        }
+    }
+
     /// Builds the release that d describes, without signing or sending
     /// it: what send_release would sign, or why the coordinator would
     /// refuse it. publish::plan checks the rest (the Arch day, the k3s
     /// file) and shows the admin what changes.
     pub fn draft_release(&self, d: &release::Draft) -> Result<Release> {
         rollout::check_static(d.binary)?;
-        release::build(d, self.last_release().as_ref(), (self.now)().0.timestamp())
+        let after = self.last_release().map(|l| l.serial);
+        release::build_after(d, after, self.release_base().as_ref(), (self.now)().0.timestamp())
     }
 
     /// Drafts the release that d describes and sends it at once: the
@@ -921,7 +943,14 @@ impl Admin {
             bail!("{} changed since the release was drafted (a new build?). Nothing was signed; look again", binary.display());
         }
         r.validate(now).map_err(unsigned)?;
-        release::decide(r, self.last_release().as_ref(), release::Place::Brain, now).map_err(unsigned)?;
+        // Its serial after the last one signed; its versions after what
+        // the machines run (release_base).
+        let last = self.last_release();
+        let base = match &last {
+            Some(l) if r.serial <= l.serial => last.clone(),
+            _ => self.release_base(),
+        };
+        release::decide(r, base.as_ref(), release::Place::Brain, now).map_err(unsigned)?;
         let r = r.clone();
         let env = release::seal(self.signer.as_ref(), &r)?;
         // Our own signature must pass our own check, or no machine would
@@ -1723,6 +1752,70 @@ pub mod tests {
             uploads: uploads.clone(),
         });
         uploads
+    }
+
+    /// Release N failed on the coordinator and went back: the machines run
+    /// M < N. A release between M and N was refused without -rollback,
+    /// here and on the coordinator, as both compared with N. Now the
+    /// versions go by M (this computer's signed copy of it), and the serial
+    /// still comes after N.
+    #[test]
+    fn after_a_release_that_went_back_the_versions_go_by_what_the_machines_run() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        recording(&mut a, &store);
+        a.load().unwrap();
+        let k3s = dir.join("no-k3s");
+        // What the coordinator took: the release this computer signed last.
+        let took = |serial: u64| {
+            let served = fsx::dir(&store.path).join(rollout::SERVED_DIR);
+            std::fs::create_dir_all(served.join(serial.to_string())).unwrap();
+            std::fs::copy(dir.join("secrets").join(RELEASE_COPY), served.join(serial.to_string()).join(rollout::RELEASE_FILE)).unwrap();
+            std::fs::write(served.join("current"), format!("{serial}\n")).unwrap();
+        };
+        let at = |v: &str| static_binary(&dir, &format!("dryserver-{v}"), v);
+        let (b1, b3, b2, b0) = (at("0.1.0"), at("0.3.0"), at("0.2.0"), at("0.0.9"));
+        fn d<'a>(bin: &'a Path, version: &'a str) -> release::Draft<'a> {
+            release::Draft { binary: bin, version, arch_date: "2026/11/19", ..release::Draft::default() }
+        }
+        let m = a.publish_release(&d(&b1, "0.1.0"), &k3s).unwrap();
+        took(m.serial);
+        let copies = dir.join("secrets").join(crate::publish::COPIES);
+        std::fs::create_dir_all(&copies).unwrap();
+        std::fs::copy(dir.join("secrets").join(RELEASE_COPY), copies.join(format!("{}.json", m.serial))).unwrap();
+        let n = a.publish_release(&d(&b3, "0.3.0"), &k3s).unwrap();
+        took(n.serial);
+        // Before it went back: 0.2.0 is older than the swarm's.
+        a.load().unwrap();
+        assert!(a.draft_release(&d(&b2, "0.2.0")).unwrap_err().to_string().contains("rollback"));
+        store
+            .update(|s| {
+                s.rollout = Rollout { serial: n.serial, phase: rollout::Phase::Failed, paused: "it reverted".into(), ..Rollout::default() };
+                s.members[0].report = Some(crate::report::Report {
+                    release: m.serial,
+                    update: "reverted".into(),
+                    update_serial: n.serial,
+                    ..crate::report::Report::default()
+                });
+                Ok(())
+            })
+            .unwrap();
+        a.load().unwrap();
+        assert_eq!(a.release_base().map(|r| r.serial), Some(m.serial));
+        assert!(a.draft_release(&d(&b0, "0.0.9")).unwrap_err().to_string().contains("rollback"), "below M");
+        let r = a.publish_release(&d(&b2, "0.2.0"), &k3s).unwrap();
+        assert!(r.serial > n.serial && !r.rollback, "{r:?}");
+        // Without this computer's copy of M: the versions go by what this
+        // dryserver is, as before any release, and by the machines
+        // themselves; the serial still follows N.
+        let mut a2 = setup(&dir).0;
+        recording(&mut a2, &store);
+        a2.secrets = dir.join("other-secrets");
+        std::fs::create_dir_all(&a2.secrets).unwrap();
+        std::fs::write(a2.secrets.join(crate::iso::JOIN_SECRET), format!("{SECRET}\n")).unwrap();
+        a2.load().unwrap();
+        assert!(a2.release_base().is_none());
+        assert!(a2.draft_release(&d(&b2, "0.2.0")).unwrap().serial > n.serial);
     }
 
     #[test]
