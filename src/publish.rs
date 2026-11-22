@@ -495,7 +495,12 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
     let day = match current_day {
         // An urgent fix is not held up by a package update on every
         // machine: it keeps the swarm's day, already on every machine.
-        Some(d) if c.urgent && given.is_empty() => Day { day: d.to_string(), how: URGENT_DAY.into() },
+        // Not when the newest went back and this computer has no copy of
+        // what the machines run: its day is unknown, and the newest's may
+        // be older than theirs (they would refuse it as a downgrade).
+        Some(d) if c.urgent && given.is_empty() && (went_back.is_none() || runs.is_some()) => {
+            Day { day: d.to_string(), how: URGENT_DAY.into() }
+        }
         _ => pick_day(ctx, days, &given, current_day, c.rollback, today)?,
     };
     let r = draft(&day.day)?;

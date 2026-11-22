@@ -1060,6 +1060,12 @@ fn after_a_release_went_back_the_preview_compares_with_what_runs() {
         assert!(!text.contains("Nothing changes"), "{text}");
         std::fs::remove_file(&copy).unwrap_or_default();
     }
+    // An urgent release does not keep the newest's day then: the machines
+    // may run a later one (seen on the VM lab: refused as a downgrade).
+    let urgent = Choice { urgent: true, ..Choice::default() };
+    let p = plan(&ctx, &a, &v, &days, &parts, &urgent, today()).unwrap();
+    assert_ne!(p.arch_how, URGENT_DAY);
+    assert_eq!(p.release.arch_date, days_ago(1));
 
     // Stopped at a server instead: the coordinator runs the newest, and
     // the preview compares with it.
