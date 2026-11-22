@@ -1321,6 +1321,34 @@ impl Node {
         out
     }
 
+    /// On a server whose sync did not reach the coordinator over the mesh:
+    /// points WireGuard at the coordinator where this server's own config
+    /// says it is (mesh::endpoint, after a ping of its switch address), if
+    /// it sends anywhere else. That needs nothing from the coordinator, so
+    /// a link that went wrong (a pulled cable, an approval that named the
+    /// wrong path) comes back without a member list, which only that link
+    /// brings. Only a peer that is there: one a cut took out stays out.
+    fn mend_coordinator(&self, ctx: &Ctx, me: SelfInfo) {
+        let Ok(Some((_, env))) = self.seen_list() else { return };
+        let Ok(list) = env.list(self.verifier.as_ref(), |h| self.fits(h)) else { return };
+        let Some(coord) = list.members.iter().find(|e| e.host == 1) else { return };
+        let peer = Member { host: 1, name: coord.name.clone(), wg_key: coord.wg_key.clone(), switch: true, ..Member::default() };
+        let Some(peer) = self.check_switch(ctx, me, &[peer]).pop() else { return };
+        let want = mesh::endpoint(&self.cfg, me, &peer);
+        let Ok(_lock) = fsx::lock(self.path(quarantine::MESH_LOCK)) else { return };
+        if want.is_empty() || !quarantine::load(self).is_ok_and(|q| !q.coordinator_cut()) {
+            return;
+        }
+        let endpoints = self.run.output(ctx, &Cmd::new("wg", &["show", "wg0", "endpoints"]).quiet().stdout_only()).unwrap_or_default();
+        let Some(now) = endpoints.lines().find_map(|l| l.split_once(char::is_whitespace).filter(|(k, _)| *k == peer.wg_key)) else {
+            return;
+        };
+        let now = now.1.trim();
+        if now != want && self.cmd(ctx, "wg", &["set", "wg0", "peer", &peer.wg_key, "endpoint", &want]).is_ok() {
+            eprintln!("dryserver: sync: the coordinator does not answer over the mesh; WireGuard sends to it at {want} now (was {now})");
+        }
+    }
+
     /// On a server: what WireGuard knows of each peer now (mesh::live_peers);
     /// nothing when wg0 is down or wg cannot tell.
     fn live_links(&self, ctx: &Ctx) -> BTreeMap<String, mesh::Live> {
@@ -1615,6 +1643,7 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
                     n.leave(ctx, &env, &gone);
                     return Err(gone);
                 }
+                n.mend_coordinator(ctx, me);
                 return Err(e);
             }
         };
@@ -2026,6 +2055,10 @@ mod tests {
                 }
                 // The report's look at the links: the coordinator only.
                 "wg" if c.args[2] == "allowed-ips" => return (format!("{COORD_WG}\t10.66.0.1/32\n"), Ok(())),
+                "wg" if c.args[0] == "set" => {
+                    self.ran.lock().unwrap().push(format!("wg {}", c.args.join(" ")));
+                    return (String::new(), Ok(()));
+                }
                 "wg" if c.args[2] == "endpoints" => return (self.live.lock().unwrap().0.clone(), Ok(())),
                 "wg" if !self.live.lock().unwrap().1.is_empty() => return (self.live.lock().unwrap().1.clone(), Ok(())),
                 "wg" => return (format!("{COORD_WG}\t{}\n", Time::now().0.timestamp() - 7), Ok(())),
@@ -2400,6 +2433,40 @@ mod tests {
             "--- coordinator\n{brain_wg}"
         );
         assert!(server_wg.contains("Endpoint = 192.168.1.50:51820") && !server_wg.contains("203.0.113.50"), "--- server\n{server_wg}");
+    }
+
+    /// A server that does not reach the coordinator over the mesh gets no
+    /// list that could set the link right: it sets it from its own config.
+    #[test]
+    fn a_server_mends_its_link_to_the_coordinator_by_itself() {
+        let (_dir, _tmp, n, fc) = joined();
+        let store = Store::new("/nonexistent");
+        assert!(sync(&Ctx::new(), &n, false, &store).unwrap());
+        *fc.mesh_down.lock().unwrap() = true;
+        let sets = |fc: &FakeCoord| fc.ran.lock().unwrap().drain(..).filter(|c| c.starts_with("wg set")).collect::<Vec<_>>();
+        sets(&fc);
+        // Sent to the wrong place (an approval or a list that lied, a cable
+        // pulled): the coordinator's address from the config.
+        *fc.live.lock().unwrap() = (format!("{COORD_WG}\t203.0.113.50:51820\n"), String::new());
+        assert!(sync(&Ctx::new(), &n, false, &store).is_err());
+        assert_eq!(sets(&fc), vec![format!("wg set wg0 peer {COORD_WG} endpoint 192.168.1.50:51820")]);
+        // Already there, or no such peer running: nothing to do.
+        for live in [format!("{COORD_WG}\t192.168.1.50:51820\n"), format!("{OTHER_WG}\t203.0.113.50:51820\n"), String::new()] {
+            *fc.live.lock().unwrap() = (live.clone(), String::new());
+            assert!(sync(&Ctx::new(), &n, false, &store).is_err());
+            assert!(sets(&fc).is_empty(), "{live}");
+        }
+        // With a switch link the switch address is tried first.
+        *fc.live.lock().unwrap() = (format!("{COORD_WG}\t203.0.113.50:51820\n"), String::new());
+        n.mend_coordinator(&Ctx::new(), SelfInfo { host: 2, switch: true });
+        assert_eq!(sets(&fc), vec![format!("wg set wg0 peer {COORD_WG} endpoint 172.16.66.1:51820")]);
+        *fc.answers.lock().unwrap() = Some(vec![]);
+        n.mend_coordinator(&Ctx::new(), SelfInfo { host: 2, switch: true });
+        assert_eq!(sets(&fc), vec![format!("wg set wg0 peer {COORD_WG} endpoint 192.168.1.50:51820")]);
+        // A coordinator this server cut off is never brought back.
+        put(&n.root, quarantine::STATE_FILE, r#"{"cuts":[{"hosts":[1]}]}"#);
+        n.mend_coordinator(&Ctx::new(), SelfInfo { host: 2, switch: false });
+        assert!(sets(&fc).is_empty());
     }
 
     /// Between two servers the list's address is a hint: a link WireGuard
