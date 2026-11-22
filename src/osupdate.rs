@@ -45,6 +45,7 @@ pub const MIRRORLIST: &str = "/etc/pacman.d/mirrorlist";
 /// The list before the last change of the pinned day.
 pub const MIRRORLIST_PREV: &str = "/etc/pacman.d/mirrorlist.prev";
 pub const PACMAN_CONF: &str = "/etc/pacman.conf";
+const SSHD_CONFIG: &str = "/etc/ssh/sshd_config";
 /// pacman holds this file while it changes the system, and leaves it
 /// behind when it is killed.
 pub const PACMAN_LOCK: &str = "/var/lib/pacman/db.lck";
@@ -290,9 +291,14 @@ impl Host<'_> {
     /// every package, not its databases. LocalFileSigLevel only concerns
     /// `pacman -U`, which an update never runs.
     ///
-    /// Returns warnings about what does not weaken signatures but works
-    /// against the update: packages pacman leaves out, and repositories
-    /// with servers outside the pinned snapshot.
+    /// It also refuses a repository with servers of its own (Server or
+    /// CacheServer lines anywhere but in MIRRORLIST: in pacman.conf, in
+    /// another mirrorlist it includes): pacman would take its packages from
+    /// there, not from the pinned snapshot, while the machine reports that
+    /// it runs the snapshot's.
+    ///
+    /// Returns warnings about what works against the update without
+    /// weakening it: packages pacman leaves out.
     pub fn check_pacman_conf(&self) -> Result<Vec<String>> {
         let mut s = ConfScan::default();
         self.scan_conf(PACMAN_CONF, &mut s, 0);
@@ -303,8 +309,13 @@ impl Host<'_> {
         if !s.problems.is_empty() {
             bail!("package signature checks are weakened, so nothing is installed: {}", s.problems.join("; "));
         }
-        for (repo, n) in &s.own_servers {
-            s.warnings.push(format!("repository [{repo}] has {n} server line(s) of its own: its packages are not pinned to the snapshot"));
+        if !s.own_servers.is_empty() {
+            let repos: Vec<String> =
+                s.own_servers.iter().map(|(repo, n)| format!("repository [{}] has {n} server line(s) of its own", show(repo))).collect();
+            bail!(
+                "pacman would not take every package from the pinned snapshot, so nothing is installed: {}. Its servers belong in {MIRRORLIST} only, which the update writes",
+                repos.join("; ")
+            );
         }
         Ok(s.warnings)
     }
@@ -347,7 +358,9 @@ impl Host<'_> {
                     s.problems.push(format!("{at}: Include {} cannot be checked (a pattern or a relative path)", show(value)));
                 }
                 "Include" => self.scan_conf(value, s, depth + 1),
-                "Server" if s.section != "options" && file != MIRRORLIST => *s.own_servers.entry(s.section.clone()).or_default() += 1,
+                "Server" | "CacheServer" if s.section != "options" && file != MIRRORLIST => {
+                    *s.own_servers.entry(s.section.clone()).or_default() += 1
+                }
                 "IgnorePkg" | "IgnoreGroup" if s.section == "options" && !value.is_empty() => {
                     s.warnings.push(format!("{at}: {key} = {}: pacman leaves these out of every update, security fixes too", show(value)));
                 }
@@ -607,6 +620,9 @@ impl Host<'_> {
         out.failure = res.err();
         (out.count, out.changes) = self.changes_since(offset);
         out.restart = restart_packages(&out.changes);
+        if out.changes.iter().any(|c| c.name == "openssh" && c.action != "removed") {
+            self.restart_sshd(&mut out);
+        }
         out.kernel_replaced = kernel_replaced(&self.root);
         let after = self.pacnew_files();
         out.pacnew = after.iter().filter(|(p, t)| before.get(*p) != Some(t)).map(|(p, _)| p.clone()).collect();
@@ -901,6 +917,33 @@ impl Host<'_> {
                 Some((name, md.modified().ok()?))
             })
             .collect()
+    }
+
+    /// After openssh changed, the running sshd is the old program, and it
+    /// starts the new one's pieces (sshd-session) for every login: logins
+    /// can fail until sshd restarts. A restart keeps running sessions
+    /// (sshd.service stops only the listener, KillMode=process), and comes
+    /// only once the new sshd accepts the settings: one that would not
+    /// start again is left running as it is, with a warning. Done after a
+    /// failed run too: openssh may be new while the run stopped later.
+    fn restart_sshd(&self, out: &mut ArchOutcome) {
+        // Its own context: a stopped update still leaves sshd usable.
+        let ctx = Ctx::new().with_timeout(Duration::from_secs(90));
+        let conf = self.path(SSHD_CONFIG).display().to_string();
+        let warn = |what: &str, e: Error| {
+            format!("openssh changed, {what} ({}): logins may fail until sshd restarts", one_line(&e.to_string(), 200))
+        };
+        if let Err(e) = self.run.ok(&ctx, &Cmd::new("sshd", &["-t", "-f", &conf])) {
+            out.warnings.push(warn("but the new sshd does not accept the settings, so it was not restarted", e));
+            return;
+        }
+        match self.run.ok(&ctx, &Cmd::new("systemctl", &["try-restart", "sshd.service"])) {
+            Ok(()) => {
+                self.say("openssh changed: sshd restarted, running sessions stay");
+                out.restart.retain(|p| p != "openssh");
+            }
+            Err(e) => out.warnings.push(warn("but restarting sshd failed", e)),
+        }
     }
 
     /// Why this machine cannot reboot by itself, or None when it can. A
@@ -1742,6 +1785,9 @@ mod tests {
                     (self.pacman)(ctx, &self.root, c)
                 }
                 ("pacman", _) => (self.pacman)(ctx, &self.root, c),
+                ("sshd", ["-t", ..]) if self.sshd_fails => {
+                    (String::new(), Err("sshd failed: exit status 255: Bad configuration option".into()))
+                }
                 ("systemd-inhibit", _) if self.no_inhibit => {
                     (String::new(), Err("exec: \"systemd-inhibit\": executable file not found in $PATH".into()))
                 }
@@ -1992,11 +2038,42 @@ mod tests {
         assert!(out.warnings.iter().any(|w| w.contains("did not pin a snapshot day")), "{:?}", out.warnings);
         assert_eq!(out.count, 3);
         assert_eq!(out.changes[0], Change { action: "upgraded".into(), name: "openssh".into(), version: "9.9p1-1 -> 9.9p1-2".into() });
-        assert_eq!(out.restart, ["openssh"]);
-        assert!(!out.kernel_replaced && out.reboot_needed() && out.reboot_safe());
+        // The new openssh needs a new sshd: restarted (sessions stay) once
+        // sshd -t passed, so no reboot is needed for it.
+        let ran = fake.lines();
+        let check = ran.iter().position(|l| l.starts_with("sshd -t -f ") && l.ends_with("/etc/ssh/sshd_config")).expect("sshd -t");
+        let restart = ran.iter().position(|l| l == "systemctl try-restart sshd.service").expect("sshd restarted");
+        assert!(check < restart, "{ran:?}");
+        assert!(out.restart.is_empty(), "{:?}", out.restart);
+        assert!(!out.kernel_replaced && !out.reboot_needed() && out.reboot_safe());
         assert_eq!(out.pacnew, ["/etc/ssh/sshd_config.pacnew"], "an older .pacnew is not new");
         let s = out.summary();
-        assert!(s.contains("3 package(s) changed") && s.contains("reboot needed") && s.contains("sshd_config.pacnew"), "{s}");
+        assert!(s.contains("3 package(s) changed") && !s.contains("reboot") && s.contains("sshd_config.pacnew"), "{s}");
+    }
+
+    #[test]
+    fn a_new_openssh_whose_sshd_refuses_the_settings_is_not_restarted() {
+        let dir = machine();
+        let r = dir.path();
+        let mut fake = Fake::with_pacman(r, |_, root, c| {
+            if c.args[0] == "-Su" {
+                append(root, PACMAN_LOG, "[2026-11-21T03:00:02+0000] [ALPM] upgraded openssh (9.9p1-1 -> 10.0p1-1)\n");
+            }
+            (String::new(), Ok(()))
+        });
+        fake.sshd_fails = true;
+        let (h, _) = host(r, &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok(), "{}", out.summary());
+        assert_eq!(fake.count("systemctl try-restart"), 0, "a sshd that would not start again is left running");
+        assert!(out.warnings.iter().any(|w| w.contains("does not accept the settings")), "{:?}", out.warnings);
+        assert_eq!(out.restart, ["openssh"], "a reboot still brings the new sshd");
+        // Nothing to restart when openssh did not change.
+        let dir = machine();
+        let fake = Fake::new(dir.path());
+        let (h, _) = host(dir.path(), &fake);
+        assert!(h.arch_update(&Ctx::new(), "2026/11/20", false).ok());
+        assert_eq!(fake.count("sshd") + fake.count("systemctl try-restart"), 0, "{:?}", fake.lines());
     }
 
     #[test]
@@ -2273,11 +2350,44 @@ mod tests {
             r,
             PACMAN_CONF,
             "[options]\nSigLevel = PackageRequired DatabaseNever\nLocalFileSigLevel = Optional\nIgnorePkg = openssh\n\
-             [core]\nSigLevel = PackageRequired\nInclude = /etc/pacman.d/mirrorlist\n[custom]\nServer = https://repo.example/$arch\n",
+             [core]\nSigLevel = PackageRequired\nInclude = /etc/pacman.d/mirrorlist\n",
         );
         let w = h.check_pacman_conf().unwrap();
         assert!(w.iter().any(|w| w.contains("IgnorePkg = \"openssh\"") && w.contains("security fixes")), "{w:?}");
-        assert!(w.iter().any(|w| w.contains("[custom]") && w.contains("not pinned")), "{w:?}");
+    }
+
+    #[test]
+    fn repositories_with_servers_of_their_own_are_refused() {
+        // pacman would take their packages from elsewhere than the pinned
+        // snapshot, while the machine reports the snapshot's day.
+        let other = "/etc/pacman.d/mirrorlist-other";
+        let base = "[options]\nSigLevel = Required DatabaseOptional\n[core]\nInclude = /etc/pacman.d/mirrorlist\n";
+        for (conf, included, want) in [
+            (format!("{base}[custom]\nServer = https://repo.example/$arch\n"), "", "[\"custom\"] has 1 server"),
+            (
+                format!("{base}[extra]\nServer = http://mirror.example/$repo/os/$arch\nInclude = /etc/pacman.d/mirrorlist\n"),
+                "",
+                "[\"extra\"]",
+            ),
+            (
+                format!("{base}[extra]\nInclude = {other}\n"),
+                "Server = https://a.example/$repo\nServer = https://b.example/$repo\n",
+                "2 server",
+            ),
+            (format!("{base}[extra]\nCacheServer = http://cache.lan/$repo\nInclude = /etc/pacman.d/mirrorlist\n"), "", "[\"extra\"]"),
+        ] {
+            let dir = machine();
+            let r = dir.path();
+            put(r, PACMAN_CONF, &conf);
+            put(r, other, included);
+            let fake = Fake::new(r);
+            let (h, _) = host(r, &fake);
+            let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+            let f = out.failure.as_ref().unwrap_or_else(|| panic!("accepted:\n{conf}"));
+            let why = f.reason.to_string();
+            assert!(f.stage == Stage::Refused && why.contains("pinned snapshot") && why.contains(want), "{why}\n{conf}");
+            assert!(fake.lines().is_empty() && get(r, MIRRORLIST) == LIVE, "{conf}");
+        }
     }
 
     #[test]
