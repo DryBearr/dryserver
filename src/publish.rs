@@ -419,6 +419,13 @@ pub struct Plan {
     /// (or without a copy here of the one it runs).
     pub reported_dryserver: Vec<String>,
     pub reported_k3s: Vec<String>,
+    /// The machines that do not run the release this one is compared with
+    /// (its rollout has not reached them, or stopped before them), each
+    /// with the Arch day of the one they run when this computer has a copy
+    /// of it and that day is another: their packages move to the release's
+    /// day from there, whatever the Arch line says (an urgent release that
+    /// keeps the day still brings them a package update).
+    pub behind: Vec<(String, Option<String>)>,
 }
 
 /// The distinct non-empty values, sorted.
@@ -506,6 +513,20 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
     let r = draft(&day.day)?;
     let last = a.last_release().map(|l| l.serial);
     let members: Vec<&Member> = v.members.iter().map(|(m, _)| m).collect();
+    let behind = match &runs {
+        Some(base) => members
+            .iter()
+            .filter_map(|m| {
+                let on = m.report.as_ref()?.release;
+                if on == base.serial {
+                    return None;
+                }
+                let day = signed_copy(a, on).map(|o| o.arch_date);
+                (day.as_deref() != Some(r.arch_date.as_str())).then(|| (m.name.clone(), day))
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     Ok(Plan {
         release: r,
         parts: parts.clone(),
@@ -519,6 +540,7 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
         servers: members.iter().filter(|m| m.host != 1).map(|m| m.name.clone()).collect(),
         reported_dryserver: distinct(members.iter().filter_map(|m| m.report.as_ref()).map(|r| r.dryserver.clone())),
         reported_k3s: distinct(members.iter().filter_map(|m| m.report.as_ref()).map(|r| r.k3s.clone())),
+        behind,
     })
 }
 
@@ -646,7 +668,24 @@ impl Plan {
         if let Some(u) = self.unsent {
             out.push(format!("Release {u} was signed here but never reached the coordinator; this one replaces it."));
         }
+        if let (Some(base), false) = (&self.runs, self.behind.is_empty()) {
+            let list: Vec<String> = self
+                .behind
+                .iter()
+                .map(|(n, d)| match d {
+                    Some(d) => format!("{n} (Arch {d})"),
+                    None => format!("{n} (its Arch day not known here)"),
+                })
+                .collect();
+            out.push(format!(
+                "Not on release {} yet: {}. Their packages go to Arch {} with this one: a package update, whatever the Arch line says.",
+                base.serial,
+                names(&list),
+                r.arch_date
+            ));
+        }
         if let Some(cur) = &self.runs
+            && self.behind.is_empty()
             && cur.dryserver.sha256 == r.dryserver.sha256
             && cur.k3s == r.k3s
             && cur.arch_date == r.arch_date

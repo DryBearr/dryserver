@@ -462,8 +462,20 @@ fn a_release_is_planned_shown_and_published() {
     assert!(e.contains("changed since you looked") && e.contains("Nothing was signed"), "{e}");
     assert_eq!(sent.lock().unwrap().len(), 1);
 
-    // The next one compares with it. Nothing changes but the urgency.
+    // Before the machines took it, the next one says they did not.
     let urgent = Choice { urgent: true, ..Choice::default() };
+    let text = plan(&ctx, &a, &v, &days, &parts, &urgent, today()).unwrap().lines().join("\n");
+    let want = format!(
+        "Not on release {} yet: coord (its Arch day not known here), node-a (its Arch day not known here) and node-b (its Arch day not known here).",
+        p.release.serial
+    );
+    assert!(text.contains(&want) && !text.contains("Nothing changes"), "{text}");
+    for host in 1..=3 {
+        on_release(&store, host, p.release.serial);
+    }
+    let v = a.load().unwrap();
+
+    // The next one compares with it. Nothing changes but the urgency.
     let p2 = plan(&ctx, &a, &v, &days, &parts, &urgent, today()).unwrap();
     assert!(p2.release.serial > p.release.serial);
     let text = p2.lines().join("\n");
@@ -973,6 +985,66 @@ fn an_urgent_release_keeps_the_arch_day() {
     assert!(p.lines().join("\n").contains(&format!("  Arch       {} -> {} (checked", days_ago(2), days_ago(0))));
 }
 
+/// An urgent release keeps the newest release's day, but a server its
+/// rollout did not reach runs an older day: the preview said "same", and
+/// that server got a package update all the same. It says which machines
+/// get packages now.
+#[test]
+fn review_an_urgent_release_says_which_machines_still_get_packages() {
+    let dir = TempDir::new();
+    let (mut a, store, _, _, parts) = desk(&dir);
+    let ctx = Ctx::new();
+    let days = FakeDays::with(&[days_ago(3)]);
+    let v = a.load().unwrap();
+    let p = plan(&ctx, &a, &v, &days, &parts, &Choice::default(), today()).unwrap();
+    let first = publish(&mut a, &p).unwrap();
+    days.have.lock().unwrap().push(days_ago(2));
+    let v = a.load().unwrap();
+    let p = plan(&ctx, &a, &v, &days, &parts, &Choice::default(), today()).unwrap();
+    let second = publish(&mut a, &p).unwrap();
+    assert_eq!((first.arch_date.as_str(), second.arch_date.as_str()), (days_ago(3).as_str(), days_ago(2).as_str()));
+    // The rollout of the second stopped before node-b, which runs the first.
+    let runs = |host: u32, release: u64| on_release(&store, host, release);
+    runs(1, second.serial);
+    runs(2, second.serial);
+    runs(3, first.serial);
+    let urgent = Choice { urgent: true, ..Choice::default() };
+    let v = a.load().unwrap();
+    let p = plan(&ctx, &a, &v, &days, &parts, &urgent, today()).unwrap();
+    assert_eq!(p.release.arch_date, days_ago(2));
+    let text = p.lines().join("\n");
+    assert!(text.contains(&format!("  Arch       same ({})", days_ago(2))), "{text}");
+    let want = format!(
+        "Not on release {} yet: node-b (Arch {}). Their packages go to Arch {} with this one: a package update",
+        second.serial,
+        days_ago(3),
+        days_ago(2)
+    );
+    assert!(text.contains(&want), "{text}");
+    // Every machine on it: nothing more to say.
+    runs(3, second.serial);
+    let v = a.load().unwrap();
+    let text = plan(&ctx, &a, &v, &days, &parts, &urgent, today()).unwrap().lines().join("\n");
+    assert!(!text.contains("Not on release"), "{text}");
+}
+
+/// A machine's report: it runs release.
+fn on_release(store: &Store, host: u32, release: u64) {
+    store
+        .update(|s| {
+            let rep = Report {
+                format: report::FORMAT,
+                time: Time::now().0.timestamp(),
+                dryserver: "0.2.0".into(),
+                k3s: iso::K3S_VERSION.into(),
+                release,
+                ..Report::default()
+            };
+            s.heartbeat(host, Heartbeat { lan_ip: "192.168.1.50".into(), report: Some(rep), ..Heartbeat::default() }, Time::now())
+        })
+        .unwrap()
+}
+
 /// The coordinator's report of itself: on release, its update of serial
 /// ended as update.
 fn brain_says(store: &Store, release: u64, update: &str, serial: u64) {
@@ -1019,6 +1091,9 @@ fn after_a_release_went_back_the_preview_compares_with_what_runs() {
         })
         .unwrap();
     brain_says(&store, m.serial, "reverted", n.serial);
+    for host in [2, 3] {
+        on_release(&store, host, m.serial);
+    }
 
     let v = a.load().unwrap();
     let p = plan(&ctx, &a, &v, &days, &parts, &Choice::default(), today()).unwrap();
@@ -1086,7 +1161,12 @@ fn after_a_release_went_back_the_preview_compares_with_what_runs() {
     let v = a.load().unwrap();
     let p = plan(&ctx, &a, &v, &days, &parts, &Choice::default(), today()).unwrap();
     assert_eq!((p.went_back, p.runs.as_ref().map(|r| r.serial)), (None, Some(n.serial)));
-    assert!(p.lines().join("\n").contains(&format!("Compared with release {}, the newest on the coordinator.", n.serial)));
+    let text = p.lines().join("\n");
+    assert!(text.contains(&format!("Compared with release {}, the newest on the coordinator.", n.serial)), "{text}");
+    // The servers it did not reach run release m still (whose copy is
+    // gone here): their packages move with this one.
+    let want = format!("Not on release {} yet: node-a (its Arch day not known here) and node-b (its Arch day not known here).", n.serial);
+    assert!(text.contains(&want), "{text}");
 }
 
 /// The copies: kept when the upload broke off too (the release is signed
