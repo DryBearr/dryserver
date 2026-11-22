@@ -226,6 +226,10 @@ out=$(inw "$BIN" quarantine -name ghost 2>&1)
 check "unknown name is refused with the member list" grep -q "members here: node-c" <<<"$out"
 out=$(inw "$BIN" quarantine -lift -name node-c 2>&1)
 check "-lift with -name is refused" grep -q "take no -name" <<<"$out"
+out=$(inw "$BIN" quarantine -same 2>&1)
+check "-same without -lift is refused" grep -q "goes with -lift" <<<"$out"
+out=$(inw "$BIN" quarantine -min-version 9 2>&1)
+check "-min-version without -lift is refused" grep -q "goes with -lift" <<<"$out"
 
 echo "== lift needs a member list signed by the admin"
 out=$(inw "$BIN" quarantine -lift 2>&1); rc=$?
@@ -237,9 +241,20 @@ check "the firewall block is back" inw nft list table inet dryserver_quarantine
 check_not "still cut off" inw ping -c1 -W1 10.66.0.1
 check_not "brain peer still out" bash -c "nsenter -t $WK -n wg show wg0 peers | grep -qF '$BP'"
 
-echo "== lift (false alarm: the same coordinator)"
+echo "== the same coordinator comes back only with -same"
+# Whoever kept a reinstalled coordinator's keys answers with the list this
+# server has; it does not take the old machine back by itself.
 cp "$W/v5" "$W/signed-reply"
-inw "$BIN" quarantine -lift > "$W/lift.out" 2>&1; rc=$?
+out=$(inw "$BIN" quarantine -lift 2>&1); rc=$?
+check "refused without -same ($rc)" bash -c "[ $rc != 0 ] && grep -q 'lift with -same' <<<'$out' && grep -q 'the quarantine stays' <<<'$out'"
+check "the firewall block is back" inw nft list table inet dryserver_quarantine
+check_not "brain peer still out" bash -c "nsenter -t $WK -n wg show wg0 peers | grep -qF '$BP'"
+out=$(inw "$BIN" quarantine -lift -same -min-version 6 2>&1); rc=$?
+check "refused below the version the desktop signed last ($rc)" bash -c "[ $rc != 0 ] && grep -q 'older than version 6 your desktop signed last' <<<'$out'"
+check_not "still cut off" inw ping -c1 -W1 10.66.0.1
+
+echo "== lift -same (false alarm: the same coordinator)"
+inw "$BIN" quarantine -lift -same -min-version 5 > "$W/lift.out" 2>&1; rc=$?
 sed 's/^/    | /' "$W/lift.out"
 check "lift exits 0" test "$rc" = 0
 check "says it is the same machine" grep -q "same machine as before" "$W/lift.out"
@@ -256,7 +271,9 @@ BK2=$(wg genkey); BP2=$(echo "$BK2" | wg pubkey)
 echo "$BK2" > "$W/bk2"
 inb wg set wg0 private-key "$W/bk2"
 sign_list "$W/signing" 9 "$BP2" "$NEW_SSH" > "$W/signed-reply"
-inw "$BIN" quarantine -lift > "$W/lift2.out" 2>&1; rc=$?
+out=$(inw "$BIN" quarantine -lift -min-version 10 2>&1); rc=$?
+check "refused when the desktop signed a newer one ($rc)" bash -c "[ $rc != 0 ] && grep -q 'older than version 10' <<<'$out'"
+inw "$BIN" quarantine -lift -min-version 9 > "$W/lift2.out" 2>&1; rc=$?
 sed 's/^/    | /' "$W/lift2.out"
 check "lift exits 0" test "$rc" = 0
 check "says it follows the new coordinator" grep -q "follows the new coordinator you signed" "$W/lift2.out"
@@ -273,7 +290,7 @@ cp "$W/v5" "$W/signed-reply"
 out=$(inw "$BIN" quarantine -lift 2>&1); rc=$?
 check "the old list is refused after the new one was seen" bash -c "[ $rc != 0 ] && grep -q 'older than version 9' <<<'$out'"
 sign_list "$W/signing" 9 "$BP2" "$NEW_SSH" > "$W/signed-reply"
-check "lift with the current list" inw "$BIN" quarantine -lift
+check "lift -same with the current list" inw "$BIN" quarantine -lift -same
 
 echo "== cut a worker by name"
 check "cut node-c" inw "$BIN" quarantine -name node-c
@@ -334,7 +351,7 @@ s = socket.socket(); s.setblocking(False)
 try: s.connect(('10.66.0.2', $port))
 except OSError: pass"; done
 inw nft add element inet dryserver offenders4 '{ 10.66.0.1 }'
-check "lift" inw "$BIN" quarantine -lift
+check "lift -same (a false alarm)" inw "$BIN" quarantine -lift -same
 check_not "the firewall's entry is gone after the lift" bash -c "nsenter -t $WK -n nft list set inet dryserver offenders4 | grep -q 10.66.0.1"
 out=$(inw "$BIN" sync 2>&1)
 check_not "the next sync does not cut the lifted member again" grep -q "by itself" <<<"$out"

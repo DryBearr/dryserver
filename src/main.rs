@@ -72,8 +72,9 @@ commands:
   ssh-config          write ~/.ssh/config.d/dryserver so "ssh <server>" works
   quarantine-all      kill switch: cut the coordinator off on every server,
                       over the WiFi/router network, never through it;
-                      -name a,b cuts those members instead, -lift undoes,
-                      -status shows
+                      -name a,b cuts those members instead, -lift undoes
+                      (onto the coordinator you signed last; -lift -same
+                      after a false alarm), -status shows
 
   approve             approve or reject machines, remove members, publish
                       an update (u); every decision is signed with
@@ -96,7 +97,8 @@ on servers:
   join                ask the coordinator to join (runs at boot until approved)
   sync                update the mesh from the member list (runs every minute)
   quarantine          cut the coordinator (or -name a,b) off this server;
-                      -lift undoes it, -status shows it
+                      -lift undoes it (-same: trust the same coordinator
+                      again), -status shows it
   scan                coordinator: report unknown devices on the network
   report              this machine's health as JSON (versions, reboot, disk,
                       k3s, firewall, WireGuard); root shows everything
@@ -569,6 +571,15 @@ fn run_sync(args: &[String]) -> Result<()> {
 const QUARANTINE_FLAGS: &[(&str, &str, &str)] = &[
     ("name", "", "members to cut, comma separated (default: the coordinator)"),
     ("lift", "false", "undo every cut"),
+    ("same", "false", "with -lift: the coordinator was not reinstalled (a false alarm); trust it again"),
+    ("status", "false", "show what is cut"),
+];
+/// On a server: quarantine-all also passes -min-version.
+const QUARANTINE_SERVER_FLAGS: &[(&str, &str, &str)] = &[
+    ("name", "", "members to cut, comma separated (default: the coordinator)"),
+    ("lift", "false", "undo every cut"),
+    ("same", "false", "with -lift: the coordinator was not reinstalled (a false alarm); trust it again"),
+    ("min-version", "0", "with -lift: refuse member lists older than this version (the newest you signed)"),
     ("status", "false", "show what is cut"),
 ];
 
@@ -582,12 +593,20 @@ fn quarantine_action(f: &Flags) -> Result<(Vec<String>, bool, bool)> {
     if (lift || status) && !names.is_empty() {
         bail!("-lift and -status cover every cut; they take no -name");
     }
+    if f.on("same") && !lift {
+        bail!("-same goes with -lift");
+    }
     Ok((names, lift, status))
 }
 
 fn run_quarantine(args: &[String]) -> Result<()> {
-    let f = Flags::parse("quarantine", args, QUARANTINE_FLAGS);
+    let f = Flags::parse("quarantine", args, QUARANTINE_SERVER_FLAGS);
     let (names, lift, status) = quarantine_action(&f)?;
+    let min_version: u64 = f.get("min-version").parse().map_err(|_| errf!("-min-version must be a number"))?;
+    if min_version > 0 && !lift {
+        bail!("-min-version goes with -lift");
+    }
+    let how = quarantine::LiftOptions { min_version, same: f.on("same") };
     let (n, _) = server_node()?;
     // The admin's session may run through the machine being cut and hang
     // up half way: finish anyway. Output errors are ignored for the same
@@ -602,7 +621,7 @@ fn run_quarantine(args: &[String]) -> Result<()> {
     if status {
         quarantine::status(&ctx, &n, &mut out)
     } else if lift {
-        quarantine::lift(&ctx, &n, is_coordinator(), &mut out)
+        quarantine::lift(&ctx, &n, is_coordinator(), how, &mut out)
     } else {
         quarantine::cut(&ctx, &n, is_coordinator(), &names, &mut out)
     }
@@ -636,7 +655,16 @@ fn run_quarantine_all(args: &[String]) -> Result<()> {
     println!("Server list: {} (written {age} ago). Servers added since then are not in it.", conf_path.display());
     let mut action = Vec::new();
     if lift {
-        action.push("-lift".to_string());
+        // No server takes a list older than the newest one signed here.
+        let copy_path = paths().secrets.join(admin::SIGNED_COPY);
+        let copy = fsx::read_string(&copy_path).map_err(|e| {
+            e.wrap(format!(
+                "no copy of the member list you signed last ({}). Lift on each server by hand: \
+                 sudo dryserver quarantine -lift (with -same after a false alarm)",
+                copy_path.display()
+            ))
+        })?;
+        action = quarantine::lift_args(&copy, f.on("same")).map_err(|e| e.wrap(copy_path.display().to_string()))?;
     } else if status {
         action.push("-status".to_string());
     } else if !names.is_empty() {
