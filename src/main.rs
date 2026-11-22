@@ -91,7 +91,8 @@ commands:
                       itself, then one server at a time (-urgent: at once,
                       -notes TEXT, -rollback; release help for the rest)
   release status      the release, one line per machine, what to do
-  release resume      let a stopped rollout go on
+  release resume      let a stopped rollout go on: the server it stopped at
+                      tries again (-skip: pass it over for this release)
 
 on servers:
   join                ask the coordinator to join (runs at boot until approved)
@@ -917,7 +918,12 @@ const RELEASE_USAGE: &str = r#"usage: dryserver release publish|status|resume [f
               -yes            do not ask
   status    the release, where its rollout stands, one line per machine,
             and what to do when it stopped
-  resume    let a stopped rollout go on (it says what that does first)
+  resume    let a stopped rollout go on (it says what that does first):
+            the server it stopped at tries again (once it is back, if it is
+            off), one that could not be drained updates without
+              -skip           pass that server over for this release
+                              instead; it keeps its release until the
+                              next one
 
   every command also takes -config FILE, -host ADDRESS and -port N
 "#;
@@ -944,9 +950,12 @@ fn run_release(args: &[String]) -> Result<()> {
             print_rollout(&mut a)
         }
         "resume" => {
-            let f = Flags::parse("release resume", rest, DESKTOP_FLAGS);
+            let mut spec = DESKTOP_FLAGS.to_vec();
+            spec.push(("skip", "false", "pass the server the rollout stopped at over for this release, instead of trying it again"));
+            let f = Flags::parse("release resume", rest, &spec);
             let (mut a, _) = release_admin(&f, "release resume")?;
-            let what = publish::resume(&mut a).map_err(|e| e.wrap("not resumed"))?;
+            let what = if f.on("skip") { publish::skip(&mut a) } else { publish::resume(&mut a) };
+            let what = what.map_err(|e| e.wrap("not resumed"))?;
             println!("Resumed: the coordinator {what}, at its next sync (within a minute).\n");
             print_rollout(&mut a)
         }

@@ -473,6 +473,33 @@ impl Swarm {
     fn fault(&self, host: u32, f: Fault) {
         self.faults.lock().unwrap().push((host, f));
     }
+
+    /// The admin's `release resume`, or with skip `release resume -skip`.
+    fn ask(&self, skip: bool) -> Result<Vec<u8>> {
+        let op = if skip { "release-skip" } else { "release-resume" };
+        self.call(op, 0, serde_json::to_string(&crate::signed::seal_admin(&ADMIN, op, self.now).unwrap()).unwrap().as_bytes())
+    }
+
+    fn resume(&self) {
+        self.ask(false).unwrap();
+    }
+
+    fn skip(&self) {
+        self.ask(true).unwrap();
+    }
+
+    /// Ticks until f says yes, at most limit minutes, and never stops on
+    /// the way.
+    fn until_unpaused(&mut self, limit: usize, f: impl Fn(&Swarm) -> bool) {
+        for _ in 0..limit {
+            if f(self) {
+                return;
+            }
+            self.tick();
+            assert!(self.rollout().paused.is_empty(), "it stopped: {:#?}", self.rollout());
+        }
+        assert!(f(self), "not reached in {limit} minutes: {:#?}", self.rollout());
+    }
 }
 
 /// A server asking the brain's registry, in process, from its mesh address.
@@ -774,7 +801,7 @@ fn a_server_with_its_kill_switch_on_is_held() {
     assert!(sw.lines().contains("Held, kill switch on: node-b."), "{}", sw.lines());
     // Even handed a turn, it does nothing.
     let m = Machine { n: &sw.server(3).node, brain: false, free: plenty };
-    let o = Offer { serial: 10, turn: true, brain_k3s: K3S_VERSION.into() };
+    let o = Offer { serial: 10, turn: true, brain_k3s: K3S_VERSION.into(), retry: 0 };
     m.step(&Ctx::new(), &Reg { sw: &sw, host: 3 }, &o, &sw.healthy(3), sw.now).unwrap();
     assert!(sw.server(3).fake.sim().applied.is_empty());
     // Lifted: it updates.
@@ -821,14 +848,19 @@ fn a_claim_of_success_without_the_new_release_is_not_success() {
     assert!(!sw.rollout().cordoned.contains(&"node-a".to_string()), "{:#?}", sw.rollout());
     assert!(!sw.kubectl().iter().any(|l| l == "cordon -- node-b"));
     assert_eq!(sw.rollout().pause, Pause::Timeout, "it waits for the admin");
-    assert!(sw.lines().contains("PAUSED:") && sw.lines().contains("passes it over"), "{}", sw.lines());
-    // The admin resumes: node-a is passed over and uncordoned.
-    let ask = serde_json::to_string(&crate::signed::seal_admin(&ADMIN, "release-resume", sw.now).unwrap()).unwrap();
-    sw.call("release-resume", 0, ask.as_bytes()).unwrap();
+    assert!(sw.lines().contains("PAUSED:") && sw.lines().contains("(node-a tries again)"), "{}", sw.lines());
+    // The admin resumes: node-a has its turn again, and stalls again.
+    sw.resume();
+    sw.until(5, |s| s.rollout().turn.is_some_and(|t| t.host == 2 && t.retry != 0));
+    sw.until(TURN_TIMEOUT as usize / 60 + 5, |s| s.rollout().pause == Pause::Timeout);
+    assert!(!sw.kubectl().iter().any(|l| l == "cordon -- node-b"));
+    // Passed over on the admin's word: uncordoned, and the others go on.
+    sw.skip();
     sw.until(30, |s| s.installed(3) == 10);
     let r = sw.rollout();
     assert!(r.skipped.iter().any(|s| s.host == 2) && !r.cordoned.contains(&"node-a".to_string()), "{r:#?}");
     assert!(sw.lines().contains("Passed over: node-a:"), "{}", sw.lines());
+    assert_eq!(sw.installed(2), 0);
 }
 
 /// What a hacked registry account wrote into the registry's rollout made
@@ -851,7 +883,7 @@ fn the_registry_account_cannot_steer_kubectl() {
                     s.members.push(Member { host: 9, name: evil.into(), wg_key, last_seen: time(now), report, ..Member::default() });
                 }
                 s.rollout.cordoned = vec![evil.into(), "coord".into()];
-                s.rollout.turn = Some(Turn { host: 1, name: "coord".into(), since: now, ready: false });
+                s.rollout.turn = Some(Turn { host: 1, name: "coord".into(), since: now, ..Turn::default() });
                 s.rollout.phase = Phase::Servers;
                 s.rollout.done.clear();
                 Ok(())
@@ -900,7 +932,7 @@ fn the_registry_account_cannot_steer_kubectl() {
         b.uncordon(name);
         assert!(b.r.cordoned.is_empty(), "{name}: {:?}", b.r.cordoned);
     }
-    b.r.turn = Some(Turn { host: 1, name: "coord".into(), since: sw.now, ready: false });
+    b.r.turn = Some(Turn { host: 1, name: "coord".into(), since: sw.now, ..Turn::default() });
     b.turn();
     assert!(b.r.turn.is_none());
     assert_eq!(sw.kubectl(), k, "kubectl ran for a refused name");
@@ -1015,6 +1047,177 @@ fn a_kill_switch_that_goes_on_in_its_turn_passes_the_turn_on() {
     sw.until(30, |s| s.installed(3) == 10);
 }
 
+// ---- resuming ----
+
+/// `release resume` used to pass a failed server over and never try it
+/// again. Now it tries the server first; its report from before it heard
+/// of the resume, which still shows the failure, does not stop the rollout
+/// again.
+#[test]
+fn resume_tries_the_failed_server_again() {
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().apply_fails = Some("dryserver failed: exit status 1: no space left on device".into());
+    sw.publish(10, true);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    let l = sw.lines();
+    assert!(l.contains("Look at it, then: ./dryserver release resume (node-a tries again)"), "{l}");
+    assert!(l.contains("Or pass node-a over for this release: ./dryserver release resume -skip"), "{l}");
+    // The admin made room on node-a and resumes.
+    sw.server(2).fake.sim().apply_fails = None;
+    sw.resume();
+    sw.until_unpaused(30, |s| s.everyone_on(10));
+    sw.ticks(2);
+    let r = sw.rollout();
+    assert!(r.paused.is_empty() && r.done == vec![2, 3] && r.again.is_empty() && r.skipped.is_empty(), "{r:#?}");
+    assert!(r.warnings.iter().any(|w| w == "resumed: node-a tries release 10 again, now"), "{r:#?}");
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 2, "tried once more, no more");
+    let l = Machine::new(&sw.server(2).node, false).load();
+    assert_eq!((l.failed, l.retry), (0, 0), "{l:?}");
+}
+
+/// A release that went back is installed again only because the admin
+/// resumed.
+#[test]
+fn resume_installs_a_release_that_went_back_again() {
+    let mut sw = Swarm::new(1);
+    sw.server(2).fake.sim().broken = true;
+    sw.publish(10, true);
+    sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+    sw.server(2).fake.revert();
+    sw.until(5, |s| !s.rollout().paused.is_empty());
+    sw.ticks(5);
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 1, "not again by itself");
+    sw.server(2).fake.sim().broken = false;
+    sw.resume();
+    sw.until_unpaused(30, |s| s.everyone_on(10));
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 2);
+}
+
+/// One that fails again stops the rollout again; -skip passes it over and
+/// the others go on. It keeps its release.
+#[test]
+fn a_server_that_fails_again_is_stopped_at_again_until_skipped() {
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().apply_fails = Some("dryserver failed: exit status 1: broken disk".into());
+    sw.publish(10, true);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    sw.resume();
+    sw.tick();
+    assert!(sw.rollout().paused.is_empty(), "{:#?}", sw.rollout());
+    sw.until(10, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert_eq!((r.pause, r.pause_host), (Pause::Failed, 2), "{r:#?}");
+    assert!(r.paused.contains("node-a (the canary): update failed again: dryserver failed: exit status 1: broken disk"), "{}", r.paused);
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 2);
+    assert!(sw.server(3).fake.sim().applied.is_empty());
+    // Resumed twice: tried twice more.
+    sw.resume();
+    sw.until(10, |s| s.server(2).fake.sim().applied.len() == 3 && !s.rollout().paused.is_empty());
+    sw.skip();
+    sw.until(30, |s| s.installed(3) == 10);
+    sw.ticks(2);
+    let r = sw.rollout();
+    assert!(r.skipped.iter().any(|s| s.host == 2 && s.why.contains("broken disk")) && r.again.is_empty(), "{r:#?}");
+    assert!(r.warnings.iter().any(|w| w == "resumed: node-a is passed over for release 10"), "{r:#?}");
+    assert!(!r.cordoned.contains(&"node-a".to_string()));
+    assert_eq!((sw.installed(2), sw.server(2).fake.sim().applied.len()), (0, 3));
+    assert!(sw.lines().contains("Passed over: node-a: node-a (the canary): update failed again"), "{}", sw.lines());
+}
+
+/// Resumed while it is switched off: the others go on, and it tries again
+/// once it is back.
+#[test]
+fn resume_at_a_server_that_is_off_tries_it_when_it_is_back() {
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().apply_fails = Some("dryserver failed: exit status 1: no space left on device".into());
+    sw.publish(10, true);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    sw.offline.push(2);
+    sw.ticks(OFFLINE as usize / 60 + 1);
+    sw.server(2).fake.sim().apply_fails = None;
+    sw.resume();
+    sw.until_unpaused(30, |s| s.installed(3) == 10);
+    let r = sw.rollout();
+    assert!(r.warnings.iter().any(|w| w == "resumed: node-a tries release 10 again, when it is back"), "{r:#?}");
+    assert!(r.again == vec![2] && r.skipped.is_empty(), "{r:#?}");
+    assert!(sw.lines().contains("Tries again at its next turn, as you resumed: node-a."), "{}", sw.lines());
+    sw.offline.clear();
+    sw.until_unpaused(30, |s| s.everyone_on(10));
+    sw.ticks(2);
+    assert!(sw.rollout().again.is_empty() && sw.rollout().done.contains(&2), "{:#?}", sw.rollout());
+}
+
+/// A resume outside the window of a normal release waits for the window.
+#[test]
+fn resume_of_a_normal_release_waits_for_the_window() {
+    let mut sw = Swarm::new(1);
+    sw.server(2).fake.sim().apply_fails = Some("dryserver failed: exit status 1: no space left on device".into());
+    sw.publish(10, false);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    sw.server(2).fake.sim().apply_fails = None;
+    sw.minute = DAYTIME;
+    sw.resume();
+    sw.ticks(10);
+    assert!(sw.rollout().warnings.iter().any(|w| w.ends_with("again, in the update window")), "{:#?}", sw.rollout());
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 1);
+    sw.minute = IN_WINDOW;
+    sw.until_unpaused(30, |s| s.everyone_on(10));
+}
+
+/// What resume and -skip do at each kind of stop, and that the brain is
+/// never passed over: the registry refuses it, and root treats a skip the
+/// registry account counted anyway as a resume.
+#[test]
+fn skip_passes_over_a_server_but_never_the_brain() {
+    // A drain that does not finish: -skip passes it over, undrained and
+    // not updated.
+    let mut sw = Swarm::new(2);
+    sw.brain.fake.sim().drain_fails.push("node-a".into());
+    sw.publish(10, false);
+    sw.until(30, |s| !s.rollout().paused.is_empty());
+    let l = sw.lines();
+    assert!(l.contains("./dryserver release resume (updates node-a without draining)") && l.contains("-skip"), "{l}");
+    sw.skip();
+    sw.until(30, |s| s.installed(3) == 10);
+    assert!(sw.server(2).fake.sim().applied.is_empty() && sw.rollout().skipped.iter().any(|s| s.host == 2));
+
+    // The canary: resume goes on, there is nothing to pass over.
+    let mut sw = Swarm::new(2);
+    sw.publish(10, false);
+    sw.until(30, |s| s.installed(2) == 10 && s.rollout().done == vec![2]);
+    sw.sick.push(2);
+    sw.ticks(2);
+    let l = sw.lines();
+    assert!(l.contains("./dryserver release resume (goes on)") && !l.contains("-skip"), "{l}");
+    sw.sick.clear();
+    sw.skip();
+    sw.until_unpaused(30, |s| s.everyone_on(10));
+
+    // The brain.
+    let mut sw = Swarm::new(1);
+    sw.brain.fake.sim().apply_fails = Some("dryserver failed: exit status 1: cannot install".into());
+    sw.publish(10, true);
+    sw.ticks(3);
+    assert_eq!(sw.rollout().phase, Phase::Failed);
+    let e = sw.ask(true).unwrap_err().to_string();
+    assert!(e.contains("never passed over") && e.contains("./dryserver release resume"), "{e}");
+    sw.brain.fake.sim().apply_fails = None;
+    sw.store
+        .update(|s| {
+            s.rollout.skip_asked += 5;
+            Ok(())
+        })
+        .unwrap();
+    sw.until(30, |s| s.everyone_on(10));
+    assert!(sw.rollout().warnings.iter().any(|w| w.contains("tries its own update again (it is never passed over")), "{:#?}", sw.rollout());
+
+    // Nothing stopped: there is nothing to pass over.
+    let mut sw = Swarm::new(1);
+    sw.publish(10, true);
+    sw.tick();
+    assert!(sw.ask(true).unwrap_err().to_string().contains("not stopped at a server"));
+}
+
 // ---- transfers ----
 
 #[test]
@@ -1092,7 +1295,7 @@ fn a_release_that_went_back_is_not_sent_again_by_itself() {
     // install the release that went back: the update commands would.
     std::fs::remove_file(sw.server(2).node.path(STORE).join(STATE_FILE)).unwrap();
     let m = Machine { n: &sw.server(2).node, brain: false, free: plenty };
-    let o = Offer { serial: 10, turn: true, brain_k3s: K3S_VERSION.into() };
+    let o = Offer { serial: 10, turn: true, brain_k3s: K3S_VERSION.into(), retry: 0 };
     let e = m.step(&Ctx::new(), &Reg { sw: &sw, host: 2 }, &o, &sw.healthy(2), sw.now).unwrap_err().to_string();
     assert!(e.contains("release 10 reverted"), "{e}");
     assert_eq!(sw.server(2).fake.sim().applied.len(), 1);
@@ -1284,7 +1487,7 @@ fn a_drain_that_a_pdb_holds_back() {
     assert!(r.paused.contains("draining node-a did not finish in 5m") && r.paused.contains("PodDisruptionBudget"), "{}", r.paused);
     assert!(!r.cordoned.contains(&"node-a".to_string()), "a node that was not drained stays cordoned");
     assert!(sw.server(2).fake.sim().applied.is_empty(), "updated without its turn");
-    assert!(sw.lines().contains("updates it without draining"), "{}", sw.lines());
+    assert!(sw.lines().contains("updates node-a without draining"), "{}", sw.lines());
     // The admin resumes: it updates without the drain.
     let ask = serde_json::to_string(&crate::signed::seal_admin(&ADMIN, "release-resume", sw.now).unwrap()).unwrap();
     sw.call("release-resume", 0, ask.as_bytes()).unwrap();

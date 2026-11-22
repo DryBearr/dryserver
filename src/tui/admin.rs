@@ -1297,7 +1297,7 @@ mod tests {
             "Release 1795000000 (urgent), made",
             ": fixes the relay\n    timeout that drops",
             "PAUSED: node-a (the canary): update failed",
-            "./dryserver release resume (passes it over)",
+            "./dryserver release resume (node-a tries again)",
             "0 of 1 servers on this release.",
         ] {
             assert!(v.contains(want), "{want}: {v}");
@@ -1540,16 +1540,16 @@ mod tests {
             .unwrap();
         o.s.load();
         let v = o.flat();
-        assert!(v.contains("Press R to resume (the coordinator passes node-a over"), "{v}");
+        assert!(v.contains("Press R to resume (the coordinator gives node-a its turn again"), "{v}");
         o.fits(60);
         o.key(Key::Char('R'));
         let v = o.flat();
-        assert!(v.contains("Resume the rollout of release 5? The coordinator then passes node-a over"), "{v}");
+        assert!(v.contains("Resume the rollout of release 5? The coordinator then gives node-a its turn again"), "{v}");
         o.key(Key::Char('n'));
         assert_eq!(store.read().unwrap().rollout.resume_asked, 0, "anything but y asks nothing");
         o.key(Key::Char('R'));
         o.key(Key::Char('y'));
-        assert!(o.s.notice.contains("Resumed: the coordinator passes node-a over"), "{}", o.s.notice);
+        assert!(o.s.notice.contains("Resumed: the coordinator gives node-a its turn again"), "{}", o.s.notice);
         assert_eq!(store.read().unwrap().rollout.resume_asked, 1);
     }
 

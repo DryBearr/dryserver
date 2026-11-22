@@ -24,8 +24,9 @@
 //! A bad update must not take the swarm down. Each machine goes back by
 //! itself when its update is not confirmed in time (lane 5's revert
 //! guard), and the rollout stops at the first machine that fails, reverts,
-//! refuses or does not finish in time; the admin looks, then resumes
-//! (`./dryserver release resume`) or publishes a fixed release. A new
+//! refuses or does not finish in time; the admin looks, then publishes a
+//! fixed release, resumes (`./dryserver release resume`: the machine tries
+//! again) or passes the server over (`release resume -skip`). A new
 //! release replaces a running rollout: machines go straight to the newest.
 //!
 //! Everything a machine gets from another one is checked here as if it
@@ -33,7 +34,7 @@
 //! signature and the checksums decide, and a server can only speak for
 //! itself. A hacked server can fail or stall only its own turn, and a
 //! stalled turn ends after TURN_TIMEOUT; but the rollout then stops there
-//! until the admin resumes, once per release per hacked server.
+//! until the admin passes it over.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -778,15 +779,26 @@ pub struct Offer {
     /// The k3s the brain runs, as the brain reports it: a server's k3s may
     /// not be newer (Kubernetes' version skew rule).
     pub brain_k3s: String,
+    /// With the turn: the admin resumed the rollout at this machine, so it
+    /// tries the release once more although it failed here before. Each
+    /// resume has its own number; 0: none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retry: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// What the registry tells member host in its sync reply. The turn holds
 /// only while the rollout runs and the server is drained.
 pub fn offer(s: &registry::State, host: u32) -> Offer {
     let r = &s.rollout;
-    let turn = host != 1 && r.paused.is_empty() && r.phase == Phase::Servers && r.turn.as_ref().is_some_and(|t| t.host == host && t.ready);
+    let mine = r.turn.as_ref().filter(|t| t.host == host && t.ready);
+    let turn = host != 1 && r.paused.is_empty() && r.phase == Phase::Servers && mine.is_some();
     let brain_k3s = s.members.iter().find(|m| m.host == 1).and_then(|m| m.report.as_ref()).map(|r| r.k3s.clone()).unwrap_or_default();
-    Offer { serial: r.serial, turn, brain_k3s }
+    let retry = if turn { mine.map_or(0, |t| t.retry) } else { 0 };
+    Offer { serial: r.serial, turn, brain_k3s, retry }
 }
 
 /// What a machine keeps about its update, in STORE/state.json.
@@ -807,8 +819,11 @@ pub struct Local {
     pub note: String,
     /// The release installed, as `dryserver update status` said last.
     pub installed: u64,
-    /// A release the admin said to try again although it went back before.
+    /// A release the admin said to try again although it failed or went
+    /// back before, and (on a server) the number of that resume
+    /// (Offer::retry): each resume is carried out once.
     pub retry: u64,
+    pub retried: u64,
     /// The release a problem that may pass held up, and at how many syncs.
     pub tries_serial: u64,
     pub tries: u32,
@@ -963,7 +978,29 @@ impl<'a> Machine<'a> {
         if l.pending != 0 {
             return self.settle(ctx, &mut l, rep, now);
         }
-        if !offer.turn || offer.serial == 0 || self.installed_serial() >= offer.serial || l.failed == offer.serial {
+        if !offer.turn || offer.serial == 0 || self.installed_serial() >= offer.serial {
+            return Ok(());
+        }
+        if offer.retry != 0 && (l.retry != offer.serial || l.retried != offer.retry) {
+            // The admin resumed the rollout here: the release is tried once
+            // more, even one that went back (ready).
+            let failed_here = l.failed == offer.serial;
+            l.retry = offer.serial;
+            l.retried = offer.retry;
+            if failed_here {
+                (l.failed, l.tries) = (0, 0);
+                l.outcome.clear();
+                l.why.clear();
+            }
+            self.save(&l)?;
+            if failed_here {
+                // Its next report no longer shows the failure, before it
+                // tries again: the brain waits for that report, so a report
+                // from before the resume does not stop the rollout again.
+                return Ok(());
+            }
+        }
+        if l.failed == offer.serial {
             return Ok(());
         }
         if self.hold().is_some() {
@@ -1278,15 +1315,19 @@ pub enum Phase {
     None,
 }
 
-/// Why the rollout stopped, which decides what resuming does.
+/// Why the rollout stopped, which decides what resuming does. A skip
+/// (`release resume -skip`) passes the server over instead: it keeps its
+/// release until the next one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Pause {
     /// The server could not be drained: resuming updates it without.
     Drain,
-    /// Its update failed, reverted or was refused: resuming passes it over.
+    /// Its update failed, reverted or was refused: resuming gives it the
+    /// turn again (now, or when it is back), and it tries once more.
     Failed,
-    /// It did not finish in TURN_TIMEOUT: resuming passes it over.
+    /// It did not finish in TURN_TIMEOUT: resuming gives it the turn
+    /// again; what it loaded so far stays.
     Timeout,
     /// The canary is not well after its update: resuming goes on.
     Canary,
@@ -1306,6 +1347,14 @@ pub struct Turn {
     pub since: i64,
     /// Drained: the server may update now.
     pub ready: bool,
+    /// The admin resumed the rollout at this server: the number of that
+    /// resume (Offer::retry), 0: its first try. A report of a failure
+    /// counts only once a report without it came in (cleared): the one
+    /// sent before the server heard of the resume still shows it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retry: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cleared: bool,
 }
 
 /// A server passed over, and why.
@@ -1347,6 +1396,13 @@ pub struct Rollout {
     pub deferred: Vec<u32>,
     /// Servers the admin let update without draining.
     pub force: Vec<u32>,
+    /// Servers the admin resumed the rollout at: they try the release again
+    /// at their next turn, before the others.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub again: Vec<u32>,
+    /// How many tries again this rollout gave (Turn::retry numbers them).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retries: u64,
     /// Nodes this rollout cordoned and did not uncordon yet.
     pub cordoned: Vec<String>,
     /// Why the rollout stopped; empty while it runs.
@@ -1360,9 +1416,14 @@ pub struct Rollout {
     pub refused_serial: u64,
     pub refused: String,
     /// Resumes the admin asked for (the registry counts them) and the ones
-    /// the brain carried out.
+    /// the brain carried out. A resume tries the server the rollout stopped
+    /// at again; a skip (`release resume -skip`) passes it over.
     pub resume_asked: u64,
     pub resume_done: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub skip_asked: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub skip_done: u64,
 }
 
 impl Rollout {
@@ -1443,6 +1504,7 @@ fn brain_tick_with(ctx: &Ctx, n: &Node, store: &Store, served: &Served, rep: &Re
     let (members, _) = registry::check_members(s.members.clone(), |h| !mesh::ip(&n.cfg.wg_subnet, h).is_empty());
     let mut b = Brain { ctx, n, served, rep, now, members: &members, r: before.clone(), free, nodes: None };
     b.r.resume_asked = s.rollout.resume_asked;
+    b.r.skip_asked = s.rollout.skip_asked;
     b.take_upload();
     if b.r.serial != 0 {
         b.resume();
@@ -1456,10 +1518,12 @@ fn brain_tick_with(ctx: &Ctx, n: &Node, store: &Store, served: &Served, rep: &Re
         eprintln!("dryserver: rollout: cannot save its state: {e}");
         return;
     }
-    if (Rollout { resume_asked: s.rollout.resume_asked, ..r.clone() }) != s.rollout {
+    // The registry's counts of the admin's asks are the registry's.
+    let copy = |s: &Rollout| Rollout { resume_asked: s.resume_asked, skip_asked: s.skip_asked, ..r.clone() };
+    if copy(&s.rollout) != s.rollout {
         let res = store.update(|s| {
             // A resume asked while this tick ran stays asked.
-            s.rollout = Rollout { resume_asked: s.rollout.resume_asked, ..r.clone() };
+            s.rollout = copy(&s.rollout);
             Ok(())
         });
         if let Err(e) = res {
@@ -1531,8 +1595,9 @@ impl Brain<'_> {
             Ok((rel, verdict)) if rel.serial == serial => {
                 let old = std::mem::take(&mut self.r);
                 let mut fresh = Rollout::start(&rel, self.now.unix, verdict.stale);
-                fresh.resume_asked = old.resume_asked;
-                fresh.resume_done = old.resume_asked;
+                // Asks for the old rollout do not carry over to the new one.
+                (fresh.resume_asked, fresh.resume_done) = (old.resume_asked, old.resume_asked);
+                (fresh.skip_asked, fresh.skip_done) = (old.skip_asked, old.skip_asked);
                 if old.serial != 0 && (old.phase == Phase::Brain || old.turn.is_some()) {
                     fresh.warn(format!("release {} replaced release {} while it rolled out", rel.serial, old.serial));
                 }
@@ -1574,25 +1639,53 @@ impl Brain<'_> {
         }
     }
 
-    /// resume_asked is the registry's count, which anyone who can write
-    /// the registry can change: a count that grew is one resume (what the
-    /// admin's resume does anyway), one that went back is none.
+    /// Carries out what the admin asked for at a stop. resume_asked and
+    /// skip_asked are the registry's counts, which anyone who can write the
+    /// registry can change: a count that grew is one ask (what the admin's
+    /// ask does anyway), one that went back is none. And what is resumed or
+    /// passed over is always the server root itself stopped at.
+    ///
+    /// - resume: the server the rollout stopped at tries again (a fresh
+    ///   turn, at once or in the window, or when it is back if it is
+    ///   offline); one that could not be drained updates without; after a
+    ///   canary the rollout goes on; the brain tries its own update again.
+    /// - skip: the server is passed over for this release. The brain never
+    ///   is: without it no server updates.
     fn resume(&mut self) {
-        if self.r.resume_asked <= self.r.resume_done {
-            self.r.resume_done = self.r.resume_asked;
+        let resume = self.r.resume_asked > self.r.resume_done;
+        let skip = self.r.skip_asked > self.r.skip_done;
+        self.r.resume_done = self.r.resume_asked;
+        self.r.skip_done = self.r.skip_asked;
+        if !resume && !skip {
             return;
         }
-        self.r.resume_done = self.r.resume_asked;
+        let serial = self.r.serial;
         if self.r.phase == Phase::Failed {
-            self.machine().forget_failure(self.r.serial);
+            self.machine().forget_failure(serial);
             self.r.phase = Phase::Brain;
             self.r.unpause();
-            self.r.warn("resumed: the coordinator tries its own update again".into());
+            let why = if skip { " (it is never passed over: without it no server updates)" } else { "" };
+            self.r.warn(format!("resumed: the coordinator tries its own update again{why}"));
             return;
         }
         let (host, name) = (self.r.pause_host, self.r.pause_name.clone());
         match self.r.pause {
             Pause::None => {}
+            Pause::Canary => {
+                self.r.canary_until = 0;
+                self.r.warn(format!("resumed: the rollout goes on after the canary {name}"));
+                self.r.unpause();
+            }
+            Pause::Drain | Pause::Failed | Pause::Timeout if skip => {
+                let why = self.r.paused.clone();
+                self.r.skipped.retain(|s| s.host != host);
+                self.r.skipped.push(Skip { host, name: name.clone(), why });
+                self.r.again.retain(|h| *h != host);
+                self.r.force.retain(|h| *h != host);
+                self.uncordon(&name);
+                self.r.warn(format!("resumed: {name} is passed over for release {serial}"));
+                self.r.unpause();
+            }
             Pause::Drain => {
                 if !self.r.force.contains(&host) {
                     self.r.force.push(host);
@@ -1600,17 +1693,17 @@ impl Brain<'_> {
                 self.r.warn(format!("resumed: {name} updates without being drained"));
                 self.r.unpause();
             }
-            Pause::Canary => {
-                self.r.canary_until = 0;
-                self.r.warn(format!("resumed: the rollout goes on after the canary {name}"));
-                self.r.unpause();
-            }
             Pause::Failed | Pause::Timeout => {
-                let why = self.r.paused.clone();
-                self.r.skipped.retain(|s| s.host != host);
-                self.r.skipped.push(Skip { host, name: name.clone(), why });
-                self.uncordon(&name);
-                self.r.warn(format!("resumed: {name} is passed over"));
+                if !self.r.again.contains(&host) {
+                    self.r.again.push(host);
+                }
+                self.r.deferred.retain(|h| *h != host);
+                let when = match self.member(host) {
+                    Some(m) if !self.online(m) => "when it is back",
+                    _ if !self.in_window() => "in the update window",
+                    _ => "now",
+                };
+                self.r.warn(format!("resumed: {name} tries release {serial} again, {when}"));
                 self.r.unpause();
             }
         }
@@ -1637,7 +1730,7 @@ impl Brain<'_> {
     fn brain_step(&mut self) {
         let m = self.machine();
         // The brain's own k3s is the control plane's.
-        let offer = Offer { serial: self.r.serial, turn: true, brain_k3s: self.rep.k3s.clone() };
+        let offer = Offer { serial: self.r.serial, turn: true, brain_k3s: self.rep.k3s.clone(), retry: 0 };
         if let Err(e) = m.step(self.ctx, &LocalSource(self.served), &offer, self.rep, self.now.unix) {
             eprintln!("dryserver: rollout: the coordinator's own update: {e}");
         }
@@ -1700,8 +1793,9 @@ impl Brain<'_> {
             .filter(|m| m.host != 1 && m.name != self.n.hostname)
             .filter(|m| !self.r.done.contains(&m.host) && !self.r.skipped.iter().any(|s| s.host == m.host))
             .collect();
+        // The ones the admin resumed at first, the silent ones last.
         let deferred = |h: u32| self.r.deferred.iter().position(|d| *d == h).map_or(0, |i| i + 1);
-        servers.sort_by_key(|m| (deferred(m.host), m.host));
+        servers.sort_by_key(|m| (!self.r.again.contains(&m.host), deferred(m.host), m.host));
         let mut already = Vec::new();
         let mut pick = None;
         for m in servers {
@@ -1716,8 +1810,20 @@ impl Brain<'_> {
             pick = Some((m.host, m.name.clone()));
             break;
         }
+        self.r.again.retain(|h| !already.contains(h));
         self.r.done.extend(already);
         let Some((host, name)) = pick else { return };
+        self.start_turn(host, name);
+    }
+
+    /// Gives host its turn: cordons it and starts draining.
+    fn start_turn(&mut self, host: u32, name: String) {
+        let retry = if self.r.again.contains(&host) {
+            self.r.retries += 1;
+            self.r.retries
+        } else {
+            0
+        };
         // The turn begins whatever the cordon does: a server that is no node
         // (its agent never joined, or the cluster dropped it) has nothing to
         // drain, and any other failure counts against DRAIN_LIMIT like a
@@ -1738,7 +1844,7 @@ impl Brain<'_> {
             self.r.cordoned.push(name.clone());
         }
         self.r.deferred.retain(|d| *d != host);
-        self.r.turn = Some(Turn { host, name, since: self.now.unix, ready });
+        self.r.turn = Some(Turn { host, name, since: self.now.unix, ready, retry, cleared: false });
         self.turn();
     }
 
@@ -1795,6 +1901,11 @@ impl Brain<'_> {
         let seen = m.last_seen.0.timestamp() >= t.since;
         let canary = if self.r.canary == 0 { " (the canary)" } else { "" };
         if let Some(rep) = m.report.as_ref().filter(|_| seen) {
+            let failed = rep.update_failed() && rep.update_serial == target;
+            if t.retry != 0 && !t.cleared && !failed {
+                // It heard of the resume: a failure from now on is new.
+                t.cleared = true;
+            }
             if rep.update == "held" {
                 // Its kill switch went on: it changes nothing now. Its turn
                 // goes to the next one; it updates once the switch is off.
@@ -1804,13 +1915,15 @@ impl Brain<'_> {
                 self.r.warn(format!("{}'s kill switch went on during its turn; it updates once it is lifted", t.name));
                 return;
             }
-            if rep.update_failed() && rep.update_serial == target {
+            if failed && (t.retry == 0 || t.cleared) {
                 let note = if rep.update_note.is_empty() { String::new() } else { format!(": {}", rep.update_note) };
-                self.r.stop(Pause::Failed, t.host, &t.name, format!("{}{canary}: update {}{note}", t.name, rep.update));
+                let again = if t.retry != 0 { " again" } else { "" };
+                self.r.stop(Pause::Failed, t.host, &t.name, format!("{}{canary}: update {}{again}{note}", t.name, rep.update));
                 return;
             }
             if Self::updated(rep, target) {
                 self.uncordon(&t.name);
+                self.r.again.retain(|h| *h != t.host);
                 self.r.done.push(t.host);
                 if self.r.canary == 0 {
                     self.r.canary = t.host;
@@ -1850,7 +1963,10 @@ impl Brain<'_> {
         let (host, name, target) = (self.r.pause_host, self.r.pause_name.clone(), self.r.serial);
         let Some(m) = self.member(host).filter(|m| m.name == name).cloned() else {
             if host != 0 {
+                // It left the swarm: nothing to wait for any more.
                 self.r.cordoned.retain(|c| *c != name);
+                self.r.warn(format!("{name} left the swarm; the rollout goes on"));
+                self.r.unpause();
             }
             return;
         };
@@ -1860,6 +1976,7 @@ impl Brain<'_> {
             if cordoned {
                 self.uncordon(&name);
             }
+            self.r.again.retain(|h| *h != host);
             self.r.done.push(host);
             self.r.warn(format!("{name} finished its update after all; the rollout goes on"));
             self.r.unpause();
@@ -1941,12 +2058,16 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
         Phase::Servers => {
             if !r.paused.is_empty() {
                 out.push((format!("PAUSED: {}.", shown(&r.paused, 300)), true));
+                let who = name(r.pause_host);
                 let what = match r.pause {
-                    Pause::Drain => "updates it without draining",
-                    Pause::Canary => "goes on",
-                    _ => "passes it over",
+                    Pause::Drain => format!("updates {who} without draining"),
+                    Pause::Canary => "goes on".into(),
+                    _ => format!("{who} tries again"),
                 };
                 out.push((format!("Look at it, then: ./dryserver release resume ({what})"), true));
+                if r.pause != Pause::Canary {
+                    out.push((format!("Or pass {who} over for this release: ./dryserver release resume -skip"), true));
+                }
             } else if let Some(t) = &r.turn {
                 let age = report::short_age((now - t.since).max(0) as u64);
                 let canary = if r.canary == 0 { ", the canary" } else { "" };
@@ -1971,9 +2092,13 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
         let mut waiting = Vec::new();
         let mut held = Vec::new();
         let mut old = Vec::new();
+        let mut again = Vec::new();
         for m in &servers {
             if r.done.contains(&m.host) || r.skipped.iter().any(|s| s.host == m.host) || r.turn.as_ref().is_some_and(|t| t.host == m.host) {
                 continue;
+            }
+            if r.again.contains(&m.host) && r.pause_host != m.host {
+                again.push(m.name.clone());
             }
             match &m.report {
                 None => old.push(m.name.clone()),
@@ -1981,6 +2106,9 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
                 Some(_) if m.last_seen.is_zero() || now - m.last_seen.0.timestamp() > OFFLINE => waiting.push(m.name.clone()),
                 Some(_) => {}
             }
+        }
+        if !again.is_empty() {
+            out.push((format!("Tries again at its next turn, as you resumed: {}.", again.join(", ")), false));
         }
         if !waiting.is_empty() {
             out.push((

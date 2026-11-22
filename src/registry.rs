@@ -901,10 +901,12 @@ fn parse_serial(s: &str) -> Result<u64> {
 ///   release-get SERIAL release              -> Offered             (the server whose turn it is)
 ///   release-get SERIAL FILE OFFSET          -> up to CHUNK bytes   (the server whose turn it is)
 ///   release-resume stdin: signed admin request -> {"resume": N}    (holder of the signing key)
+///   release-skip stdin: signed admin request -> {"skip": N}        (holder of the signing key)
 ///
 /// The key that reaches this command is on every server and on the USB
-/// stick, so it proves nothing. admin, publish, release-put and
-/// release-resume are allowed by the signature on their input alone.
+/// stick, so it proves nothing. admin, publish, release-put,
+/// release-resume and release-skip are allowed by the signature on their
+/// input alone.
 #[allow(clippy::too_many_arguments)]
 pub fn serve(
     st: &Store,
@@ -1007,6 +1009,25 @@ pub fn serve(
                 Ok(s.rollout.resume_asked)
             })?;
             send(out, &serde_json::json!({ "resume": asked }))
+        }
+        ("release-skip", 1) => {
+            let req: Envelope = decode_first(input).ok_or_else(|| Error::new("bad admin request"))?;
+            signed::open_admin(verifier, &req, "release-skip", now.0.timestamp())?;
+            let asked = st.update(|s| {
+                let r = &s.rollout;
+                if r.serial == 0 {
+                    return Err("there is no rollout to resume".into());
+                }
+                if r.phase == rollout::Phase::Failed {
+                    return Err("the coordinator's own update is never passed over: ./dryserver release resume tries it again".into());
+                }
+                if r.paused.is_empty() || r.pause_host == 0 {
+                    return Err("the rollout is not stopped at a server: there is nothing to pass over".into());
+                }
+                s.rollout.skip_asked = s.rollout.skip_asked.wrapping_add(1);
+                Ok(s.rollout.skip_asked)
+            })?;
+            send(out, &serde_json::json!({ "skip": asked }))
         }
         ("release-get", 3 | 4) => {
             // Only the server whose turn it is, and only the release of
@@ -1784,7 +1805,7 @@ mod tests {
     fn members_get_their_turn_and_the_admin_the_rollout() {
         let dir = TempDir::new();
         let st = coordinator(&dir);
-        let turn = |ready: bool| rollout::Turn { host: 2, name: "node-a".into(), since: 1, ready };
+        let turn = |ready: bool| rollout::Turn { host: 2, name: "node-a".into(), since: 1, ready, ..rollout::Turn::default() };
         let set = |r: Rollout| {
             st.update(|s| {
                 s.rollout = r;

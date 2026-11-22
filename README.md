@@ -556,9 +556,10 @@ summary, `y` sends it.
   minute instead of five. For security fixes.
 - **When it stops**: a rollout stops by itself at a server whose update
   fails. `release status` says where and what to do: look at the machine,
-  then `./dryserver release resume` (it says what that does first), or
-  publish a fixed release (it gets a higher serial and replaces the
-  rollout).
+  then `./dryserver release resume` (it says what that does first: the
+  server tries again), `./dryserver release resume -skip` (the server is
+  passed over for this release), or publish a fixed release (it gets a
+  higher serial and replaces the rollout).
 - **Stop it or go back**: build the dryserver the swarm ran before and
   publish it with `-rollback`. That replaces the rollout, and machines
   that updated already go back to it. Add `-arch-date` with the older day
@@ -594,10 +595,18 @@ refused by its own checks, or does not finish in 20 minutes, and at a
 canary that is not well. `./dryserver approve` shows why, and the release
 on every machine. A stopped server stays cordoned while it is up and not
 well, and is uncordoned once it runs its old release well again. Look at
-it, then publish a fixed release, or `./dryserver release resume`: that
-passes the server over (or, when it could not be drained, updates it
-without draining; when the coordinator's own update failed, tries it
-again).
+it, then publish a fixed release, or:
+
+- `./dryserver release resume`: the server tries the release once more
+  (drained again, at once for an urgent release or in the window for a
+  normal one; when it is switched off, the others go on and it tries once
+  it is back). What it loaded so far stays. A server that could not be
+  drained updates without draining; after a canary that was not well the
+  rollout goes on; when the coordinator's own update failed, it tries
+  again.
+- `./dryserver release resume -skip`: the server is passed over. It keeps
+  its release until the next one, and the others go on. The coordinator
+  is never passed over: no server updates before it does.
 
 Passed over without stopping, and shown: a server that is switched off
 (it updates when it is back, still one at a time), one whose kill switch
@@ -610,9 +619,9 @@ checks for itself (one that never took an update counts the dryserver
 and k3s it was installed with as its own). It does decide when machines update (the window and
 the turns are its doing). A hacked server can fail or stall only its own
 turn, and a stalled turn ends after 20 minutes. But a failed or stalled
-turn stops the whole rollout there until you resume: a hacked server can
-hold every release up once, until you look and resume (each hacked
-server, once per release).
+turn stops the whole rollout there until you act: a hacked server can
+hold every release up until you look and pass it over (`release resume
+-skip`; a plain resume lets it fail again).
 
 ### On each machine
 
@@ -715,7 +724,7 @@ On your desktop:
 | `./dryserver apps` | what runs on your cluster: start an app from a container image, remove one |
 | `./dryserver outside` | the ways in from the internet: open, sync or close the Cloudflare Tunnel, and which host names use it |
 | `./dryserver release publish` | check a release of this dryserver, show what changes, sign it and roll it out (`-urgent`, `-notes`, `-rollback`, `-arch-date`, `-k3s`) |
-| `./dryserver release status` / `resume` | the release, one line per machine, and what to do when it stopped; let a stopped one go on |
+| `./dryserver release status` / `resume` | the release, one line per machine, and what to do when it stopped; let a stopped one go on (the server tries again; `-skip` passes it over) |
 | `./dryserver ssh-config` | SSH config for all servers |
 | `./dryserver quarantine-all` | kill switch: cut the coordinator off on every server |
 | `./dryserver backup-pull` | copy the coordinator's newest encrypted backups into `secrets/backups/` |

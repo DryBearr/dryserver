@@ -973,12 +973,24 @@ impl Admin {
     }
 
     /// Lets a stopped rollout go on (what that means depends on why it
-    /// stopped; see rollout::Pause). Returns how many resumes were asked.
+    /// stopped; see rollout::Pause): a server whose update failed or did
+    /// not finish tries again. Returns how many resumes were asked.
     pub fn resume_release(&mut self) -> Result<u64> {
-        let ask = signed::seal_admin(self.signer.as_ref(), "release-resume", (self.now)().0.timestamp())?;
-        let out = self.link.call("release-resume", &serde_json::to_string(&ask)?)?;
+        self.release_ask("release-resume", "resume")
+    }
+
+    /// Lets a rollout stopped at a server go on without it: the server is
+    /// passed over for this release. Refused for the coordinator's own
+    /// update. Returns how many skips were asked.
+    pub fn skip_release(&mut self) -> Result<u64> {
+        self.release_ask("release-skip", "skip")
+    }
+
+    fn release_ask(&mut self, op: &str, field: &str) -> Result<u64> {
+        let ask = signed::seal_admin(self.signer.as_ref(), op, (self.now)().0.timestamp())?;
+        let out = self.link.call(op, &serde_json::to_string(&ask)?)?;
         let v: serde_json::Value = serde_json::from_str(&out).map_err(|e| Error::from(e).wrap("the coordinator's answer"))?;
-        Ok(v["resume"].as_u64().unwrap_or(0))
+        Ok(v[field].as_u64().unwrap_or(0))
     }
 }
 
@@ -1849,6 +1861,22 @@ pub mod tests {
             .unwrap();
         assert_eq!(a.resume_release().unwrap(), 1);
         assert_eq!(store.read().unwrap().rollout.resume_asked, 1);
+        // Passing over needs a stop at a server, never the coordinator.
+        assert!(a.skip_release().unwrap_err().to_string().contains("not stopped at a server"));
+        let at = |phase, pause_host| {
+            store
+                .update(|s| {
+                    s.rollout = Rollout { serial: 5, phase, paused: "x".into(), pause_host, ..s.rollout.clone() };
+                    Ok(())
+                })
+                .unwrap()
+        };
+        at(rollout::Phase::Failed, 0);
+        assert!(a.skip_release().unwrap_err().to_string().contains("never passed over"));
+        at(rollout::Phase::Servers, 2);
+        assert_eq!(a.skip_release().unwrap(), 1);
+        let r = store.read().unwrap().rollout;
+        assert_eq!((r.skip_asked, r.resume_asked), (1, 1));
     }
 
     #[test]

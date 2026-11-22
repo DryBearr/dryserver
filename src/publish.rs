@@ -641,8 +641,12 @@ pub fn stopped(r: &Rollout) -> bool {
     r.serial != 0 && (r.phase == Phase::Failed || !r.paused.is_empty())
 }
 
-/// What a resume does now ("passes node-a over"), or why there is
-/// nothing to resume.
+fn paused_name(r: &Rollout) -> String {
+    if r.pause_name.is_empty() { "the server".to_string() } else { r.pause_name.clone() }
+}
+
+/// What a resume does now ("gives node-a its turn again..."), or why
+/// there is nothing to resume.
 pub fn resume_does(r: &Rollout) -> Result<String> {
     if r.serial == 0 {
         bail!("there is no rollout to resume (a new release starts its rollout within a minute of its publish)");
@@ -653,11 +657,31 @@ pub fn resume_does(r: &Rollout) -> Result<String> {
     if r.paused.is_empty() {
         bail!("the rollout of release {} is not stopped: there is nothing to resume", r.serial);
     }
-    let name = if r.pause_name.is_empty() { "the server".to_string() } else { r.pause_name.clone() };
+    let name = paused_name(r);
     Ok(match r.pause {
         Pause::Drain => format!("updates {name} without draining it"),
         Pause::Canary => format!("goes on after the canary {name}"),
-        _ => format!("passes {name} over and goes on with the next server"),
+        _ => format!("gives {name} its turn again, to try release {} once more", r.serial),
+    })
+}
+
+/// What `release resume -skip` does now ("passes node-a over..."), or why
+/// it does nothing: the rollout is not stopped at a server, or it stopped
+/// at the coordinator's own update, which is never passed over.
+pub fn skip_does(r: &Rollout) -> Result<String> {
+    if r.serial == 0 {
+        bail!("there is no rollout to resume (a new release starts its rollout within a minute of its publish)");
+    }
+    if r.phase == Phase::Failed {
+        bail!("the coordinator's own update is never passed over: ./dryserver release resume tries it again");
+    }
+    if r.paused.is_empty() || r.pause_host == 0 {
+        bail!("the rollout of release {} is not stopped at a server: there is nothing to pass over", r.serial);
+    }
+    let name = paused_name(r);
+    Ok(match r.pause {
+        Pause::Canary => format!("goes on after the canary {name}"),
+        _ => format!("passes {name} over for release {} and goes on with the next server", r.serial),
     })
 }
 
@@ -667,6 +691,15 @@ pub fn resume(a: &mut Admin) -> Result<String> {
     let v = a.load()?;
     let what = resume_does(&v.rollout)?;
     a.resume_release()?;
+    Ok(what)
+}
+
+/// Lets a rollout stopped at a server go on without it, after a fresh
+/// look. Returns what the coordinator then does.
+pub fn skip(a: &mut Admin) -> Result<String> {
+    let v = a.load()?;
+    let what = skip_does(&v.rollout)?;
+    a.skip_release()?;
     Ok(what)
 }
 
@@ -766,6 +799,11 @@ pub fn status_lines(v: &View, now: i64) -> Vec<String> {
         out.push(String::new());
         out.push("The rollout is stopped. Look at the machine first, then either".into());
         out.push(format!("  ./dryserver release resume                       the coordinator {what}, or"));
+        if let Ok(skip) = skip_does(&v.rollout)
+            && v.rollout.pause != Pause::Canary
+        {
+            out.push(format!("  ./dryserver release resume -skip                 the coordinator {skip}, or"));
+        }
         out.push("  ./dryserver release publish -notes \"the fix\"    a fixed release: it gets a higher serial".into());
         out.push("                                                   and replaces this rollout".into());
     }
@@ -778,9 +816,13 @@ pub fn stopped_keys(r: &Rollout) -> Option<String> {
         return None;
     }
     let what = resume_does(r).ok()?;
-    Some(format!(
+    let mut s = format!(
         "Press R to resume (the coordinator {what}), or u to publish a fixed release: it gets a higher serial and replaces this rollout."
-    ))
+    );
+    if skip_does(r).is_ok() && r.pause != Pause::Canary {
+        s += &format!(" To pass {} over instead: ./dryserver release resume -skip", paused_name(r));
+    }
+    Some(s)
 }
 
 #[cfg(test)]

@@ -621,18 +621,25 @@ fn resume_says_what_it_does_or_why_not() {
     assert!(e.contains("release 9 is not stopped: there is nothing to resume"), "{e}");
     assert!(!stopped(&base) && !stopped(&Rollout::default()));
     let paused = |pause: Pause| Rollout { paused: "why".into(), pause, ..base.clone() };
-    for (pause, want) in [
-        (Pause::Failed, "passes node-a over and goes on with the next server"),
-        (Pause::Timeout, "passes node-a over"),
-        (Pause::Drain, "updates node-a without draining it"),
-        (Pause::Canary, "goes on after the canary node-a"),
+    // A resume tries the server again; -skip passes it over.
+    for (pause, want, skip) in [
+        (Pause::Failed, "gives node-a its turn again, to try release 9 once more", "passes node-a over for release 9"),
+        (Pause::Timeout, "gives node-a its turn again", "passes node-a over for release 9"),
+        (Pause::Drain, "updates node-a without draining it", "passes node-a over for release 9"),
+        (Pause::Canary, "goes on after the canary node-a", "goes on after the canary node-a"),
     ] {
         assert!(stopped(&paused(pause)));
         let does = resume_does(&paused(pause)).unwrap();
         assert!(does.starts_with(want), "{pause:?}: {does}");
+        let does = skip_does(&paused(pause)).unwrap();
+        assert!(does.starts_with(skip), "{pause:?}: {does}");
     }
     let failed = Rollout { phase: Phase::Failed, paused: "its update failed".into(), ..base.clone() };
     assert_eq!(resume_does(&failed).unwrap(), "tries its own update again");
+    // The coordinator is never passed over, and nothing is when nothing stopped.
+    assert!(skip_does(&failed).unwrap_err().to_string().contains("never passed over"));
+    assert!(skip_does(&base).unwrap_err().to_string().contains("nothing to pass over"));
+    assert!(skip_does(&Rollout::default()).unwrap_err().to_string().contains("no rollout to resume"));
 }
 
 #[test]
@@ -649,16 +656,22 @@ fn resume_asks_the_coordinator_only_when_it_stopped() {
         .unwrap();
     assert!(resume(&mut a).unwrap_err().to_string().contains("not stopped"));
     assert_eq!(store.read().unwrap().rollout.resume_asked, 0, "nothing was asked");
+    assert!(skip(&mut a).unwrap_err().to_string().contains("nothing to pass over"));
+    assert_eq!(store.read().unwrap().rollout.skip_asked, 0, "nothing was asked");
     store
         .update(|s| {
             s.rollout.paused = "node-a: update failed".into();
             s.rollout.pause = Pause::Failed;
+            s.rollout.pause_host = 2;
             s.rollout.pause_name = "node-a".into();
             Ok(())
         })
         .unwrap();
-    assert_eq!(resume(&mut a).unwrap(), "passes node-a over and goes on with the next server");
+    assert_eq!(resume(&mut a).unwrap(), "gives node-a its turn again, to try release 5 once more");
     assert_eq!(store.read().unwrap().rollout.resume_asked, 1);
+    assert_eq!(skip(&mut a).unwrap(), "passes node-a over for release 5 and goes on with the next server");
+    let r = store.read().unwrap().rollout;
+    assert_eq!((r.resume_asked, r.skip_asked), (1, 1));
 }
 
 // ---- status ----
@@ -739,14 +752,17 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
         &format!("  node-f         server       rebooting (release {s})"),
         "! node-g         server       held: its kill switch is on",
         "The rollout is stopped. Look at the machine first, then either",
-        "./dryserver release resume                       the coordinator passes node-b over",
+        "./dryserver release resume                       the coordinator gives node-b its turn again",
+        "./dryserver release resume -skip                 the coordinator passes node-b over for release",
         "./dryserver release publish -notes \"the fix\"    a fixed release: it gets a higher serial",
     ] {
         assert!(text.contains(want), "{want}:\n{text}");
     }
     let keys = stopped_keys(&v.rollout).unwrap();
     assert!(
-        keys.contains("Press R to resume (the coordinator passes node-b over") && keys.contains("u to publish a fixed release"),
+        keys.contains("Press R to resume (the coordinator gives node-b its turn again")
+            && keys.contains("u to publish a fixed release")
+            && keys.contains("To pass node-b over instead: ./dryserver release resume -skip"),
         "{keys}"
     );
 
@@ -754,7 +770,7 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
     let mut running = v.clone();
     running.rollout.paused.clear();
     running.rollout.pause = Pause::None;
-    running.rollout.turn = Some(Turn { host: 4, name: "node-c".into(), since: now - 60, ready: true });
+    running.rollout.turn = Some(Turn { host: 4, name: "node-c".into(), since: now - 60, ready: true, ..Turn::default() });
     running.members[3].0.last_seen = Time(chrono::DateTime::from_timestamp(now - 10, 0).unwrap());
     let text = status_lines(&running, 0).join("\n");
     assert!(!text.contains("The rollout is stopped") && stopped_keys(&running.rollout).is_none(), "{text}");
