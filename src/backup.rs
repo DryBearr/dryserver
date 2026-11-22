@@ -35,8 +35,11 @@
 //! would follow its links, and the host key would sign its files.
 
 use std::collections::BTreeSet;
+use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -86,6 +89,14 @@ const STAGING: &str = ".staging";
 /// service (a crash, a kill, its timeout), the unit's ExecStopPost starts
 /// k3s again when it finds this.
 pub const K3S_MARK: &str = "/run/dryserver-backup.k3s-stopped";
+/// Where backups were kept before they moved to BACKUP_DIR: OLD_NAME in
+/// the registry account's directory, root's (0750, group wheel), with an
+/// ACL entry on that directory (group wheel may pass, g:wheel:--x) for
+/// the admin's login. A coordinator installed then still has both; every
+/// backup run puts them away (Job::retire_old), and finds nothing once
+/// that is done.
+const OLD_PARENT: &str = "var/lib/dryserver";
+const OLD_NAME: &CStr = c"backups";
 
 /// One thing that goes into the backup, a path relative to "/".
 struct Source {
@@ -307,7 +318,12 @@ impl<'a> Job<'a> {
         let Some(_lock) = fsx::try_lock_for(self.dir().join(LOCK_FILE), LOCK_WAIT)? else {
             bail!("another backup is running");
         };
-        let res = self.make(ctx, now, out);
+        // Before make: backups moved from the old place count in its plan.
+        let old = self.retire_old(out);
+        let res = self.make(ctx, now, out).map(|mut d| {
+            d.warnings.extend(old);
+            d
+        });
         let mut st = Status { time: now, ..Status::default() };
         match &res {
             Ok(d) => {
@@ -400,6 +416,130 @@ impl<'a> Job<'a> {
         }
         f.set_permissions(std::fs::Permissions::from_mode(0o750)).map_err(|e| Error::from(e).wrap(format!("chmod {}", dir.display())))?;
         self.wheel(&dir)
+    }
+
+    /// Puts away the old place of the backups (OLD_NAME in the registry's
+    /// directory) and the ACL entry made for it. Returns what was left as
+    /// it is and why, said on out as well.
+    ///
+    /// The registry account owns that directory and may have put anything
+    /// there, so nothing is looked up there by path: it is opened once
+    /// without following a link (its own directory, /var/lib, is root's
+    /// alone: prepare_dir checked), and everything inside is reached
+    /// through that. Only what the backups made is touched: a directory of
+    /// root's that nobody else may write, and in it the names the backups
+    /// wrote. Backups and their signatures move to BACKUP_DIR (never over a
+    /// file there) and count in its plan; the status, lock, temporary files
+    /// and the staging copy go, links removed as links. Anything else stays,
+    /// and with it the directory.
+    fn retire_old(&self, out: &mut dyn Write) -> Vec<String> {
+        let mut notes = Vec::new();
+        let parent_path = self.at(OLD_PARENT);
+        // No registry directory (or no directory there): nothing to do.
+        let Ok(parent) = DirFd::open(&parent_path) else { return notes };
+        if let Some(gid) = self.wheel_gid() {
+            match parent.drop_acl_group(gid) {
+                Ok(true) => {
+                    let _ = writeln!(out, "backup: took the old ACL entry for group wheel off {}", parent_path.display());
+                }
+                Ok(false) => {}
+                Err(e) => notes.push(format!("the old ACL entry for group wheel on {} stays: {e}", parent_path.display())),
+            }
+        }
+        if let Some(note) = self.retire_old_dir(&parent, out) {
+            notes.push(note);
+        }
+        for n in &notes {
+            let _ = writeln!(out, "backup: warning: {n}");
+        }
+        notes
+    }
+
+    /// The old directory itself; Some(why) when it stays.
+    fn retire_old_dir(&self, parent: &DirFd, out: &mut dyn Write) -> Option<String> {
+        let shown = self.at(OLD_PARENT).join(&*OLD_NAME.to_string_lossy());
+        let name = OLD_NAME;
+        let left = |why: String| Some(format!("{} is left as it is: {why}", shown.display()));
+        let old = match parent.open_at(name) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => {
+                return left("it is not a directory the backups made".into());
+            }
+            Err(e) => return left(e.to_string()),
+        };
+        let st = match old.stat() {
+            Ok(st) => st,
+            Err(e) => return left(e.to_string()),
+        };
+        if st.st_uid != fsx::geteuid() || st.st_mode & 0o022 != 0 {
+            return left(format!("it is not the directory the backups made (owner {}, mode {:04o})", st.st_uid, st.st_mode & 0o7777));
+        }
+        let new = match DirFd::open(&self.dir()) {
+            Ok(d) => d,
+            Err(e) => return left(format!("open {}: {e}", self.dir().display())),
+        };
+        let names = match old.names() {
+            Ok(n) => n,
+            Err(e) => return left(e.to_string()),
+        };
+        let (mut moved, mut kept) = (0, Vec::new());
+        for n in names {
+            let s = n.to_string_lossy().into_owned();
+            let kind = old.stat_at(&n).map(|st| st.st_mode & libc::S_IFMT).unwrap_or(0);
+            let backup = parse_name(&s).is_some() || s.strip_suffix(".sig").and_then(parse_name).is_some();
+            let leftover = s == STATUS_FILE
+                || s == format!("{STATUS_FILE}.tmp")
+                || s == LOCK_FILE
+                || (s.starts_with(".brain-") && s.ends_with(".tmp"));
+            let res = if backup && kind == libc::S_IFREG {
+                old.move_to(&n, &new).map(|()| {
+                    moved += 1;
+                    let p = self.dir().join(&s);
+                    let _ = open_regular(&p).and_then(|f| {
+                        f.set_permissions(std::fs::Permissions::from_mode(0o640))
+                            .map_err(|e| Error::from(e).wrap(format!("chmod {}", p.display())))
+                    });
+                    let _ = self.wheel(&p);
+                })
+            } else if leftover && kind != libc::S_IFDIR {
+                old.unlink_at(&n, false)
+            } else if s == STAGING {
+                old.remove_tree_at(&n, 0)
+            } else {
+                Err(std::io::Error::other("not made by the backups"))
+            };
+            if let Err(e) = res {
+                kept.push(format!("{s:?} ({e})"));
+            }
+        }
+        if !kept.is_empty() {
+            return left(format!("in it: {}", kept.join(", ")));
+        }
+        // By name only while the name is still this directory.
+        match parent.stat_at(name) {
+            Ok(now) if now.st_ino == st.st_ino && now.st_dev == st.st_dev => {
+                if let Err(e) = parent.unlink_at(name, true) {
+                    return left(format!("emptied, but: {e}"));
+                }
+                let _ = writeln!(
+                    out,
+                    "backup: moved {moved} file(s) from the old place {} to {} and removed it",
+                    shown.display(),
+                    self.dir().display()
+                );
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// The group id of wheel in this machine's /etc/group.
+    fn wheel_gid(&self) -> Option<u32> {
+        fsx::read_or_empty(self.at("etc/group")).lines().find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            if f.len() >= 3 && f[0] == "wheel" { f[2].parse().ok() } else { None }
+        })
     }
 
     fn make(&self, ctx: &Ctx, now: Time, out: &mut dyn Write) -> Result<Done> {
@@ -724,6 +864,206 @@ fn open_regular(p: &Path) -> Result<File> {
         bail!("{} is not a regular file", p.display());
     }
     Ok(f)
+}
+
+/// A directory opened without following a link. Everything in it is
+/// reached by name through it (openat and friends), never by a path
+/// that is looked up again: a directory someone else owns cannot swap
+/// what is behind a name of root's on the way.
+struct DirFd(OwnedFd);
+
+fn last_err() -> std::io::Error {
+    std::io::Error::last_os_error()
+}
+
+impl DirFd {
+    const FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    fn open(p: &Path) -> std::io::Result<DirFd> {
+        let c = CString::new(p.as_os_str().as_bytes())?;
+        // SAFETY: c is a valid C string; the descriptor is owned below.
+        let fd = unsafe { libc::open(c.as_ptr(), Self::FLAGS) };
+        if fd < 0 {
+            return Err(last_err());
+        }
+        // SAFETY: fd was just opened and nothing else owns it.
+        Ok(DirFd(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn open_at(&self, name: &CStr) -> std::io::Result<DirFd> {
+        // SAFETY: a valid directory descriptor and C string.
+        let fd = unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), Self::FLAGS) };
+        if fd < 0 {
+            return Err(last_err());
+        }
+        // SAFETY: fd was just opened and nothing else owns it.
+        Ok(DirFd(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn stat(&self) -> std::io::Result<libc::stat> {
+        // SAFETY: an all-zero stat is a valid value to be filled in.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid descriptor and out pointer.
+        if unsafe { libc::fstat(self.0.as_raw_fd(), &mut st) } != 0 {
+            return Err(last_err());
+        }
+        Ok(st)
+    }
+
+    /// The entry name itself, a link not followed.
+    fn stat_at(&self, name: &CStr) -> std::io::Result<libc::stat> {
+        // SAFETY: an all-zero stat is a valid value to be filled in.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid directory descriptor, C string and out pointer.
+        if unsafe { libc::fstatat(self.0.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(last_err());
+        }
+        Ok(st)
+    }
+
+    /// The names in the directory, without . and ..
+    fn names(&self) -> std::io::Result<Vec<CString>> {
+        // SAFETY: duplicating a valid descriptor; the copy goes to the stream.
+        let dup = unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            return Err(last_err());
+        }
+        // SAFETY: dup is a valid directory descriptor; on success the stream owns it.
+        let d = unsafe { libc::fdopendir(dup) };
+        if d.is_null() {
+            let e = last_err();
+            // SAFETY: dup is still ours when fdopendir failed.
+            unsafe { libc::close(dup) };
+            return Err(e);
+        }
+        let mut v = Vec::new();
+        // SAFETY: d is a valid stream until closedir; each entry is read
+        // before the next readdir call.
+        unsafe {
+            // The copy shares the position with the original: from the start.
+            libc::rewinddir(d);
+            loop {
+                let e = libc::readdir(d);
+                if e.is_null() {
+                    break;
+                }
+                let n = CStr::from_ptr((*e).d_name.as_ptr());
+                if n != c"." && n != c".." {
+                    v.push(n.to_owned());
+                }
+            }
+            libc::closedir(d);
+        }
+        Ok(v)
+    }
+
+    /// Removes the name itself: a link, never what it points to.
+    fn unlink_at(&self, name: &CStr, dir: bool) -> std::io::Result<()> {
+        // SAFETY: a valid directory descriptor and C string.
+        if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), if dir { libc::AT_REMOVEDIR } else { 0 }) } != 0 {
+            return Err(last_err());
+        }
+        Ok(())
+    }
+
+    /// Removes name and, if it is a directory, everything in it, never
+    /// following a link.
+    fn remove_tree_at(&self, name: &CStr, depth: u32) -> std::io::Result<()> {
+        if self.stat_at(name)?.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return self.unlink_at(name, false);
+        }
+        if depth > 64 {
+            return Err(std::io::Error::other("too deep"));
+        }
+        let sub = self.open_at(name)?;
+        for n in sub.names()? {
+            sub.remove_tree_at(&n, depth + 1)?;
+        }
+        self.unlink_at(name, true)
+    }
+
+    /// Moves name into to under the same name, never over anything there:
+    /// a hard link fails rather than replace, and does not follow a link.
+    fn move_to(&self, name: &CStr, to: &DirFd) -> std::io::Result<()> {
+        // SAFETY: valid directory descriptors and C strings.
+        if unsafe { libc::linkat(self.0.as_raw_fd(), name.as_ptr(), to.0.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(last_err());
+        }
+        self.unlink_at(name, false)
+    }
+
+    /// Takes the entry group gid --x (what the backups added) off the
+    /// directory's ACL. Whether there was one.
+    fn drop_acl_group(&self, gid: u32) -> std::io::Result<bool> {
+        const NAME: &CStr = c"system.posix_acl_access";
+        let fd = self.0.as_raw_fd();
+        // SAFETY: a valid descriptor and C string; size 0 asks for the length.
+        let len = unsafe { libc::fgetxattr(fd, NAME.as_ptr(), std::ptr::null_mut(), 0) };
+        if len < 0 {
+            let e = last_err();
+            // No ACL, or a filesystem without them.
+            return match e.raw_os_error() {
+                Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(false),
+                _ => Err(e),
+            };
+        }
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: buf has room for len bytes.
+        let got = unsafe { libc::fgetxattr(fd, NAME.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        if got < 0 {
+            return Err(last_err());
+        }
+        buf.truncate(got as usize);
+        let Some(acl) = acl_without_group(&buf, gid) else { return Ok(false) };
+        // SAFETY: a valid descriptor, C string and buffer.
+        if unsafe { libc::fsetxattr(fd, NAME.as_ptr(), acl.as_ptr().cast(), acl.len(), 0) } != 0 {
+            return Err(last_err());
+        }
+        Ok(true)
+    }
+}
+
+/// An access ACL (the kernel's xattr form: version 2, then entries of
+/// tag, perm and id, little endian) without the entry group gid --x, or
+/// None when it has no such entry or is not in that form. Like
+/// `setfacl -x g:wheel`, and when no named entry is left the mask goes
+/// too, folded into the group's own entry: the kernel then sees an ACL
+/// plain mode bits can say and removes it. No one gets more than before.
+fn acl_without_group(raw: &[u8], gid: u32) -> Option<Vec<u8>> {
+    const USER: u16 = 0x02;
+    const GROUP_OBJ: u16 = 0x04;
+    const GROUP: u16 = 0x08;
+    const MASK: u16 = 0x10;
+    if raw.len() < 4 || !(raw.len() - 4).is_multiple_of(8) || raw[..4] != 2u32.to_le_bytes() {
+        return None;
+    }
+    let mut e: Vec<(u16, u16, u32)> = raw[4..]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| (u16::from_le_bytes([c[0], c[1]]), u16::from_le_bytes([c[2], c[3]]), u32::from_le_bytes([c[4], c[5], c[6], c[7]])))
+        .collect();
+    let before = e.len();
+    e.retain(|&(tag, perm, id)| !(tag == GROUP && id == gid && perm == 1));
+    if e.len() == before {
+        return None;
+    }
+    if let Some(mask) = e.iter().find(|x| x.0 == MASK).map(|x| x.1) {
+        if e.iter().any(|x| x.0 == USER || x.0 == GROUP) {
+            let union = e.iter().filter(|x| matches!(x.0, USER | GROUP | GROUP_OBJ)).fold(0, |a, x| a | x.1);
+            e.iter_mut().filter(|x| x.0 == MASK).for_each(|x| x.1 = mask & union);
+        } else {
+            e.iter_mut().filter(|x| x.0 == GROUP_OBJ).for_each(|x| x.1 &= mask);
+            e.retain(|x| x.0 != MASK);
+        }
+    }
+    let mut out = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in e {
+        out.extend(tag.to_le_bytes());
+        out.extend(perm.to_le_bytes());
+        out.extend(id.to_le_bytes());
+    }
+    Some(out)
 }
 
 /// Removes what a killed run left at p (the name itself, a link too),
@@ -1756,6 +2096,217 @@ mod tests {
         let link = dir.join("link");
         std::os::unix::fs::symlink(&victim, &link).unwrap();
         assert!(file_sum(&link).unwrap_err().to_string().contains("symbolic link"));
+    }
+
+    /// The raw xattr of an access ACL: (tag, perm, id) entries.
+    fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut v = 2u32.to_le_bytes().to_vec();
+        for (t, p, i) in entries {
+            v.extend(t.to_le_bytes());
+            v.extend(p.to_le_bytes());
+            v.extend(i.to_le_bytes());
+        }
+        v
+    }
+
+    const ANY: u32 = u32::MAX;
+
+    /// Sets an access ACL on p; false where the filesystem has none.
+    fn set_acl(p: &Path, raw: &[u8]) -> bool {
+        let c = CString::new(p.as_os_str().as_bytes()).unwrap();
+        // SAFETY: valid C strings and buffer.
+        let r = unsafe { libc::setxattr(c.as_ptr(), c"system.posix_acl_access".as_ptr(), raw.as_ptr().cast(), raw.len(), 0) };
+        if r != 0 {
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOTSUP), "setxattr {}", p.display());
+            return false;
+        }
+        true
+    }
+
+    fn get_acl(p: &Path) -> Option<Vec<u8>> {
+        let d = DirFd::open(p).unwrap();
+        let mut buf = vec![0u8; 512];
+        // SAFETY: a valid descriptor, C string and buffer.
+        let n = unsafe { libc::fgetxattr(d.0.as_raw_fd(), c"system.posix_acl_access".as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        (n >= 0).then(|| buf[..n as usize].to_vec())
+    }
+
+    #[test]
+    fn the_acl_entry_for_wheel_comes_off_and_nothing_else() {
+        let base = |g: u16| vec![(0x01, 7, ANY), (0x04, g, ANY)];
+        // Only the wheel entry beside the plain ones: mask and all go.
+        let mut with = base(5);
+        with.extend([(0x08, 1, 10), (0x10, 5, ANY), (0x20, 5, ANY)]);
+        assert_eq!(acl_without_group(&acl(&with), 10), Some(acl(&[(0x01, 7, ANY), (0x04, 5, ANY), (0x20, 5, ANY)])));
+        // A narrower mask is kept in the group's own entry: nobody gains.
+        let narrow = [(0x01, 7, ANY), (0x04, 5, ANY), (0x08, 1, 10), (0x10, 1, ANY), (0x20, 0, ANY)];
+        assert_eq!(acl_without_group(&acl(&narrow), 10), Some(acl(&[(0x01, 7, ANY), (0x04, 1, ANY), (0x20, 0, ANY)])));
+        // Other named entries stay, and the mask with them (never wider).
+        let others = [(0x01, 7, ANY), (0x02, 5, 1234), (0x04, 0, ANY), (0x08, 1, 10), (0x10, 5, ANY), (0x20, 0, ANY)];
+        assert_eq!(
+            acl_without_group(&acl(&others), 10),
+            Some(acl(&[(0x01, 7, ANY), (0x02, 5, 1234), (0x04, 0, ANY), (0x10, 5, ANY), (0x20, 0, ANY)]))
+        );
+        // Not what the backups made: wheel with more than --x, another
+        // group, no such entry, a form this does not know.
+        for (raw, gid) in [
+            (acl(&[(0x01, 7, ANY), (0x04, 5, ANY), (0x08, 7, 10), (0x10, 7, ANY), (0x20, 5, ANY)]), 10),
+            (acl(&with), 11),
+            (acl(&base(5)), 10),
+            (vec![1, 0, 0, 0], 10),
+            (vec![2, 0, 0, 0, 1], 10),
+        ] {
+            assert_eq!(acl_without_group(&raw, gid), None);
+        }
+    }
+
+    /// A coordinator installed while the backups were kept in the
+    /// registry's directory: backups and signatures there, the leftovers
+    /// of a run, and the ACL entry for wheel.
+    fn old_place(root: &Path) -> PathBuf {
+        let old = root.join("var/lib/dryserver/backups");
+        let (a, b) = (name_of(t(2026, 11, 19, 2)), name_of(t(2026, 11, 20, 2)));
+        for (n, c) in [
+            (a.clone(), "old backup a"),
+            (format!("{a}.sig"), "sig a"),
+            (b.clone(), "old backup b"),
+            (format!("{b}.sig"), "sig b"),
+            (STATUS_FILE.into(), "{}"),
+            (format!("{STATUS_FILE}.tmp"), ""),
+            (LOCK_FILE.into(), ""),
+            (format!(".{b}.tmp"), "half"),
+        ] {
+            put(&old, &n, c);
+        }
+        put(&old, ".staging/etc/dryserver/config.env", "plain copy");
+        std::fs::set_permissions(old.join(&a), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o750)).unwrap();
+        put(root, "etc/group", "root:x:0:\nwheel:x:4242:admin\n");
+        old
+    }
+
+    #[test]
+    fn the_old_place_is_put_away_once() {
+        let dir = TempDir::new();
+        let root = coordinator(&dir, AGE);
+        let old = old_place(&root);
+        let parent = root.join("var/lib/dryserver");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wheel_x = acl(&[(0x01, 7, ANY), (0x04, 5, ANY), (0x08, 1, 4242), (0x10, 5, ANY), (0x20, 5, ANY)]);
+        let acls = set_acl(&parent, &wheel_x);
+        // Links the registry account may have put in the staging copy
+        // (it was copied there with its owner): removed as links.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        let victim_dir = dir.join("victim-dir");
+        put(&victim_dir, "keep", "mine");
+        std::os::unix::fs::symlink(&victim, old.join(".staging/etc/dryserver/registry.json")).unwrap();
+        std::os::unix::fs::symlink(&victim_dir, old.join(".staging/var")).unwrap();
+        std::os::unix::fs::symlink(&victim, old.join(format!("{STATUS_FILE}.tmp.link"))).unwrap();
+        std::fs::remove_file(old.join(format!("{STATUS_FILE}.tmp"))).unwrap();
+        std::os::unix::fs::symlink(&victim, old.join(format!("{STATUS_FILE}.tmp"))).unwrap();
+        let f = Fake::new(&dir.join("age"), "active");
+        let j = job(&root, &dir.join("age"), &f);
+        let mut out = Vec::new();
+        let d = j.run(&Ctx::new(), now(), &mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        // One name in it was not made by the backups: the directory stays,
+        // with that alone in it, and says so.
+        let names: BTreeSet<String> =
+            std::fs::read_dir(&old).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, BTreeSet::from([format!("{STATUS_FILE}.tmp.link")]), "{text}");
+        assert!(d.warnings.iter().any(|w| w.contains("is left as it is") && w.contains("not made by the backups")), "{:?}", d.warnings);
+        assert_eq!(status(&j.dir()).warnings, d.warnings);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(get(&victim_dir, "keep"), "mine");
+        // The backups moved, as root's 0640 group wheel, and count in the
+        // plan beside the new one.
+        let bdir = j.dir();
+        let (a, b) = (name_of(t(2026, 11, 19, 2)), name_of(t(2026, 11, 20, 2)));
+        assert_eq!(get(&bdir, &a), "old backup a");
+        assert_eq!(get(&bdir, &format!("{b}.sig")), "sig b");
+        assert_eq!(std::fs::metadata(bdir.join(&a)).unwrap().permissions().mode() & 0o7777, 0o640);
+        assert!(f.calls().contains(&format!("chgrp -h wheel {}", bdir.join(&a).display())), "{:?}", f.calls());
+        assert_eq!(j.backups().unwrap().len(), 3);
+        if acls {
+            assert_eq!(get_acl(&parent), None, "the ACL entry for wheel is still there");
+            assert_eq!(std::fs::metadata(&parent).unwrap().permissions().mode() & 0o7777, 0o755);
+            assert!(text.contains("took the old ACL entry for group wheel off"), "{text}");
+        }
+
+        // That name gone, the next run removes the directory; the one
+        // after finds nothing and says nothing about it.
+        std::fs::remove_file(old.join(format!("{STATUS_FILE}.tmp.link"))).unwrap();
+        let later = Time(now().0 + chrono::TimeDelta::days(1));
+        let mut out = Vec::new();
+        let d = j.run(&Ctx::new(), later, &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("from the old place"), "{}", String::from_utf8_lossy(&out));
+        assert!(!old.exists() && d.warnings.is_empty(), "{:?}", d.warnings);
+        assert!(parent.join("registry.json").exists(), "the registry's own file stays");
+        let mut out = Vec::new();
+        let d = j.run(&Ctx::new(), Time(later.0 + chrono::TimeDelta::days(1)), &mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(!text.contains("old place") && !text.contains("ACL") && d.warnings.is_empty(), "{text}");
+    }
+
+    #[test]
+    fn an_old_place_the_backups_did_not_make_is_left_alone() {
+        // A link (to a directory that would pass) or a file at the name.
+        for link in [true, false] {
+            let dir = TempDir::new();
+            let root = coordinator(&dir, AGE);
+            let elsewhere = dir.join("elsewhere");
+            let backup = name_of(t(2026, 11, 19, 2));
+            put(&elsewhere, &backup, "theirs");
+            put(&elsewhere, LOCK_FILE, "");
+            let old = root.join("var/lib/dryserver/backups");
+            if link {
+                std::os::unix::fs::symlink(&elsewhere, &old).unwrap();
+            } else {
+                std::fs::write(&old, "a file").unwrap();
+            }
+            let f = Fake::new(&dir.join("age"), "active");
+            let j = job(&root, &dir.join("age"), &f);
+            let d = j.run(&Ctx::new(), now(), &mut Vec::new()).unwrap();
+            assert!(d.warnings.iter().any(|w| w.contains("not a directory the backups made")), "{:?}", d.warnings);
+            assert!(std::fs::symlink_metadata(&old).is_ok() && get(&elsewhere, &backup) == "theirs" && elsewhere.join(LOCK_FILE).exists());
+            assert!(!j.dir().join(&backup).exists(), "a file from the link was taken in");
+        }
+        // A directory others may write to: whatever is in it may be theirs.
+        let dir = TempDir::new();
+        let root = coordinator(&dir, AGE);
+        let old = old_place(&root);
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let before: BTreeSet<String> =
+            std::fs::read_dir(&old).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        let f = Fake::new(&dir.join("age"), "active");
+        let j = job(&root, &dir.join("age"), &f);
+        let d = j.run(&Ctx::new(), now(), &mut Vec::new()).unwrap();
+        assert!(d.warnings.iter().any(|w| w.contains("not the directory the backups made") && w.contains("mode 0777")), "{:?}", d.warnings);
+        let after: BTreeSet<String> =
+            std::fs::read_dir(&old).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(before, after);
+        // A backup name standing for something else than a file there
+        // (a link to one) is not taken in.
+        let dir = TempDir::new();
+        let root = coordinator(&dir, AGE);
+        let old = old_place(&root);
+        let theirs = dir.join("theirs");
+        std::fs::write(&theirs, "not a backup").unwrap();
+        let name = name_of(t(2026, 11, 18, 2));
+        std::os::unix::fs::symlink(&theirs, old.join(&name)).unwrap();
+        let f = Fake::new(&dir.join("age"), "active");
+        let j = job(&root, &dir.join("age"), &f);
+        let d = j.run(&Ctx::new(), now(), &mut Vec::new()).unwrap();
+        assert!(d.warnings.iter().any(|w| w.contains(&name)), "{:?}", d.warnings);
+        assert!(!j.dir().join(&name).exists() && std::fs::symlink_metadata(old.join(&name)).is_ok());
+        // A machine without the old place: nothing happens, nothing said.
+        let dir = TempDir::new();
+        let root = coordinator(&dir, AGE);
+        let f = Fake::new(&dir.join("age"), "active");
+        let mut out = Vec::new();
+        let d = job(&root, &dir.join("age"), &f).run(&Ctx::new(), now(), &mut out).unwrap();
+        assert!(d.warnings.is_empty() && !String::from_utf8_lossy(&out).contains("old"), "{}", String::from_utf8_lossy(&out));
     }
 
     #[test]

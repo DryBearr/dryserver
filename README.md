@@ -492,7 +492,10 @@ On the coordinator, the backups are in `/var/lib/dryserver-backup` (root's,
 readable by your login; not inside `/var/lib/dryserver`, which belongs to
 the account every server reaches), `sudo dryserver backup` makes one now,
 `/var/lib/dryserver-backup/last.json` says how the last one went, and
-`journalctl -u dryserver-backup` has the details. Restoring is not built
+`journalctl -u dryserver-backup` has the details. On a coordinator
+installed when backups were kept in `/var/lib/dryserver/backups`, the next
+backup moves them over, removes that directory and the ACL entry it had for
+your login, and touches nothing there it did not make. Restoring is not built
 yet; to look inside one:
 `age -d -i secrets/backup_ed25519 FILE | tar -tv`.
 
