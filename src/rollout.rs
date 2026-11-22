@@ -116,8 +116,15 @@ const MAX_ROLLOUT: u64 = 256 << 10;
 pub const WINDOW: (u32, u32) = (3 * 60, 5 * 60);
 /// A server that has not finished its update this long after its turn
 /// began stops the rollout (or, when it was never heard from since, is
-/// passed over until it is back).
-pub const TURN_TIMEOUT: i64 = 20 * 60;
+/// passed over until it is back). An update with new packages and a new
+/// k3s loads them, installs them, restarts k3s and may reboot: minutes
+/// each on a mini PC and a slow archive. One that finishes later after
+/// all lets the rollout go on by itself.
+pub const TURN_TIMEOUT: i64 = 60 * 60;
+/// A server never heard from since its turn began is passed over sooner:
+/// it is off (an update that reboots is back within minutes, one that runs
+/// keeps syncing).
+pub const SILENT_TURN: i64 = 20 * 60;
 /// How long the brain tries to drain a server before it gives up.
 pub const DRAIN_LIMIT: i64 = 5 * 60;
 /// One drain attempt; it goes on at the next sync. kubectl waits this long
@@ -139,9 +146,15 @@ const FETCH_BUDGET: Duration = Duration::from_secs(25);
 /// deadline is kept: the next piece starts where it ended, so a slow link
 /// gets on at every sync instead of loading the same piece again.
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
-/// Installing and confirming are not cut off by the sync's deadline: a
-/// half-run installer is worse than a late sync.
-const APPLY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Starting the apply: it runs in a service of its own (update apply
+/// --detach), and the sync follows it with update status.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// Confirming and reverting are not cut off by the sync's deadline: a
+/// half-run command is worse than a late sync.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// An apply that was started says how it went within this (in update
+/// status); one that says nothing at all is tried again.
+const START_GRACE: i64 = 5 * 60;
 /// How many syncs in a row a problem that may pass (the update commands
 /// do not answer, the disk is full for now, the brain's k3s is not known
 /// yet) is tried again before the release counts as failed here: well
@@ -202,6 +215,9 @@ pub struct UpdateStatus {
     /// What the last update action was and how it ended.
     #[serde(deserialize_with = "report::lenient")]
     pub last: Option<Last>,
+    /// An apply (or a confirm, a revert) runs now: it decides.
+    #[serde(deserialize_with = "report::lenient")]
+    pub busy: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -221,14 +237,31 @@ pub struct Pending {
     /// The release that ran before this one, if any.
     #[serde(deserialize_with = "report::lenient")]
     pub previous: Option<u64>,
+    /// "armed": applied, waits for its confirm; anything else: its apply
+    /// did not finish (and, when nothing is busy, will not).
+    #[serde(deserialize_with = "report::lenient")]
+    pub stage: String,
+    /// What its apply does now.
+    #[serde(deserialize_with = "report::lenient")]
+    pub step: String,
+    /// The apply rebooted the machine, and the restarts seen since.
+    #[serde(deserialize_with = "report::lenient")]
+    pub reboot: bool,
+    #[serde(deserialize_with = "report::lenient")]
+    pub boots: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Last {
+    /// Unix seconds.
+    #[serde(deserialize_with = "report::lenient")]
+    pub at: i64,
     #[serde(deserialize_with = "report::lenient")]
     pub serial: u64,
-    /// "applied", "confirmed", "reverted", ...
+    /// "applied", "confirmed", "reverted"; "postponed" (nothing changed, a
+    /// problem that may pass) or "refused" (nothing changed, it does not
+    /// go on this machine).
     #[serde(deserialize_with = "report::lenient")]
     pub action: String,
     #[serde(deserialize_with = "report::lenient")]
@@ -266,28 +299,40 @@ impl UpdateStatus {
 /// Every call to them is here, so a change in their interface is a change
 /// in one place.
 ///
-/// - apply --release FILE --binary FILE --brain-k3s VERSION: copies the
-///   binary into its own staging, checks the release, arms the revert
-///   timer and installs it; exit 0: installed, pending confirmation.
+/// - apply --detach --reboot --release FILE --binary FILE [--k3s FILE]
+///   --brain-k3s VERSION: starts the apply in a service of its own and
+///   returns; the apply copies the files into its own staging, checks
+///   them, loads the packages, installs the binary, k3s (the file is
+///   given when this machine runs another k3s) and the packages, and may
+///   reboot. Its outcome shows in status: busy while it runs, then a
+///   pending release (armed: waits for confirm), or last (reverted,
+///   postponed, refused).
 /// - confirm --serial N: keeps it, after its own selfcheck.
+/// - revert: puts back an update whose apply stopped part way.
 /// - status --json: UpdateStatus.
-///
-/// The k3s binary of a release is loaded and kept with it (STORE), for
-/// when apply installs k3s too; it takes no k3s file yet.
 pub struct Update<'a> {
     pub run: &'a dyn crate::runner::Runner,
     pub bin: &'a str,
 }
 
 impl Update<'_> {
-    pub fn apply(&self, ctx: &Ctx, release: &Path, binary: &Path, brain_k3s: &str) -> Result<()> {
+    pub fn apply(&self, ctx: &Ctx, release: &Path, binary: &Path, k3s: Option<&Path>, brain_k3s: &str) -> Result<()> {
         let (r, b) = (release.display().to_string(), binary.display().to_string());
-        let args = ["update", "apply", "--release", &r, "--binary", &b, "--brain-k3s", brain_k3s];
+        let mut args = vec!["update", "apply", "--detach", "--reboot", "--release", &r, "--binary", &b];
+        let k = k3s.map(|k| k.display().to_string());
+        if let Some(k) = &k {
+            args.extend(["--k3s", k.as_str()]);
+        }
+        args.extend(["--brain-k3s", brain_k3s]);
         self.run.ok(ctx, &Cmd::new(self.bin, &args))
     }
 
     pub fn confirm(&self, ctx: &Ctx, serial: u64) -> Result<()> {
         self.run.ok(ctx, &Cmd::new(self.bin, &["update", "confirm", "--serial", &serial.to_string()]))
+    }
+
+    pub fn revert(&self, ctx: &Ctx) -> Result<()> {
+        self.run.ok(ctx, &Cmd::new(self.bin, &["update", "revert"]))
     }
 
     pub fn status(&self, ctx: &Ctx) -> Result<UpdateStatus> {
@@ -863,10 +908,9 @@ enum Stop {
     /// A problem that may pass but may also stay: again at the next sync,
     /// MAX_TRIES times, then the update failed.
     Later(String),
-    /// The release did not pass this machine's checks.
+    /// The release did not pass this machine's checks. (Installing it
+    /// runs on after the sync that started it: settle sees how it ended.)
     Refused(String),
-    /// Installing it did not work.
-    Failed(String),
     /// It was installed before and went back: not sent again unless the
     /// admin resumes.
     Reverted(String),
@@ -1043,28 +1087,43 @@ impl<'a> Machine<'a> {
                 }
                 return Err(e);
             }
-            Err(Stop::Later(why)) => {
-                if l.tries_serial != offer.serial {
-                    (l.tries_serial, l.tries) = (offer.serial, 0);
-                }
-                l.tries += 1;
-                if l.tries < MAX_TRIES {
-                    l.note = report::note(&why);
-                    self.save(&l)?;
-                    return Err(errf!("release {}: {why} (tried {} of {MAX_TRIES} times, again at the next sync)", offer.serial, l.tries));
-                }
-                ("failed", format!("{why} ({MAX_TRIES} syncs in a row)"))
-            }
+            Err(Stop::Later(why)) => return self.later(&mut l, offer.serial, &why),
             Err(Stop::Refused(why)) => ("refused", why),
-            Err(Stop::Failed(why)) => ("failed", why),
             Err(Stop::Reverted(why)) => ("reverted", why),
         };
-        l.failed = offer.serial;
+        self.fail(&mut l, offer.serial, outcome, &why)
+    }
+
+    /// A problem that may pass held release serial up: it is tried again
+    /// at the next sync, MAX_TRIES syncs in a row, then it failed here.
+    fn later(&self, l: &mut Local, serial: u64, why: &str) -> Result<()> {
+        if l.tries_serial != serial {
+            (l.tries_serial, l.tries) = (serial, 0);
+        }
+        l.tries += 1;
+        if l.tries < MAX_TRIES {
+            l.note = report::note(why);
+            self.save(l)?;
+            return Err(errf!("release {serial}: {why} (tried {} of {MAX_TRIES} times, again at the next sync)", l.tries));
+        }
+        self.fail(l, serial, "failed", &format!("{why} ({MAX_TRIES} syncs in a row)"))
+    }
+
+    /// Release serial did not work here (outcome: failed, refused or
+    /// reverted): recorded, shown in the report, not tried again.
+    fn fail(&self, l: &mut Local, serial: u64, outcome: &str, why: &str) -> Result<()> {
+        l.failed = serial;
         l.outcome = outcome.into();
-        l.why = report::note(&why);
+        l.why = report::note(why);
         l.note.clear();
-        self.save(&l)?;
-        Err(errf!("release {} {outcome}: {why}", offer.serial))
+        self.save(l)?;
+        Err(errf!("release {serial} {outcome}: {why}"))
+    }
+
+    /// What holds the update up for now, for the report.
+    fn wait(&self, l: &mut Local, why: &str) -> Result<()> {
+        l.note = report::note(why);
+        self.save(l)
     }
 
     /// What the update commands say before anything is loaded: true, go
@@ -1074,6 +1133,9 @@ impl<'a> Machine<'a> {
     fn ready(&self, ctx: &Ctx, offer: &Offer, now: i64, l: &mut Local) -> std::result::Result<bool, Stop> {
         // The sync's own time running out ends up here too.
         let st = self.update().status(ctx).map_err(|e| Stop::Later(format!("cannot ask how its updates stand: {e}")))?;
+        if st.busy {
+            return Err(Stop::Again(errf!("an update runs on this machine now")));
+        }
         if st.confirmed_serial() >= offer.serial {
             l.installed = st.confirmed_serial();
             self.save(l).map_err(Stop::Again)?;
@@ -1168,14 +1230,33 @@ impl<'a> Machine<'a> {
             self.fetch(ctx, src, r.serial, K3S_FILE, meta.k3s_size, &r.k3s.sha256, until, &mut pieces)?;
         }
         // Everything is here and checked: install it. The update commands
-        // check the release once more themselves.
-        let actx = Ctx::new().with_timeout(APPLY_TIMEOUT);
+        // check the release once more themselves. It runs on in a service of
+        // its own; the syncs that follow watch it (settle). A start that
+        // does not happen may well work later.
+        let k3s = meta.need_k3s.then(|| inc.join(K3S_FILE));
         self.update()
-            .apply(&actx, &inc.join(RELEASE_FILE), &inc.join(DRYSERVER_FILE), &offer.brain_k3s)
-            .map_err(|e| Stop::Failed(e.to_string()))?;
+            .apply(
+                &Ctx::new().with_timeout(START_TIMEOUT),
+                &inc.join(RELEASE_FILE),
+                &inc.join(DRYSERVER_FILE),
+                k3s.as_deref(),
+                &offer.brain_k3s,
+            )
+            .map_err(|e| Stop::Later(format!("cannot start the update: {e}")))?;
         // The resume it acted on stays: if this goes back too, the same
-        // turn's offer must not clear that failure again.
-        *l = Local { pending: r.serial, applied: now, installed: l.installed, retry: l.retry, retried: l.retried, ..Local::default() };
+        // turn's offer must not clear that failure again. So do the tries
+        // of a release that was postponed before.
+        *l = Local {
+            pending: r.serial,
+            applied: now,
+            installed: l.installed,
+            retry: l.retry,
+            retried: l.retried,
+            note: "installing".into(),
+            tries_serial: l.tries_serial,
+            tries: l.tries,
+            ..Local::default()
+        };
         self.save(l).map_err(again)?;
         Ok(())
     }
@@ -1270,17 +1351,34 @@ impl<'a> Machine<'a> {
         fsx::rename(&part, &done).map_err(Stop::Again)
     }
 
-    /// An installed release waiting for its confirmation.
+    /// An update this machine started: its apply runs, or it waits for its
+    /// confirmation, or it ended without installing the release.
     fn settle(&self, ctx: &Ctx, l: &mut Local, rep: &Report, now: i64) -> Result<()> {
         let up = self.update();
         let st = up.status(ctx)?;
         l.installed = st.confirmed_serial();
+        let mine = st.pending.as_ref().filter(|p| p.serial == l.pending);
+        if st.busy {
+            // The apply runs (pacman may take its time): it decides.
+            let step = mine.map(|p| p.step.as_str()).filter(|s| !s.is_empty()).unwrap_or("installing");
+            return self.wait(l, step);
+        }
         let pending = st.pending_serial();
         if pending != 0 && pending != l.pending {
             // Another release waits: its own deadline settles it.
             return self.save(l);
         }
-        if pending == l.pending {
+        if let Some(p) = mine {
+            if p.stage != "armed" {
+                // Nothing runs, so its apply stopped part way (killed, or it
+                // crashed): back now, not when its timer fires. The next sync
+                // finds it reverted (or postponed, when it was loading).
+                up.revert(&Ctx::new().with_timeout(CONFIRM_TIMEOUT))?;
+                return self.wait(l, "its apply stopped part way; it went back");
+            }
+            if p.reboot && p.boots == 0 {
+                return self.wait(l, "it reboots for its new packages and is confirmed after the restart");
+            }
             if now.saturating_sub(l.applied) < CONFIRM_AFTER && now >= l.applied {
                 return self.save(l);
             }
@@ -1300,13 +1398,37 @@ impl<'a> Machine<'a> {
                 }
                 return Ok(());
             }
-            up.confirm(&Ctx::new().with_timeout(APPLY_TIMEOUT), l.pending)?;
+            up.confirm(&Ctx::new().with_timeout(CONFIRM_TIMEOUT), l.pending)?;
             l.installed = l.installed.max(l.pending);
             return self.promote(l);
         }
         if st.confirmed_serial() >= l.pending {
             // Confirmed meanwhile.
             return self.promote(l);
+        }
+        // Nothing waits and nothing runs: the apply ended without
+        // installing it, and said why (results of this start only).
+        let serial = l.pending;
+        let said = st.last.as_ref().filter(|x| x.serial == serial && x.at >= l.applied);
+        let message = said.map(|x| x.message.clone()).filter(|m| !m.is_empty());
+        match said.map(|x| x.action.as_str()) {
+            Some("postponed") => {
+                l.pending = 0;
+                return self.later(l, serial, message.as_deref().unwrap_or("it was postponed"));
+            }
+            Some("refused") => {
+                l.pending = 0;
+                return self.fail(l, serial, "refused", message.as_deref().unwrap_or("this machine refused it"));
+            }
+            None if st.reverted(serial).is_none() => {
+                if now >= l.applied && now - l.applied < START_GRACE {
+                    // Started a moment ago: not running yet.
+                    return self.wait(l, "installing");
+                }
+                l.pending = 0;
+                return self.later(l, serial, "the update ended without saying how");
+            }
+            _ => {}
         }
         let why = st.reverted(l.pending).or_else(|| st.last.as_ref().filter(|x| !x.ok && !x.message.is_empty()).map(|x| x.message.clone()));
         l.failed = l.pending;
@@ -2185,7 +2307,7 @@ impl Brain<'_> {
                 return;
             }
         }
-        if now - t.since > TURN_TIMEOUT {
+        if now - t.since > TURN_TIMEOUT || (!seen && now - t.since > SILENT_TURN) {
             let late = report::short_age(TURN_TIMEOUT as u64);
             if !seen {
                 // Never heard from since its turn began: offline. Its turn

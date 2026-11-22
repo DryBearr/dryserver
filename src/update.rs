@@ -1984,7 +1984,10 @@ pub fn revert_by_hand(m: &Machine, ctx: &Ctx, now: i64, out: &mut dyn Write) -> 
         }
         bail!("no update waits for confirm, there is nothing to revert");
     };
-    revert(m, &Ctx::new().with_timeout(REVERT_TIME), p, "reverted by hand", false, now, out, Undo::Revert)
+    // An apply stopped while it loaded the packages changed nothing but the
+    // mirrorlist: postponed, worth another try.
+    let undo = if p.stage == STAGE_PREPARING { Undo::Postpone } else { Undo::Revert };
+    revert(m, &Ctx::new().with_timeout(REVERT_TIME), p, "reverted by hand", false, now, out, undo)
 }
 
 // ---- confirm ----

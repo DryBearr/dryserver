@@ -64,6 +64,23 @@ struct Sim {
     api_down: bool,
     /// `update status` does not answer this many more times.
     status_fails: u32,
+    /// The machine's clock (the swarm's), for when last happened.
+    clock: i64,
+    last_at: i64,
+    /// The detached apply still runs at this many more status calls; and
+    /// how many each apply takes.
+    busy: u32,
+    slow: u32,
+    /// The apply loads nothing (the archive is down) this many more times:
+    /// postponed, nothing changed.
+    postpone: u32,
+    /// The apply refuses the release, nothing changed.
+    refuse: Option<String>,
+    /// The apply stopped part way (killed): its record stays installing.
+    dies: bool,
+    /// The apply rebooted the machine for new packages; restarts since.
+    reboot: bool,
+    boots: u32,
 }
 
 struct Fake(Mutex<Sim>);
@@ -75,13 +92,24 @@ impl Fake {
 
     /// The revert timer fires: back to what ran before.
     fn revert(&self) {
-        let mut s = self.sim();
-        if s.pending != 0 {
-            s.last = (s.pending, "reverted".into(), true, "not confirmed before its deadline".into());
-            s.pending = 0;
-            let b = s.before.clone();
-            std::fs::write(exe(&s.root), b).unwrap();
+        self.sim().revert("not confirmed before its deadline");
+    }
+}
+
+impl Sim {
+    fn revert(&mut self, why: &str) {
+        if self.pending != 0 {
+            self.done(self.pending, "reverted", true, why);
+            self.pending = 0;
+            self.dies = false;
+            let b = self.before.clone();
+            std::fs::write(exe(&self.root), b).unwrap();
         }
+    }
+
+    fn done(&mut self, serial: u64, action: &str, ok: bool, msg: &str) {
+        self.last = (serial, action.into(), ok, msg.into());
+        self.last_at = self.clock;
     }
 }
 
@@ -119,20 +147,42 @@ impl Runner for Fake {
                 }
                 (String::new(), Ok(()))
             }
-            (quarantine::SERVER_BIN, ["update", "apply", "--release", rel, "--binary", bin, "--brain-k3s", _]) => {
+            // Started in a service of its own: here it runs at once, and
+            // its outcome shows in status (busy for a while, if told).
+            (quarantine::SERVER_BIN, ["update", "apply", "--detach", "--reboot", "--release", rel, "--binary", bin, rest @ ..]) => {
+                assert!(matches!(rest, ["--brain-k3s", _] | ["--k3s", _, "--brain-k3s", _]), "{c}");
+                if let ["--k3s", k, ..] = rest {
+                    assert!(std::fs::metadata(k).is_ok(), "{c}: the k3s file is not there");
+                }
                 s.applied.push(c.args.clone());
                 let env: Envelope = serde_json::from_str(&std::fs::read_to_string(rel).unwrap()).unwrap();
                 let r: Release = serde_json::from_str(&env.doc).unwrap();
+                if s.postpone > 0 {
+                    s.postpone -= 1;
+                    let msg = format!("release {} not applied for now, nothing was installed (downloading the packages failed)", r.serial);
+                    s.done(r.serial, "postponed", false, &msg);
+                    return (String::new(), Ok(()));
+                }
+                if let Some(e) = s.refuse.clone() {
+                    s.done(r.serial, "refused", false, &format!("release {} refused, nothing was changed: {e}", r.serial));
+                    return (String::new(), Ok(()));
+                }
+                s.before = std::fs::read(exe(&s.root)).unwrap();
                 if let Some(e) = s.apply_fails.clone() {
-                    s.last = (r.serial, "applied".into(), false, e.clone());
-                    return (String::new(), Err(e.into()));
+                    let msg = format!("release {} reverted (the apply failed: {e}); this machine runs what it ran before", r.serial);
+                    s.done(r.serial, "reverted", true, &msg);
+                    return (String::new(), Ok(()));
                 }
                 s.pending = r.serial;
-                s.last = (r.serial, "applied".into(), true, String::new());
-                s.before = std::fs::read(exe(&s.root)).unwrap();
+                s.busy = s.slow;
+                s.done(r.serial, "applied", true, "");
                 if !s.broken {
                     std::fs::copy(bin, exe(&s.root)).unwrap();
                 }
+                (String::new(), Ok(()))
+            }
+            (quarantine::SERVER_BIN, ["update", "revert"]) => {
+                s.revert("reverted by hand");
                 (String::new(), Ok(()))
             }
             (quarantine::SERVER_BIN, ["update", "confirm", "--serial", n]) => {
@@ -149,9 +199,14 @@ impl Runner for Fake {
                 let pending = if s.pending == 0 {
                     serde_json::Value::Null
                 } else {
+                    let stage = if s.dies { "installing" } else { "armed" };
                     serde_json::json!({"serial": s.pending, "previous": if s.installed == 0 { serde_json::Value::Null } else { s.installed.into() },
-                        "stage": "booted", "deadline": 0, "seconds_left": 300, "boots": 0, "files": []})
+                        "stage": stage, "step": "", "reboot": s.reboot, "deadline": 0, "seconds_left": 300, "boots": s.boots, "files": []})
                 };
+                let busy = s.busy > 0;
+                if busy {
+                    s.busy -= 1;
+                }
                 // Like the real `update status`: an applied release counts as
                 // installed at once, pending until it is confirmed.
                 let shown = if s.pending == 0 { s.installed } else { s.pending };
@@ -159,8 +214,9 @@ impl Runner for Fake {
                     "running": "0.1.0",
                     "installed": {"serial": shown, "version": "0.1.0", "k3s": K3S_VERSION},
                     "pending": pending,
-                    "last": {"at": 0, "serial": s.last.0, "action": s.last.1, "ok": s.last.2, "message": s.last.3},
+                    "last": {"at": s.last_at, "serial": s.last.0, "action": s.last.1, "ok": s.last.2, "message": s.last.3},
                     "problems": [],
+                    "busy": busy,
                 });
                 (st.to_string(), Ok(()))
             }
@@ -345,6 +401,7 @@ impl Swarm {
     }
 
     fn brain_sync(&self) {
+        self.brain.fake.sim().clock = self.now;
         let m = Machine { n: &self.brain.node, brain: true, free: self.free(1) };
         let mut rep = self.healthy(1);
         m.describe(&mut rep);
@@ -386,6 +443,7 @@ impl Swarm {
         if self.offline.contains(&m.host) {
             return Ok(());
         }
+        m.fake.sim().clock = self.now;
         let mach = Machine { n: &m.node, brain: false, free: self.free(m.host) };
         let mut rep = self.healthy(m.host);
         mach.describe(&mut rep);
@@ -661,7 +719,18 @@ fn a_release_reaches_every_machine_brain_first_then_one_at_a_time() {
     for m in std::iter::once(&sw.brain).chain(&sw.servers) {
         let inc = m.node.path(STORE).join(INCOMING);
         let path = |f: &str| inc.join(f).display().to_string();
-        let want = ["update", "apply", "--release", &path(RELEASE_FILE), "--binary", &path(DRYSERVER_FILE), "--brain-k3s", K3S_VERSION];
+        let want = [
+            "update",
+            "apply",
+            "--detach",
+            "--reboot",
+            "--release",
+            &path(RELEASE_FILE),
+            "--binary",
+            &path(DRYSERVER_FILE),
+            "--brain-k3s",
+            K3S_VERSION,
+        ];
         assert_eq!(m.fake.sim().applied, vec![want.map(String::from).to_vec()], "{}", m.name);
         assert_eq!(m.fake.sim().confirmed, vec![vec!["update".to_string(), "confirm".into(), "--serial".into(), "10".into()]]);
     }
@@ -757,7 +826,13 @@ fn a_brain_whose_update_fails_touches_no_server() {
     sw.ticks(5);
     let r = sw.rollout();
     assert_eq!(r.phase, Phase::Failed, "{r:#?}");
-    assert!(r.paused.contains("own update to release 10 failed") && r.paused.contains("No server was touched"), "{}", r.paused);
+    assert!(
+        r.paused.contains(
+            "own update to release 10 reverted: release 10 reverted (the apply failed: dryserver failed: exit status 1: cannot install)"
+        ) && r.paused.contains("No server was touched"),
+        "{}",
+        r.paused
+    );
     assert!(sw.lines().contains("FAILED:"), "{}", sw.lines());
     assert!(sw.kubectl().is_empty() && sw.servers.iter().all(|m| m.fake.sim().applied.is_empty()));
     assert_eq!(sw.brain.fake.sim().applied.len(), 1, "a failed update is not tried again by itself");
@@ -907,7 +982,7 @@ fn a_claim_of_success_without_the_new_release_is_not_success() {
     sw.ticks(TURN_TIMEOUT as usize / 60 + 2);
     let r = sw.rollout();
     assert_eq!(r.pause, Pause::Timeout, "{r:#?}");
-    assert!(r.paused.contains("node-a (the canary) did not finish its update in 20m: it runs release 0"), "{}", r.paused);
+    assert!(r.paused.contains("node-a (the canary) did not finish its update in 1h: it runs release 0"), "{}", r.paused);
     // It runs its old release well: uncordoned, and nobody else is touched.
     sw.ticks(5);
     assert!(!sw.rollout().cordoned.contains(&"node-a".to_string()), "{:#?}", sw.rollout());
@@ -1127,7 +1202,13 @@ fn a_canary_that_fails_stops_the_rollout() {
     sw.until(20, |s| !s.rollout().paused.is_empty());
     let r = sw.rollout();
     assert_eq!(r.pause, Pause::Failed);
-    assert!(r.paused.contains("node-a (the canary): update failed: dryserver failed: exit status 1: no space left"), "{}", r.paused);
+    assert!(
+        r.paused.contains(
+            "node-a (the canary): update reverted: release 10 reverted (the apply failed: dryserver failed: exit status 1: no space left"
+        ),
+        "{}",
+        r.paused
+    );
     sw.ticks(10);
     assert!(sw.servers[1..].iter().all(|m| m.fake.sim().applied.is_empty()), "a server after a failed canary updated");
     // It runs its old release well: not held cordoned.
@@ -1647,7 +1728,7 @@ fn a_server_that_fails_again_is_stopped_at_again_until_skipped() {
     sw.until(10, |s| !s.rollout().paused.is_empty());
     let r = sw.rollout();
     assert_eq!((r.pause, r.pause_host), (Pause::Failed, 2), "{r:#?}");
-    assert!(r.paused.contains("node-a (the canary): update failed again: dryserver failed: exit status 1: broken disk"), "{}", r.paused);
+    assert!(r.paused.contains("node-a (the canary): update reverted again: release 10 reverted (the apply failed: dryserver failed: exit status 1: broken disk"), "{}", r.paused);
     assert_eq!(sw.server(2).fake.sim().applied.len(), 2);
     assert!(sw.server(3).fake.sim().applied.is_empty());
     // Resumed twice: tried twice more.
@@ -1661,7 +1742,7 @@ fn a_server_that_fails_again_is_stopped_at_again_until_skipped() {
     assert!(r.warnings.iter().any(|w| w == "resumed: node-a is passed over for release 10"), "{r:#?}");
     assert!(!r.cordoned.contains(&"node-a".to_string()));
     assert_eq!((sw.installed(2), sw.server(2).fake.sim().applied.len()), (0, 3));
-    assert!(sw.lines().contains("Passed over: node-a: node-a (the canary): update failed again"), "{}", sw.lines());
+    assert!(sw.lines().contains("Passed over: node-a: node-a (the canary): update reverted again"), "{}", sw.lines());
 }
 
 /// Resumed while it is switched off: the others go on, and it tries again
@@ -2458,4 +2539,112 @@ fn update_status_is_read_leniently() {
     // Nothing pending; fields of the wrong kind read as empty.
     let s: UpdateStatus = serde_json::from_str(r#"{"installed":{"serial":"x"},"pending":null,"last":5}"#).unwrap();
     assert_eq!((s.installed.serial, s.pending_serial(), s.last), (0, 0, None));
+}
+
+// ---- the detached apply ----
+
+#[test]
+fn an_apply_that_takes_its_time_is_waited_for() {
+    // Loading and installing the packages take many minutes; the apply runs
+    // in a service of its own, and the server keeps syncing meanwhile.
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().slow = 15;
+    sw.publish(10, true);
+    sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+    for _ in 0..8 {
+        sw.tick();
+        assert!(sw.server(2).fake.sim().confirmed.is_empty(), "confirmed while its apply still ran");
+        let r = sw.store.read().unwrap().members.iter().find(|m| m.host == 2).unwrap().report.clone().unwrap();
+        assert_eq!((r.update.as_str(), r.update_serial), ("pending", 10), "{r:?}");
+    }
+    sw.until_unpaused(40, |s| s.everyone_on(10));
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 1, "started once");
+}
+
+#[test]
+fn a_dead_mirror_postpones_and_is_tried_again() {
+    // Nothing changed when the packages could not be loaded: tried again,
+    // not a failed release.
+    let mut sw = Swarm::new(2);
+    sw.brain.fake.sim().postpone = 2;
+    sw.server(2).fake.sim().postpone = 3;
+    sw.publish(10, true);
+    sw.until_unpaused(60, |s| s.everyone_on(10));
+    assert_eq!(sw.brain.fake.sim().applied.len(), 3);
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 4);
+    // One that never works fails after MAX_TRIES, and stops the rollout.
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().postpone = 1000;
+    sw.publish(10, true);
+    sw.until(60, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert!(r.pause == Pause::Failed && r.paused.contains("update failed") && r.paused.contains("syncs in a row"), "{}", r.paused);
+    assert_eq!(sw.server(2).fake.sim().applied.len(), MAX_TRIES as usize);
+}
+
+#[test]
+fn a_release_the_apply_refuses_stops_the_rollout() {
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().refuse = Some("pacman would not take every package from the pinned snapshot".into());
+    sw.publish(10, true);
+    sw.until(30, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert!(r.pause == Pause::Failed && r.paused.contains("update refused") && r.paused.contains("pinned snapshot"), "{}", r.paused);
+    assert_eq!(sw.server(2).fake.sim().applied.len(), 1, "not tried again by itself");
+}
+
+#[test]
+fn an_apply_that_stopped_part_way_goes_back_at_once() {
+    // Killed in the middle (its record says installing, nothing runs): the
+    // next sync reverts it instead of waiting for its timer.
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().dies = true;
+    sw.publish(10, true);
+    sw.until(30, |s| !s.rollout().paused.is_empty());
+    let r = sw.rollout();
+    assert!(r.pause == Pause::Failed && r.paused.contains("update reverted") && r.paused.contains("reverted by hand"), "{}", r.paused);
+    let s = sw.server(2).fake.sim();
+    assert!(s.pending == 0 && s.confirmed.is_empty(), "never confirmed");
+}
+
+#[test]
+fn an_update_that_reboots_is_confirmed_after_the_restart() {
+    let mut sw = Swarm::new(1);
+    sw.server(2).fake.sim().reboot = true;
+    sw.publish(10, true);
+    sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+    sw.ticks(5);
+    assert!(sw.server(2).fake.sim().confirmed.is_empty(), "confirmed before the reboot it waits for");
+    sw.server(2).fake.sim().boots = 1;
+    sw.until_unpaused(10, |s| s.everyone_on(10));
+}
+
+#[test]
+fn an_old_rollback_sent_again_does_not_move_a_fresh_machine_below_its_install() {
+    // The swarm took its first look now; a rollback signed two days ago, of
+    // a dryserver older than the one the machines run, is an old one sent
+    // again: refused, by the coordinator already.
+    let mut sw = Swarm::new(1);
+    sw.tick();
+    let bin = b"\x7fELF dryserver 0.0.1, old".to_vec();
+    let r = Release {
+        serial: 9,
+        created: sw.now - 2 * release::DAY,
+        expires: sw.now + release::DAY,
+        dryserver: release::Binary { version: "0.0.1".into(), sha256: sha(&bin), size: bin.len() as u64 },
+        k3s: release::K3s { version: K3S_VERSION.into(), sha256: sha(K3S) },
+        arch_date: "2026/11/19".into(),
+        rollback: true,
+        urgent: true,
+        notes: "old".into(),
+    };
+    sw.upload(&release::seal(&ADMIN, &r).unwrap(), &bin, None).unwrap();
+    sw.ticks(3);
+    let ro = sw.rollout();
+    assert!(ro.refused.contains("below what this machine was installed with"), "{ro:#?}");
+    assert!(sw.brain.fake.sim().applied.is_empty() && sw.server(2).fake.sim().applied.is_empty());
+    // A rollback signed now (after the first look) goes through.
+    let r = Release { serial: 10, created: sw.now - 60, ..r };
+    sw.upload(&release::seal(&ADMIN, &r).unwrap(), &bin, None).unwrap();
+    sw.until_unpaused(30, |s| s.everyone_on(10));
 }
