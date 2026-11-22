@@ -813,7 +813,9 @@ then a reboot when the packages need one. A release that keeps the k3s
 binary and the day restarts no k3s and runs no pacman, so a dryserver fix
 stays quick. The rollout runs it as `sudo dryserver update apply --detach
 --reboot ...` (in a service of its own, `dryserver-update-apply`, so the
-minute sync goes on and stopping the sync never stops pacman), and follows
+minute sync goes on and stopping the sync never stops pacman; the new
+dryserver's steps and pacman go on even when the apply itself dies, and
+its revert timer settles the update after them), and follows
 it with `dryserver update status`. By hand, `sudo dryserver update apply
 --release FILE --binary FILE [--k3s FILE]` runs in the terminal and reboots
 only with `--reboot`.

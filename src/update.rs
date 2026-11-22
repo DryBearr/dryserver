@@ -2087,13 +2087,17 @@ fn keep_boot_guard(m: &Machine, ctx: &Ctx, rebooting: bool) -> Result<()> {
 /// own (APPLY_UNIT) and returns once it runs. The sync that starts it stays
 /// responsive while pacman works, and stopping or killing the sync never
 /// stops pacman half way. The service's own stop (a shutdown, systemctl
-/// stop) sends SIGINT to the apply alone (KillMode=mixed), which passes it
-/// on to the new binary's step and that to pacman alone: pacman then stops
-/// between two packages, and the hooks it runs (mkinitcpio, ukify making a
-/// boot image) are never interrupted. With the default, every process of
-/// the service got SIGINT, those hooks too. What is left after
-/// APPLY_STOP_TIME is killed. `update status` says how it goes (busy, then
-/// pending or last).
+/// stop) sends SIGINT to the apply alone (KillMode=process), which passes
+/// it on to the new binary's step and that to pacman alone: pacman then
+/// stops between two packages, and the hooks it runs (mkinitcpio, ukify
+/// making a boot image) are never interrupted. With the default, every
+/// process of the service got SIGINT, those hooks too. Only the apply
+/// itself is killed after APPLY_STOP_TIME, or when it dies (out of memory):
+/// the new binary's step and pacman go on and finish, holding the update
+/// lock they were handed, so no revert starts under them; the apply's
+/// timer then settles the update (guard_timer). With KillMode=mixed they
+/// were killed with it, pacman in the middle of a package. `update status`
+/// says how it goes (busy, then pending or last).
 pub fn start_detached(m: &Machine, ctx: &Ctx, a: &Apply, out: &mut dyn Write) -> Result<()> {
     if !(MIN_WINDOW..=MAX_WINDOW).contains(&a.window) {
         bail!("the window must be between {MIN_WINDOW} and {MAX_WINDOW} seconds, not {}", a.window);
@@ -2109,7 +2113,7 @@ pub fn start_detached(m: &Machine, ctx: &Ctx, a: &Apply, out: &mut dyn Write) ->
         "--collect".into(),
         "--service-type=exec".into(),
         "--property=KillSignal=SIGINT".into(),
-        "--property=KillMode=mixed".into(),
+        "--property=KillMode=process".into(),
         format!("--property=TimeoutStopSec={APPLY_STOP_TIME}"),
         format!("--description=Apply dryserver release {}", a.release.display()),
         m.shown(SERVER_BIN),
@@ -2796,6 +2800,12 @@ pub fn guard_timer(m: &Machine, ctx: &Ctx, id: &str, applying: bool, now: i64, o
             revert(m, &rctx, p, &why, false, now, out, Undo::Revert)
         }
         STAGE_ARMED => {
+            // The window's timer is the new binary's. The binary that
+            // started the update armed one of its own when the new one was
+            // done (kept_in_hand), unless it died before: then this one
+            // (it runs first) does; one that is there already stays.
+            let left = (p.deadline - now).clamp(1, p.window.clamp(MIN_WINDOW, MAX_WINDOW));
+            let _ = arm(m, &rctx, Timer::Started, &p.id, p.serial, left, false);
             say(out, format!("release {} finished applying; its confirm window has a timer of its own", p.serial));
             Ok(())
         }
@@ -5587,7 +5597,7 @@ mod tests {
             "--unit=dryserver-update-apply",
             "--collect",
             "--property=KillSignal=SIGINT",
-            "--property=KillMode=mixed",
+            "--property=KillMode=process",
             "--property=TimeoutStopSec=30min",
             "/usr/local/bin/dryserver update apply --release /tmp/release-8.json --binary",
             "--k3s /tmp/k3s-8",
@@ -5830,8 +5840,13 @@ mod tests {
         let lab = Lab::new();
         lab.apply(&rel(7, NEW)).unwrap();
         let p = lab.pending().unwrap();
+        lab.fake.ran.lock().unwrap().clear();
         guard_timer(&lab.m(), &Ctx::new(), &p.id, true, p.deadline - 1, &mut Vec::new()).unwrap();
         assert!(lab.pending().is_some(), "within the window the window's timers decide");
+        // One of them its own, also when the apply died before it armed it
+        // (out of memory): the new binary's step went on without it.
+        let timer = format!("systemd-run --unit=dryserver-update-revert-{}-started --on-active=1s", p.id);
+        assert!(lab.fake.has(&timer), "{:#?}", lab.fake.ran());
         guard_timer(&lab.m(), &Ctx::new(), &p.id, true, p.deadline + 3 * 3600, &mut Vec::new()).unwrap();
         assert!(lab.pending().is_none(), "only the new binary's own timer would revert it");
         lab.assert_old("reverted by the apply's timer");
