@@ -27,6 +27,10 @@ pub struct Cmd {
     pub stdout_only: bool,
     /// What the command gets when its context is done.
     pub stop: Stop,
+    /// An open descriptor of this process the command keeps (every other
+    /// one closes as it starts): the update lock, so it stays held while
+    /// the step that runs under it does, also when this process dies.
+    pub keep_fd: Option<i32>,
 }
 
 /// How a running command is stopped when its context is done.
@@ -64,6 +68,12 @@ impl Cmd {
     /// Stopped with SIGINT instead of SIGKILL (see Stop::Interrupt).
     pub fn interrupt(mut self, grace: Option<Duration>) -> Cmd {
         self.stop = Stop::Interrupt(grace);
+        self
+    }
+
+    /// The command keeps fd open (see Cmd::keep_fd).
+    pub fn keep_fd(mut self, fd: Option<i32>) -> Cmd {
+        self.keep_fd = fd;
         self
     }
 }
@@ -136,6 +146,20 @@ type Exec = (String, String, Result<()>);
 fn exec(ctx: &Ctx, c: &Cmd, emit: LogFn) -> Result<Exec> {
     let mut cmd = Command::new(&c.name);
     cmd.args(&c.args);
+    if let Some(fd) = c.keep_fd {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: runs in the child between fork and exec, and calls only
+        // fcntl, which is async-signal-safe; it clears close-on-exec on one
+        // descriptor of the child's own copy of the table.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     for e in &c.env {
         if let Some((k, v)) = e.split_once('=') {
             cmd.env(k, v);
@@ -442,5 +466,22 @@ mod tests {
         assert!(res.unwrap_err().to_string().contains("signal: killed"));
         let took = start.elapsed();
         assert!(took >= Duration::from_millis(250) && took < Duration::from_secs(5), "{took:?}");
+    }
+
+    #[test]
+    fn a_command_keeps_only_the_descriptor_it_is_given() {
+        use std::os::fd::AsRawFd;
+        let dir = crate::testutil::TempDir::new();
+        let f = std::fs::File::create(dir.path().join("lock")).unwrap();
+        let fd = f.as_raw_fd();
+        let r = ExecRunner::silent();
+        let ctx = Ctx::new();
+        let look = format!("test -e /proc/self/fd/{fd}");
+        // Opened by Rust with close-on-exec: a child does not get it...
+        assert!(r.ok(&ctx, &Cmd::new("sh", &["-c", &look])).is_err());
+        // ...unless it is told to keep it, and this process keeps its own
+        // close-on-exec flag for the commands after.
+        r.ok(&ctx, &Cmd::new("sh", &["-c", &look]).keep_fd(Some(fd))).unwrap();
+        assert!(r.ok(&ctx, &Cmd::new("sh", &["-c", &look])).is_err());
     }
 }

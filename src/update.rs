@@ -6,49 +6,91 @@
 //! unreachable, so every update reverts by itself unless it is confirmed in
 //! time.
 //!
-//! `update apply`, step by step:
+//! `update apply`, step by step. The binary that runs it (the old one)
+//! only checks and hands over; the new binary does everything else, so a
+//! fix to the k3s, Arch or reboot code reaches a machine with the very
+//! release that carries it:
 //!
-//! 1. Checks the release against the installed one, the binaries against
-//!    the release (copied into a directory only root can write), and, when
-//!    the packages go to another snapshot day, pacman's settings and the
-//!    room on disk (osupdate::arch_check). Refusals change nothing.
-//! 2. Writes a pending record and arms a revert timer that covers the
+//! 1. The old binary checks the release against the installed one and
+//!    what runs (signature, serial, the floor, the k3s skew), and the new
+//!    binary against the release (copied into a directory only root can
+//!    write). Refusals change nothing.
+//! 2. It writes a pending record and arms a revert timer that covers the
 //!    whole apply. From then on, whatever happens (an error, Ctrl-C, a lost
 //!    SSH session, a power cut), the machine goes back to what it ran before
 //!    unless the update finishes and is confirmed in time.
-//! 3. Loads the packages before anything else changes: the mirrorlist is
-//!    pinned to the release's day (recorded like any file the update
-//!    writes) and pacman refreshes its lists and the signing keys and
-//!    downloads everything (osupdate::arch_download). A dead or slow mirror
-//!    ends the update here with the mirrorlist put back: "postponed",
+//! 3. It copies the new binary next to the installed one under a
+//!    temporary name (NEW_BIN) and runs its self check there.
+//! 4. The new binary, from that copy (`update prepare`), decides the k3s
+//!    and Arch steps and checks what they need (pacman's settings, the room
+//!    on disk, no other pacman at work: osupdate::arch_check; the k3s
+//!    binary, staged), and loads the packages before anything else changes:
+//!    the mirrorlist is pinned to the release's day (recorded like any file
+//!    the update writes) and pacman refreshes its lists and the signing keys
+//!    and downloads everything (osupdate::arch_download). A dead or slow
+//!    mirror ends the update here with the mirrorlist put back: "postponed",
 //!    tried again later, not a failed release. The signing keys may stay
 //!    newer: they only ever move forward.
-//! 4. Copies the new binary next to the installed one under a temporary
-//!    name and runs its self check there. Only then does it take the
-//!    installed name, by a rename: a power cut leaves the old or the new
-//!    binary, never half of one. The old one stays as dryserver.prev.
-//! 5. Hands over to the new binary (`update activate`), which renders the
-//!    system files from config.env with its own code, writes those that
-//!    changed (each atomically, its old content kept), checks them with the
-//!    real tools (nft -c, sshd -t, visudo -c, systemd-analyze verify), runs
-//!    the state migrations it knows, and reloads only what changed. sshd is
-//!    reloaded, never restarted: running sessions stay.
-//! 6. Installs the release's k3s when this machine runs another one (by its
-//!    checksum, whatever the records say) and waits until k3s is healthy
-//!    with it (osupdate::k3s_install); the k3s that ran before is kept to go
-//!    back to.
-//! 7. Installs the packages (osupdate::arch_install), the one step a revert
-//!    cannot undo, last. pacman is never killed while it installs.
-//! 8. Records the release as installed, and starts the confirm window: the
-//!    timer is armed again with the window, which counts from now.
-//! 9. Reboots, when the new packages need it (a new kernel, glibc,
-//!    systemd...), the run finished, the boot images are current, the
-//!    machine can come back by itself, and it was allowed (`--reboot`, the
-//!    rollout's apply). Once: the record is armed, so the boot unit and a
-//!    confirm after the reboot carry the update across it.
+//! 5. The old binary puts the new one in place, by a rename: a power cut
+//!    leaves the old or the new binary, never half of one. The old one
+//!    stays as dryserver.prev.
+//! 6. The new binary, now the installed one (`update activate`), renders
+//!    the system files from config.env, writes those that changed (each
+//!    atomically, its old content kept), checks them with the real tools
+//!    (nft -c, sshd -t, visudo -c, systemd-analyze verify), runs the state
+//!    migrations it knows, and reloads only what changed. sshd is reloaded,
+//!    never restarted: running sessions stay.
+//! 7. It installs the release's k3s when this machine runs another one (by
+//!    its checksum, whatever the records say) and waits until k3s is
+//!    healthy with it (osupdate::k3s_install); the k3s that ran before is
+//!    kept to go back to.
+//! 8. It installs the packages (osupdate::arch_install), the one step a
+//!    revert cannot undo, last. pacman is never killed while it installs.
+//! 9. It records the release as installed, and starts the confirm window:
+//!    the timer is armed again with the window, which counts from now.
+//! 10. It reboots, when the new packages need it (a new kernel, glibc,
+//!     systemd...), the run finished, the boot images are current, the
+//!     machine can come back by itself, and it was allowed (`--reboot`, the
+//!     rollout's apply). Once: the record is armed, so the boot unit and a
+//!     confirm after the reboot carry the update across it.
 //!
-//! A release that keeps the k3s binary and the snapshot day restarts no k3s
-//! and runs no pacman: a dryserver fix stays fast.
+//! When a step of the new binary fails, the old binary goes back (its
+//! revert, as below). A release that keeps the k3s binary and the snapshot
+//! day restarts no k3s and runs no pacman: a dryserver fix stays fast.
+//!
+//! The handover, the contract between any two dryserver binaries (one may
+//! be years older than the other); every later version keeps it:
+//! - `NEW update handover` prints the highest protocol NEW speaks (a
+//!   number; HANDOVER). A binary from before the handover fails on it: it
+//!   counts as 0. The old binary uses the lower of that and its own, and
+//!   writes it into the record (Pending::handover). A binary keeps
+//!   speaking every protocol from 1 up to its own.
+//! - Protocol 1: the old binary passes the record's id and nothing else:
+//!   `NEW update prepare --id ID` run from NEW_BIN at stage "preparing",
+//!   then `NEW update activate --id ID` run as SERVER_BIN at stage
+//!   "installing". The new binary reads all it needs from the record (the
+//!   release envelope, k3s_file, brain_k3s, may_reboot, window) and keeps
+//!   its own notes between its two steps in Pending::work. A failed
+//!   prepare sets Pending::why and Pending::again (postponed when true),
+//!   exits non-zero, and the old binary reverts. activate exits zero once
+//!   the record is armed and the release recorded as applied; non-zero, and
+//!   the old binary reverts.
+//! - Protocol 0 (either binary from before the handover): the old binary
+//!   runs steps 4 and 7 to 10 itself, and `update activate` writes the
+//!   files only. A binary of this version does so when it hands over to an
+//!   older one (a rollback), and does only the files when an older one
+//!   hands over to it (the record says 0).
+//! - The record's fields only grow (PENDING_FORMAT); a binary keeps the
+//!   ones it does not know (Pending::rest), and the revert of any version
+//!   puts back what the files list says.
+//! - The update lock is kept open across the handover (Cmd::keep_fd) and
+//!   by pacman's install: while any of them runs, the lock is held, also
+//!   when the process that took it died, and no revert starts under them.
+//!
+//! The first release with the handover is applied by binaries without it,
+//! which run its k3s and Arch steps with their own code: that release best
+//! keeps k3s and the Arch day (dryserver only); the next ones get the new
+//! code all the way.
 //!
 //! `update confirm` makes it final once the self check passes. Without it,
 //! the timer reverts: old binary, old files (the mirrorlist among them),
@@ -169,7 +211,22 @@ const APPLY_STOP_TIME: &str = "30min";
 /// (no clock battery) would otherwise get a fresh window each time.
 pub const MAX_BOOTS: u32 = 3;
 const SELFCHECK_TIME: Duration = Duration::from_secs(60);
+/// `update activate` of a binary from before the handover: the files only.
 const ACTIVATE_TIME: Duration = Duration::from_secs(180);
+/// The handover this binary speaks (see the module): the highest protocol
+/// it answers `update handover` with, and the one it uses with a new
+/// binary that speaks it too.
+pub const HANDOVER: u32 = 1;
+/// How long the new binary's `update prepare` (the checks, the refresh and
+/// the download, each with limits of its own) may take before it is asked
+/// to stop (SIGINT), and how long it then gets before it is killed: it has
+/// installed nothing.
+const PREPARE_TIME: Duration = Duration::from_secs(3 * 3600);
+const PREPARE_GRACE: Duration = Duration::from_secs(10 * 60);
+/// How long the new binary's `update activate` (files, k3s, the packages)
+/// may take before it is asked to stop. It is never killed: pacman may be
+/// installing under it.
+const HANDOVER_TIME: Duration = Duration::from_secs(8 * 3600);
 const REVERT_TIME: Duration = Duration::from_secs(180);
 /// The longest an update command waits for another one to finish.
 const LOCK_WAIT: Duration = Duration::from_secs(60);
@@ -341,6 +398,31 @@ pub struct Pending {
     /// only after that reboot.
     #[serde(default)]
     pub reboot: bool,
+    /// The handover (see the module): the protocol the binary that started
+    /// the update and the new one both speak; 0 when it was started by, or
+    /// handed to, a binary from before it.
+    #[serde(default)]
+    pub handover: u32,
+    /// What `update apply` was asked besides the release, for the new
+    /// binary: the k3s binary given (--k3s, "" none), the coordinator's
+    /// k3s the release was checked against, and whether it may reboot.
+    #[serde(default)]
+    pub k3s_file: String,
+    #[serde(default)]
+    pub brain_k3s: String,
+    #[serde(default)]
+    pub may_reboot: bool,
+    /// Set by the new binary when its `update prepare` fails: why, and
+    /// whether another try later may work (postponed, not refused).
+    #[serde(default)]
+    pub why: String,
+    #[serde(default)]
+    pub again: bool,
+    /// What the new binary's `update prepare` decided and loaded, for its
+    /// `update activate`. Its format is that binary's own; other binaries
+    /// keep it as it is.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub work: serde_json::Value,
     /// Fields a newer binary added: kept when an older one rewrites the
     /// record.
     #[serde(flatten)]
@@ -1315,6 +1397,7 @@ fn host<'a>(m: &'a Machine, log: &HostLog) -> osupdate::Host<'a> {
         owner: m.owner,
         limits: m.limits.clone(),
         hook: m.hook.clone(),
+        lock_fd: None,
     }
 }
 
@@ -1355,19 +1438,31 @@ struct Refusal {
     err: Error,
 }
 
-/// What an apply is to do, decided before it changes anything.
-struct Plan {
+/// What the binary that runs `update apply` checked before it hands over:
+/// the signed release, and the new binary staged and checked against it.
+struct Intake {
     env: Envelope,
     rel: Release,
-    role: Role,
     previous: Option<u64>,
     staged: PathBuf,
     prev_sha256: String,
+    /// The coordinator's k3s the release was checked against (a server).
+    brain_k3s: String,
+}
+
+/// The k3s and Arch steps of an update, decided and loaded by the binary
+/// that carries them out (the new one: see the handover) before anything
+/// but the mirrorlist changed, and installed once it took over the files.
+/// Between its two steps it waits in the record (Pending::work); its
+/// format is that binary's own.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Work {
     /// The k3s step: the staged binary (None: the release's is in place,
     /// its check still due), and the checksum of the k3s to go back to.
     k3s: Option<(Option<PathBuf>, String)>,
-    /// The packages go to the release's snapshot day: checked, to be
-    /// loaded and installed.
+    /// The packages go to the release's snapshot day: checked and loaded,
+    /// to be installed.
     arch: Option<ArchOutcome>,
 }
 
@@ -1386,9 +1481,11 @@ fn refused(m: &Machine, out: &mut dyn Write, now: i64, r: Refusal) -> Error {
     r.err
 }
 
-/// Checks the release and decides what the apply does. Changes nothing
-/// but the staging directory (and clears a stale pacman lock).
-fn plan(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, log: &HostLog, out: &mut dyn Write) -> std::result::Result<Option<Plan>, Refusal> {
+/// The checks of the binary that runs `update apply`: the release (its
+/// signature, against what is installed and what runs), and the new binary
+/// staged and checked against it. Changes nothing but the staging
+/// directory.
+fn intake(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, out: &mut dyn Write) -> std::result::Result<Option<Intake>, Refusal> {
     let early = |again: bool| move |err: Error| Refusal { serial: 0, again, err };
     refuse_if_cut(m).map_err(early(true))?;
     let env = read_envelope(&a.release).map_err(early(false))?;
@@ -1419,7 +1516,7 @@ fn plan(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, log: &HostLog, out: &mut dy
         None => Place::Brain,
         Some(b) => Place::Worker { brain_k3s: b },
     };
-    let (since, pinned) = start_of(m, now);
+    let (since, _) = start_of(m, now);
     let start = release::Start { since };
     let (rel, verdict) =
         release::check_from(m.verifier.as_ref(), &env, installed.as_ref().map(|(_, r)| r), start, place, now).map_err(early(false))?;
@@ -1441,10 +1538,26 @@ fn plan(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, log: &HostLog, out: &mut dy
     }
     let serial = rel.serial;
     let no = move |err: Error| Refusal { serial, again: false, err };
+    let staged = stage(m, &a.binary, &rel).map_err(no)?;
+    release::verify_file(&staged, &rel.dryserver.sha256, rel.dryserver.size)
+        .map_err(|e| no(e.wrap("the binary is not the one the release names")))?;
+    let (prev_sha256, _) =
+        release::hash_file(&m.path(SERVER_BIN), release::MAX_BINARY).map_err(|e| no(e.wrap("the installed dryserver")))?;
+    let previous = installed.as_ref().map(|(_, r)| r.serial);
+    Ok(Some(Intake { env, rel, previous, staged, prev_sha256, brain_k3s: brain.unwrap_or_default() }))
+}
+
+/// Decides the k3s and Arch steps of release rel and checks what they
+/// need: pacman (osupdate::arch_check: its settings, the room on disk, no
+/// other pacman at work) and the k3s binary, staged from k3s_file. Changes
+/// nothing but the staging directory (and clears a stale pacman lock).
+/// Err: whether another try later may work, and why.
+fn plan_work(m: &Machine, rel: &Release, k3s_file: &str, log: &HostLog, out: &mut dyn Write) -> std::result::Result<Work, (bool, Error)> {
+    let now = m.now();
+    let installed = load_installed(m).map_err(|e| (false, e))?.is_some();
+    let (since, pinned) = start_of(m, now);
     let host = host(m, log);
-    // The packages first: their checks are quick, and a pacman at work or
-    // a full disk ends the apply before anything large is copied.
-    let arch = if let Some(day) = pinned.as_deref().filter(|p| newer_here(p, &rel, installed.is_some(), since)) {
+    let arch = if let Some(day) = pinned.as_deref().filter(|p| newer_here(p, rel, installed, since)) {
         tell(
             m,
             out,
@@ -1459,7 +1572,7 @@ fn plan(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, log: &HostLog, out: &mut dy
         let o = host.arch_check(&rel.arch_date, rel.rollback);
         log.flush(m, out);
         if let Some(f) = &o.failure {
-            return Err(Refusal { serial, again: f.again, err: f.reason.clone() });
+            return Err((f.again, f.reason.clone()));
         }
         for w in &o.warnings {
             tell(m, out, now, &format!("warning: {w}"));
@@ -1468,23 +1581,64 @@ fn plan(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, log: &HostLog, out: &mut dy
     } else {
         None
     };
-    let staged = stage(m, &a.binary, &rel).map_err(no)?;
-    release::verify_file(&staged, &rel.dryserver.sha256, rel.dryserver.size)
-        .map_err(|e| no(e.wrap("the binary is not the one the release names")))?;
-    let (prev_sha256, _) =
-        release::hash_file(&m.path(SERVER_BIN), release::MAX_BINARY).map_err(|e| no(e.wrap("the installed dryserver")))?;
     // k3s by what this machine runs, whatever its records say.
     let sha_of = |p: &str| release::hash_file(&m.path(p), osupdate::MAX_K3S).ok().map(|(h, _)| h);
     let running = sha_of(K3S_BIN);
     let k3s = if running.as_deref() == Some(rel.k3s.sha256.as_str()) {
         host.k3s_unchecked(&rel.k3s.sha256).then(|| (None, sha_of(osupdate::K3S_PREV).unwrap_or_default()))
     } else {
-        let src = a.k3s.as_ref().ok_or_else(|| {
-            no(errf!("release {serial} names k3s {} and this machine runs another one: give its binary with --k3s", rel.k3s.version))
-        })?;
-        Some((Some(stage_k3s(m, src, &rel).map_err(no)?), running.unwrap_or_default()))
+        if k3s_file.is_empty() {
+            let e =
+                errf!("release {} names k3s {} and this machine runs another one: give its binary with --k3s", rel.serial, rel.k3s.version);
+            return Err((false, e));
+        }
+        Some((Some(stage_k3s(m, Path::new(k3s_file), rel).map_err(|e| (false, e))?), running.unwrap_or_default()))
     };
-    Ok(Some(Plan { env, rel, role, previous: installed.as_ref().map(|(_, r)| r.serial), staged, prev_sha256, k3s, arch }))
+    Ok(Work { k3s, arch })
+}
+
+/// The steps before the new binary takes over the files: plan_work, then
+/// the packages are loaded (the mirrorlist pinned through the record
+/// first). Err: whether another try later may work, and why.
+fn prepare_work(
+    m: &Machine,
+    ctx: &Ctx,
+    p: &mut Pending,
+    rel: &Release,
+    log: &HostLog,
+    out: &mut dyn Write,
+) -> std::result::Result<Work, (bool, Error)> {
+    let mut w = plan_work(m, rel, &p.k3s_file, log, out)?;
+    let mut what = Vec::new();
+    if w.k3s.is_some() {
+        what.push(format!("k3s {}", rel.k3s.version));
+    }
+    if let Some(o) = &w.arch {
+        what.push(format!("the Arch packages of {}", o.date));
+        p.arch_date = o.date.clone();
+        save_pending(m, p).map_err(|e| (true, e))?;
+    }
+    if !what.is_empty() {
+        tell(m, out, m.now(), &format!("release {} brings {} too", rel.serial, what.join(" and ")));
+    }
+    // The packages are loaded before anything else changes: a dead or slow
+    // mirror ends the update here, with only the mirrorlist to put back.
+    if let Some(o) = w.arch.as_mut() {
+        prepare_arch(m, ctx, p, o, log, out)?;
+    }
+    Ok(w)
+}
+
+/// The handover protocol the binary at bin speaks (`update handover`; see
+/// the module), 0 for one from before it: a rollback to an older
+/// dryserver, which only writes the files and expects the rest of the
+/// update of the binary that started it.
+fn handover_of(m: &Machine, ctx: &Ctx, bin: &Path) -> u32 {
+    let (o, res) = m.run.run(&ctx.with_timeout(SELFCHECK_TIME), &Cmd::new(&bin.display().to_string(), &["update", "handover"]));
+    if res.is_err() {
+        return 0;
+    }
+    o.split_whitespace().next().and_then(|w| w.parse().ok()).unwrap_or(0)
 }
 
 /// Installs and checks the release in envelope `release` with the binary
@@ -1497,39 +1651,42 @@ pub fn apply(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, out: &mut dyn Write) -
         bail!("the window must be between {MIN_WINDOW} and {MAX_WINDOW} seconds, not {}", a.window);
     }
     ensure_dirs(m)?;
-    let _lock = lock_wait(m, ctx, APPLY_LOCK_WAIT)?;
-    let log = HostLog::default();
-    let mut plan = match plan(m, ctx, a, now, &log, out) {
-        Ok(Some(p)) => p,
+    let lock = lock_wait(m, ctx, APPLY_LOCK_WAIT)?;
+    let i = match intake(m, ctx, a, now, out) {
+        Ok(Some(i)) => i,
         Ok(None) => return Ok(()),
         Err(r) => return Err(refused(m, out, now, r)),
     };
-    let rel = plan.rel.clone();
+    let rel = i.rel.clone();
     let serial = rel.serial;
     if let Err(e) = ensure_boot_guard(m, ctx) {
         let err = e.wrap("cannot install the boot half of the revert guard, nothing was changed");
         return Err(refused(m, out, now, Refusal { serial, again: true, err }));
     }
+    let k3s_file = match &a.k3s {
+        Some(k) => std::path::absolute(k).unwrap_or_else(|_| k.clone()).display().to_string(),
+        None => String::new(),
+    };
     let mut p = Pending {
         format: PENDING_FORMAT,
         id: fsx::hex(&fsx::random_bytes(8)),
-        stage: if plan.arch.is_some() { STAGE_PREPARING } else { STAGE_INSTALLING }.into(),
+        stage: STAGE_PREPARING.into(),
         serial,
         version: rel.dryserver.version.clone(),
-        previous: plan.previous,
-        release: plan.env.clone(),
+        previous: i.previous,
+        release: i.env.clone(),
         applied: now,
         deadline: now.saturating_add(APPLY_TIME),
         window: a.window,
         boots: 0,
-        prev_sha256: plan.prev_sha256.clone(),
+        prev_sha256: i.prev_sha256.clone(),
         new_sha256: rel.dryserver.sha256.clone(),
         files: Vec::new(),
         step: "starting".into(),
-        k3s_prev_sha256: String::new(),
-        arch_date: plan.arch.as_ref().map(|o| o.date.clone()).unwrap_or_default(),
-        reboot: false,
-        rest: BTreeMap::new(),
+        k3s_file,
+        brain_k3s: i.brain_k3s.clone(),
+        may_reboot: a.reboot,
+        ..Pending::default()
     };
     let armed = save_pending(m, &p).and_then(|_| arm(m, ctx, Timer::Apply, &p.id, serial, APPLY_TIME, false));
     if let Err(e) = armed {
@@ -1538,56 +1695,98 @@ pub fn apply(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, out: &mut dyn Write) -
         return Err(refused(m, out, now, Refusal { serial, again: true, err }));
     }
     let notes = if rel.notes.is_empty() { String::new() } else { format!(": {}", rel.notes) };
-    let mut what = format!("dryserver {}", rel.dryserver.version);
-    if plan.k3s.is_some() {
-        what += &format!(", k3s {}", rel.k3s.version);
-    }
-    if plan.arch.is_some() {
-        what += &format!(", the Arch packages of {}", rel.arch_date);
-    }
-    tell(m, out, now, &format!("applying release {serial} ({what}){notes}"));
-    // The packages are loaded before anything else changes: a dead or slow
-    // mirror ends the update here, with only the mirrorlist to put back.
-    if let Some(o) = plan.arch.as_mut()
-        && let Err((again, e)) = prepare_arch(m, ctx, &mut p, o, &log, out)
-    {
-        let _ = fs::remove_file(staged_k3s(m, serial));
-        let latest = load_pending(m).ok().flatten().filter(|q| q.id == p.id).unwrap_or(p);
-        let undo = if again { Undo::Postpone } else { Undo::Refuse };
-        return match revert(m, &Ctx::new().with_timeout(REVERT_TIME), latest, &e.to_string(), false, now, out, undo) {
-            Ok(()) => Err(e.wrap(format!("release {serial} not applied, nothing was installed"))),
-            Err(r) => Err(errf!("release {serial} not applied: {e}\nand putting the mirrorlist back did not finish: {r}")),
+    tell(m, out, now, &format!("applying release {serial} (dryserver {}){notes}", rel.dryserver.version));
+    let res = steps(m, ctx, &i, &mut p, Some(lock.as_raw_fd()), out);
+    let _ = fs::remove_file(staged_k3s(m, serial));
+    let Err((undo, e)) = res else {
+        let _ = fs::remove_file(&i.staged);
+        return Ok(());
+    };
+    // The latest record: the new binary may have added files. A fresh
+    // context: when the apply was cancelled (Ctrl-C), the way back must
+    // still run.
+    let latest = load_pending(m).ok().flatten().filter(|q| q.id == p.id).unwrap_or(p);
+    let rctx = Ctx::new().with_timeout(REVERT_TIME);
+    if undo == Undo::Revert {
+        let why = format!("the apply failed: {e}");
+        return match revert(m, &rctx, latest, &why, false, m.now(), out, Undo::Revert) {
+            Ok(()) => Err(e.wrap(format!("release {serial} not applied, this machine runs what it ran before"))),
+            Err(r) => Err(errf!("release {serial} not applied: {e}\nand the way back did not finish: {r}")),
         };
+    }
+    match revert(m, &rctx, latest, &e.to_string(), false, m.now(), out, undo) {
+        Ok(()) => Err(e.wrap(format!("release {serial} not applied, nothing was installed"))),
+        Err(r) => Err(errf!("release {serial} not applied: {e}\nand putting the mirrorlist back did not finish: {r}")),
+    }
+}
+
+/// The part of apply after the record and its timer are there: the new
+/// binary checked next to the installed one, then handed over to (see the
+/// module). Err: how the update goes back, and why.
+fn steps(
+    m: &Machine,
+    ctx: &Ctx,
+    i: &Intake,
+    p: &mut Pending,
+    lock_fd: Option<i32>,
+    out: &mut dyn Write,
+) -> std::result::Result<(), (Undo, Error)> {
+    let back = |e: Error| (Undo::Revert, e);
+    let rel = &i.rel;
+    check_new_binary(m, ctx, &i.staged, rel, out).map_err(back)?;
+    let new = m.path(NEW_BIN);
+    let handover = handover_of(m, ctx, &new).min(HANDOVER);
+    let log = HostLog::default();
+    let mut work = None;
+    if handover >= 1 {
+        p.handover = handover;
+        p.step = "the new dryserver checks what else the release brings, and loads it".into();
+        save_pending(m, p).map_err(back)?;
+        let cmd =
+            Cmd::new(&new.display().to_string(), &["update", "prepare", "--id", &p.id]).interrupt(Some(PREPARE_GRACE)).keep_fd(lock_fd);
+        let (o, res) = m.run.run(&ctx.with_timeout(PREPARE_TIME), &cmd);
+        let _ = out.write_all(o.as_bytes());
+        let q = current(m, &p.id).map_err(back)?;
+        if let Err(e) = res {
+            // The new binary says why, and whether another try may work.
+            // One that died without saying is a release that does not work
+            // here.
+            let (undo, why) = match (q.why.is_empty(), q.again) {
+                (true, _) => (Undo::Refuse, e.wrap("the new dryserver could not prepare the update")),
+                (false, true) => (Undo::Postpone, Error::new(q.why.clone())),
+                (false, false) => (Undo::Refuse, Error::new(q.why.clone())),
+            };
+            *p = q;
+            return Err((undo, why));
+        }
+        *p = q;
+    } else {
+        // A dryserver from before the handover (a rollback to one) only
+        // writes the files: the rest is this binary's, as it expects.
+        let w = prepare_work(m, ctx, p, rel, &log, out).map_err(|(again, e)| (if again { Undo::Postpone } else { Undo::Refuse }, e))?;
+        work = Some(w);
     }
     p.stage = STAGE_INSTALLING.into();
     p.step = format!("installing dryserver {}", rel.dryserver.version);
-    let res = save_pending(m, &p).and_then(|_| finish(m, ctx, &mut plan, &p.id, a, &log, out));
-    let _ = fs::remove_file(staged_k3s(m, serial));
-    match res {
-        Ok(rebooting) => {
-            let _ = fs::remove_file(&plan.staged);
-            let deadline = load_pending(m).ok().flatten().map_or(p.deadline, |q| q.deadline);
-            let msg = format!(
-                "release {serial} is applied. Confirm it before {} (dryserver update confirm), or it reverts by itself",
-                when(deadline)
-            );
-            record(m, out, m.now(), serial, "applied", true, &msg);
-            reboot_after(m, ctx, &plan, rebooting, &p.id, out);
-            Ok(())
-        }
-        Err(e) => {
-            // The latest record: the new binary may have added files.
-            let latest = load_pending(m).ok().flatten().filter(|q| q.id == p.id).unwrap_or(p);
-            // A fresh context: when the apply was cancelled (Ctrl-C), the
-            // way back must still run.
-            let rctx = Ctx::new().with_timeout(REVERT_TIME);
-            let why = format!("the apply failed: {e}");
-            match revert(m, &rctx, latest, &why, false, m.now(), out, Undo::Revert) {
-                Ok(()) => Err(e.wrap(format!("release {serial} not applied, this machine runs what it ran before"))),
-                Err(r) => Err(errf!("release {serial} not applied: {e}\nand the way back did not finish: {r}")),
-            }
-        }
-    }
+    save_pending(m, p).map_err(back)?;
+    switch_binary(m, rel, out).map_err(back)?;
+    // The new binary takes over: the files, and from a handover on all the
+    // rest. pacman is never killed: a stopped apply passes SIGINT on.
+    let cmd = Cmd::new(&m.shown(SERVER_BIN), &["update", "activate", "--id", &p.id]);
+    let (o, res) = if handover >= 1 {
+        m.run.run(&ctx.with_timeout(HANDOVER_TIME), &cmd.interrupt(None).keep_fd(lock_fd))
+    } else {
+        m.run.run(&ctx.with_timeout(ACTIVATE_TIME), &cmd)
+    };
+    let _ = out.write_all(o.as_bytes());
+    let Some(mut w) = work else {
+        return res.map_err(|e| back(e.wrap("the new dryserver could not finish the update")));
+    };
+    res.map_err(|e| back(e.wrap("the new dryserver could not take over the system files")))?;
+    let role = role_of(m).map_err(back)?;
+    let rebooting = install_work(m, ctx, &p.id, &i.env, rel, role, &mut w, lock_fd, &log, out).map_err(back)?;
+    applied(m, ctx, rel.serial, w.arch.as_ref(), rebooting, &p.id, out);
+    Ok(())
 }
 
 /// `update apply --detach`: starts the apply in a transient service of its
@@ -1674,25 +1873,105 @@ fn current(m: &Machine, id: &str) -> Result<Pending> {
     Ok(p)
 }
 
-/// The part of apply that changes the machine: the binary, the system
-/// files, k3s and the packages, in this order (what a revert puts back
-/// first, what it cannot last). Then the release counts as installed and
-/// the confirm window starts. Returns whether the machine reboots now.
-fn finish(m: &Machine, ctx: &Ctx, plan: &mut Plan, id: &str, a: &Apply, log: &HostLog, out: &mut dyn Write) -> Result<bool> {
-    let rel = plan.rel.clone();
-    install_binary(m, ctx, &plan.staged, &rel, out)?;
-    // The new binary renders and reloads with its own code.
-    let (o, res) = m.run.run(&ctx.with_timeout(ACTIVATE_TIME), &Cmd::new(&m.shown(SERVER_BIN), &["update", "activate", "--id", id]));
-    let _ = out.write_all(o.as_bytes());
-    res.map_err(|e| e.wrap("the new dryserver could not take over the system files"))?;
+/// The update lock as this process got it from the apply that started it
+/// (Cmd::keep_fd), marked close-on-exec again: only pacman's install keeps
+/// it (osupdate::Host::lock_fd). None when there is none.
+fn inherited_lock(m: &Machine) -> Option<i32> {
+    let want = m.path(LOCK);
+    for e in fs::read_dir("/proc/self/fd").ok()?.flatten().take(4096) {
+        let Some(fd) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+        if fs::read_link(e.path()).ok().as_deref() == Some(want.as_path()) {
+            // SAFETY: fcntl on a descriptor of this process; it only sets
+            // its close-on-exec flag.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            return Some(fd);
+        }
+    }
+    None
+}
+
+/// The new binary's record of update id, for its steps: the one being
+/// applied, at stage, handed over in a way this binary knows.
+fn handed(m: &Machine, id: &str, stage: &str, what: &str) -> Result<Pending> {
+    if try_lock(m)?.is_some() {
+        bail!("update {what} is a step of update apply and runs only inside it");
+    }
+    let p = load_pending(m)?.ok_or_else(|| errf!("no update is being applied"))?;
+    if p.id != id || p.stage != stage {
+        bail!("update {id:?} is not the one being applied");
+    }
+    if p.handover > HANDOVER {
+        bail!("update {id:?} hands over the way {} does, which this dryserver does not know (it knows {HANDOVER})", p.handover);
+    }
+    Ok(p)
+}
+
+/// The release in the record, its signature checked again by this binary.
+fn release_of(m: &Machine, p: &Pending) -> Result<Release> {
+    let rel = release::open(m.verifier.as_ref(), &p.release, m.now())?;
+    if rel.serial != p.serial || rel.dryserver.sha256 != p.new_sha256 {
+        bail!("the pending record does not match its release");
+    }
+    Ok(rel)
+}
+
+/// `update prepare`: the new binary's first step (handover), run from its
+/// copy next to the installed one before it takes over: decides and checks
+/// the k3s and Arch steps and loads the packages (prepare_work). On a
+/// failure it says in the record why and whether another try may work;
+/// the binary that started the update puts the mirrorlist back.
+pub fn prepare(m: &Machine, ctx: &Ctx, id: &str, out: &mut dyn Write) -> Result<()> {
+    let mut p = handed(m, id, STAGE_PREPARING, "prepare")?;
+    if p.handover == 0 {
+        bail!("update {id:?} was not handed over to this binary");
+    }
+    let _ = inherited_lock(m);
+    let log = HostLog::default();
+    let res = release_of(m, &p).map_err(|e| (false, e)).and_then(|rel| {
+        refuse_if_cut(m).map_err(|e| (true, e))?;
+        prepare_work(m, ctx, &mut p, &rel, &log, out)
+    });
+    match res {
+        Ok(w) => {
+            p.work = serde_json::to_value(&w)?;
+            p.step = "loaded; the new dryserver takes over next".into();
+            save_pending(m, &p)
+        }
+        Err((again, e)) => {
+            let mut q = current(m, id).unwrap_or(p);
+            q.why = e.to_string();
+            q.again = again;
+            let _ = save_pending(m, &q);
+            Err(e)
+        }
+    }
+}
+
+/// The part of an update after the new binary took over the files: k3s
+/// and the packages, in this order (what a revert puts back first, what it
+/// cannot last). Then the release counts as installed and the confirm
+/// window starts. Returns whether the machine reboots now.
+#[allow(clippy::too_many_arguments)]
+fn install_work(
+    m: &Machine,
+    ctx: &Ctx,
+    id: &str,
+    env: &Envelope,
+    rel: &Release,
+    role: Role,
+    w: &mut Work,
+    lock_fd: Option<i32>,
+    log: &HostLog,
+    out: &mut dyn Write,
+) -> Result<bool> {
     let mut p = current(m, id)?;
-    let host = host(m, log);
-    if let Some((staged, prev)) = &plan.k3s {
+    let host = osupdate::Host { lock_fd, ..host(m, log) };
+    if let Some((staged, prev)) = &w.k3s {
         // Recorded first: a revert from here on puts that k3s back.
         p.k3s_prev_sha256 = prev.clone();
         p.step = format!("installing k3s {}", rel.k3s.version);
         save_pending(m, &p)?;
-        let outcome = host.k3s_install(ctx, staged.as_deref(), &rel.k3s.sha256, &rel.k3s.version, plan.role);
+        let outcome = host.k3s_install(ctx, staged.as_deref(), &rel.k3s.sha256, &rel.k3s.version, role);
         log.flush(m, out);
         match outcome? {
             K3sOutcome::Unchanged | K3sOutcome::Running => {}
@@ -1710,7 +1989,7 @@ fn finish(m: &Machine, ctx: &Ctx, plan: &mut Plan, id: &str, a: &Apply, log: &Ho
         m.at("k3s done")?;
     }
     let mut reboot = false;
-    if let Some(o) = plan.arch.as_mut() {
+    if let Some(o) = w.arch.as_mut() {
         // The last moment to stop before what a revert cannot undo.
         refuse_if_cut(m)?;
         p.step = format!("installing the packages of Arch {}", o.date);
@@ -1724,14 +2003,14 @@ fn finish(m: &Machine, ctx: &Ctx, plan: &mut Plan, id: &str, a: &Apply, log: &Ho
         if !o.ok() {
             bail!("{}", o.summary());
         }
-        reboot = a.reboot && o.reboot_needed() && o.reboot_safe() && host.reboot_blocker().is_none();
+        reboot = p.may_reboot && o.reboot_needed() && o.reboot_safe() && host.reboot_blocker().is_none();
     }
     let mut ch = Changes::new(m, p);
-    ch.put(INSTALLED, 0o600, (serde_json::to_string_pretty(&plan.env)? + "\n").as_bytes())?;
+    ch.put(INSTALLED, 0o600, (serde_json::to_string_pretty(env)? + "\n").as_bytes())?;
     let mut p = ch.p;
     // The confirm window starts now that the apply is done; a reboot gets
     // it the time to come back.
-    let window = if reboot { (a.window + REBOOT_WINDOW).min(MAX_WINDOW) } else { a.window };
+    let window = if reboot { (p.window + REBOOT_WINDOW).min(MAX_WINDOW) } else { p.window };
     arm(m, ctx, Timer::Window, id, rel.serial, window, false).map_err(|e| e.wrap("cannot arm the timer of the confirm window"))?;
     p.stage = STAGE_ARMED.into();
     p.deadline = m.now().saturating_add(window);
@@ -1743,6 +2022,16 @@ fn finish(m: &Machine, ctx: &Ctx, plan: &mut Plan, id: &str, a: &Apply, log: &Ho
     // The apply's own timer has nothing left to do (and would do nothing).
     stop_timer(m, ctx, id, Timer::Apply);
     Ok(reboot)
+}
+
+/// The end of an apply that went well: said and recorded, then the reboot
+/// its packages need.
+fn applied(m: &Machine, ctx: &Ctx, serial: u64, arch: Option<&ArchOutcome>, rebooting: bool, id: &str, out: &mut dyn Write) {
+    let deadline = load_pending(m).ok().flatten().map_or(0, |q| q.deadline);
+    let msg =
+        format!("release {serial} is applied. Confirm it before {} (dryserver update confirm), or it reverts by itself", when(deadline));
+    record(m, out, m.now(), serial, "applied", true, &msg);
+    reboot_after(m, ctx, arch, rebooting, id, out);
 }
 
 /// What the last run did to the packages, kept beside the update records:
@@ -1776,8 +2065,8 @@ fn reboot_reason(kernel: bool, restart: &[String]) -> String {
 /// the record says so, and the confirm waits for the restart) or left to
 /// the admin, and said either way. Never after a failed run: that one
 /// reverted instead.
-fn reboot_after(m: &Machine, ctx: &Ctx, plan: &Plan, rebooting: bool, id: &str, out: &mut dyn Write) {
-    let Some(o) = plan.arch.as_ref().filter(|o| o.reboot_needed()) else { return };
+fn reboot_after(m: &Machine, ctx: &Ctx, arch: Option<&ArchOutcome>, rebooting: bool, id: &str, out: &mut dyn Write) {
+    let Some(o) = arch.filter(|o| o.reboot_needed()) else { return };
     let now = m.now();
     let what = reboot_reason(o.kernel_replaced, &o.restart);
     if !o.reboot_safe() {
@@ -1804,17 +2093,16 @@ fn reboot_after(m: &Machine, ctx: &Ctx, plan: &Plan, rebooting: bool, id: &str, 
     }
 }
 
-/// Puts the staged binary in place of the installed one, keeping that one
-/// as dryserver.prev. The new one has to pass its self check before it
-/// takes the installed name.
-fn install_binary(m: &Machine, ctx: &Ctx, staged: &Path, rel: &Release, out: &mut dyn Write) -> Result<()> {
+/// Copies the staged binary next to the installed one (NEW_BIN) and has it
+/// pass its self check there: what runs is the copy, so the copy is what
+/// is checked. Nothing is switched yet.
+fn check_new_binary(m: &Machine, ctx: &Ctx, staged: &Path, rel: &Release, out: &mut dyn Write) -> Result<()> {
     let new = m.path(NEW_BIN);
     let bin_dir = fsx::dir(m.path(SERVER_BIN));
     let checked = (|| -> Result<()> {
         copy_exact(m, staged, &new, rel.dryserver.size, 0o700, "copy")?;
         fsx::chmod(&new, 0o755)?;
         sync_dir(&bin_dir)?;
-        // The copy is what runs: check it, not only its source.
         release::verify_file(&new, &rel.dryserver.sha256, rel.dryserver.size).map_err(|e| e.wrap("the copy of the new binary"))?;
         m.at("binary copied")?;
         let (o, res) = m.run.run(&ctx.with_timeout(SELFCHECK_TIME), &Cmd::new(&new.display().to_string(), &["selfcheck"]));
@@ -1828,8 +2116,17 @@ fn install_binary(m: &Machine, ctx: &Ctx, staged: &Path, rel: &Release, out: &mu
         let _ = fs::remove_file(&new);
         return Err(e);
     }
-    m.at("binary checked")?;
-    let (bin, prev, prev_tmp) = (m.path(SERVER_BIN), m.path(PREV_BIN), m.path(PREV_TMP));
+    m.at("binary checked")
+}
+
+/// Puts the checked copy (NEW_BIN) in place of the installed binary,
+/// keeping that one as dryserver.prev.
+fn switch_binary(m: &Machine, rel: &Release, out: &mut dyn Write) -> Result<()> {
+    let (bin, prev, prev_tmp, new) = (m.path(SERVER_BIN), m.path(PREV_BIN), m.path(PREV_TMP), m.path(NEW_BIN));
+    let bin_dir = fsx::dir(&bin);
+    // The copy that was checked and ran its first step, still the one the
+    // release names.
+    release::verify_file(&new, &rel.dryserver.sha256, rel.dryserver.size).map_err(|e| e.wrap("the copy of the new binary"))?;
     remove_if_exists(&prev_tmp)?;
     fs::hard_link(&bin, &prev_tmp).map_err(|e| Error::from(e).wrap(format!("link {} {}", bin.display(), prev_tmp.display())))?;
     fsx::rename(&prev_tmp, &prev)?;
@@ -1845,41 +2142,61 @@ fn install_binary(m: &Machine, ctx: &Ctx, staged: &Path, rel: &Release, out: &mu
     Ok(())
 }
 
-/// The new binary's half of apply: renders the system files, writes what
-/// changed, runs the state migrations, checks and reloads. Runs only inside
-/// `update apply`, which holds the lock and reverts when this fails.
+/// `update activate`: the new binary's half of apply, run as the installed
+/// binary once it took that name. It renders the system files, writes what
+/// changed, runs the state migrations, checks and reloads; then, when the
+/// update was handed over to it (from a binary with the handover on), the
+/// rest: k3s, the packages, the release recorded as installed, the confirm
+/// window, the reboot. Runs only inside `update apply`, which holds the
+/// lock and reverts when this fails.
 pub fn activate(m: &Machine, ctx: &Ctx, id: &str, out: &mut dyn Write) -> Result<()> {
-    if try_lock(m)?.is_some() {
-        bail!("update activate is a step of update apply and runs only inside it");
+    let p = {
+        // Sync, join and the kill switch change the mesh files under this
+        // lock; a cut that landed since apply looked counts too. The record
+        // is read under it as well: a revert that ran while this waited for
+        // the lock has cleared it or marked it reverting.
+        if try_lock(m)?.is_some() {
+            bail!("update activate is a step of update apply and runs only inside it");
+        }
+        let _mesh = fsx::lock(m.path(quarantine::MESH_LOCK))?;
+        let p = handed(m, id, STAGE_INSTALLING, "activate")?;
+        refuse_if_cut(m)?;
+        let files = render_managed(m)?;
+        let mut ch = Changes::new(m, p);
+        for f in &files {
+            ch.put(&f.path, f.mode, f.content.as_bytes())?;
+        }
+        let migrated = migrate(&mut ch, m.migrations)?;
+        let changed = ch.changed.clone();
+        validate(m, ctx, &changed)?;
+        reload(m, ctx, &changed)?;
+        if changed.is_empty() {
+            say(out, "no system file changed");
+        }
+        for c in &changed {
+            say(out, format!("changed {c}"));
+        }
+        for w in migrated {
+            say(out, format!("state migrated: {w}"));
+        }
+        ch.p
+    };
+    if p.handover == 0 {
+        // Started by a dryserver from before the handover: it installs k3s
+        // and the packages itself.
+        return Ok(());
     }
-    // Sync, join and the kill switch change the mesh files under this lock;
-    // a cut that landed since apply looked counts too. The record is read
-    // under it as well: a revert that ran while this waited for the lock
-    // has cleared it or marked it reverting.
-    let _mesh = fsx::lock(m.path(quarantine::MESH_LOCK))?;
-    let p = load_pending(m)?.ok_or_else(|| errf!("no update is being applied"))?;
-    if p.id != id || p.stage != STAGE_INSTALLING {
-        bail!("update {id:?} is not the one being applied");
-    }
-    refuse_if_cut(m)?;
-    let files = render_managed(m)?;
-    let mut ch = Changes::new(m, p);
-    for f in &files {
-        ch.put(&f.path, f.mode, f.content.as_bytes())?;
-    }
-    let migrated = migrate(&mut ch, m.migrations)?;
-    let changed = ch.changed.clone();
-    validate(m, ctx, &changed)?;
-    reload(m, ctx, &changed)?;
-    if changed.is_empty() {
-        say(out, "no system file changed");
-    }
-    for c in &changed {
-        say(out, format!("changed {c}"));
-    }
-    for w in migrated {
-        say(out, format!("state migrated: {w}"));
-    }
+    let lock_fd = inherited_lock(m);
+    let rel = release_of(m, &p)?;
+    let role = role_of(m)?;
+    let mut w: Work = if p.work.is_null() {
+        Work::default()
+    } else {
+        serde_json::from_value(p.work.clone()).map_err(|e| Error::from(e).wrap("what update prepare loaded"))?
+    };
+    let log = HostLog::default();
+    let rebooting = install_work(m, ctx, id, &p.release, &rel, role, &mut w, lock_fd, &log, out)?;
+    applied(m, ctx, rel.serial, w.arch.as_ref(), rebooting, id, out);
     Ok(())
 }
 
@@ -2603,6 +2920,16 @@ mod tests {
         reboot_fails: bool,
         /// The install takes this long by the machine's clock.
         install_takes: i64,
+        /// The new binary is from before the handover: it knows no
+        /// `update handover` or `update prepare`, and its activate writes
+        /// the files only.
+        new_is_legacy: bool,
+        /// The k3s and Arch code of the binary that started the update is
+        /// broken (as c4e6b2c's k3s version check was): its pacman and k3s
+        /// commands fail. The new binary's work.
+        old_os_code_broken: bool,
+        /// update prepare dies without saying why.
+        prepare_dies: bool,
     }
 
     struct Fake {
@@ -2612,6 +2939,11 @@ mod tests {
         migrations: Mutex<&'static [Migration]>,
         script: Mutex<Script>,
         ran: Mutex<Vec<String>>,
+        /// Which binary ran each command: "old" (the one that runs update
+        /// apply) or "new" (its prepare and activate).
+        by: Mutex<Vec<(&'static str, String)>>,
+        /// The commands that kept a descriptor (the update lock).
+        kept: Mutex<Vec<String>>,
         /// The firewall each `nft -f` loaded, the SSH drop-in each sshd
         /// reload read.
         loaded: Mutex<Vec<String>>,
@@ -2626,12 +2958,25 @@ mod tests {
         Arc::new(|_| Ok(()))
     }
 
+    /// The fake as one binary sees it.
+    struct As(Arc<Fake>, &'static str);
+
+    impl Runner for As {
+        fn run(&self, ctx: &Ctx, c: &Cmd) -> (String, Result<()>) {
+            self.0.run_as(ctx, c, self.1)
+        }
+    }
+
     impl Fake {
         fn machine(&self) -> Machine {
+            self.machine_as("old")
+        }
+
+        fn machine_as(&self, who: &'static str) -> Machine {
             let clock = self.clock.clone();
             Machine {
                 root: self.root.clone(),
-                run: self.me.get().unwrap().upgrade().unwrap(),
+                run: Arc::new(As(self.me.get().unwrap().upgrade().unwrap(), who)),
                 verifier: Arc::new(fake::Key("admin")),
                 owner: *self.owner.lock().unwrap(),
                 hook: self.hook.lock().unwrap().clone(),
@@ -2702,12 +3047,29 @@ mod tests {
         fn has(&self, prefix: &str) -> bool {
             self.index(prefix).is_some()
         }
+
+        /// The binaries that ran commands starting with prefix.
+        fn who_ran(&self, prefix: &str) -> Vec<&'static str> {
+            let mut v: Vec<&'static str> = self.by.lock().unwrap().iter().filter(|(_, c)| c.starts_with(prefix)).map(|(w, _)| *w).collect();
+            v.dedup();
+            v
+        }
     }
 
     impl Runner for Fake {
         fn run(&self, ctx: &Ctx, c: &Cmd) -> (String, Result<()>) {
+            self.run_as(ctx, c, "old")
+        }
+    }
+
+    impl Fake {
+        fn run_as(&self, ctx: &Ctx, c: &Cmd, who: &'static str) -> (String, Result<()>) {
             let root = self.root.display().to_string();
             self.ran.lock().unwrap().push(c.to_string().replace(&root, ""));
+            self.by.lock().unwrap().push((who, c.to_string().replace(&root, "")));
+            if c.keep_fd.is_some() {
+                self.kept.lock().unwrap().push(c.to_string().replace(&root, ""));
+            }
             let s = *self.script.lock().unwrap();
             let name = c.name.replace(&root, "");
             let args: Vec<&str> = c.args.iter().map(String::as_str).collect();
@@ -2715,7 +3077,22 @@ mod tests {
             let ok = || (String::new(), Ok(()));
             let read = |p: &str| fs::read_to_string(p).unwrap_or_default();
             let dropin = || read(&fsx::under(&self.root, SSHD_DROPIN).display().to_string());
+            let os_cmd = name == "pacman" || name.contains("k3s") || args.contains(&"k3s.service");
+            if who == "old" && s.old_os_code_broken && os_cmd && !matches!(args.as_slice(), ["--version"]) {
+                return fail("the old binary's broken k3s and Arch code");
+            }
+            if who == "old" && s.old_os_code_broken && name.ends_with("k3s.dryserver-new") {
+                return fail("the old binary's broken k3s and Arch code");
+            }
             match (name.as_str(), args.as_slice()) {
+                (NEW_BIN, ["update", "handover"]) if s.new_is_legacy => fail("exit status 1: unknown update command \"handover\""),
+                (NEW_BIN, ["update", "handover"]) => (format!("{HANDOVER}\n"), Ok(())),
+                (NEW_BIN, ["update", "prepare", "--id", _]) if s.prepare_dies => fail("signal 11 (core dumped)"),
+                (NEW_BIN, ["update", "prepare", "--id", id]) => {
+                    let mut o = Vec::new();
+                    let r = prepare(&self.machine_as("new"), ctx, id, &mut o);
+                    (String::from_utf8_lossy(&o).into_owned(), r)
+                }
                 (NEW_BIN, ["selfcheck"]) if s.new_crashes => fail("signal 11 (core dumped)"),
                 (_, ["selfcheck"]) if s.selfcheck_fails => fail("exit status 1"),
                 (_, ["selfcheck"]) => {
@@ -2728,7 +3105,10 @@ mod tests {
                         return fail("signal 6 (aborted)");
                     }
                     let mut o = Vec::new();
-                    let r = activate(&self.machine(), ctx, id, &mut o);
+                    let m = self.machine_as("new");
+                    // A binary from before the handover finds no handover in
+                    // the record, and writes the files only: this one too.
+                    let r = activate(&m, ctx, id, &mut o);
                     if s.activate_dies_late {
                         return fail("signal 6 (aborted)");
                     }
@@ -2814,6 +3194,8 @@ mod tests {
                 migrations: Mutex::new(&[]),
                 script: Mutex::default(),
                 ran: Mutex::default(),
+                by: Mutex::default(),
+                kept: Mutex::default(),
                 loaded: Mutex::default(),
                 reloaded_sshd: Mutex::default(),
                 k3s: Mutex::new((Some(K3S_OLD.to_vec()), 1)),
@@ -3229,7 +3611,7 @@ mod tests {
             let lab = Lab::new();
             lab.script(|s| (s.activate_dies, s.activate_dies_late) = (!late, late));
             let e = lab.apply(&rel(7, NEW)).unwrap_err().to_string();
-            assert!(e.contains("could not take over") && e.contains("signal 6"), "{e}");
+            assert!(e.contains("could not finish the update") && e.contains("signal 6"), "{e}");
             lab.assert_old(&format!("late {late}"));
             assert_eq!(lab.bytes(PREV_BIN), OLD);
             if late {
@@ -4231,13 +4613,16 @@ mod tests {
         assert_eq!(lab.pinned().as_deref(), Some(NEXT_DAY));
         let a = lab.arch().unwrap();
         assert!(a.date == NEXT_DAY && a.done, "{a:?}");
-        // The order: the packages are loaded before anything changes; then
-        // the binary, the files, k3s, and the packages last.
+        // The order: the new binary is checked next to the old one, then
+        // loads the packages before anything changes; then the binary, the
+        // files, k3s, and the packages last.
         let order = [
             "systemd-run --unit=dryserver-update-revert-",
+            "/usr/local/bin/.dryserver.new selfcheck",
+            "/usr/local/bin/.dryserver.new update handover",
+            "/usr/local/bin/.dryserver.new update prepare --id",
             "pacman -Syy",
             "pacman -Suw",
-            "/usr/local/bin/.dryserver.new selfcheck",
             "/usr/local/bin/dryserver update activate",
             "systemctl restart --no-block k3s.service",
             "pacman -Su --noconfirm",
@@ -4288,8 +4673,10 @@ mod tests {
         let e = lab.apply_os(&r, Some(K3S_NEW)).unwrap_err().to_string();
         assert!(e.contains("downloading the packages failed") && e.contains("nothing was installed"), "{e}");
         lab.assert_os_old("postponed");
+        // The new binary was checked next to the old one, and loaded; it
+        // never took over.
         assert!(
-            !lab.fake.has("/usr/local/bin/.dryserver.new") && !lab.fake.has("systemctl restart --no-block k3s"),
+            !lab.fake.has("/usr/local/bin/dryserver update activate") && !lab.fake.has("systemctl restart --no-block k3s"),
             "{:#?}",
             lab.fake.ran()
         );
@@ -4319,7 +4706,7 @@ mod tests {
         let e = lab.apply_os(&os_rel(8, K3S_NEW, DAY), None).unwrap_err().to_string();
         assert!(e.contains("give its binary with --k3s"), "{e}");
         lab.assert_os_old("refused");
-        assert!(!lab.fake.has("systemd-run"));
+        assert!(!lab.fake.has("/usr/local/bin/dryserver update activate"), "it never took over");
         assert_eq!((lab.last().action.as_str(), lab.last().serial), (REFUSED, 8));
         // A binary that is not the release's is refused too.
         let e = lab.apply_os(&os_rel(8, K3S_NEW, DAY), Some(K3S_SICK)).unwrap_err().to_string();
@@ -4545,7 +4932,10 @@ mod tests {
         let e = lab.apply_os(&os_rel(8, K3S_NEW, NEXT_DAY), Some(K3S_NEW)).unwrap_err().to_string();
         assert!(e.contains("pacman is already running"), "{e}");
         lab.assert_os_old("pacman busy");
-        assert!(!lab.fake.has("systemd-run"), "refused before anything was armed");
+        // The new binary looked, under the timer the old one armed, and
+        // nothing but that timer was there to go.
+        assert!(lab.fake.has("/usr/local/bin/.dryserver.new update prepare") && !lab.fake.has("pacman"), "{:#?}", lab.fake.ran());
+        assert!(lab.fake.has("systemctl stop dryserver-update-revert-"), "{:#?}", lab.fake.ran());
         assert_eq!((lab.last().action.as_str(), lab.last().serial), (POSTPONED, 8));
     }
 
@@ -4597,5 +4987,101 @@ mod tests {
         let _held = try_lock(&lab.m()).unwrap().unwrap();
         let e = start_detached(&lab.m(), &Ctx::new(), &a, &mut Vec::new()).unwrap_err().to_string();
         assert!(e.contains("another update is running"), "{e}");
+    }
+
+    #[test]
+    fn a_fix_to_the_k3s_and_arch_code_reaches_machines_with_its_own_release() {
+        // The binary that runs `update apply` checks and hands over; the new
+        // one runs everything else, so its fixes apply already. Here the
+        // old one's k3s and Arch code fails every command it runs.
+        let lab = Lab::new();
+        lab.script(|s| s.old_os_code_broken = true);
+        let a = Apply { reboot: true, ..lab.os_opts(&os_rel(8, K3S_NEW, NEXT_DAY), Some(K3S_NEW)) };
+        apply(&lab.m(), &Ctx::new(), &a, now(), &mut Vec::new()).unwrap();
+        lab.assert_new("handed over");
+        assert!(lab.bytes(K3S_BIN) == K3S_NEW && lab.pinned().as_deref() == Some(NEXT_DAY) && lab.arch().unwrap().done);
+        let f = &lab.fake;
+        for (prefix, who) in [
+            ("/usr/local/bin/.dryserver.new selfcheck", "old"),
+            ("/usr/local/bin/.dryserver.new update prepare", "old"),
+            ("/usr/local/bin/dryserver update activate", "old"),
+            ("pacman -Syy", "new"),
+            ("pacman -Suw", "new"),
+            ("/usr/local/bin/.k3s.dryserver-new --version", "new"),
+            ("systemctl restart --no-block k3s.service", "new"),
+            ("pacman -Su --noconfirm", "new"),
+            ("nft -f /etc/nftables.conf", "new"),
+        ] {
+            assert_eq!(f.who_ran(prefix), [who], "{prefix}: {:#?}", f.by.lock().unwrap());
+        }
+        // The old binary armed the apply's timer; the new one the window.
+        let p = lab.pending().unwrap();
+        assert_eq!((p.handover, p.stage.as_str(), p.may_reboot), (HANDOVER, STAGE_ARMED, true));
+        assert_eq!(f.who_ran(&format!("systemd-run --unit=dryserver-update-revert-{}-apply ", p.id)), ["old"]);
+        assert_eq!(f.who_ran(&format!("systemd-run --unit=dryserver-update-revert-{} ", p.id)), ["new"]);
+        assert_eq!(lab.last().action, "applied");
+        // Both steps of the new binary, and pacman's install under it, keep
+        // the update lock: nothing reverts under them if apply dies.
+        let kept = f.kept.lock().unwrap().clone();
+        for want in ["/usr/local/bin/.dryserver.new update prepare --id", "/usr/local/bin/dryserver update activate --id", "pacman -Su "] {
+            assert!(kept.iter().any(|k| k.starts_with(want)), "{want}: {kept:#?}");
+        }
+        assert!(!kept.iter().any(|k| k.starts_with("pacman -Syy") || k.contains("selfcheck")), "{kept:#?}");
+        // Without the handover (the new binary from before it), the old
+        // code runs those steps, and the update goes back.
+        let lab = Lab::new();
+        lab.script(|s| (s.old_os_code_broken, s.new_is_legacy) = (true, true));
+        assert!(lab.apply_os(&os_rel(8, K3S_NEW, NEXT_DAY), Some(K3S_NEW)).is_err());
+        lab.assert_os_old("the old code ran");
+    }
+
+    #[test]
+    fn a_new_binary_from_before_the_handover_gets_the_old_way() {
+        // A rollback to a dryserver from before the handover: it knows no
+        // `update prepare`, its activate writes the files only, and the
+        // binary that started the update does the rest itself.
+        let lab = Lab::new();
+        lab.script(|s| s.new_is_legacy = true);
+        lab.apply_os(&os_rel(8, K3S_NEW, NEXT_DAY), Some(K3S_NEW)).unwrap();
+        lab.assert_new("the old way");
+        assert!(lab.bytes(K3S_BIN) == K3S_NEW && lab.arch().unwrap().done);
+        let f = &lab.fake;
+        assert!(!f.has("/usr/local/bin/.dryserver.new update prepare"));
+        for prefix in ["pacman -Syy", "systemctl restart --no-block k3s.service", "pacman -Su --noconfirm"] {
+            assert_eq!(f.who_ran(prefix), ["old"], "{prefix}");
+        }
+        assert_eq!(f.who_ran("nft -f /etc/nftables.conf"), ["new"], "the files are still the new binary's");
+        assert_eq!((lab.pending().unwrap().handover, lab.last().action.as_str()), (0, "applied"));
+        // A binary from before the handover starting the update: the record
+        // has none, and this binary's activate writes the files only.
+        let lab = Lab::new();
+        let id = "0123456789abcdef";
+        let p = Pending { format: PENDING_FORMAT, id: id.into(), stage: STAGE_INSTALLING.into(), serial: 7, ..Pending::default() };
+        save_pending(&lab.m(), &p).unwrap();
+        let apply_lock = try_lock(&lab.m()).unwrap().expect("the update lock");
+        activate(&lab.fake.machine_as("new"), &Ctx::new(), id, &mut Vec::new()).unwrap();
+        let mut p = lab.pending().unwrap();
+        assert_eq!(p.stage, STAGE_INSTALLING, "the binary that started it arms the window");
+        assert!(lab.get(FIREWALL) == lab.rendered(FIREWALL) && !lab.fake.has("pacman") && load_installed(&lab.m()).unwrap().is_none());
+        // A handover newer than this binary knows is not guessed at.
+        p.handover = HANDOVER + 1;
+        save_pending(&lab.m(), &p).unwrap();
+        let e = activate(&lab.fake.machine_as("new"), &Ctx::new(), id, &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("does not know"), "{e}");
+        drop(apply_lock);
+    }
+
+    #[test]
+    fn a_new_binary_that_dies_while_it_prepares_changes_nothing() {
+        let lab = Lab::new();
+        lab.script(|s| s.prepare_dies = true);
+        let e = lab.apply_os(&os_rel(8, K3S_NEW, NEXT_DAY), Some(K3S_NEW)).unwrap_err().to_string();
+        assert!(e.contains("could not prepare the update") && e.contains("signal 11"), "{e}");
+        lab.assert_os_old("prepare died");
+        assert_eq!((lab.last().action.as_str(), lab.last().serial), (REFUSED, 8), "a release whose binary crashes does not work here");
+        assert!(!lab.p(NEW_BIN).exists() && !lab.fake.has("/usr/local/bin/dryserver update activate"));
+        // Started by hand, or by anything but an apply: refused.
+        let e = prepare(&lab.m(), &Ctx::new(), "0123456789abcdef", &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("runs only inside it"), "{e}");
     }
 }

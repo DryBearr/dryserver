@@ -1229,7 +1229,19 @@ fn run_update(args: &[String]) -> Result<()> {
                 _ => bail!("update guard: give --id or --boot"),
             }
         }
-        // The new binary's half of apply; apply runs it.
+        // The new binary's half of apply; apply runs it (see update.rs,
+        // the handover). handover says which protocol this binary speaks.
+        "handover" => {
+            Flags::parse(&name, rest, &[]);
+            println!("{}", update::HANDOVER);
+            Ok(())
+        }
+        "prepare" => {
+            let f = Flags::parse(&name, rest, &[("id", "", "the update being applied")]);
+            let m = update_machine()?;
+            keep_going_on_hangup();
+            update::prepare(&m, &Ctx::on_signals(), f.get("id"), &mut out)
+        }
         "activate" => {
             let f = Flags::parse(&name, rest, &[("id", "", "the update being applied")]);
             let m = update_machine()?;

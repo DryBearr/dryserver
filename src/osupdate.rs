@@ -32,6 +32,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
+
 use crate::ctx::Ctx;
 use crate::err::{Error, Result};
 use crate::release::{self, K3sVersion};
@@ -152,6 +154,10 @@ pub struct Host<'a> {
     /// Called where a power cut could stop an update (update.rs's hook);
     /// tests crash or fail there.
     pub hook: Hook,
+    /// The update lock's descriptor: pacman keeps it while it installs, so
+    /// the lock stays held for as long as pacman runs, also when the update
+    /// that started it died (nothing reverts under a running pacman).
+    pub lock_fd: Option<i32>,
 }
 
 impl<'a> Host<'a> {
@@ -473,7 +479,7 @@ impl Failure {
 }
 
 /// One line of pacman's log: "upgraded openssh 9.9p1-1 -> 9.9p1-2".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     /// installed, upgraded, downgraded, reinstalled or removed.
     pub action: String,
@@ -481,8 +487,12 @@ pub struct Change {
     pub version: String,
 }
 
-/// What an Arch update did.
-#[derive(Debug, Clone, Default)]
+/// What an Arch update did. It goes into the update's record between the
+/// download and the install (they run in two processes of the new
+/// dryserver: update.rs, the handover); a failure ends the update before
+/// that, so it is not kept.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ArchOutcome {
     /// The snapshot day asked for, and the one pinned before (None when
     /// the mirrorlist did not pin one, as after an install).
@@ -510,6 +520,7 @@ pub struct ArchOutcome {
     /// one kernel is ever in flight.
     pub lts_waits: bool,
     pub warnings: Vec<String>,
+    #[serde(skip)]
     pub failure: Option<Failure>,
     /// The end of the output of the pacman run that failed.
     pub tail: String,
@@ -809,7 +820,7 @@ impl Host<'_> {
         let (o, res) = if stage == Stage::Install {
             // Never killed (see Limits::install), and no shutdown while it
             // runs: that would stop it half way through a package as well.
-            let cmd = pacman(args).interrupt(None);
+            let cmd = pacman(args).interrupt(None).keep_fd(self.lock_fd);
             self.inhibited("pacman installs an update", &mut out.warnings, || self.run.run(&tctx, &cmd))
         } else {
             self.run.run(&tctx, &pacman(args).interrupt(Some(PACMAN_GRACE)))
@@ -2024,7 +2035,7 @@ mod tests {
             ..Limits::default()
         };
         let log: LogFn = Arc::new(move |s: &str| l.lock().unwrap().push(s.to_string()));
-        (Host { root: root.into(), run, log, owner: fsx::geteuid(), limits, hook: Arc::new(|_| Ok(())) }, logs)
+        (Host { root: root.into(), run, log, owner: fsx::geteuid(), limits, hook: Arc::new(|_| Ok(())), lock_fd: None }, logs)
     }
 
     fn append(root: &Path, path: &str, text: &str) {

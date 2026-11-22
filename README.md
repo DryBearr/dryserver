@@ -764,33 +764,40 @@ stays quick. The rollout runs it as `sudo dryserver update apply --detach
 minute sync goes on and stopping the sync never stops pacman), and follows
 it with `dryserver update status`. By hand, `sudo dryserver update apply
 --release FILE --binary FILE [--k3s FILE]` runs in the terminal and reboots
-only with `--reboot`. Step by step:
+only with `--reboot`.
+
+The dryserver that runs checks the release and the new binary, then hands
+over: everything after that is the new binary's code. So a fix to how k3s
+or the packages are updated (or to the reboot) works already with the
+release that brings it. Step by step:
 
 1. **Checks, nothing changed yet.** The signature and the checksums (the
-   binaries are copied into a directory only root can write first);
-   pacman's settings (package signatures required, every repository on the
-   pinned snapshot only); `/boot` mounted; room on `/` and `/boot`; no
-   other pacman at work. A refusal changes nothing and says whether it
-   is worth another try (*postponed*: a busy pacman, a full disk) or not
-   (*refused*).
+   binaries are copied into a directory only root can write first). A
+   refusal changes nothing and says whether it is worth another try
+   (*postponed*: a busy pacman, a full disk) or not (*refused*).
 2. **A revert is armed** (a timer, and a boot unit that carries it across
    a power cut). From here on the machine goes back by itself unless the
    update finishes and is confirmed.
-3. **The packages are loaded first**: pacman's mirrorlist is pinned to the
+3. **The new dryserver** is copied beside the old one and checks itself
+   there.
+4. **The packages are loaded first**, by the new dryserver: it checks
+   pacman's settings (package signatures required, every repository on
+   the pinned snapshot only), `/boot` mounted, room on `/` and `/boot`, no
+   other pacman at work; then pacman's mirrorlist is pinned to the
    release's day of the Arch archive and pacman refreshes its lists, takes
    newer signing keys and downloads everything. A dead or slow mirror ends
    the update here with the mirrorlist put back: *postponed*, tried again
    at the next sync (10 times), not a failed release.
-4. **The new dryserver** goes in beside the old one and takes its place in
-   one rename (a power cut leaves one of the two, never half a file), after
-   it checked itself. It rewrites the system files it manages from
-   `/etc/dryserver/config.env`, each validated first (`nft -c`, `sshd -t`,
-   `systemd-analyze verify`), and reloads only what changed.
-5. **k3s**, when this machine runs another binary than the release's: put
+5. **The new dryserver takes the old one's place** in one rename (a power
+   cut leaves one of the two, never half a file). It rewrites the system
+   files it manages from `/etc/dryserver/config.env`, each validated first
+   (`nft -c`, `sshd -t`, `systemd-analyze verify`), and reloads only what
+   changed.
+6. **k3s**, when this machine runs another binary than the release's: put
    in place the same way, the old one kept as `k3s.prev`, and k3s must
    come back healthy with it (the kubelet, and on the coordinator the API
    server); otherwise the old one goes back and the update reverts.
-6. **The packages are installed** (`pacman -Su`, `-Suu` for a rollback),
+7. **The packages are installed** (`pacman -Su`, `-Suu` for a rollback),
    the one step a revert cannot undo, so it comes last. pacman is never
    killed while it installs: stopped, it gets SIGINT and finishes the
    package it is at; and no shutdown is let in meanwhile. After a new
@@ -802,13 +809,13 @@ only with `--reboot`. Step by step:
    cut in pacman's hooks) are made again with `mkinitcpio -P`. A machine
    installed after the release, whose packages are of a newer day, keeps
    them; the next release moves them.
-7. **The confirm window starts** (10 minutes, from the end of the apply,
+8. **The confirm window starts** (10 minutes, from the end of the apply,
    however long it took). Unless `sudo dryserver update confirm` follows,
    the machine puts back the old binary, the files, the mirrorlist and the
    old k3s by itself. That needs no network and no coordinator. The
    packages stay where they are: the way back for them is a release signed
    with `-rollback` and the older `-arch-date`.
-8. **A reboot**, when a new kernel or glibc, systemd and the like came,
+9. **A reboot**, when a new kernel or glibc, systemd and the like came,
    pacman finished cleanly and the boot images are current, and the machine
    can come back by itself (a disk that asks for its passphrase at boot
    cannot): once, with the update still waiting for its confirm, which
@@ -819,6 +826,13 @@ only with `--reboot`. Step by step:
 
 A machine whose kill switch has cut the coordinator off takes no update,
 and one whose cut lands during the update stops before the packages.
+
+**The first release after the handover came in** is still applied by
+dryservers without it, which update k3s and the packages with their own
+code: publish it with the k3s and the Arch day the swarm runs
+(dryserver only). From the next release on, the new code does it all. A
+rollback to a dryserver from before the handover works too: the running
+one then does those steps itself, as that one expects.
 `dryserver update status` shows what runs now, the pinned Arch day and
 the last package update, the reboot that is due, and how the last update
 ended.
