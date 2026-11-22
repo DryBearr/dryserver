@@ -339,9 +339,19 @@ impl Host<'_> {
     /// new kernel into the empty directory under it, the boot loader keeps
     /// starting the old kernel, and that kernel finds its modules gone: no
     /// network, no WireGuard.
+    ///
+    /// A file that cannot be read says nothing either way, so it refuses:
+    /// an fstab nobody can read could be hiding the /boot partition.
     fn check_boot_mounted(&self) -> Result<()> {
-        let listed = |p: &str| fsx::read_or_empty(self.path(p)).lines().any(|l| mount_point(l) == Some("/boot"));
-        if listed("/etc/fstab") && !listed("/proc/self/mounts") {
+        // The mount table of a machine running pods is long.
+        let listed = |p: &str, missing_ok: bool| -> Result<bool> {
+            match read_capped(&self.path(p), 8 * MAX_CONF) {
+                Ok(t) => Ok(t.lines().any(|l| mount_point(l).is_some_and(|m| m.trim_end_matches('/') == "/boot"))),
+                Err(e) if missing_ok && e.is_not_found() => Ok(false),
+                Err(e) => Err(e.wrap("cannot tell whether /boot is mounted, so nothing is installed")),
+            }
+        };
+        if listed("/etc/fstab", true)? && !listed("/proc/self/mounts", false)? {
             bail!("/boot is not mounted: a new kernel would land beside the boot partition, not on it. Mount it (mount /boot) first");
         }
         Ok(())
@@ -370,7 +380,9 @@ impl Host<'_> {
         if fs::symlink_metadata(&lock).is_err() {
             return Ok(None);
         }
-        let pids = self.pacman_pids();
+        // Only when it is sure that no pacman runs: removing the lock of
+        // one that does would let a second pacman into its transaction.
+        let pids = self.pacman_pids().map_err(|e| e.wrap(format!("cannot tell whether pacman runs, so {PACMAN_LOCK} stays")))?;
         if !pids.is_empty() {
             let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
             bail!("pacman is already running (pid {}) and holds {PACMAN_LOCK}: the next run tries again", pids.join(", "));
@@ -381,10 +393,10 @@ impl Host<'_> {
         Ok(Some(msg))
     }
 
-    fn pacman_pids(&self) -> Vec<u32> {
-        let Ok(dir) = fs::read_dir(self.path("/proc")) else {
-            return Vec::new();
-        };
+    /// The pacman processes, from /proc. Err when /proc cannot be listed.
+    fn pacman_pids(&self) -> Result<Vec<u32>> {
+        let proc = self.path("/proc");
+        let dir = fs::read_dir(&proc).map_err(|e| Error::from(e).wrap(format!("list {}", proc.display())))?;
         let mut pids: Vec<u32> = dir
             .flatten()
             .filter_map(|e| {
@@ -393,7 +405,7 @@ impl Host<'_> {
             })
             .collect();
         pids.sort_unstable();
-        pids
+        Ok(pids)
     }
 }
 
@@ -957,8 +969,16 @@ impl Host<'_> {
     /// keyboard. A disk the TPM unlocks can, once the TPM is enrolled (the
     /// first boot takes the passphrase and removes its one-time key); so
     /// can one that is not encrypted.
+    ///
+    /// A crypttab that cannot be read counts as a disk that waits for its
+    /// passphrase: a machine that reboots into that prompt stays away
+    /// until someone comes.
     pub fn reboot_blocker(&self) -> Option<String> {
-        let crypttab = fsx::read_or_empty(self.path("/etc/crypttab"));
+        let crypttab = match read_capped(&self.path("/etc/crypttab"), MAX_CONF) {
+            Ok(t) => t,
+            Err(e) if e.is_not_found() => String::new(),
+            Err(e) => return Some(format!("cannot tell how the disk unlocks ({e}): reboot it by hand")),
+        };
         let line = crypttab.lines().find(|l| l.split_whitespace().next() == Some(crate::install::ROOT_MAPPER))?;
         if !line.contains("tpm2-device=") {
             return Some("the disk asks for its passphrase at every boot: reboot it by hand".into());
@@ -2309,6 +2329,47 @@ mod tests {
         // Once that pacman is gone, the lock it left is stale.
         fs::remove_dir_all(r.join("proc/4242")).unwrap();
         assert!(h.arch_update(&Ctx::new(), "2026/11/20", false).ok());
+    }
+
+    #[test]
+    fn what_cannot_be_read_is_not_taken_for_safe() {
+        // /proc that cannot be listed: whether pacman runs is not known,
+        // so its lock stays (removing a live pacman's lock would let a
+        // second one into its transaction).
+        let dir = machine();
+        let r = dir.path();
+        put(r, PACMAN_LOCK, "");
+        fs::set_permissions(r.join("proc"), fs::Permissions::from_mode(0o311)).unwrap();
+        let fake = Fake::new(r);
+        let (h, _) = host(r, &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        fs::set_permissions(r.join("proc"), fs::Permissions::from_mode(0o755)).unwrap();
+        let f = out.failure.as_ref().unwrap();
+        assert!(f.stage == Stage::Refused && f.again && f.reason.to_string().contains("cannot tell whether pacman runs"), "{}", f.reason);
+        assert!(h.path(PACMAN_LOCK).exists() && fake.lines().is_empty());
+        // An fstab or a mount table that cannot be read: whether /boot is
+        // mounted is not known.
+        for p in ["/etc/fstab", "/proc/self/mounts"] {
+            let dir = machine();
+            let r = dir.path();
+            fs::remove_file(fsx::under(r, p)).unwrap();
+            fs::create_dir(fsx::under(r, p)).unwrap();
+            let fake = Fake::new(r);
+            let (h, _) = host(r, &fake);
+            let why = h.arch_update(&Ctx::new(), "2026/11/20", false).failure.unwrap().reason.to_string();
+            assert!(why.contains("cannot tell whether /boot is mounted"), "{p}: {why}");
+            assert!(fake.lines().is_empty(), "{p}");
+        }
+        // No fstab at all: no /boot partition to mount.
+        let dir = machine();
+        fs::remove_file(fsx::under(dir.path(), "/etc/fstab")).unwrap();
+        let fake = Fake::new(dir.path());
+        let (h, _) = host(dir.path(), &fake);
+        assert!(h.arch_update(&Ctx::new(), "2026/11/20", false).ok());
+        // A crypttab that cannot be read: the machine may wait for a
+        // passphrase at boot.
+        fs::create_dir_all(fsx::under(dir.path(), "/etc/crypttab")).unwrap();
+        assert!(h.reboot_blocker().unwrap().contains("cannot tell how the disk unlocks"), "{:?}", h.reboot_blocker());
     }
 
     #[test]
