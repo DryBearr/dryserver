@@ -806,7 +806,16 @@ release that brings it. Step by step:
    the fallback kernel (linux-lts) first, linux-lts in a run of its own and
    only once the main kernel has booted well, else at the next update; so
    one kernel is always known good. Boot images that were not made (a power
-   cut in pacman's hooks) are made again with `mkinitcpio -P`. A machine
+   cut in pacman's hooks) are made again with `mkinitcpio -P`. When pacman
+   refuses (files in the way, a damaged package), the update says pacman's
+   own error lines; it changed nothing then, and rebooting stays safe.
+   Files in the way are taken over in two cases only, each file named: a
+   rollback across a package split (Arch moved files into a new package
+   the older day does not have, like openssl-3; the older package takes
+   them back, the new one leaves pacman's database, and what the older day
+   lacks and nothing needs is removed), and an install cut off by a power
+   cut in the middle of a package (its own files, owned by no package).
+   Anything else is refused with the files, for you to look at. A machine
    installed after the release, whose packages are of a newer day, keeps
    them; the next release moves them.
 8. **The confirm window starts** (10 minutes, from the end of the apply,

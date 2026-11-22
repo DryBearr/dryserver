@@ -11,10 +11,16 @@
 //! that would make the run unsafe is checked, and the update is refused
 //! with the reason: package signatures weakened in pacman.conf, /boot not
 //! mounted, too little disk space, another pacman at work. pacman's own
-//! checks stay on: no --overwrite, no skipped signatures, ever. A run that
-//! fails part way leaves pacman's own state and the next run picks it up;
-//! until one succeeds the machine must not reboot, since its boot image
-//! may be half made.
+//! checks stay on: no skipped signatures, ever, and no blanket --overwrite.
+//! Files in pacman's way are taken over only in two cases dryserver can
+//! account for file by file, each path named exactly (install_run): a
+//! rollback across a package split (the files' owner is not in the older
+//! snapshot), and an install that was cut off in the middle of a package
+//! (files of that package's own list, owned by none). A run that pacman
+//! refused changed nothing (its log says so) and keeps reboots safe; one
+//! that fails part way leaves pacman's own state and the next run picks it
+//! up; until one succeeds the machine must not reboot, since its boot
+//! image may be half made. The reason keeps pacman's own error lines.
 //!
 //! k3s: the binary the release names, checked against its sha256 and
 //! swapped in with a rename, so a power cut leaves the old binary or the
@@ -25,7 +31,7 @@
 //! Neither guards against a second update at the same time: the caller
 //! holds the update lock for the whole release.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -52,6 +58,15 @@ const SSHD_CONFIG: &str = "/etc/ssh/sshd_config";
 /// pacman holds this file while it changes the system, and leaves it
 /// behind when it is killed.
 pub const PACMAN_LOCK: &str = "/var/lib/pacman/db.lck";
+/// There while pacman installs an update; left only when it was cut off
+/// (a power cut): then files of the package it was at may be on disk and
+/// owned by no package.
+pub const INSTALLING: &str = "/var/lib/dryserver-update/arch-installing";
+/// A rollback across a package split (SplitRecord), until the newer
+/// packages that owned the files lost their database entry.
+pub const SPLIT: &str = "/var/lib/dryserver-update/arch-split.json";
+/// Where pacman keeps the packages it loaded (CacheDir, as Arch ships it).
+const PKG_CACHE: &str = "/var/cache/pacman/pkg";
 const PACMAN_LOG: &str = "/var/log/pacman.log";
 /// Where systemd-boot finds the kernel images it starts on UEFI machines
 /// (the installer's UKI_PRESET): arch-KERNEL.efi for each kernel package
@@ -520,8 +535,20 @@ pub struct ArchOutcome {
     /// one kernel is ever in flight.
     pub lts_waits: bool,
     pub warnings: Vec<String>,
+    /// The pacman run that failed changed nothing (pacman refused before it
+    /// began: files in the way, a damaged package, no room): the packages
+    /// are as before it, and a reboot is as safe as it was.
+    pub untouched: bool,
+    /// What dryserver did to get pacman past files in the way, said.
+    pub repairs: Vec<String>,
     #[serde(skip)]
     pub failure: Option<Failure>,
+    /// What the pacman run that failed said.
+    #[serde(skip)]
+    pub said: PacmanSaid,
+    /// The last install was cut off (INSTALLING was there at the start).
+    #[serde(skip)]
+    cut_off: bool,
     /// The end of the output of the pacman run that failed.
     pub tail: String,
     /// Where pacman's log ended and which .pacnew files there were before
@@ -585,6 +612,9 @@ impl ArchOutcome {
         }
         if self.lts_waits {
             s += ", the fallback kernel linux-lts follows at the next update";
+        }
+        for r in &self.repairs {
+            s += &format!(", {r}");
         }
         if !self.pacnew.is_empty() {
             s += &format!(", new config files to merge by hand: {}", self.pacnew.join(" "));
@@ -673,7 +703,8 @@ impl Host<'_> {
         if fallback {
             args.extend(["--ignore", "linux-lts"]);
         }
-        out.failure = self.pacman_step(ctx, Stage::Install, &args, self.limits.install, out).err();
+        out.cut_off = fs::symlink_metadata(self.path(INSTALLING)).is_ok();
+        out.failure = self.install_run(ctx, &args, out).err();
         out.installed = true;
         if let Err(e) = self.at("arch installed")
             && out.failure.is_none()
@@ -686,12 +717,18 @@ impl Host<'_> {
                 out.lts_waits = true;
                 self.say("Arch: the fallback kernel linux-lts waits for the next update: the main kernel has to boot well first, one kernel at a time");
             } else {
-                out.failure = self.pacman_step(ctx, Stage::Install, &all, self.limits.install, out).err();
+                out.failure = self.install_run(ctx, &all, out).err();
                 if let Err(e) = self.at("arch installed lts")
                     && out.failure.is_none()
                 {
                     out.failure = Some(Failure { stage: Stage::Install, reason: e, again: false });
                 }
+            }
+        }
+        if out.failure.is_none() {
+            self.drop_split_owners(ctx, out);
+            if out.downgrade {
+                self.remove_foreign_orphans(ctx, out);
             }
         }
         (out.count, out.changes) = self.changes_since(out.log_offset);
@@ -815,21 +852,253 @@ impl Host<'_> {
         self.pacman_step(ctx, Stage::Download, &args, self.limits.download, out)
     }
 
+    /// One pacman install run with args. When pacman refused it, changing
+    /// nothing, for files in the way that dryserver can account for one by
+    /// one (overwrite_plan), it runs once more with exactly those paths
+    /// allowed (--overwrite, each path matching itself only). Never more.
+    fn install_run(&self, ctx: &Ctx, args: &[&str], out: &mut ArchOutcome) -> Result<(), Failure> {
+        let f = match self.pacman_step(ctx, Stage::Install, args, self.limits.install, out) {
+            Ok(()) => return Ok(()),
+            Err(f) => f,
+        };
+        if !out.untouched || out.said.conflicts.is_empty() || ctx.done() {
+            return Err(f);
+        }
+        let paths = match self.overwrite_plan(ctx, out) {
+            Ok(p) => p,
+            Err(why) => return Err(Failure { reason: errf!("{}. {why}", f.reason), ..f }),
+        };
+        let mut again: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        for p in &paths {
+            // Checked by overwrite_plan: every path has one.
+            again.extend(["--overwrite".to_string(), exact_pattern(p).unwrap_or_default()]);
+        }
+        let again: Vec<&str> = again.iter().map(String::as_str).collect();
+        self.pacman_step(ctx, Stage::Install, &again, self.limits.install, out)
+    }
+
+    /// Which of the files in pacman's way (out.said) it may install over,
+    /// all of them or none; Err says why not. Only two cases, checked file
+    /// by file:
+    /// - a rollback across a package split: every file is owned by a
+    ///   package the older snapshot does not have (foreign once the lists of
+    ///   its day are loaded). Arch split openssl-3 off openssl after the day
+    ///   a rollback went back to, and the older openssl ships the files
+    ///   itself. The older package takes them; the newer one's database
+    ///   entry goes afterwards (drop_split_owners, from SPLIT).
+    /// - an install that was cut off in the middle of a package (INSTALLING
+    ///   was left): every file is owned by no package and is in the incoming
+    ///   package's own file list, from its package file in the cache.
+    fn overwrite_plan(&self, ctx: &Ctx, out: &mut ArchOutcome) -> std::result::Result<Vec<String>, String> {
+        let said = out.said.clone();
+        if said.more_conflicts || !said.both.is_empty() || !said.corrupt.is_empty() {
+            return Err("nothing was overwritten".into());
+        }
+        if let Some(c) = said.conflicts.iter().find(|c| exact_pattern(&c.path).is_none()) {
+            return Err(format!("{} cannot be named to pacman exactly, so nothing was overwritten", c.path));
+        }
+        let paths: Vec<String> = said.conflicts.iter().map(|c| c.path.clone()).collect();
+        let shown = || paths.join(" ");
+        let owned = said.conflicts.iter().filter(|c| c.owner.is_some()).count();
+        if owned == said.conflicts.len() {
+            if !out.downgrade {
+                return Err(format!(
+                    "Other packages own them, and only a rollback across a package split takes such files over: nothing was overwritten ({})",
+                    shown()
+                ));
+            }
+            let foreign = self.foreign(ctx)?;
+            let owners: BTreeSet<String> = said.owners().into_iter().map(str::to_string).collect();
+            if let Some(o) = owners.iter().find(|o| !foreign.contains(*o)) {
+                return Err(format!(
+                    "{o} owns them and the snapshot of {} has {o} too: not a package split, nothing was overwritten ({})",
+                    out.date,
+                    shown()
+                ));
+            }
+            let record = SplitRecord { owners: owners.iter().cloned().collect(), paths: paths.clone() };
+            fsx::mkdir_all(fsx::dir(self.path(SPLIT)), 0o700)
+                .and_then(|_| write_atomic(&self.path(SPLIT), serde_json::to_string_pretty(&record).unwrap_or_default().as_bytes(), 0o600))
+                .map_err(|e| format!("{e}: nothing was overwritten"))?;
+            let targets: BTreeSet<&str> = said.conflicts.iter().map(|c| c.target.as_str()).collect();
+            let msg = format!(
+                "rollback across a package split: {} take(s) over {} from {}, which the snapshot of {} does not have",
+                targets.into_iter().collect::<Vec<_>>().join(", "),
+                shown(),
+                record.owners.join(", "),
+                out.date
+            );
+            self.say(&format!("Arch: {msg}"));
+            out.repairs.push(msg);
+            return Ok(paths);
+        }
+        if owned > 0 {
+            return Err(format!("Some of them belong to other packages, some to none: nothing was overwritten ({})", shown()));
+        }
+        let manual = format!(
+            "Look at each (pacman -Qo PATH says no package owns it). If it is left from an install that was cut off, move it away and run the update again; files of your own, keep elsewhere: {}",
+            shown()
+        );
+        if !out.cut_off {
+            return Err(format!(
+                "They belong to no package and no install of dryserver's was cut off, so nothing was overwritten. {manual}"
+            ));
+        }
+        let mut files: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        for c in &said.conflicts {
+            if !files.contains_key(c.target.as_str()) {
+                let list = self.package_files(ctx, &c.target).map_err(|e| format!("{e}. {manual}"))?;
+                files.insert(c.target.as_str(), list);
+            }
+            if !files[c.target.as_str()].contains(&c.path) {
+                return Err(format!("{} is not in {}'s own file list, so nothing was overwritten. {manual}", c.path, c.target));
+            }
+        }
+        let msg = format!(
+            "an install cut off half way left files of the packages it was at: {} take(s) them over ({})",
+            files.keys().copied().collect::<Vec<_>>().join(", "),
+            shown()
+        );
+        self.say(&format!("Arch: {msg}"));
+        out.repairs.push(msg);
+        Ok(paths)
+    }
+
+    /// The installed packages no repository of the snapshot pacman reads
+    /// has (pacman -Qmq).
+    fn foreign(&self, ctx: &Ctx) -> std::result::Result<BTreeSet<String>, String> {
+        let tctx = ctx.with_timeout(self.limits.sync);
+        let (o, res) = self.run.run(&tctx, &pacman(&["-Qmq"]).quiet());
+        // pacman -Qm exits 1 when there is none.
+        if res.is_err() && !o.trim().is_empty() {
+            return Err("cannot tell which packages the snapshot lacks (pacman -Qmq failed): nothing was overwritten".into());
+        }
+        Ok(o.lines().map(str::trim).filter(|l| package_name(l)).map(str::to_string).collect())
+    }
+
+    /// The files of package (as the snapshot has it), from its package file
+    /// in pacman's cache: absolute paths.
+    fn package_files(&self, ctx: &Ctx, package: &str) -> Result<BTreeSet<String>> {
+        let tctx = ctx.with_timeout(self.limits.sync);
+        let name = self.run.output(&tctx, &pacman(&["-Sddp", "--print-format", "%f", package]).quiet())?;
+        let name = name.lines().next().unwrap_or("").trim().to_string();
+        if name.is_empty() || name.contains('/') || name.starts_with('.') {
+            bail!("pacman names no package file for {package}");
+        }
+        let file = self.path(&format!("{PKG_CACHE}/{name}"));
+        let list = self.run.output(&tctx, &pacman(&["-Qlpq", &file.display().to_string()]).quiet())?;
+        Ok(list.lines().map(str::trim).filter(|l| l.starts_with('/') && !l.ends_with('/')).map(str::to_string).collect())
+    }
+
+    /// After a rollback across a package split went in (SPLIT): the newer
+    /// packages that owned the files lose their database entry (pacman
+    /// -Rdd --dbonly: their files stay, owned by the older package alone),
+    /// each only while it is still installed and foreign, and once every
+    /// one of its files there is owned by another package as well. Then
+    /// pacman checks its database (-Dk). A power cut on the way leaves SPLIT,
+    /// and the next run that installs well does it again.
+    fn drop_split_owners(&self, ctx: &Ctx, out: &mut ArchOutcome) {
+        let Ok(text) = fs::read_to_string(self.path(SPLIT)) else { return };
+        let Ok(record) = serde_json::from_str::<SplitRecord>(&text) else {
+            out.warnings.push(format!("{SPLIT} is damaged: the packages it names keep their database entry"));
+            let _ = fs::remove_file(self.path(SPLIT));
+            return;
+        };
+        let tctx = ctx.with_timeout(self.limits.sync);
+        let foreign = match self.foreign(ctx) {
+            Ok(f) => f,
+            Err(e) => {
+                out.warnings.push(e);
+                return;
+            }
+        };
+        let others_own = |path: &str| {
+            self.run
+                .output(&tctx, &pacman(&["-Qoq", path]).quiet())
+                .is_ok_and(|o| o.lines().map(str::trim).any(|p| package_name(p) && !record.owners.iter().any(|x| x == p)))
+        };
+        if let Some(p) = record.paths.iter().find(|p| !others_own(p)) {
+            out.warnings.push(format!(
+                "{p} is not owned by the package that took it over yet: {} keep(s) its database entry for now",
+                record.owners.join(", ")
+            ));
+            return;
+        }
+        let drop: Vec<&str> = record.owners.iter().map(String::as_str).filter(|o| package_name(o) && foreign.contains(*o)).collect();
+        if !drop.is_empty() {
+            let mut args = vec!["-Rdd", "--dbonly", "--noconfirm"];
+            args.extend(&drop);
+            if let Err(f) = self.pacman_step(ctx, Stage::Install, &args, self.limits.install, out) {
+                out.warnings.push(format!("removing the database entry of {} failed: {}", drop.join(", "), f.reason));
+                return;
+            }
+            let msg = format!("{} left pacman's database (their files stay, owned by the older packages)", drop.join(", "));
+            self.say(&format!("Arch: {msg}"));
+            out.repairs.push(msg);
+        }
+        let (o, res) = self.run.run(&tctx, &pacman(&["-Dk"]));
+        if res.is_err() {
+            out.warnings.push(format!("pacman -Dk finds problems in its database: {}", one_line(&o, 600)));
+        }
+        let _ = fs::remove_file(self.path(SPLIT));
+    }
+
+    /// After a rollback: packages from the newer snapshot the older one
+    /// does not have and nothing needs any more (orphans, pacman -Qdtq, that
+    /// are foreign, pacman -Qmq) go, in a normal transaction (pacman -Rns).
+    /// Never one installed on purpose: those are no orphans.
+    fn remove_foreign_orphans(&self, ctx: &Ctx, out: &mut ArchOutcome) {
+        let tctx = ctx.with_timeout(self.limits.sync);
+        let (o, _) = self.run.run(&tctx, &pacman(&["-Qdtq"]).quiet());
+        let orphans: BTreeSet<String> = o.lines().map(str::trim).filter(|l| package_name(l)).map(str::to_string).collect();
+        if orphans.is_empty() {
+            return;
+        }
+        let Ok(foreign) = self.foreign(ctx) else { return };
+        let gone: Vec<&str> = orphans.iter().filter(|p| foreign.contains(*p)).map(String::as_str).collect();
+        if gone.is_empty() {
+            return;
+        }
+        let mut args = vec!["-Rns", "--noconfirm"];
+        args.extend(&gone);
+        match self.pacman_step(ctx, Stage::Install, &args, self.limits.install, out) {
+            Ok(()) => {
+                let msg = format!("removed what the older snapshot does not have and nothing needs: {}", gone.join(", "));
+                self.say(&format!("Arch: {msg}"));
+                out.repairs.push(msg);
+            }
+            Err(f) => out.warnings.push(format!("removing {} failed: {}", gone.join(", "), f.reason)),
+        }
+    }
+
     fn pacman_step(&self, ctx: &Ctx, stage: Stage, args: &[&str], limit: Duration, out: &mut ArchOutcome) -> Result<(), Failure> {
         let tctx = ctx.with_timeout(limit);
+        let log_before = fs::metadata(self.path(PACMAN_LOG)).map(|m| m.len()).unwrap_or(0);
         let (o, res) = if stage == Stage::Install {
             // Never killed (see Limits::install), and no shutdown while it
             // runs: that would stop it half way through a package as well.
+            // The marker stays only when it is cut off all the same.
             let cmd = pacman(args).interrupt(None).keep_fd(self.lock_fd);
-            self.inhibited("pacman installs an update", &mut out.warnings, || self.run.run(&tctx, &cmd))
+            let _ = fsx::mkdir_all(fsx::dir(self.path(INSTALLING)), 0o700)
+                .and_then(|_| write_atomic(&self.path(INSTALLING), format!("{}\n", out.date).as_bytes(), 0o600));
+            let r = self.inhibited("pacman installs an update", &mut out.warnings, || self.run.run(&tctx, &cmd));
+            let _ = fs::remove_file(self.path(INSTALLING));
+            r
         } else {
             self.run.run(&tctx, &pacman(args).interrupt(Some(PACMAN_GRACE)))
         };
         out.hook_failed |= o.contains(HOOK_FAILED);
         let Err(e) = res else {
+            out.untouched = false;
             return Ok(());
         };
         out.tail = tail(&o);
+        let said = parse_pacman(&o);
+        // pacman says "no packages were upgraded" after any failed commit;
+        // its log says whether one was all the same.
+        out.untouched = said.none_upgraded && self.changes_since(log_before).0 == 0;
+        let real = said.lines();
+        out.said = said;
         // The error ends with pacman's last line of output: text from the
         // mirror (a file name, a server's answer) on its way to the log and
         // the report.
@@ -843,13 +1112,16 @@ impl Host<'_> {
         } else {
             e
         };
-        let problem = pacman_problem(&o);
+        let problem = pacman_problem(&o, &out.said);
+        // What pacman itself said, not only its last line.
+        let said = if real.is_empty() || ctx.done() || tctx.done() { e.to_string() } else { real };
         let reason = match stage {
+            Stage::Install if out.untouched => errf!("pacman changed nothing ({problem}): {said}"),
             Stage::Install => errf!(
-                "pacman stopped part way ({problem}): the system may be partly upgraded. Do not reboot; the next run tries again: {e}"
+                "pacman stopped part way ({problem}): the system may be partly upgraded. Do not reboot; the next run tries again: {said}"
             ),
-            Stage::Sync => errf!("refreshing the package lists of {} failed ({problem}); nothing was installed: {e}", out.date),
-            _ => errf!("downloading the packages failed ({problem}); nothing was installed: {e}"),
+            Stage::Sync => errf!("refreshing the package lists of {} failed ({problem}); nothing was installed: {said}", out.date),
+            _ => errf!("downloading the packages failed ({problem}); nothing was installed: {said}"),
         };
         // Nothing was installed before the install: another try may well
         // work (the archive back, a broken download loaded again).
@@ -1204,25 +1476,165 @@ fn restart_packages(changes: &[Change]) -> Vec<String> {
 }
 
 /// Why pacman failed, in a few words, from its output.
-fn pacman_problem(out: &str) -> &'static str {
-    let has = |s: &str| out.contains(s);
-    if has("exists in filesystem") {
-        "files on disk that belong to no package are in the way; dryserver never overwrites them: look at the files pacman names"
-    } else if has("unable to lock database") {
-        "another pacman holds the lock"
-    } else if has("signature") || has("PGP") {
-        "a package signature did not check out"
-    } else if has("failed retrieving file") || has("failed to synchronize") || has("Could not resolve host") || has("too slow") {
-        "downloads failed, the Arch archive may be slow or down"
-    } else if has("not enough free disk space") || has("No space left on device") {
-        "the disk is full"
-    } else if has("could not satisfy dependencies") {
-        "a dependency is missing from the snapshot"
-    } else if has("conflict") {
-        "packages conflict"
-    } else {
-        "see the log"
+/// A file pacman would not install over: "openssl: /usr/lib/libcrypto.so.3
+/// exists in filesystem (owned by openssl-3)".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Conflict {
+    /// The package that brings the file.
+    pub target: String,
+    pub path: String,
+    /// The installed package that owns it; None: no package does.
+    pub owner: Option<String>,
+}
+
+/// What a pacman run that failed said, read from its output (pacman runs
+/// in the C locale: see pacman()).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PacmanSaid {
+    /// Its "error:" lines, cleaned, at most MAX_SAID.
+    pub errors: Vec<String>,
+    /// Files in the way ("exists in filesystem"), at most MAX_CONFLICTS.
+    pub conflicts: Vec<Conflict>,
+    /// More of them than that.
+    pub more_conflicts: bool,
+    /// Lines about two packages of the run bringing the same file.
+    pub both: Vec<String>,
+    /// Packages pacman found invalid or corrupted.
+    pub corrupt: Vec<String>,
+    /// "Errors occurred, no packages were upgraded.": what pacman prints
+    /// after any commit that failed; its log says whether that is so.
+    pub none_upgraded: bool,
+}
+
+/// SPLIT: the newer packages whose files a rollback gave to the older
+/// ones, and the files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct SplitRecord {
+    owners: Vec<String>,
+    paths: Vec<String>,
+}
+
+const MAX_SAID: usize = 8;
+const MAX_CONFLICTS: usize = 64;
+
+/// A package name as pacman prints it.
+fn package_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 128 && s.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c))
+}
+
+fn parse_pacman(out: &str) -> PacmanSaid {
+    let mut s = PacmanSaid::default();
+    for line in out.lines().take(MAX_SCAN) {
+        let l = line.trim();
+        if let Some(e) = l.strip_prefix("error: ") {
+            if s.errors.len() < MAX_SAID {
+                s.errors.push(one_line(&format!("error: {e}"), 300));
+            }
+        } else if l == "Errors occurred, no packages were upgraded." {
+            s.none_upgraded = true;
+        } else if let Some(c) = parse_conflict(l) {
+            if s.conflicts.len() < MAX_CONFLICTS {
+                s.conflicts.push(c);
+            } else {
+                s.more_conflicts = true;
+            }
+        } else if l.contains(" exists in both '") {
+            if s.both.len() < MAX_SAID {
+                s.both.push(one_line(l, 300));
+            }
+        } else if let Some(p) = l.strip_suffix(" is invalid or corrupted")
+            && s.corrupt.len() < MAX_SAID
+        {
+            s.corrupt.push(one_line(p, 200));
+        }
     }
+    s
+}
+
+/// "TARGET: PATH exists in filesystem" with " (owned by OWNER)" or not.
+fn parse_conflict(l: &str) -> Option<Conflict> {
+    let (target, rest) = l.split_once(": ")?;
+    let (path, owner) = match rest.rsplit_once(" exists in filesystem") {
+        Some((p, "")) => (p, None),
+        Some((p, tail)) => (p, Some(tail.strip_prefix(" (owned by ")?.strip_suffix(')')?)),
+        None => return None,
+    };
+    if !package_name(target) || !path.starts_with('/') || owner.is_some_and(|o| !package_name(o)) {
+        return None;
+    }
+    Some(Conflict { target: target.into(), path: printable(path), owner: owner.map(str::to_string) })
+}
+
+impl PacmanSaid {
+    /// What pacman said, for the reason: its errors, then what they are
+    /// about. One line.
+    fn lines(&self) -> String {
+        let mut v = self.errors.clone();
+        v.extend(self.conflicts.iter().take(MAX_SAID).map(|c| match &c.owner {
+            Some(o) => format!("{}: {} exists in filesystem (owned by {o})", c.target, c.path),
+            None => format!("{}: {} exists in filesystem", c.target, c.path),
+        }));
+        if self.conflicts.len() > MAX_SAID || self.more_conflicts {
+            v.push("and more files in the way".into());
+        }
+        v.extend(self.both.iter().cloned());
+        v.extend(self.corrupt.iter().map(|p| format!("{p} is invalid or corrupted")));
+        one_line(&v.join("; "), 1500)
+    }
+
+    /// The packages that own files in the way.
+    fn owners(&self) -> BTreeSet<&str> {
+        self.conflicts.iter().filter_map(|c| c.owner.as_deref()).collect()
+    }
+}
+
+fn pacman_problem(out: &str, said: &PacmanSaid) -> String {
+    let has = |s: &str| out.contains(s);
+    let owners = said.owners();
+    if !said.conflicts.is_empty() && owners.is_empty() {
+        "files on disk that belong to no package are in the way; dryserver never overwrites them unless it knows where they came from: look at the files pacman names".into()
+    } else if !said.conflicts.is_empty() && said.conflicts.iter().all(|c| c.owner.is_some()) {
+        format!("files that {} own(s) are in the way", owners.into_iter().collect::<Vec<_>>().join(", "))
+    } else if !said.conflicts.is_empty() {
+        "files in the way, some owned by other packages and some by none".into()
+    } else if !said.both.is_empty() {
+        "two packages of the snapshot bring the same file".into()
+    } else if has("unable to lock database") {
+        "another pacman holds the lock".into()
+    } else if has("PGP signature") || has("unknown trust") || has("signature from") || has("could not be looked up") {
+        "a package signature did not check out: its key is unknown or not trusted, or the package was changed".into()
+    } else if !said.corrupt.is_empty() || has("invalid or corrupted package") {
+        "a downloaded package is invalid or corrupted; pacman deletes it, the next try loads it again".into()
+    } else if has("failed retrieving file") || has("failed to synchronize") || has("Could not resolve host") || has("too slow") {
+        "downloads failed, the Arch archive may be slow or down".into()
+    } else if has("not enough free disk space") || has("No space left on device") {
+        "the disk is full".into()
+    } else if has("could not satisfy dependencies") {
+        "a dependency is missing from the snapshot".into()
+    } else if has("conflict") {
+        "packages conflict".into()
+    } else {
+        "see the log".into()
+    }
+}
+
+/// A path as a pattern for pacman's --overwrite that matches that path
+/// only (fnmatch without flags: a backslash takes the next character as it
+/// is). None for a path that cannot be named so: pacman splits the
+/// option's value at commas, and takes a leading ! as a negation.
+fn exact_pattern(path: &str) -> Option<String> {
+    if !path.starts_with('/') || path.contains(',') || path.chars().any(char::is_control) {
+        return None;
+    }
+    let mut s = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            s.push('\\');
+        }
+        s.push(c);
+    }
+    Some(s)
 }
 
 /// The last lines of a command's output, at most about 4 KiB.
@@ -2662,6 +3074,8 @@ mod tests {
                 "pacman -Syy --noconfirm",
                 "pacman -Suuw --noconfirm --ignore archlinux-keyring",
                 "pacman -Suu --noconfirm --ignore archlinux-keyring",
+                // What the newer snapshot brought and nothing needs: none.
+                "pacman -Qdtq",
                 "pacman -Sc --noconfirm",
             ],
             "older packages, but the newer signing keys stay"
@@ -2951,6 +3365,255 @@ mod tests {
         let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
         let p = out.boot_problem.clone().unwrap_or_default();
         assert!(!out.reboot_safe() && p.contains(lts) && p.contains("linux-lts changed"), "{p}");
+    }
+
+    /// What pacman printed on the coordinator for a rollback from Arch
+    /// 2026/11/22 to 2026/11/08: openssl went to 4.x after 11/08 and the
+    /// compatibility package openssl-3 took the .so.3 files over, which the
+    /// older openssl ships itself.
+    const SPLIT_OUT: &str = "checking for file conflicts...\n\
+        error: failed to commit transaction (conflicting files)\n\
+        openssl: /usr/lib/libcrypto.so.3 exists in filesystem (owned by openssl-3)\n\
+        openssl: /usr/lib/libssl.so.3 exists in filesystem (owned by openssl-3)\n\
+        Errors occurred, no packages were upgraded.\n";
+    const SPLIT_ERR: &str = "pacman failed: exit status 1: Errors occurred, no packages were upgraded.";
+    const ROLLBACK: &str = "pacman -Suu --noconfirm --ignore archlinux-keyring --ignore linux-lts";
+    const OVERWRITE: &str = "--overwrite /usr/lib/libcrypto.so.3 --overwrite /usr/lib/libssl.so.3";
+
+    #[test]
+    fn pacmans_own_errors_are_read_not_guessed() {
+        let said = parse_pacman(SPLIT_OUT);
+        assert!(said.none_upgraded && said.errors == ["error: failed to commit transaction (conflicting files)"], "{said:?}");
+        assert_eq!(
+            said.conflicts,
+            [
+                Conflict { target: "openssl".into(), path: "/usr/lib/libcrypto.so.3".into(), owner: Some("openssl-3".into()) },
+                Conflict { target: "openssl".into(), path: "/usr/lib/libssl.so.3".into(), owner: Some("openssl-3".into()) },
+            ]
+        );
+        assert_eq!(pacman_problem(SPLIT_OUT, &said), "files that openssl-3 own(s) are in the way");
+        // No owner, a corrupt package, a signature, a download.
+        let lone = parse_pacman("foo: /usr/bin/foo exists in filesystem\nfoo: /usr/share/a b exists in filesystem\n");
+        assert_eq!(lone.conflicts[1], Conflict { target: "foo".into(), path: "/usr/share/a b".into(), owner: None });
+        assert!(pacman_problem("", &lone).contains("belong to no package"));
+        let bad = "error: glibc: signature from \"X <x@y>\" is unknown trust\n:: File /var/cache/pacman/pkg/glibc.pkg.tar.zst is corrupted (invalid or corrupted package (PGP signature)).\nerror: failed to commit transaction (invalid or corrupted package (PGP signature))\n/var/cache/pacman/pkg/glibc.pkg.tar.zst is invalid or corrupted\nErrors occurred, no packages were upgraded.\n";
+        let said = parse_pacman(bad);
+        assert!(pacman_problem(bad, &said).contains("signature did not check out") && said.corrupt.len() == 1, "{said:?}");
+        let damaged = "error: failed to commit transaction (invalid or corrupted package)\n/var/cache/pacman/pkg/x.pkg.tar.zst is invalid or corrupted\n";
+        assert!(pacman_problem(damaged, &parse_pacman(damaged)).contains("invalid or corrupted"));
+        let net = "error: failed retrieving file 'glibc.pkg.tar.zst' from archive.archlinux.org : Could not resolve host\n";
+        assert!(pacman_problem(net, &parse_pacman(net)).contains("downloads failed"));
+        // Lines from outside are cleaned; nothing but a path is a path.
+        let evil = parse_pacman("x: /a\u{1b}[2J exists in filesystem\nfoo bar: /b exists in filesystem\nfoo: b exists in filesystem\n");
+        assert_eq!(evil.conflicts, [Conflict { target: "x".into(), path: "/a?[2J".into(), owner: None }]);
+        // A path matches itself only, or cannot be named at all.
+        assert_eq!(exact_pattern("/usr/lib/libssl.so.3").as_deref(), Some("/usr/lib/libssl.so.3"));
+        assert_eq!(exact_pattern("/a*b?[c]\\d").as_deref(), Some("/a\\*b\\?\\[c\\]\\\\d"));
+        for never in ["/a,b", "relative", "/a\nb"] {
+            assert_eq!(exact_pattern(never), None, "{never:?}");
+        }
+    }
+
+    /// The pacman of a rollback across the openssl split: which answers
+    /// it gives, and whether the snapshot gone back to has openssl-3.
+    fn split_pacman(snapshot_has_owner: bool) -> impl Fn(&Ctx, &Path, &Cmd) -> (String, Result<()>) + Send + Sync + 'static {
+        move |_, root, c| {
+            let line = c.to_string();
+            let ok = |s: &str| (s.to_string(), Ok(()));
+            let dropped = fsx::under(root, "/var/lib/pacman/local/openssl-3-dropped").exists();
+            match line.as_str() {
+                l if l == ROLLBACK => (SPLIT_OUT.into(), Err(SPLIT_ERR.into())),
+                l if l == format!("{ROLLBACK} {OVERWRITE}") => {
+                    append(root, PACMAN_LOG, "[2026-11-23T03:00:02+0000] [ALPM] downgraded openssl (4.0.0-1 -> 3.6.5-1)\n");
+                    ok("")
+                }
+                "pacman -Qmq" if snapshot_has_owner => ok("libnew\n"),
+                "pacman -Qmq" if dropped => ok("libnew\n"),
+                "pacman -Qmq" => ok("openssl-3\nlibnew\n"),
+                l if l.starts_with("pacman -Qoq /usr/lib/lib") => ok("openssl\nopenssl-3\n"),
+                "pacman -Rdd --dbonly --noconfirm openssl-3" => {
+                    put(root, "/var/lib/pacman/local/openssl-3-dropped", "");
+                    ok("")
+                }
+                "pacman -Dk" => ok("No database errors have been found!\n"),
+                "pacman -Qdtq" => ok("libnew\nlibold\n"),
+                _ => ok(""),
+            }
+        }
+    }
+
+    #[test]
+    fn a_rollback_across_a_package_split_takes_the_files_over() {
+        let dir = two_kernels();
+        let r = dir.path();
+        put(r, MIRRORLIST, mirrorlist("2026/11/22").unwrap());
+        let fake = Fake::with_pacman(r, split_pacman(false));
+        let (h, _) = host(r, &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/08", true);
+        assert!(out.ok(), "{}", out.summary());
+        let ran: Vec<String> = fake.pacman_lines().into_iter().filter(|l| !l.starts_with("pacman -Qu")).collect();
+        assert_eq!(
+            ran,
+            [
+                "pacman -Syy --noconfirm",
+                "pacman -Suuw --noconfirm --ignore archlinux-keyring",
+                ROLLBACK,
+                "pacman -Qmq",
+                &format!("{ROLLBACK} {OVERWRITE}"),
+                // linux-lts in a run of its own, once the rest went in.
+                "pacman -Suu --noconfirm --ignore archlinux-keyring",
+                "pacman -Qmq",
+                "pacman -Qoq /usr/lib/libcrypto.so.3",
+                "pacman -Qoq /usr/lib/libssl.so.3",
+                "pacman -Rdd --dbonly --noconfirm openssl-3",
+                "pacman -Dk",
+                "pacman -Qdtq",
+                "pacman -Qmq",
+                "pacman -Rns --noconfirm libnew",
+                "pacman -Sc --noconfirm",
+            ]
+        );
+        let s = out.summary();
+        assert!(s.contains("openssl take(s) over /usr/lib/libcrypto.so.3 /usr/lib/libssl.so.3 from openssl-3"), "{s}");
+        assert!(s.contains("openssl-3 left pacman's database") && s.contains("libnew"), "{s}");
+        assert!(!s.contains("libold"), "only what the older snapshot lacks goes: {s}");
+        assert!(!h.path(SPLIT).exists() && !h.path(INSTALLING).exists());
+        // The installs ran under the inhibitor, never killed.
+        for c in
+            fake.ran.lock().unwrap().iter().filter(|c| {
+                c.name == "pacman" && (c.args[0].starts_with("-Suu") && !c.args[0].ends_with('w') || c.args[0].starts_with("-R"))
+            })
+        {
+            assert_eq!(c.stop, Stop::Interrupt(None), "{c}");
+        }
+    }
+
+    #[test]
+    fn a_power_cut_after_the_files_were_taken_over_finishes_next_time() {
+        // The overwrite went in; the power went before the newer package
+        // lost its database entry. The next run installs well and does it.
+        let dir = two_kernels();
+        let r = dir.path();
+        put(r, MIRRORLIST, mirrorlist("2026/11/08").unwrap());
+        let record =
+            SplitRecord { owners: vec!["openssl-3".into()], paths: vec!["/usr/lib/libcrypto.so.3".into(), "/usr/lib/libssl.so.3".into()] };
+        put(r, SPLIT, serde_json::to_string(&record).unwrap());
+        let fake = Fake::with_pacman(r, |_, _, c| match c.args[0].as_str() {
+            "-Qmq" => ("openssl-3\n".into(), Ok(())),
+            "-Qoq" => ("openssl\nopenssl-3\n".into(), Ok(())),
+            _ => (String::new(), Ok(())),
+        });
+        let (h, _) = host(r, &fake);
+        let mut out = h.arch_check("2026/11/08", true);
+        out.downloaded = true;
+        h.arch_install(&Ctx::new(), &mut out);
+        assert!(out.ok() && fake.count("pacman -Rdd --dbonly --noconfirm openssl-3") == 1, "{:?}", fake.pacman_lines());
+        assert!(!h.path(SPLIT).exists());
+        // Files not owned by the older package yet: the entry stays, and so
+        // does the record, for the next run.
+        let dir = two_kernels();
+        let r = dir.path();
+        put(r, SPLIT, serde_json::to_string(&record).unwrap());
+        let fake = Fake::with_pacman(r, |_, _, c| {
+            if c.args[0] == "-Qoq" {
+                return ("openssl-3\n".into(), Ok(()));
+            }
+            if c.args[0] == "-Qmq" {
+                return ("openssl-3\n".into(), Ok(()));
+            }
+            (String::new(), Ok(()))
+        });
+        let (h, _) = host(r, &fake);
+        let mut out = h.arch_check("2026/11/08", true);
+        out.downloaded = true;
+        h.arch_install(&Ctx::new(), &mut out);
+        assert!(fake.count("pacman -Rdd") == 0 && h.path(SPLIT).exists(), "{:?}", fake.pacman_lines());
+        assert!(out.warnings.iter().any(|w| w.contains("keep(s) its database entry")), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn files_in_the_way_that_dryserver_cannot_account_for_are_never_overwritten() {
+        // The owner is in the snapshot gone back to: no split.
+        let dir = two_kernels();
+        let r = dir.path();
+        put(r, MIRRORLIST, mirrorlist("2026/11/22").unwrap());
+        let fake = Fake::with_pacman(r, split_pacman(true));
+        let (h, _) = host(r, &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/08", true);
+        let f = out.failure.as_ref().unwrap();
+        let why = f.reason.to_string();
+        assert!(why.contains("openssl-3 owns them and the snapshot of 2026/11/08 has openssl-3 too"), "{why}");
+        assert!(why.contains("pacman changed nothing") && !why.contains("Do not reboot") && out.untouched, "{why}");
+        assert!(why.contains("openssl: /usr/lib/libcrypto.so.3 exists in filesystem (owned by openssl-3)"), "pacman's own words: {why}");
+        assert!(!fake.lines().iter().any(|l| l.contains("--overwrite")), "{:?}", fake.pacman_lines());
+        assert!(!h.path(SPLIT).exists());
+        // A forward update with files that belong to no package: refused,
+        // with the paths.
+        let lone = "error: failed to commit transaction (conflicting files)\nfoo: /usr/bin/foo exists in filesystem\nErrors occurred, no packages were upgraded.\n";
+        let dir = two_kernels();
+        let fake = Fake::with_pacman(dir.path(), |_, _, c| {
+            if c.args[0] == "-Su" {
+                return (lone.into(), Err(SPLIT_ERR.into()));
+            }
+            (String::new(), Ok(()))
+        });
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        let why = out.failure.as_ref().unwrap().reason.to_string();
+        assert!(
+            why.contains("no install of dryserver's was cut off") && why.contains("/usr/bin/foo") && why.contains("pacman -Qo"),
+            "{why}"
+        );
+        assert!(!fake.lines().iter().any(|l| l.contains("--overwrite")));
+        // A forward update over files of another package: refused too.
+        let owned = "foo: /usr/bin/foo exists in filesystem (owned by bar)\nErrors occurred, no packages were upgraded.\n";
+        let dir = two_kernels();
+        let fake =
+            Fake::with_pacman(
+                dir.path(),
+                |_, _, c| if c.args[0] == "-Su" { (owned.into(), Err(SPLIT_ERR.into())) } else { (String::new(), Ok(())) },
+            );
+        let (h, _) = host(dir.path(), &fake);
+        let why = h.arch_update(&Ctx::new(), "2026/11/20", false).failure.unwrap().reason.to_string();
+        assert!(why.contains("only a rollback across a package split"), "{why}");
+        assert!(!fake.lines().iter().any(|l| l.contains("--overwrite")));
+    }
+
+    #[test]
+    fn an_install_cut_off_half_way_is_finished_over_its_own_files() {
+        // A power cut in the middle of foo: its new files are on disk, owned
+        // by no package (pacman wrote foo's entry only after them).
+        let lone = "foo: /usr/bin/foo exists in filesystem\nfoo: /usr/share/foo/a exists in filesystem\nErrors occurred, no packages were upgraded.\n";
+        let make = |in_list: bool| {
+            let dir = two_kernels();
+            put(dir.path(), INSTALLING, "2026/11/20\n");
+            let fake = Fake::with_pacman(dir.path(), move |_, _, c| {
+                let line = c.to_string();
+                match c.args[0].as_str() {
+                    "-Su" if !line.contains("--overwrite") => (lone.into(), Err(SPLIT_ERR.into())),
+                    "-Sddp" => ("foo-2.0-1-x86_64.pkg.tar.zst\n".into(), Ok(())),
+                    "-Qlpq" if in_list => ("/usr/\n/usr/bin/\n/usr/bin/foo\n/usr/share/foo/\n/usr/share/foo/a\n".into(), Ok(())),
+                    "-Qlpq" => ("/usr/bin/foo\n".into(), Ok(())),
+                    _ => (String::new(), Ok(())),
+                }
+            });
+            (dir, fake)
+        };
+        let (dir, fake) = make(true);
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok() && out.summary().contains("cut off half way"), "{}", out.summary());
+        let lines = fake.pacman_lines();
+        assert!(lines.iter().any(|l| l.ends_with("--overwrite /usr/bin/foo --overwrite /usr/share/foo/a")), "{lines:?}");
+        let list = lines.iter().find(|l| l.starts_with("pacman -Qlpq")).unwrap();
+        assert!(list.ends_with("/var/cache/pacman/pkg/foo-2.0-1-x86_64.pkg.tar.zst"), "{list}");
+        assert!(!h.path(INSTALLING).exists(), "the marker goes once pacman returned");
+        // A file in the way that is not the package's own: refused.
+        let (dir, fake) = make(false);
+        let (h, _) = host(dir.path(), &fake);
+        let why = h.arch_update(&Ctx::new(), "2026/11/20", false).failure.unwrap().reason.to_string();
+        assert!(why.contains("/usr/share/foo/a is not in foo's own file list"), "{why}");
+        assert!(!fake.lines().iter().any(|l| l.contains("--overwrite")));
     }
 
     // ---- k3s ----

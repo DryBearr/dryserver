@@ -512,6 +512,10 @@ pub struct ArchState {
     /// The fallback kernel's update waits for the next run, once the main
     /// kernel booted well (osupdate: one kernel at a time).
     pub lts_waits: bool,
+    /// The run failed, but pacman changed nothing (it refused before it
+    /// began: files in the way, a damaged package): not done, and still
+    /// safe to reboot.
+    pub untouched: bool,
 }
 
 fn read_json<T: DeserializeOwned>(m: &Machine, path: &str) -> Result<Option<T>> {
@@ -2046,6 +2050,7 @@ fn save_arch_state(m: &Machine, o: &ArchOutcome) {
         boot_problem: o.boot_problem.clone().unwrap_or_default(),
         summary: o.summary(),
         lts_waits: o.lts_waits,
+        untouched: !o.ok() && o.untouched,
     };
     if let Err(e) = save_json(m, ARCH_STATE, &s) {
         note(m, m.now(), &format!("cannot keep {ARCH_STATE}: {e}"));
@@ -2701,7 +2706,7 @@ fn boot_time(m: &Machine) -> i64 {
 /// The reboot this machine is due, if any (see Status::reboot).
 fn reboot_state(m: &Machine, arch: Option<&ArchState>) -> String {
     let since_boot = arch.filter(|a| a.at >= boot_time(m));
-    if let Some(a) = arch.filter(|a| !a.done) {
+    if let Some(a) = arch.filter(|a| !a.done && !a.untouched) {
         return format!("do NOT reboot: the package update to {} stopped part way; the next one finishes it", a.date);
     }
     if let Some(a) = since_boot.filter(|a| !a.boot_problem.is_empty()) {
@@ -2914,6 +2919,9 @@ mod tests {
         download_fails: bool,
         /// pacman stops part way through the install.
         install_fails: bool,
+        /// pacman refuses the install before it changes anything (files of
+        /// another package in the way), as it did on the coordinator.
+        install_refused: bool,
         /// The install brings a new kernel (and its boot image).
         new_kernel: bool,
         /// systemctl reboot fails.
@@ -3010,6 +3018,11 @@ mod tests {
                 "-Su" | "-Suu" => {
                     assert_eq!(c.stop, crate::runner::Stop::Interrupt(None), "pacman is never killed while it installs");
                     self.clock.fetch_add(s.install_takes, Ordering::SeqCst);
+                    if s.install_refused {
+                        let o = "checking for file conflicts...\nerror: failed to commit transaction (conflicting files)\n\
+                            openssl: /usr/lib/libcrypto.so.3 exists in filesystem (owned by openssl-3)\nErrors occurred, no packages were upgraded.\n";
+                        return (o.into(), Err("pacman failed: exit status 1: Errors occurred, no packages were upgraded.".into()));
+                    }
                     log("upgraded htop (3.3.0-1 -> 3.3.0-2)");
                     if s.install_fails {
                         let o = "error: failed to commit transaction (conflicting files)\nfoo: /usr/bin/foo exists in filesystem\n";
@@ -4733,6 +4746,25 @@ mod tests {
         lab.apply_os(&os_rel(9, K3S_NEW, NEXT_DAY), Some(K3S_NEW)).unwrap();
         assert!(lab.arch().unwrap().done);
         assert!(status(&lab.m(), now()).reboot.is_empty());
+    }
+
+    #[test]
+    fn a_package_install_pacman_refused_says_its_words_and_leaves_reboots_safe() {
+        // pacman refused before it changed anything: the update goes back
+        // (k3s and the files), the packages are as they were, and a reboot
+        // is as safe as before. What pacman said is kept, not guessed.
+        let lab = Lab::new();
+        lab.script(|s| s.install_refused = true);
+        let e = lab.apply_os(&os_rel(8, K3S_NEW, NEXT_DAY), Some(K3S_NEW)).unwrap_err().to_string();
+        assert!(e.contains("pacman changed nothing") && !e.contains("Do not reboot"), "{e}");
+        let words = "openssl: /usr/lib/libcrypto.so.3 exists in filesystem (owned by openssl-3)";
+        assert!(e.contains("error: failed to commit transaction (conflicting files)") && e.contains(words), "{e}");
+        lab.assert_os_old("refused by pacman");
+        let a = lab.arch().unwrap();
+        assert!(!a.done && a.untouched && a.summary.contains(words), "{a:?}");
+        assert!(!status(&lab.m(), now()).reboot.contains("do NOT reboot"), "{}", status(&lab.m(), now()).reboot);
+        assert!(fs::read_to_string(lab.p(LOG)).unwrap().contains(words), "the update log has pacman's words");
+        assert!(arch_due(&lab.m(), NEXT_DAY), "tried again by the next release");
     }
 
     #[test]
