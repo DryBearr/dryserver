@@ -403,7 +403,7 @@ impl Real {
             .find(|f| f.len() > 2 && f[0] == REGISTRY_USER)
             .and_then(|f| f[2].parse::<u32>().ok())
             .ok_or_else(|| errf!("the account {REGISTRY_USER} was not created"))?;
-        self.write(&format!("/etc/systemd/system/user-{uid}.slice.d/50-dryserver.conf"), 0o644, sysconf::REGISTRY_SLICE)?;
+        self.write(&crate::update::registry_slice(uid), 0o644, sysconf::REGISTRY_SLICE)?;
         // The key, where only root may change it; sshd forces the same
         // command whatever the key says (see sysconf's sshd).
         let public = fsx::read_string(format!("{}.pub", self.registry_key.display()))?;

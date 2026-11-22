@@ -876,7 +876,29 @@ pub fn managed(path: &str) -> bool {
 
 /// The system files this machine gets from this binary.
 pub fn render_managed(m: &Machine) -> Result<Vec<sysconf::File>> {
-    Ok(sysconf::render(&machine_params(m)?)?.into_iter().filter(|f| managed(&f.path)).collect())
+    let p = machine_params(m)?;
+    let mut files: Vec<sysconf::File> = sysconf::render(&p)?.into_iter().filter(|f| managed(&f.path)).collect();
+    // The registry account's limits: the installer writes them under its
+    // uid, which only the machine knows; an update keeps them in step too.
+    // A coordinator without that account has nothing to limit.
+    if p.role == Role::Coordinator
+        && let Some(uid) = uid_of(m, sysconf::REGISTRY_USER)
+    {
+        files.push(sysconf::File { path: registry_slice(uid), mode: 0o644, content: sysconf::REGISTRY_SLICE.into() });
+    }
+    Ok(files)
+}
+
+/// Where the registry account's slice settings go (systemd names a user's
+/// slice by number).
+pub fn registry_slice(uid: u32) -> String {
+    format!("/etc/systemd/system/user-{uid}.slice.d/50-dryserver.conf")
+}
+
+/// The uid of an account of this machine, from its /etc/passwd.
+fn uid_of(m: &Machine, user: &str) -> Option<u32> {
+    let passwd = fsx::read_or_empty(m.path("/etc/passwd"));
+    passwd.lines().map(|l| l.split(':').collect::<Vec<_>>()).find(|f| f.len() > 2 && f[0] == user).and_then(|f| f[2].parse().ok())
 }
 
 // ---- writing files with a way back ----
@@ -4360,6 +4382,34 @@ mod tests {
             assert_eq!(lab.get(p), c, "{p}");
         }
         assert!(!lab.pending().unwrap().files.iter().any(|f| !managed(&f.path)));
+    }
+
+    #[test]
+    fn the_registry_accounts_limits_follow_the_update_on_the_coordinator() {
+        // Installed before IPAddressDeny was in them: the update brings it,
+        // as any other file it manages, and a revert puts the old one back.
+        let lab = Lab::new();
+        lab.write(ROLE_FILE, b"coordinator\n", 0o644);
+        lab.write("/etc/passwd", b"root:x:0:0::/root:/bin/bash\ndryreg:x:973:973::/var/lib/dryreg:/bin/sh\n", 0o644);
+        let slice = registry_slice(973);
+        let old = "[Slice]\nTasksMax=200\nMemoryMax=384M\nMemorySwapMax=0\n";
+        lab.write(&slice, old.as_bytes(), 0o644);
+        lab.apply(&rel(7, NEW)).unwrap();
+        assert_eq!(lab.get(&slice), sysconf::REGISTRY_SLICE);
+        assert!(lab.get(&slice).contains("IPAddressDeny=any"));
+        assert!(lab.pending().unwrap().files.iter().any(|f| f.path == slice));
+        let verified = lab.fake.ran().iter().any(|c| c.starts_with("systemd-analyze verify") && c.ends_with(" user-973.slice"));
+        assert!(verified && lab.fake.has("systemctl daemon-reload"), "{:#?}", lab.fake.ran());
+        revert_by_hand(&lab.m(), &Ctx::new(), now(), &mut Vec::new()).unwrap();
+        assert_eq!(lab.get(&slice), old);
+        // A server has no such account; a coordinator without it (or a
+        // passwd that does not say) gets nothing, and no error.
+        let lab = Lab::new();
+        lab.write("/etc/passwd", b"dryreg:x:973:973::/var/lib/dryreg:/bin/sh\n", 0o644);
+        assert!(!render_managed(&lab.m()).unwrap().iter().any(|f| f.path.contains(".slice.d/")));
+        lab.write(ROLE_FILE, b"coordinator\n", 0o644);
+        lab.write("/etc/passwd", b"root:x:0:0::/root:/bin/bash\ndryreg:x:nope:973::/:/bin/sh\n", 0o644);
+        assert!(!render_managed(&lab.m()).unwrap().iter().any(|f| f.path.contains(".slice.d/")));
     }
 
     #[test]
