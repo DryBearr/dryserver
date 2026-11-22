@@ -30,9 +30,9 @@ use chrono::NaiveDate;
 use crate::admin::{Admin, View};
 use crate::ctx::Ctx;
 use crate::err::Result;
-use crate::registry::Member;
+use crate::registry::{self, Member};
 use crate::release::{self, K3sVersion, Release, Version};
-use crate::rollout::{self, Pause, Phase, Rollout};
+use crate::rollout::{self, Pause, Phase, Rollout, Skip, Turn};
 use crate::runner::{Cmd, ExecRunner, Runner};
 use crate::{bail, errf, fsx, iso, report};
 
@@ -604,7 +604,10 @@ impl Plan {
                 r.k3s.version
             ));
         }
-        out
+        // Names and versions come from the coordinator (checked at the
+        // load): still, no line reaches the terminal with a control
+        // character.
+        out.into_iter().map(|l| l.replace(|c: char| c.is_control(), "?")).collect()
     }
 }
 
@@ -637,6 +640,42 @@ pub fn publish(a: &mut Admin, p: &Plan) -> Result<Release> {
     Ok(p.release.clone())
 }
 
+// ---- the coordinator's rollout, as the desktop takes it ----
+
+/// The most warnings and passed-over servers taken: far more than a
+/// rollout makes.
+const MAX_SHOWN: usize = 64;
+
+impl Rollout {
+    /// The rollout as the desktop may show it, taken right after a load
+    /// (like report::Report::sanitized). The registry account writes the
+    /// copy the desktop reads, and may be hacked: every text in it is cut
+    /// to printable ASCII, so no escape sequence reaches the admin's
+    /// terminal (OSC 52 sets the clipboard, ESC [2J clears the screen and
+    /// the warnings on it); a name that is not a hostname is dropped (the
+    /// text then says "the server" or the host number); the lists are
+    /// capped.
+    pub fn sanitized(self) -> Rollout {
+        let name = |s: String| if registry::valid_name(&s) { s } else { String::new() };
+        let newest = self.warnings.len().saturating_sub(MAX_SHOWN);
+        Rollout {
+            turn: self.turn.map(|t| Turn { name: name(t.name), ..t }),
+            skipped: self
+                .skipped
+                .into_iter()
+                .take(MAX_SHOWN)
+                .map(|s| Skip { name: name(s.name), why: report::shown(&s.why, 200), ..s })
+                .collect(),
+            cordoned: self.cordoned.into_iter().filter(|n| registry::valid_name(n)).take(MAX_SHOWN).collect(),
+            paused: report::shown(&self.paused, 300),
+            pause_name: name(self.pause_name),
+            warnings: self.warnings.iter().skip(newest).map(|w| report::shown(w, 300)).collect(),
+            refused: report::shown(&self.refused, 300),
+            ..self
+        }
+    }
+}
+
 // ---- resuming ----
 
 /// Whether the rollout stopped and waits for the admin.
@@ -645,7 +684,7 @@ pub fn stopped(r: &Rollout) -> bool {
 }
 
 fn paused_name(r: &Rollout) -> String {
-    if r.pause_name.is_empty() { "the server".to_string() } else { r.pause_name.clone() }
+    if registry::valid_name(&r.pause_name) { r.pause_name.clone() } else { "the server".to_string() }
 }
 
 /// What a resume does now ("gives node-a its turn again..."), or why
@@ -743,7 +782,7 @@ fn machine_state(m: &Member, r: &Rollout, now: i64) -> (String, bool) {
         _ => {}
     }
     if let Some(s) = r.skipped.iter().find(|s| s.host == m.host) {
-        return (format!("passed over: {}", s.why), true);
+        return (format!("passed over: {}", report::shown(&s.why, 200)), true);
     }
     if r.turn.as_ref().is_some_and(|t| t.host == m.host) {
         let ready = r.turn.as_ref().is_some_and(|t| t.ready);
@@ -812,7 +851,9 @@ pub fn status_lines(v: &View, now: i64) -> Vec<String> {
         out.push("  ./dryserver release publish -notes \"the fix\"    a fixed release: it gets a higher serial".into());
         out.push("                                                   and replaces this rollout".into());
     }
-    out
+    // Every line carries the coordinator's words: none reaches the
+    // terminal with a character it would obey.
+    out.into_iter().map(|l| l.replace(|c: char| c.is_control(), "?")).collect()
 }
 
 /// The same advice for the approve screen, with its keys.

@@ -511,7 +511,9 @@ impl Admin {
             }
         }
         v.release = self.release.clone();
-        v.rollout = st.rollout;
+        // The registry account writes the rollout: its words are cut to
+        // plain text before anything shows them.
+        v.rollout = st.rollout.sanitized();
         v.coordinator_now = st.now;
         if st.now > 0 && (st.now - now).abs() > CLOCK_OFF {
             let off = crate::report::short_age((st.now - now).unsigned_abs());
@@ -609,9 +611,10 @@ impl Admin {
         }
         v.members = members.iter().map(|m| (m.clone(), self.base.has(m))).collect();
         // What members say they cut off. A member's word, relayed by the
-        // coordinator: something to look into, not a fact.
+        // coordinator: something to look into, not a fact. Only hostnames
+        // are shown of it.
         for m in &members {
-            for c in &m.cuts {
+            for c in m.cuts.iter().filter(|c| registry::valid_name(&c.name)) {
                 v.reports.push(if c.auto {
                     format!("{} cut off {} by itself: {} tried closed ports on it. Check {}.", m.name, c.name, c.name, c.name)
                 } else {

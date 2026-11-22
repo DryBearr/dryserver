@@ -182,7 +182,24 @@ fn is_zero(n: &u64) -> bool {
 /// A note from a machine made safe to show: printable ASCII only, so no
 /// escape sequence reaches a terminal, and at most MAX_NOTE characters.
 pub fn note(s: &str) -> String {
-    s.chars().map(|c| if (' '..='~').contains(&c) { c } else { '?' }).take(MAX_NOTE).collect()
+    shown(s, MAX_NOTE)
+}
+
+/// Text from another machine made safe to show: printable ASCII only, at
+/// most max characters. Anything else becomes '?': a terminal obeys
+/// control characters (an escape sequence can set the clipboard, the
+/// title, or clear the screen), and other characters can pass for what
+/// they are not.
+pub fn shown(s: &str, max: usize) -> String {
+    s.chars().map(|c| if (' '..='~').contains(&c) { c } else { '?' }).take(max).collect()
+}
+
+/// Text for the admin's terminal that may carry another machine's words,
+/// such as an error: every control character but newline and tab becomes
+/// '?', so no escape sequence (and no carriage return that writes over a
+/// line) reaches the terminal. Everything else stays as it is.
+pub fn printable(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() && !matches!(c, '\n' | '\t') { '?' } else { c }).collect()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -679,6 +696,22 @@ mod tests {
              [2026-11-10T12:00:00+0100] [PACMAN] Running 'pacman -S htop'\n",
         );
         dir
+    }
+
+    /// The two filters for another machine's words: shown keeps printable
+    /// ASCII alone (C0 and C1 controls, DEL, a direction override all
+    /// become '?') and cuts; printable takes out the controls a terminal
+    /// obeys and leaves the rest, newlines and tabs included.
+    #[test]
+    fn text_from_elsewhere_reaches_no_terminal_as_commands() {
+        let evil = "a\x1b]52;c;Y3VybA==\x07b\x1b[2J\u{9b}2J\u{9d}0;t\x07\r\x7f\u{202e}°";
+        assert_eq!(shown(evil, 100), "a?]52;c;Y3VybA==?b?[2J?2J?0;t?????");
+        assert_eq!(shown("abcdef", 3), "abc");
+        assert_eq!(note(&"x".repeat(500)).len(), MAX_NOTE);
+        let p = printable(&format!("{evil}\nnext\tline"));
+        assert!(!p.chars().any(|c| c.is_control() && c != '\n' && c != '\t'), "{p:?}");
+        assert!(p.ends_with("\u{202e}°\nnext\tline") && p.starts_with("a?]52;"), "{p:?}");
+        assert_eq!(printable("plain words: 3°C"), "plain words: 3°C");
     }
 
     #[test]

@@ -181,7 +181,7 @@ fn finish(res: Result<()>) -> ExitCode {
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("dryserver: {e}");
+            eprintln!("dryserver: {}", report::printable(&e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -275,7 +275,7 @@ fn run_app() -> Result<()> {
             return Ok(());
         };
         if let Err(e) = res {
-            eprintln!("dryserver: {e}");
+            eprintln!("dryserver: {}", report::printable(&e.to_string()));
             return Ok(());
         }
     }
@@ -416,7 +416,7 @@ fn run_ssh_config(args: &[String]) -> Result<()> {
     // what the coordinator says; only LAN addresses are its word.
     let view = a.load()?;
     for w in &view.warnings {
-        eprintln!("warning: {w}");
+        eprintln!("warning: {}", report::printable(w));
     }
     let servers = a.servers();
     let coord_ip = mesh::ip(&a.subnet, 1);
@@ -960,7 +960,7 @@ fn run_release(args: &[String]) -> Result<()> {
             let (mut a, _) = release_admin(&f, "release resume")?;
             let what = if f.on("skip") { publish::skip(&mut a) } else { publish::resume(&mut a) };
             let what = what.map_err(|e| e.wrap("not resumed"))?;
-            println!("Resumed: the coordinator {what}, at its next sync (within a minute).\n");
+            println!("Resumed: the coordinator {}, at its next sync (within a minute).\n", report::printable(&what));
             print_rollout(&mut a)
         }
         other => {
@@ -988,7 +988,7 @@ fn release_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
 fn print_rollout(a: &mut admin::Admin) -> Result<()> {
     let v = a.load()?;
     for w in &v.warnings {
-        eprintln!("warning: {w}");
+        eprintln!("warning: {}", report::printable(w));
     }
     for l in publish::status_lines(&v, Time::now().0.timestamp()) {
         println!("{l}");
@@ -1010,7 +1010,7 @@ fn release_publish(args: &[String]) -> Result<()> {
     let (mut a, host) = release_admin(&f, "release publish")?;
     let v = a.load().map_err(|e| e.wrap("not published, nothing was signed"))?;
     for w in &v.warnings {
-        eprintln!("warning: {w}");
+        eprintln!("warning: {}", report::printable(w));
     }
     // The release is this binary: the one the admin runs now.
     let k3s = match f.get("k3s") {
