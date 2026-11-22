@@ -75,6 +75,14 @@ for i in /boot/EFI/Linux/*.efi; do
 done
 du -h /boot/EFI/Linux/*.efi
 
+echo "== the main kernel booted well: the installer's fallback image keeps its counter, and is kept"
+mv /boot/EFI/Linux/arch-linux+3.efi /boot/EFI/Linux/arch-linux.efi
+before=$(sha256sum /boot/EFI/Linux/arch-linux-lts+3.efi)
+mkinitcpio -P >/tmp/out 2>&1 || { cat /tmp/out; fail "mkinitcpio -P after the install"; }
+grep -q "kept arch-linux-lts+3.efi" /tmp/out || { cat /tmp/out; fail "the installer's fallback image not kept"; }
+want "arch-linux+3.efi arch-linux-lts+3.efi"
+[[ "$(sha256sum /boot/EFI/Linux/arch-linux-lts+3.efi)" == "$before" ]] || fail "the installer's fallback image changed"
+
 echo "== a new initramfs: the fallback keeps the image it was made with"
 mv /boot/EFI/Linux/arch-linux+3.efi /boot/EFI/Linux/arch-linux.efi
 mv /boot/EFI/Linux/arch-linux-lts+3.efi /boot/EFI/Linux/arch-linux-lts.efi

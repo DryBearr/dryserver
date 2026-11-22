@@ -189,8 +189,8 @@ failed check restarts it while another image has tries left, so this needs
 nobody at the machine. When nothing else is left, the machine stays up as it is.
 
 New firmware or a new systemd rebuild every image; `linux-lts` keeps the one
-it was made with until `linux-lts` itself is updated, so one bad initramfs
-cannot reach both kernels. `sudo dryserver boot status` shows the images,
+it was made with (the installer's too) until `linux-lts` itself is updated,
+so one bad initramfs cannot reach both kernels. `sudo dryserver boot status` shows the images,
 which one started and whether the fallback waits; `./dryserver approve` shows
 "running fallback kernel" or "no fallback kernel" for a machine.
 

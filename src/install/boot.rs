@@ -31,9 +31,15 @@
 //!   checks the image, flushes it to disk and renames it into place,
 //!   counted, and only then removes the older image of that kernel.
 //! - The fallback kernel's image is replaced only when the fallback
-//!   kernel itself changed. New firmware or a new systemd makes mkinitcpio
-//!   build every image again; the fallback keeps the one it was made with,
-//!   so a broken initramfs cannot reach both kernels at once.
+//!   kernel itself changed (or was put on disk again, or its image failed
+//!   its tries). New firmware or a new systemd makes mkinitcpio build every
+//!   image again; the fallback keeps the one it was made with, so a broken
+//!   initramfs cannot reach both kernels at once. That holds for the image
+//!   the installer made too: it is counted like every new image
+//!   (`arch-linux-lts+3.efi`), and keeps its counter until the fallback is
+//!   ever started, since the main kernel is what starts first. Placing it
+//!   uncounted would call an image good that never booted, and a broken
+//!   one would then be started again and again.
 //! - Before pacman replaces a kernel, its modules go and the old image is
 //!   then a kernel without modules. A pacman hook (`dryserver boot mark`,
 //!   before mkinitcpio's own, which would remove the plain-named image)
@@ -247,6 +253,9 @@ impl Image {
         match self.left {
             None => "good (it booted well)".into(),
             Some(0) => format!("bad: it failed {} tries", self.done),
+            Some(n) if self.done == 0 && self.kernel == Kernel::Fallback => {
+                format!("waits for a main kernel that fails, not needed yet ({n} tries then)")
+            }
             Some(n) if self.done == 0 => format!("new, not tried yet ({n} tries)"),
             Some(n) => format!("being tried: {} tries done, {n} left", self.done),
         }
@@ -422,6 +431,19 @@ fn read_uki(path: &Path) -> Result<Uki> {
     Ok(uki)
 }
 
+/// FAT, the boot partition's file system, keeps times to two seconds.
+const TIME_SLACK: Duration = Duration::from_secs(2);
+
+/// When a file was put in place on this machine: its change time, which
+/// only the kernel sets (pacman keeps a package's modification times).
+fn changed_at(md: &fs::Metadata) -> std::time::SystemTime {
+    use std::os::unix::fs::MetadataExt;
+    match u64::try_from(md.ctime()) {
+        Ok(secs) => std::time::UNIX_EPOCH + Duration::new(secs, md.ctime_nsec().clamp(0, 999_999_999) as u32),
+        Err(_) => std::time::UNIX_EPOCH,
+    }
+}
+
 fn sync_file(path: &Path) -> Result<()> {
     File::open(path).and_then(|f| f.sync_all()).map_err(|e| Error::from(e).wrap(format!("sync {}", path.display())))
 }
@@ -464,8 +486,9 @@ fn say(out: &mut dyn Write, line: &str) {
 ///
 /// The steps, each safe to cut the power after:
 /// 1. check the staged image, flush it to disk;
-/// 2. the fallback kernel: when a good image of the same kernel release is
-///    there, keep it and drop the staged one;
+/// 2. the fallback kernel: when an image of the same kernel release is
+///    there that did not fail its tries and was made after its kernel was
+///    put on disk, keep it and drop the staged one;
 /// 3. rename it to its counted name (uncounted without a fallback kernel:
 ///    there is nothing to fall back to);
 /// 4. remove the older images of that kernel.
@@ -493,7 +516,18 @@ pub fn place(root: &Path, uki: &str, kver: &str, out: &mut dyn Write) -> Result<
     let size = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
     let old: Vec<Image> = images(&dir)?.into_iter().filter(|i| i.kernel == kernel).collect();
     if kernel == Kernel::Fallback {
-        let same = |i: &&Image| i.left.is_none() && read_uki(&dir.join(&i.name)).is_ok_and(|u| u.uname.as_deref() == Some(kver));
+        // Kept unless it failed its tries, or is older than its kernel on
+        // disk (the package was put there again). Counted or not: the image
+        // the installer made keeps its counter until the fallback is ever
+        // needed, since the main kernel is the one that starts.
+        let kernel_at = fs::symlink_metadata(fsx::under(root, format!("/usr/lib/modules/{kver}/vmlinuz"))).ok().map(|m| changed_at(&m));
+        let current = |i: &Image| {
+            let made = fs::metadata(dir.join(&i.name)).and_then(|m| m.modified()).ok();
+            matches!((made, kernel_at), (Some(made), Some(at)) if made + TIME_SLACK >= at)
+        };
+        let same = |i: &&Image| {
+            !i.bad() && !kver.is_empty() && current(i) && read_uki(&dir.join(&i.name)).is_ok_and(|u| u.uname.as_deref() == Some(kver))
+        };
         if let Some(keep) = old.iter().find(same) {
             remove_quietly(&staged)?;
             for i in old.iter().filter(|i| i.name != keep.name) {
@@ -961,6 +995,42 @@ mod tests {
         place_ok(root, Kernel::Fallback, "6.12.59-1-lts");
         assert_eq!(names(root), ["arch-linux-lts+3.efi", "arch-linux.efi"]);
         assert!(image_tag(root, "arch-linux-lts+3.efi").contains("kernel upgraded"));
+    }
+
+    #[test]
+    fn review_the_fallback_image_from_the_install_keeps_its_initramfs() {
+        // The installer places both images counted; the main kernel starts
+        // first and loses its counter, the fallback keeps it. A new systemd
+        // or firmware later rebuilds every image: the fallback keeps its own.
+        let dir = machine(true);
+        let root = dir.path();
+        put_image(root, "arch-linux.efi", MAIN_V, "main");
+        put_image(root, &Kernel::Fallback.counted(TRIES, 0), LTS_V, "from the install");
+        stage(root, Kernel::Fallback, LTS_V, "rebuilt with the new systemd");
+        place_ok(root, Kernel::Fallback, LTS_V);
+        let lts: Vec<String> = names(root).into_iter().filter(|n| n.starts_with("arch-linux-lts")).collect();
+        assert_eq!(lts.len(), 1, "{lts:?}");
+        assert!(image_tag(root, &lts[0]).contains("from the install"), "the rebuilt initramfs replaced the fallback image too");
+        assert_eq!(lts[0], "arch-linux-lts+3.efi", "it keeps its counter for when it is needed");
+        // Also one with a try taken (marked by a transaction that then
+        // changed nothing).
+        fs::rename(esp(root).join("arch-linux-lts+3.efi"), esp(root).join("arch-linux-lts+1.efi")).unwrap();
+        stage(root, Kernel::Fallback, LTS_V, "rebuilt again");
+        place_ok(root, Kernel::Fallback, LTS_V);
+        assert!(image_tag(root, "arch-linux-lts+1.efi").contains("from the install"));
+        // The same release put on disk again (a reinstall): its image is
+        // older than its kernel now, and is made again.
+        let old = std::time::SystemTime::now() - Duration::from_secs(86_400);
+        File::options().write(true).open(esp(root).join("arch-linux-lts+1.efi")).unwrap().set_modified(old).unwrap();
+        stage(root, Kernel::Fallback, LTS_V, "after the reinstall");
+        place_ok(root, Kernel::Fallback, LTS_V);
+        assert_eq!(names(root), ["arch-linux-lts+3.efi", "arch-linux.efi"]);
+        assert!(image_tag(root, "arch-linux-lts+3.efi").contains("after the reinstall"));
+        // The status says it waits, not that it is a new image to try.
+        let mut out = Vec::new();
+        status(root, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("waits for a main kernel that fails, not needed yet (3 tries then)"), "{out}");
     }
 
     #[test]
