@@ -1407,7 +1407,8 @@ fn a_server_that_confirms_after_its_turn_timed_out() {
 /// not confirmed yet): the brain waits for it before it updates itself, so
 /// never two machines update at once (one_at_a_time checks every minute).
 /// A server that says it is in the middle for ever holds it up for
-/// TURN_TIMEOUT at most.
+/// TURN_TIMEOUT, then the rollout stops there for the admin (it went on by
+/// itself before, beside a server that may still have been updating).
 #[test]
 fn a_new_release_waits_for_the_server_in_the_middle_of_the_old_one() {
     let mut sw = Swarm::new(2);
@@ -1433,8 +1434,16 @@ fn a_new_release_waits_for_the_server_in_the_middle_of_the_old_one() {
     Machine::new(&sw.server(2).node, false).save(&Local { pending: 10, applied: sw.now, ..Local::default() }).unwrap();
     sw.publish(11, true);
     let start = sw.now;
-    sw.until(TURN_TIMEOUT as usize / 60 + 5, |s| s.brain.fake.sim().applied.len() == 2);
+    sw.until(TURN_TIMEOUT as usize / 60 + 5, |s| s.rollout().pause == Pause::Timeout);
     assert!(sw.now - start >= TURN_TIMEOUT, "it waited {}s", sw.now - start);
+    sw.ticks(10);
+    assert_eq!(sw.brain.fake.sim().applied.len(), 1, "the brain went on by itself");
+    // Passed over on the admin's word: the brain goes on.
+    sw.skip();
+    sw.until(5, |s| s.brain.fake.sim().applied.len() == 2);
+    let r = sw.rollout();
+    assert!(r.warnings.iter().any(|w| w.contains("node-a is passed over for release 11; the coordinator updates itself")), "{r:#?}");
+    assert!(!r.cordoned.contains(&"node-a".to_string()), "{r:#?}");
 }
 
 /// The brain's sync killed (or the brain switched off) right after it
@@ -2179,7 +2188,13 @@ fn a_new_release_replaces_a_running_rollout() {
     let r = sw.rollout();
     assert_eq!(r.serial, 11);
     assert!(r.warnings.iter().any(|w| w.contains("release 11 replaced release 10")), "{r:#?}");
-    assert!(sw.kubectl().contains(&"uncordon -- node-b".to_string()), "the old turn's node stays cordoned");
+    // node-b had its turn for release 10 and may be in the middle of it: it
+    // stays cordoned (it may still reboot for it) until a report shows it
+    // done, and only then the brain goes on.
+    assert!(!sw.kubectl().contains(&"uncordon -- node-b".to_string()) && r.cordoned == vec!["node-b".to_string()], "{r:#?}");
+    let uncordoned = |s: &Swarm| s.kubectl().contains(&"uncordon -- node-b".to_string());
+    sw.until(10, |s| uncordoned(s) || s.brain.fake.sim().applied.len() > 1);
+    assert!(uncordoned(&sw), "the brain updated before node-b was done");
     sw.until(60, |s| s.everyone_on(11));
     sw.ticks(2);
     assert_eq!(sw.rollout().done, vec![2, 3, 4]);
@@ -2854,4 +2869,81 @@ fn review_root_never_reads_releases_through_a_planted_link() {
     };
     let why = b.served_k3s_problem().unwrap_or_default();
     assert!(why.contains("cannot be read") && why.contains("symbolic link"), "{why}");
+}
+
+/// A slow server whose turn timed out, then a fixed release: the brain
+/// waited TURN_TIMEOUT for it at most and then updated itself, and the
+/// next server, while the slow one still applied. Now nothing starts while
+/// a server says its update is pending; after TURN_TIMEOUT the rollout
+/// stops there for the admin instead of going on. And the node stays
+/// cordoned while it is in the middle.
+#[test]
+fn review_a_slow_server_from_the_old_rollout_is_not_updating_beside_the_next() {
+    let mut sw = Swarm::new(3);
+    sw.server(3).fake.sim().slow = 100_000;
+    sw.publish(10, true);
+    sw.until(120, |s| s.server(3).fake.sim().pending == 10);
+    sw.until(90, |s| s.rollout().pause == Pause::Timeout);
+    sw.publish(11, true);
+    sw.ticks(130); // tick() asserts one_at_a_time
+    let r = sw.rollout();
+    assert!(r.serial == 11 && r.phase == Phase::Brain && (r.pause, r.pause_host) == (Pause::Timeout, 3), "{r:#?}");
+    assert!(r.paused.contains("node-b did not finish the update it is in"), "{}", r.paused);
+    assert!(r.cordoned == vec!["node-b".to_string()], "uncordoned in the middle of its update: {r:#?}");
+    assert_eq!(sw.brain.fake.sim().applied.len(), 1);
+    let l = sw.lines();
+    assert!(l.contains("PAUSED: node-b did not finish") && l.contains("./dryserver release resume -skip"), "{l}");
+    // The admin resumes: it waits once more, and stops again.
+    sw.resume();
+    sw.ticks(5);
+    assert!(sw.rollout().paused.is_empty() && sw.brain.fake.sim().applied.len() == 1, "{:#?}", sw.rollout());
+    assert!(sw.rollout().warnings.iter().any(|w| w.contains("waits once more for node-b")), "{:#?}", sw.rollout());
+    sw.until(TURN_TIMEOUT as usize / 60 + 2, |s| s.rollout().pause == Pause::Timeout);
+    // It finishes after all: uncordoned, and the brain goes on by itself.
+    (sw.server(3).fake.sim().busy, sw.server(3).fake.sim().slow) = (0, 0);
+    sw.until(60, |s| s.everyone_on(11));
+    assert!(sw.rollout().paused.is_empty(), "{:#?}", sw.rollout());
+    let k = sw.kubectl();
+    let at = |l: &str| k.iter().rposition(|x| x == l).unwrap();
+    assert!(at("uncordon -- node-b") < k.iter().rposition(|x| x.starts_with("cordon")).unwrap(), "{k:?}");
+    assert!(sw.rollout().warnings.iter().any(|w| w == "node-b finished the update it was in; the coordinator updates itself"));
+}
+
+/// A hacked server that says its update is pending, out of any turn and
+/// for ever, holds the rollout up only until the admin passes it over: it
+/// stops there after TURN_TIMEOUT.
+#[test]
+fn a_server_that_says_it_is_in_the_middle_for_ever_holds_up_until_passed_over() {
+    for brain_first in [true, false] {
+        let mut sw = Swarm::new(3);
+        sw.offline.push(4);
+        sw.publish(10, true);
+        if !brain_first {
+            sw.until(10, |s| s.installed(1) == 10);
+        }
+        let lie = |sw: &Swarm| {
+            let rep = Report { update: "pending".into(), update_serial: 10, ..sw.healthy(4) };
+            sw.store.update(|s| s.heartbeat(4, Heartbeat { report: Some(rep), ..Heartbeat::default() }, time(sw.now))).unwrap();
+        };
+        let applies = |sw: &Swarm| std::iter::once(&sw.brain).chain(&sw.servers).map(|m| m.fake.sim().applied.len()).sum::<usize>();
+        // What started before the lie finishes; nothing starts after it.
+        lie(&sw);
+        let before = applies(&sw);
+        for _ in 0..TURN_TIMEOUT / 60 + 5 {
+            lie(&sw);
+            sw.tick();
+        }
+        let r = sw.rollout();
+        assert_eq!((r.pause, r.pause_host), (Pause::Timeout, 4), "{brain_first}: {r:#?}");
+        assert!(r.paused.contains("node-c did not finish the update it is in within 1h (its update says pending)"), "{}", r.paused);
+        assert_eq!(applies(&sw), before, "{brain_first}: updated beside it");
+        sw.skip();
+        for _ in 0..40 {
+            lie(&sw);
+            sw.tick();
+        }
+        assert!(sw.everyone_on(10) || sw.servers[..2].iter().all(|m| sw.installed(m.host) == 10), "{:#?}", sw.rollout());
+        assert!(sw.installed(1) == 10 && sw.rollout().paused.is_empty(), "{:#?}", sw.rollout());
+        assert!(sw.rollout().skipped.iter().any(|s| s.host == 4));
+    }
 }

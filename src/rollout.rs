@@ -1672,11 +1672,17 @@ pub struct Rollout {
     pub skip_asked: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub skip_done: u64,
-    /// The server a release this one replaced was updating: the brain
-    /// waits for it to finish before it updates itself (one machine at a
-    /// time), at most TURN_TIMEOUT. 0: none.
+    /// A server in the middle of an update (the one a release this one
+    /// replaced was updating, or one whose report says its update is
+    /// pending): nothing starts beside it, neither the brain's own update
+    /// nor a turn (one machine at a time). After TURN_TIMEOUT the rollout
+    /// stops at it for the admin. 0: none.
     #[serde(skip_serializing_if = "is_zero32")]
     pub wait_for: u32,
+    /// When the wait for it began, on the brain's clock (0 in a rollout
+    /// from before: its start).
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub wait_since: i64,
     /// Root's last tick on the brain's clock (not handed to the registry),
     /// and when its ticks went on after a gap or a jump of its clock.
     #[serde(skip_serializing_if = "is_zero_i64")]
@@ -1872,7 +1878,7 @@ impl Brain<'_> {
         }
         let gap = now.saturating_sub(last);
         let jumped = !(0..=OFFLINE).contains(&gap);
-        let timing = self.r.turn.is_some() || self.r.canary_until > last;
+        let timing = self.r.turn.is_some() || self.r.canary_until > last || self.r.wait_since != 0;
         if jumped {
             self.r.back = now;
             if timing {
@@ -1890,6 +1896,9 @@ impl Brain<'_> {
             }
             if self.r.canary_until > last {
                 self.r.canary_until = self.r.canary_until.saturating_add(gap);
+            }
+            if self.r.wait_since != 0 {
+                self.r.wait_since = self.r.wait_since.saturating_add(gap);
             }
         }
     }
@@ -1933,13 +1942,24 @@ impl Brain<'_> {
                 fresh.wait_for = match &old.turn {
                     Some(t) if t.ready => t.host,
                     _ if matches!(old.pause, Pause::Failed | Pause::Timeout) => old.pause_host,
-                    _ => 0,
+                    _ => old.wait_for,
                 };
+                if fresh.wait_for != 0 {
+                    fresh.wait_since = self.now.unix;
+                }
                 (fresh.ticked, fresh.back) = (old.ticked, old.back);
                 self.r = fresh;
                 // The old rollout's cordons go; the new one starts clean.
+                // But for the node of the server in the middle: it may
+                // still reboot for its update, its pods elsewhere. It is
+                // uncordoned once it is done (hold_for_the_middle).
+                let middle = self.member(self.r.wait_for).map(|m| m.name.clone());
                 for name in old.cordoned {
-                    self.uncordon(&name);
+                    if middle.as_ref() == Some(&name) {
+                        self.r.cordoned.push(name);
+                    } else {
+                        self.uncordon(&name);
+                    }
                 }
             }
             Ok((rel, _)) => {
@@ -2004,6 +2024,25 @@ impl Brain<'_> {
             return;
         }
         let (host, name) = (self.r.pause_host, self.r.pause_name.clone());
+        if self.r.phase == Phase::Brain && self.r.pause != Pause::None {
+            // Stopped at a server in the middle of an update, before the
+            // brain's own: resume waits once more, -skip goes on without it.
+            if skip {
+                let why = self.r.paused.clone();
+                self.r.skipped.retain(|s| s.host != host);
+                self.r.skipped.push(Skip { host, name: name.clone(), why });
+                self.uncordon(&name);
+                (self.r.wait_for, self.r.wait_since) = (0, 0);
+                self.r.warn(format!(
+                    "resumed: {name} is passed over for release {serial}; the coordinator updates itself without waiting for it"
+                ));
+            } else {
+                self.r.wait_since = self.now.unix;
+                self.r.warn(format!("resumed: the coordinator waits once more for {name} to finish the update it is in"));
+            }
+            self.r.unpause();
+            return;
+        }
         match self.r.pause {
             Pause::None => {}
             Pause::Canary => {
@@ -2018,6 +2057,9 @@ impl Brain<'_> {
                 self.r.again.retain(|h| *h != host);
                 self.r.force.retain(|h| *h != host);
                 self.uncordon(&name);
+                if self.r.wait_for == host {
+                    (self.r.wait_for, self.r.wait_since) = (0, 0);
+                }
                 self.r.warn(format!("resumed: {name} is passed over for release {serial}"));
                 self.r.unpause();
             }
@@ -2033,8 +2075,12 @@ impl Brain<'_> {
                     self.r.again.push(host);
                 }
                 self.r.deferred.retain(|h| *h != host);
-                // The admin looked: its turns count from here.
+                // The admin looked: its turns count from here, and so does
+                // the wait for it, while it is in the middle of an update.
                 self.r.turns.retain(|h| *h != host);
+                if self.r.wait_for == host {
+                    self.r.wait_since = self.now.unix;
+                }
                 let when = match self.member(host) {
                     Some(m) if !self.online(m) => "when it is back",
                     _ if !self.in_window() => "in the update window",
@@ -2074,21 +2120,22 @@ impl Brain<'_> {
     /// The brain updates itself, from its registry's copy.
     fn brain_step(&mut self) {
         let m = Machine { n: self.n, brain: true, free: self.free };
-        if self.r.wait_for != 0 && m.load().pending == 0 && m.installed_serial() < self.r.serial {
-            // Its report is made before its sync steps: one sent up to a
-            // minute after the switch may come from a sync that still had
-            // the old turn and installs it right after. A later one shows
-            // whether it did. Switched off in the middle (a reboot of its
-            // update) is waited for too.
-            let settled = self.member(self.r.wait_for).is_none_or(|s| {
-                s.last_seen.0.timestamp() >= self.r.started.saturating_add(60) && s.report.as_ref().is_none_or(|r| r.update != "pending")
-            });
-            // A hacked server could say it is in the middle for ever:
-            // TURN_TIMEOUT at most.
-            if !settled && self.now.unix.saturating_sub(self.r.started) < TURN_TIMEOUT {
+        if m.load().pending == 0 && m.installed_serial() < self.r.serial {
+            // Its own update starts only while no server is in the middle
+            // of one.
+            if !self.r.paused.is_empty() {
+                // Stopped at the one in the middle: on by itself once it is
+                // done.
+                if self.in_the_middle().is_some() {
+                    return;
+                }
+                let name = self.r.pause_name.clone();
+                self.r.warn(format!("{name} finished the update it was in; the coordinator updates itself"));
+                self.r.unpause();
+            }
+            if self.hold_for_the_middle() {
                 return;
             }
-            self.r.wait_for = 0;
         }
         // The brain's own k3s is the control plane's.
         let offer = Offer { serial: self.r.serial, turn: true, brain_k3s: self.rep.k3s.clone(), ..Offer::default() };
@@ -2114,6 +2161,77 @@ impl Brain<'_> {
                 l.why
             );
         }
+    }
+
+    /// The server in the middle of an update, if one is, which nothing may
+    /// update beside: the one this rollout waits for (wait_for) until a
+    /// report from a minute after the rollout began shows it done, or any
+    /// server whose report says its update is pending. Not one the admin
+    /// passed over, and not one that left.
+    ///
+    /// A server's report is made before its sync steps: one sent up to a
+    /// minute after a switch to a newer release may come from a sync that
+    /// still had the old turn and installs it right after. A later one
+    /// shows whether it did. One switched off in the middle (the reboot of
+    /// its update) still says pending, and is waited for too.
+    fn in_the_middle(&self) -> Option<(u32, String)> {
+        let skipped = |h: u32| self.r.skipped.iter().any(|s| s.host == h);
+        let pending = |m: &Member| m.report.as_ref().is_some_and(|r| r.update == "pending");
+        if self.r.wait_for != 0
+            && !skipped(self.r.wait_for)
+            && let Some(m) = self.member(self.r.wait_for)
+            && (m.last_seen.0.timestamp() < self.r.started.saturating_add(60) || pending(m))
+        {
+            return Some((m.host, m.name.clone()));
+        }
+        self.members
+            .iter()
+            .filter(|m| m.host != 1 && m.name != self.n.hostname && !skipped(m.host))
+            .find(|m| pending(m))
+            .map(|m| (m.host, m.name.clone()))
+    }
+
+    /// Holds the next step back (the brain's own update, a server's turn)
+    /// while a server is in the middle of an update: never two machines
+    /// at once. One that stays in the middle for TURN_TIMEOUT (it hangs,
+    /// or, hacked, says so for ever) stops the rollout there for the
+    /// admin: resume waits once more, -skip goes on without it. true:
+    /// wait. The node of one that is done is uncordoned, if this rollout
+    /// kept it cordoned.
+    fn hold_for_the_middle(&mut self) -> bool {
+        let now = self.now.unix;
+        let middle = self.in_the_middle();
+        let was = self.r.wait_for;
+        if was != 0 && middle.as_ref().is_none_or(|(h, _)| *h != was) {
+            (self.r.wait_for, self.r.wait_since) = (0, 0);
+            if let Some(name) = self.member(was).map(|m| m.name.clone())
+                && self.r.cordoned.contains(&name)
+            {
+                self.uncordon(&name);
+            }
+        }
+        let Some((host, name)) = middle else { return false };
+        if self.r.wait_for != host {
+            (self.r.wait_for, self.r.wait_since) = (host, now);
+        }
+        if self.r.wait_since == 0 {
+            // A rollout from before wait_since: from its start.
+            self.r.wait_since = self.r.started;
+        }
+        if now.saturating_sub(self.r.wait_since) >= TURN_TIMEOUT {
+            let state = self.member(host).and_then(|m| m.report.as_ref()).map(|r| r.update.clone()).filter(|s| !s.is_empty());
+            let late = report::short_age(TURN_TIMEOUT as u64);
+            self.r.stop(
+                Pause::Timeout,
+                host,
+                &name,
+                format!(
+                    "{name} did not finish the update it is in within {late} (its update says {}): nothing updates beside it",
+                    state.as_deref().unwrap_or("nothing yet")
+                ),
+            );
+        }
+        true
     }
 
     /// One step of the brain's own update: settles one it installed, or
@@ -2171,7 +2289,7 @@ impl Brain<'_> {
             }
             return;
         }
-        if !self.in_window() || self.settling() {
+        if self.settling() || self.hold_for_the_middle() || !self.in_window() {
             return;
         }
         self.next();
@@ -2201,9 +2319,11 @@ impl Brain<'_> {
     }
 
     /// Nodes cordoned earlier that nothing holds any more (an uncordon
-    /// that failed, a server that left).
+    /// that failed, a server that left). The node of a server in the middle
+    /// of an update stays cordoned: it may still reboot.
     fn tidy_cordons(&mut self) {
-        let keep: Vec<String> = self.r.turn.iter().map(|t| t.name.clone()).chain(Some(self.r.pause_name.clone())).collect();
+        let middle = self.in_the_middle().map(|(_, name)| name);
+        let keep: Vec<String> = self.r.turn.iter().map(|t| t.name.clone()).chain(Some(self.r.pause_name.clone())).chain(middle).collect();
         for name in self.r.cordoned.clone() {
             if !keep.contains(&name) {
                 self.uncordon(&name);
@@ -2420,6 +2540,15 @@ impl Brain<'_> {
             }
             return;
         };
+        if self.r.pause == Pause::Timeout && self.r.wait_for == host && self.in_the_middle().is_none_or(|(h, _)| h != host) {
+            // Stopped at one in the middle of an update outside a turn of
+            // its own: done now, so the rollout goes on (its node is
+            // uncordoned with the wait).
+            self.r.warn(format!("{name} finished the update it was in; the rollout goes on"));
+            self.r.unpause();
+            self.hold_for_the_middle();
+            return;
+        }
         let Some(rep) = m.report.as_ref().filter(|_| self.online(&m)) else { return };
         let cordoned = self.r.cordoned.contains(&name);
         if matches!(self.r.pause, Pause::Timeout) && Self::updated(rep, target) {
@@ -2500,6 +2629,12 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
     match r.phase {
         Phase::None => {}
         Phase::Waiting => out.push((format!("Waiting for the update window {window} on the coordinator's clock."), false)),
+        Phase::Brain if !r.paused.is_empty() => {
+            let who = name(r.pause_host);
+            out.push((format!("PAUSED: {}.", shown(&r.paused, 300)), true));
+            out.push((format!("Look at it, then: ./dryserver release resume (the coordinator waits once more for {who})"), true));
+            out.push((format!("Or let the coordinator update itself without waiting for {who}: ./dryserver release resume -skip"), true));
+        }
         Phase::Brain if r.wait_for != 0 => {
             out.push((format!("The coordinator updates itself first, once {} finished the update it is in.", name(r.wait_for)), false))
         }
