@@ -505,23 +505,69 @@ backup can be opened.
 ## Updates
 
 A fix reaches every machine from your desktop, without a reinstall and
-without anyone at the machines:
+without anyone at the machines.
+
+### How to update the swarm
+
+One command, in the dryserver folder on your desktop:
 
 ```sh
-make                                   # the static binary you want to ship
+make                                                  # the static binary to ship
 ./dryserver release publish -notes "fixes the join timeout"
-./dryserver release publish -urgent -notes "security fix"   # at once
-./dryserver release status             # or watch it in ./dryserver approve
 ```
 
-`publish` signs a release of the binary you run (with
-`secrets/signing_ed25519`, like the machine list: only what you signed is
-ever installed) and sends it with the binary to the coordinator. A
-release says which dryserver, which k3s (the one the USB stick pins) and
-which Arch snapshot the machines run. It is refused on your desktop
-already when the machines would refuse it: an older version (unless you
-give `-rollback`), notes that are not plain text, or a binary that is not
-the static one `make` builds.
+It checks the release, shows what changes and asks before anything is
+signed:
+
+```
+Release 1795400000 for 3 machines:
+  dryserver  0.1.0 -> 0.2.0
+  k3s        same (v1.37.2+k3s1)
+  Arch       2026/11/19 -> 2026/11/21 (the newest on archive.archlinux.org; ...)
+  urgent     no: machines update only 03:00-05:00 on the coordinator's clock
+  rollback   no
+  notes      fixes the join timeout
+Compared with release 1795000000, the newest on the coordinator.
+coord updates itself first, then the servers one at a time: node-a and
+node-b (node-a is the canary, watched for 5m).
+Sign it and send it to the coordinator at 192.168.1.50? [y/N]
+```
+
+Or press `u` in `./dryserver approve`: the same checks and the same
+summary, `y` sends it.
+
+- **Checked before signing**: the binary is the static one `make`
+  builds; nothing is older than what the swarm runs (unless you go back,
+  below); the k3s binary has the checksum this dryserver pins
+  (`out/pkgcache/k3s-VERSION`, downloaded by `./dryserver build`; when it
+  is missing and the coordinator needs it you are told how to get it);
+  the Arch snapshot day is on archive.archlinux.org. The day is the
+  newest one there (today's, or a few days back while today's is not
+  out); name one with `-arch-date YYYY/MM/DD`. Only the day goes to the
+  archive, nothing about you or the swarm.
+- **What happens**: the coordinator updates itself first, then one server
+  at a time, each one drained first and kept on the new release only once
+  it is healthy (below).
+- **Watch it**: `./dryserver release status` (one line per machine), or
+  Updates in `./dryserver approve`.
+- **Urgent** (`-urgent`): the rollout starts at once instead of in the
+  update window 03:00-05:00 on the coordinator's clock. It is still the
+  coordinator first and one server at a time; the canary is watched for a
+  minute instead of five. For security fixes.
+- **When it stops**: a rollout stops by itself at a server whose update
+  fails. `release status` says where and what to do: look at the machine,
+  then `./dryserver release resume` (it says what that does first), or
+  publish a fixed release (it gets a higher serial and replaces the
+  rollout).
+- **Stop it or go back**: build the dryserver the swarm ran before and
+  publish it with `-rollback`. That replaces the rollout, and machines
+  that updated already go back to it. Add `-arch-date` with the older day
+  to take the Arch packages back too.
+
+`publish` signs with `secrets/signing_ed25519`, like the machine list:
+only what you signed is ever installed. If that key has a passphrase,
+`ssh-keygen` asks for it in the terminal at each signature; the approve
+screen cannot ask, so it refuses to start.
 
 Then the coordinator rolls it out:
 
@@ -665,11 +711,11 @@ On your desktop:
 | `./dryserver build` | build the ISO, log to stdout |
 | `./dryserver disks` | list disks and which ones may be flashed |
 | `sudo ./dryserver flash --iso FILE` | flash any image to a USB drive |
-| `./dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed |
+| `./dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed. `u` publishes an update, `R` resumes a stopped rollout |
 | `./dryserver apps` | what runs on your cluster: start an app from a container image, remove one |
 | `./dryserver outside` | the ways in from the internet: open, sync or close the Cloudflare Tunnel, and which host names use it |
-| `./dryserver release publish` | sign a release of this dryserver and roll it out (`-urgent`, `-notes`, `-rollback`) |
-| `./dryserver release status` / `resume` | where the rollout stands; let a stopped one go on |
+| `./dryserver release publish` | check a release of this dryserver, show what changes, sign it and roll it out (`-urgent`, `-notes`, `-rollback`, `-arch-date`, `-k3s`) |
+| `./dryserver release status` / `resume` | the release, one line per machine, and what to do when it stopped; let a stopped one go on |
 | `./dryserver ssh-config` | SSH config for all servers |
 | `./dryserver quarantine-all` | kill switch: cut the coordinator off on every server |
 | `./dryserver backup-pull` | copy the coordinator's newest encrypted backups into `secrets/backups/` |
