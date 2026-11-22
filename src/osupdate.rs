@@ -48,12 +48,20 @@ pub const PACMAN_CONF: &str = "/etc/pacman.conf";
 /// behind when it is killed.
 pub const PACMAN_LOCK: &str = "/var/lib/pacman/db.lck";
 const PACMAN_LOG: &str = "/var/log/pacman.log";
-/// The one kernel image systemd-boot starts on UEFI machines (the
-/// installer's UKI_PRESET), and the kernel and initramfs GRUB starts on
-/// BIOS machines. There is no fallback image: a broken one does not boot.
-const UKI: &str = "/boot/EFI/Linux/arch-linux.efi";
-const VMLINUZ: &str = "/boot/vmlinuz-linux";
-const INITRAMFS: &str = "/boot/initramfs-linux.img";
+/// Where systemd-boot finds the kernel images it starts on UEFI machines
+/// (the installer's UKI_PRESET): arch-KERNEL.efi for each kernel package
+/// (arch-linux.efi, and the fallback arch-linux-lts.efi), each name also
+/// with a systemd-boot boot counter (arch-linux+3.efi, arch-linux+2-1.efi).
+/// BIOS machines boot /boot/vmlinuz-KERNEL with /boot/initramfs-KERNEL.img
+/// through GRUB.
+const UKI_DIR: &str = "/boot/EFI/Linux";
+/// The kernels pacman installs: /usr/lib/modules/VERSION/vmlinuz, with the
+/// name of its package in pkgbase next to it.
+const MODULES: &str = "/usr/lib/modules";
+/// The most entries looked at in MODULES and UKI_DIR.
+const MAX_KERNELS: usize = 64;
+/// FAT, the boot partition's file system, keeps times to two seconds.
+const TIME_SLACK: Duration = Duration::from_secs(2);
 /// What pacman prints when one of its hooks fails (mkinitcpio among
 /// them). pacman still exits 0 after a failed hook that runs after the
 /// transaction, so its output is the only sign.
@@ -574,7 +582,6 @@ impl Host<'_> {
         }
         let before = self.pacnew_files();
         let offset = fs::metadata(self.path(PACMAN_LOG)).map(|m| m.len()).unwrap_or(0);
-        let started = SystemTime::now();
         if let Err(e) = self.pin_snapshot(date) {
             out.failure = Some(Failure { stage: Stage::Refused, reason: e.wrap("pin the snapshot") });
             self.say(&out.summary());
@@ -589,8 +596,13 @@ impl Host<'_> {
         out.kernel_replaced = kernel_replaced(&self.root);
         let after = self.pacnew_files();
         out.pacnew = after.iter().filter(|(p, t)| before.get(*p) != Some(t)).map(|(p, _)| p.clone()).collect();
-        let kernel_changed = out.kernel_replaced || out.changes.iter().any(|c| c.name == "linux" && c.action != "removed");
-        out.boot_problem = self.boot_problem(hook_failed, kernel_changed, started);
+        let kernels = self.kernels();
+        let kernel_changed = out.kernel_replaced
+            || out
+                .changes
+                .iter()
+                .any(|c| c.action != "removed" && (KERNEL_PACKAGES.contains(&c.name.as_str()) || kernels.contains_key(&c.name)));
+        out.boot_problem = self.boot_problem(hook_failed, kernel_changed, &kernels);
         if out.failure.is_none() {
             // Old packages pile up in the cache with every update until the
             // disk is full; the archive keeps them for a rollback.
@@ -744,9 +756,19 @@ impl Host<'_> {
     }
 
     /// Why rebooting now would not start this machine again, if anything
-    /// says so: a failed pacman hook (mkinitcpio is one), or a kernel that
-    /// changed while the image the boot loader starts did not.
-    fn boot_problem(&self, hook_failed: bool, kernel_changed: bool, started: SystemTime) -> Option<String> {
+    /// says so: a failed pacman hook (mkinitcpio is one), or a kernel whose
+    /// boot image was not made again after the kernel was put on disk.
+    ///
+    /// A boot image is current when it was written after its kernel: its
+    /// modification time is at least the change time of the newest
+    /// MODULES/*/vmlinuz of that kernel package (pacman sets the change
+    /// time when it unpacks the file; the modification time it keeps is
+    /// the package's build time). That stays true for every later run, so a
+    /// machine that waits for its reboot is not called unsafe because a
+    /// second run had no reason to build the image again. Every kernel
+    /// package on disk is looked at, the fallback kernel too; of the images
+    /// of one kernel (boot counter names) the newest counts.
+    fn boot_problem(&self, hook_failed: bool, kernel_changed: bool, kernels: &BTreeMap<String, SystemTime>) -> Option<String> {
         if hook_failed {
             return Some(
                 "a pacman hook failed, maybe the one that builds the boot image: reboot only after mkinitcpio -P ran cleanly".into(),
@@ -755,12 +777,75 @@ impl Host<'_> {
         if !kernel_changed {
             return None;
         }
-        let made = |p: &str| fs::metadata(self.path(p)).and_then(|m| m.modified()).is_ok_and(|t| t + Duration::from_secs(2) >= started);
-        let images: &[&str] = if self.path("/boot/EFI/Linux").is_dir() { &[UKI] } else { &[VMLINUZ, INITRAMFS] };
-        images
-            .iter()
-            .find(|p| !made(p))
-            .map(|p| format!("the kernel changed but {p} was not made again: the machine would start a kernel without its modules"))
+        let written = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+        let stale = |base: &str, p: &str| {
+            format!("the kernel {base} changed but {p} was not made again: the machine would start a kernel without its modules")
+        };
+        let uefi = self.path(UKI_DIR).is_dir();
+        for (base, put) in kernels {
+            let current = |t: Option<SystemTime>| t.is_some_and(|t| t + TIME_SLACK >= *put);
+            let bios = [format!("/boot/vmlinuz-{base}"), format!("/boot/initramfs-{base}.img")];
+            if !uefi {
+                if let Some(p) = bios.iter().find(|p| !current(written(&self.path(p)))) {
+                    return Some(stale(base, p));
+                }
+                continue;
+            }
+            // mkinitcpio builds the image from /boot/vmlinuz-KERNEL when the
+            // preset says so: that copy must be the new kernel too.
+            let copy = &bios[0];
+            if self.path(copy).exists() && !current(written(&self.path(copy))) {
+                return Some(stale(base, copy));
+            }
+            match self.boot_images(base).into_iter().max_by_key(|(_, t)| *t) {
+                None => return Some(format!("there is no boot image for the kernel {base} in {UKI_DIR}: the machine would not start it")),
+                Some((name, t)) if !current(Some(t)) => return Some(stale(base, &format!("{UKI_DIR}/{name}"))),
+                Some(_) => {}
+            }
+        }
+        None
+    }
+
+    /// The kernel packages on disk, each with the time its newest vmlinuz
+    /// was put there.
+    fn kernels(&self) -> BTreeMap<String, SystemTime> {
+        let mut found: BTreeMap<String, SystemTime> = BTreeMap::new();
+        let Ok(rd) = fs::read_dir(self.path(MODULES)) else {
+            return found;
+        };
+        for e in rd.flatten().take(MAX_KERNELS) {
+            let Ok(md) = fs::symlink_metadata(e.path().join("vmlinuz")) else {
+                continue;
+            };
+            if !md.is_file() {
+                continue;
+            }
+            let base = read_capped(&e.path().join("pkgbase"), 256).unwrap_or_default().trim().to_string();
+            let base = if kernel_name(&base) { base } else { "linux".to_string() };
+            let at = changed_at(&md);
+            let slot = found.entry(base).or_insert(at);
+            *slot = (*slot).max(at);
+        }
+        found
+    }
+
+    /// The boot images of the kernel package base in UKI_DIR, by name, with
+    /// the time each was written.
+    fn boot_images(&self, base: &str) -> Vec<(String, SystemTime)> {
+        let Ok(rd) = fs::read_dir(self.path(UKI_DIR)) else {
+            return Vec::new();
+        };
+        rd.flatten()
+            .take(MAX_KERNELS)
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                if uki_kernel(&name)? != base {
+                    return None;
+                }
+                let md = fs::symlink_metadata(e.path()).ok().filter(|m| m.is_file())?;
+                Some((name, md.modified().ok()?))
+            })
+            .collect()
     }
 
     /// Why this machine cannot reboot by itself, or None when it can. A
@@ -787,6 +872,46 @@ fn pacman(args: &[&str]) -> Cmd {
     let mut c = Cmd::new("pacman", args);
     c.env.push("LC_ALL=C".into());
     c
+}
+
+/// The kernel packages a machine may boot: the kernel, and the fallback.
+const KERNEL_PACKAGES: [&str; 2] = ["linux", "linux-lts"];
+
+/// A kernel package name as pkgbase gives it.
+fn kernel_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The kernel package a boot image in UKI_DIR belongs to, from its name:
+/// arch-KERNEL.efi, arch-KERNEL+N.efi or arch-KERNEL+N-M.efi (the boot
+/// counter systemd-boot keeps in the name: N tries left, M used).
+fn uki_kernel(name: &str) -> Option<&str> {
+    let s = name.strip_prefix("arch-")?.strip_suffix(".efi")?;
+    let digits = |x: &str| !x.is_empty() && x.len() <= 6 && x.bytes().all(|b| b.is_ascii_digit());
+    let base = match s.split_once('+') {
+        None => s,
+        Some((base, counter)) => {
+            let ok = match counter.split_once('-') {
+                Some((left, used)) => digits(left) && digits(used),
+                None => digits(counter),
+            };
+            if !ok {
+                return None;
+            }
+            base
+        }
+    };
+    kernel_name(base).then_some(base)
+}
+
+/// When a file was put in place or last changed on this machine: its
+/// change time, which only the kernel sets (unpacking a package keeps the
+/// package's modification times).
+fn changed_at(md: &fs::Metadata) -> SystemTime {
+    match u64::try_from(md.ctime()) {
+        Ok(secs) => SystemTime::UNIX_EPOCH + Duration::new(secs, md.ctime_nsec().clamp(0, 999_999_999) as u32),
+        Err(_) => SystemTime::UNIX_EPOCH,
+    }
 }
 
 /// Whether the running kernel was replaced, the way report.rs decides it:
@@ -1467,6 +1592,10 @@ mod tests {
         f.set_modified(SystemTime::now() - Duration::from_secs(86_400)).unwrap();
     }
 
+    /// The boot images the installer makes.
+    const UKI: &str = "/boot/EFI/Linux/arch-linux.efi";
+    const VMLINUZ: &str = "/boot/vmlinuz-linux";
+    const INITRAMFS: &str = "/boot/initramfs-linux.img";
     const RUNNING: &str = "6.12.1-arch1-1";
     const LIVE: &str = "Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\nServer = https://mirror.example.org/$repo/os/$arch\n";
     const ARCH_CONF: &str = "#\n# /etc/pacman.conf\n#\n[options]\nHoldPkg     = pacman glibc\nArchitecture = auto\nCheckSpace\n\
@@ -1977,8 +2106,113 @@ mod tests {
 
     #[test]
     fn the_boot_image_is_where_the_installer_puts_it() {
-        assert!(crate::install::UKI_PRESET.contains(&format!("default_uki=\"{UKI}\"")));
-        assert!(crate::install::UKI_PRESET.contains(VMLINUZ));
+        let preset = crate::install::UKI_PRESET;
+        let value = |key: &str| preset.lines().find_map(|l| l.strip_prefix(key)).unwrap().trim_matches('"').to_string();
+        let uki = value("default_uki=");
+        let (dir, name) = uki.rsplit_once('/').unwrap();
+        assert_eq!((dir, uki_kernel(name)), (UKI_DIR, Some("linux")), "{uki}");
+        assert_eq!(value("ALL_kver="), VMLINUZ);
+    }
+
+    #[test]
+    fn boot_image_names_with_counters_and_the_fallback() {
+        for (name, kernel) in [
+            ("arch-linux.efi", Some("linux")),
+            ("arch-linux+3.efi", Some("linux")),
+            ("arch-linux+2-1.efi", Some("linux")),
+            ("arch-linux+0-3.efi", Some("linux")),
+            ("arch-linux-lts.efi", Some("linux-lts")),
+            ("arch-linux-lts+3.efi", Some("linux-lts")),
+            ("arch-linux-lts+1-2.efi", Some("linux-lts")),
+            ("arch-linux.efi.bak", None),
+            ("arch-linux+.efi", None),
+            ("arch-linux+a.efi", None),
+            ("arch-linux+1-.efi", None),
+            ("arch-linux+1-2-3.efi", None),
+            ("arch-.efi", None),
+            ("linux.efi", None),
+            ("arch-Linux.efi", None),
+            ("arch-linux+1234567.efi", None),
+        ] {
+            assert_eq!(uki_kernel(name), kernel, "{name}");
+        }
+    }
+
+    /// Puts kernel version of package base on disk, as pacman unpacks it.
+    fn put_kernel(root: &Path, version: &str, base: &str) {
+        put(root, &format!("{MODULES}/{version}/vmlinuz"), "kernel");
+        put(root, &format!("{MODULES}/{version}/pkgbase"), format!("{base}\n"));
+    }
+
+    #[test]
+    fn a_second_run_while_the_reboot_is_due_is_still_safe() {
+        // The first run brought a new kernel and its image; the machine has
+        // not rebooted yet. A later run installs nothing and builds no image:
+        // the image it has is still the right one.
+        let dir = machine();
+        let r = dir.path();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let n = calls.clone();
+        let fake = Fake::with_pacman(r, move |_, root, c| {
+            if c.args[0] == "-Su" && n.fetch_add(1, Ordering::SeqCst) == 0 {
+                new_kernel(root, &[VMLINUZ, UKI]);
+            }
+            (String::new(), Ok(()))
+        });
+        let (h, _) = host(r, &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok() && out.kernel_replaced && out.reboot_safe(), "{}", out.summary());
+        // Longer than the slack for FAT's two-second times.
+        std::thread::sleep(Duration::from_millis(2300));
+        let out = h.arch_update(&Ctx::new(), "2026/11/21", false);
+        assert!(out.ok() && out.count == 0 && out.kernel_replaced, "{}", out.summary());
+        assert!(out.reboot_needed() && out.reboot_safe(), "a false alarm: {}", out.summary());
+    }
+
+    #[test]
+    fn every_kernel_on_disk_needs_its_image() {
+        // The fallback kernel and boot counters in the names (lane 2's
+        // layout): each kernel needs a current image under one of its names.
+        let lts = "/boot/EFI/Linux/arch-linux-lts+3.efi";
+        let setup = |lts_image: Option<bool>| {
+            let dir = machine();
+            let r = dir.path();
+            fs::remove_file(fsx::under(r, UKI)).unwrap();
+            put(r, "/boot/EFI/Linux/arch-linux+2-1.efi", "old image");
+            age(r, "/boot/EFI/Linux/arch-linux+2-1.efi");
+            put_kernel(r, "6.6.60-1-lts", "linux-lts");
+            match lts_image {
+                Some(true) => put(r, lts, "lts image"),
+                Some(false) => {
+                    put(r, lts, "old lts image");
+                    age(r, lts);
+                }
+                None => {}
+            }
+            let fake = Fake::with_pacman(r, |_, root, c| {
+                if c.args[0] == "-Su" {
+                    new_kernel(root, &[VMLINUZ, "/boot/EFI/Linux/arch-linux+3.efi"]);
+                }
+                (String::new(), Ok(()))
+            });
+            (dir, fake)
+        };
+        let (dir, fake) = setup(Some(true));
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(out.ok() && out.reboot_safe(), "the newest image of each kernel is current: {}", out.summary());
+
+        let (dir, fake) = setup(None);
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        let p = out.boot_problem.clone().unwrap_or_default();
+        assert!(!out.reboot_safe() && p.contains("no boot image for the kernel linux-lts"), "{p}");
+
+        let (dir, fake) = setup(Some(false));
+        let (h, _) = host(dir.path(), &fake);
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        let p = out.boot_problem.clone().unwrap_or_default();
+        assert!(!out.reboot_safe() && p.contains(lts) && p.contains("linux-lts changed"), "{p}");
     }
 
     // ---- k3s ----
