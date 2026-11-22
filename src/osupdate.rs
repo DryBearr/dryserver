@@ -115,6 +115,10 @@ pub struct Limits {
     pub min_free_root: u64,
     /// Free bytes on /boot: a new kernel image is written there.
     pub min_free_boot: u64,
+    /// Free bytes that must be left on a file system once an update made
+    /// its copies of the new binaries there (staged, and next to the
+    /// installed ones): for the logs and the records.
+    pub reserve: u64,
     /// Refreshing the package lists and the signing keys.
     pub sync: Duration,
     /// Downloading the packages: may be stopped at any time without harm.
@@ -144,6 +148,7 @@ impl Default for Limits {
         Limits {
             min_free_root: 2 << 30,
             min_free_boot: 200 << 20,
+            reserve: 64 << 20,
             sync: Duration::from_secs(10 * 60),
             download: Duration::from_secs(45 * 60),
             install: Duration::from_secs(2 * 3600),

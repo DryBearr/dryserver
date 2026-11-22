@@ -1281,6 +1281,31 @@ fn arm_args(m: &Machine, t: Timer, id: &str, serial: u64, secs: i64, boot: bool)
     args
 }
 
+/// Whether the file systems of these paths have room for copies of these
+/// sizes (the sizes on one file system add up), with limits.reserve left
+/// on each. Err says where room is short.
+fn room_for(m: &Machine, copies: &[(PathBuf, u64)]) -> Result<()> {
+    let mut by_fs: BTreeMap<u64, (PathBuf, u64)> = BTreeMap::new();
+    for (path, size) in copies {
+        let dir = if path.is_dir() { path.clone() } else { fsx::dir(path) };
+        let dev = fs::metadata(&dir).map_err(|e| Error::from(e).wrap(format!("stat {}", dir.display())))?.dev();
+        by_fs.entry(dev).or_insert((dir, 0)).1 += size;
+    }
+    for (dir, need) in by_fs.into_values() {
+        let (_, free) = fsx::space(&dir)?;
+        let want = need.saturating_add(m.limits.reserve);
+        if free < want {
+            bail!(
+                "only {} MiB free on the file system of {}, and the update needs {} MiB there for its copies of the new binaries: make room first",
+                free >> 20,
+                dir.display(),
+                want.div_ceil(1 << 20)
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Whether a step that failed this way may work on another try: the disk
 /// is full or read-only for now, or the system is short of something.
 fn passing(e: &Error) -> bool {
@@ -1598,7 +1623,15 @@ fn intake(m: &Machine, ctx: &Ctx, a: &Apply, now: i64, out: &mut dyn Write) -> s
     }
     let serial = rel.serial;
     let no = move |err: Error| Refusal { serial, again: false, err };
-    let staged = stage(m, &a.binary, &rel).map_err(no)?;
+    // A full disk passes once room is made: postponed, not refused.
+    let full = move |err: Error| Refusal { serial, again: passing(&err), err };
+    let staged_already = a.binary.parent() == Some(m.path(STAGING).as_path());
+    let mut copies = vec![(m.path(SERVER_BIN), rel.dryserver.size)];
+    if !staged_already {
+        copies.push((m.path(STAGING), rel.dryserver.size));
+    }
+    room_for(m, &copies).map_err(|err| Refusal { serial, again: true, err })?;
+    let staged = stage(m, &a.binary, &rel).map_err(full)?;
     release::verify_file(&staged, &rel.dryserver.sha256, rel.dryserver.size)
         .map_err(|e| no(e.wrap("the binary is not the one the release names")))?;
     let (prev_sha256, _) =
@@ -1652,7 +1685,11 @@ fn plan_work(m: &Machine, rel: &Release, k3s_file: &str, log: &HostLog, out: &mu
                 errf!("release {} names k3s {} and this machine runs another one: give its binary with --k3s", rel.serial, rel.k3s.version);
             return Err((false, e));
         }
-        Some((Some(stage_k3s(m, Path::new(k3s_file), rel).map_err(|e| (false, e))?), running.unwrap_or_default()))
+        // Staged, then copied next to the installed one (osupdate).
+        let size = fs::metadata(k3s_file).map(|md| md.len()).unwrap_or(0);
+        room_for(m, &[(m.path(STAGING), size), (m.path(K3S_BIN), size)]).map_err(|e| (true, e))?;
+        let staged = stage_k3s(m, Path::new(k3s_file), rel).map_err(|e| (passing(&e), e))?;
+        Some((Some(staged), running.unwrap_or_default()))
     };
     Ok(Work { k3s, arch })
 }
@@ -3060,6 +3097,8 @@ mod tests {
         by: Mutex<Vec<(&'static str, String)>>,
         /// The commands that kept a descriptor (the update lock).
         kept: Mutex<Vec<String>>,
+        /// What must stay free beside the update's copies (Limits::reserve).
+        reserve: Mutex<u64>,
         /// The firewall each `nft -f` loaded, the SSH drop-in each sshd
         /// reload read.
         loaded: Mutex<Vec<String>>,
@@ -3100,6 +3139,7 @@ mod tests {
                 limits: osupdate::Limits {
                     min_free_root: 0,
                     min_free_boot: 0,
+                    reserve: *self.reserve.lock().unwrap(),
                     k3s_ready_brain: Duration::from_millis(300),
                     k3s_ready_agent: Duration::from_millis(300),
                     k3s_settle: Duration::from_millis(1),
@@ -3317,6 +3357,7 @@ mod tests {
                 ran: Mutex::default(),
                 by: Mutex::default(),
                 kept: Mutex::default(),
+                reserve: Mutex::new(0),
                 loaded: Mutex::default(),
                 reloaded_sshd: Mutex::default(),
                 k3s: Mutex::new((Some(K3S_OLD.to_vec()), 1)),
@@ -3804,6 +3845,36 @@ mod tests {
         assert!(e.contains("no space left on device"), "{e}");
         lab.hook(noop());
         lab.assert_old("disk full in the files");
+    }
+
+    #[test]
+    fn review_a_full_disk_while_staging_postpones() {
+        let lab = Lab::new();
+        lab.hook(Arc::new(|p| if p == "stage" { Err(io::Error::from_raw_os_error(libc::ENOSPC)) } else { Ok(()) }));
+        let src = lab.p("/var/lib/dryserver-releases/incoming/dryserver");
+        fsx::mkdir_all(fsx::dir(&src), 0o700).unwrap();
+        fs::write(&src, NEW).unwrap();
+        let _ = apply(&lab.m(), &Ctx::new(), &lab.opts(&rel(7, NEW), src), now(), &mut Vec::new());
+        assert_eq!(lab.last().action, POSTPONED);
+        lab.assert_old("disk full while staging");
+        // Too little room is seen before anything is copied: postponed too,
+        // with where and how much; nothing armed, nothing staged.
+        let lab = Lab::new();
+        *lab.fake.reserve.lock().unwrap() = u64::MAX / 4;
+        let src = lab.p("/tmp/dryserver");
+        fsx::mkdir_all(fsx::dir(&src), 0o755).unwrap();
+        fs::write(&src, NEW).unwrap();
+        let e = apply(&lab.m(), &Ctx::new(), &lab.opts(&rel(7, NEW), src), now(), &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("MiB free on the file system of") && e.contains("make room first"), "{e}");
+        assert_eq!((lab.last().action.as_str(), lab.last().serial), (POSTPONED, 7));
+        assert!(!lab.fake.has("systemd-run") && !lab.p(&format!("{STAGING}/dryserver-7")).exists());
+        // The k3s binary, in the new binary's step: postponed as well.
+        let lab = Lab::new();
+        let a = lab.os_opts(&os_rel(8, K3S_NEW, DAY), Some(K3S_NEW));
+        lab.hook(Arc::new(|p| if p == "stage k3s" { Err(io::Error::from_raw_os_error(libc::EDQUOT)) } else { Ok(()) }));
+        assert!(apply(&lab.m(), &Ctx::new(), &a, now(), &mut Vec::new()).is_err());
+        assert_eq!((lab.last().action.as_str(), lab.last().serial), (POSTPONED, 8), "{:?}", lab.last());
+        lab.assert_os_old("disk full while staging k3s");
     }
 
     #[test]
