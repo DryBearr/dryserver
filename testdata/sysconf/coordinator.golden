@@ -454,10 +454,19 @@ TimeoutStartSec=5min
 Requires=dryserver-boot-check.service
 ===== /etc/systemd/system.conf.d/10-dryserver-watchdog.conf (0644)
 # dryserver: a hardware watchdog, when the machine has one, restarts it when
-# the kernel or systemd hangs, so a new kernel that hangs uses up its tries
-# without someone at the machine.
+# the kernel or systemd hangs, and a crash of systemd restarts it too, so a
+# new kernel that hangs uses up its tries without someone at the machine.
 [Manager]
 RuntimeWatchdogSec=1min
+CrashAction=reboot
+===== /etc/systemd/system/emergency.service.d/10-dryserver.conf (0644)
+# dryserver: nobody is at a server's console and root is locked, so emergency
+# mode in the initramfs (a kernel that finds no disk, an unlock that failed)
+# could only wait. It restarts the machine after 30 seconds instead: a new
+# kernel that cannot boot uses up its tries and the other kernel starts.
+# After the switch to the real root this does nothing.
+[Service]
+ExecStartPre=-/usr/bin/sh -c 'test -e /etc/initrd-release || exit 0; echo "dryserver: restarting in 30 seconds"; sleep 30; systemctl --no-block reboot'
 ===== /etc/cron.d/dryserver-scan (0644)
 # dryserver: look for unknown devices on the network (report only).
 */15 * * * * root /usr/local/bin/dryserver scan >/dev/null 2>&1

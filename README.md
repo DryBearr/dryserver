@@ -183,9 +183,10 @@ disk, sshd runs and the kernel found a network device. Nothing else counts:
 the coordinator, the mesh, the internet, a cable, a router or k3s being down
 never makes a good kernel bad (a missing driver does, an unplugged cable does
 not). A kernel panic restarts the machine after 10 seconds, a hang restarts
-it through the hardware watchdog when it has one, and a failed check
-restarts it while another image has tries left, so this needs nobody at the
-machine. When nothing else is left, the machine stays up as it is.
+it through the hardware watchdog when it has one, emergency mode in the
+initramfs (a kernel that finds no disk) restarts it after 30 seconds, and a
+failed check restarts it while another image has tries left, so this needs
+nobody at the machine. When nothing else is left, the machine stays up as it is.
 
 New firmware or a new systemd rebuild every image; `linux-lts` keeps the one
 it was made with until `linux-lts` itself is updated, so one bad initramfs

@@ -170,6 +170,7 @@ pub fn render(p: &Params) -> Result<Vec<File>> {
         file(boot::CHECK_UNIT_PATH, 0o644, boot::CHECK_UNIT_TEXT),
         file(boot::COMPLETE_DROPIN, 0o644, boot::COMPLETE_DROPIN_TEXT),
         file(boot::WATCHDOG_DROPIN, 0o644, boot::WATCHDOG_TEXT),
+        file(boot::EMERGENCY_DROPIN, 0o644, boot::EMERGENCY_TEXT),
     ];
     if p.role == Role::Coordinator {
         files.push(file("/etc/cron.d/dryserver-scan", 0o644, SCAN_CRON));
@@ -1208,6 +1209,7 @@ mod tests {
                 (boot::CHECK_UNIT_PATH, 0o644),
                 (boot::COMPLETE_DROPIN, 0o644),
                 (boot::WATCHDOG_DROPIN, 0o644),
+                (boot::EMERGENCY_DROPIN, 0o644),
             ] {
                 assert_eq!(find(&files, path).mode, mode, "{name}: {path}");
                 assert!(crate::update::managed(path), "{path} would not reach machines installed before");

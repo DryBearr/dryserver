@@ -56,7 +56,8 @@ pacman -Syu --noconfirm --needed linux linux-lts mkinitcpio systemd-ukify >/dev/
 
 install -m755 /w/dryserver /usr/local/bin/dryserver
 for f in etc/initcpio/post/dryserver-boot etc/pacman.d/hooks/55-dryserver-boot-mark.hook \
-    etc/systemd/system/dryserver-boot-check.service etc/systemd/system/boot-complete.target.d/10-dryserver.conf; do
+    etc/systemd/system/dryserver-boot-check.service etc/systemd/system/boot-complete.target.d/10-dryserver.conf \
+    etc/systemd/system/emergency.service.d/10-dryserver.conf; do
     install -D -m "$(stat -c %a "/w/root/$f")" "/w/root/$f" "/$f"
 done
 sh -n /etc/initcpio/post/dryserver-boot
@@ -93,7 +94,20 @@ want "arch-linux-lts+1.efi arch-linux.efi"
 dryserver boot status | grep -q "no fallback kernel" || fail "status does not say there is no fallback"
 
 echo "== the boot check unit"
-systemd-analyze verify --man=no dryserver-boot-check.service boot-complete.target
+systemd-analyze verify --man=no dryserver-boot-check.service boot-complete.target emergency.service
+
+echo "== emergency mode in the initramfs restarts the machine"
+for d in /usr/lib/modules/*; do [[ "$(cat "$d/pkgbase" 2>/dev/null)" == linux ]] && kver=${d##*/}; done
+mkinitcpio -k "$kver" -g /tmp/initramfs.img >/tmp/out 2>&1 || { cat /tmp/out; fail "mkinitcpio -g"; }
+lsinitcpio /tmp/initramfs.img | sed 's|^\./||' >/tmp/files
+for f in etc/systemd/system/emergency.service.d/10-dryserver.conf etc/initrd-release usr/bin/sh usr/bin/sleep usr/bin/systemctl; do
+    grep -qx "$f" /tmp/files || fail "$f is not in the initramfs"
+done
+# Outside the initramfs the drop-in's command does nothing, at once.
+cmd=$(sed -n "s/^ExecStartPre=-//p" /etc/systemd/system/emergency.service.d/10-dryserver.conf)
+start=$SECONDS
+eval "timeout 5 $cmd" || fail "the emergency drop-in failed outside the initramfs"
+(( SECONDS - start < 3 )) || fail "the emergency drop-in waited outside the initramfs"
 echo "all ok"
 EOF
 

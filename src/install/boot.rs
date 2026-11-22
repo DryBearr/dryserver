@@ -140,10 +140,23 @@ Requires=dryserver-boot-check.service
 ";
 
 pub const WATCHDOG_TEXT: &str = "# dryserver: a hardware watchdog, when the machine has one, restarts it when
-# the kernel or systemd hangs, so a new kernel that hangs uses up its tries
-# without someone at the machine.
+# the kernel or systemd hangs, and a crash of systemd restarts it too, so a
+# new kernel that hangs uses up its tries without someone at the machine.
 [Manager]
 RuntimeWatchdogSec=1min
+CrashAction=reboot
+";
+
+/// Emergency mode in the initramfs restarts the machine (mkinitcpio puts
+/// emergency.service's drop-ins into the image).
+pub const EMERGENCY_DROPIN: &str = "/etc/systemd/system/emergency.service.d/10-dryserver.conf";
+pub const EMERGENCY_TEXT: &str = "# dryserver: nobody is at a server's console and root is locked, so emergency
+# mode in the initramfs (a kernel that finds no disk, an unlock that failed)
+# could only wait. It restarts the machine after 30 seconds instead: a new
+# kernel that cannot boot uses up its tries and the other kernel starts.
+# After the switch to the real root this does nothing.
+[Service]
+ExecStartPre=-/usr/bin/sh -c 'test -e /etc/initrd-release || exit 0; echo \"dryserver: restarting in 30 seconds\"; sleep 30; systemctl --no-block reboot'
 ";
 
 /// The two kernels.
@@ -1208,7 +1221,14 @@ mod tests {
         }
         assert!(!MARK_HOOK_TEXT.contains("AbortOnFail") && !MARK_HOOK_TEXT.contains("Operation = Upgrade"));
         assert!(MARK_HOOK.ends_with(".hook") && MARK_HOOK.starts_with("/etc/pacman.d/hooks/"));
-        assert!(WATCHDOG_TEXT.contains("[Manager]\nRuntimeWatchdogSec="));
+        assert!(WATCHDOG_TEXT.contains("[Manager]\nRuntimeWatchdogSec=") && WATCHDOG_TEXT.contains("\nCrashAction=reboot\n"));
+        // Only in the initramfs; never fails emergency.service itself.
+        assert!(EMERGENCY_DROPIN.starts_with("/etc/systemd/system/emergency.service.d/"));
+        assert!(
+            EMERGENCY_TEXT.contains("[Service]\nExecStartPre=-/usr/bin/sh -c 'test -e /etc/initrd-release || exit 0;"),
+            "{EMERGENCY_TEXT}"
+        );
+        assert!(EMERGENCY_TEXT.contains("systemctl --no-block reboot'\n"));
     }
 
     /// test/validate-boot.sh runs the real mkinitcpio with copies of the
