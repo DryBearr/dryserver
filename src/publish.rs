@@ -612,6 +612,7 @@ impl Plan {
 /// publishes at once (two terminals, the screen and a terminal) never
 /// both sign.
 pub const LOCK: &str = "release.lock";
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Signs and sends what p shows, or nothing. Refused before anything is
 /// signed when another publish runs on this computer, when the
@@ -619,7 +620,9 @@ pub const LOCK: &str = "release.lock";
 /// the one p was made against.
 pub fn publish(a: &mut Admin, p: &Plan) -> Result<Release> {
     let lock = a.secrets.join(LOCK);
-    let Some(_held) = fsx::try_lock(&lock)? else {
+    // A short wait: a program another thread forks holds a copy of the
+    // lock until it starts, and a publish that really runs takes minutes.
+    let Some(_held) = fsx::try_lock_for(&lock, LOCK_WAIT)? else {
         bail!("another publish runs on this computer ({} is taken). Nothing was signed; wait for it, then look again", lock.display());
     };
     let v = a.load().map_err(|e| e.wrap("nothing was signed"))?;
