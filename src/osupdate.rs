@@ -40,10 +40,11 @@ use crate::sysconf::{self, Role};
 use crate::update::Hook;
 use crate::{bail, errf, fsx};
 
-/// pacman's list of servers; [core] and [extra] include it.
+/// pacman's list of servers; [core] and [extra] include it. The caller
+/// pins it to the release's day (mirrorlist) before arch_download:
+/// update.rs writes it through its pending record, so a revert puts the
+/// list from before back.
 pub const MIRRORLIST: &str = "/etc/pacman.d/mirrorlist";
-/// The list before the last change of the pinned day.
-pub const MIRRORLIST_PREV: &str = "/etc/pacman.d/mirrorlist.prev";
 pub const PACMAN_CONF: &str = "/etc/pacman.conf";
 const SSHD_CONFIG: &str = "/etc/ssh/sshd_config";
 /// pacman holds this file while it changes the system, and leaves it
@@ -197,41 +198,6 @@ pub fn pinned_date(text: &str) -> Option<String> {
     let date = value.trim().strip_prefix(release::ARCH_ARCHIVE)?.strip_suffix("/$repo/os/$arch")?;
     release::arch_day(date).ok()?;
     Some(date.to_string())
-}
-
-impl Host<'_> {
-    /// Pins pacman to date. The list it replaces is kept as
-    /// MIRRORLIST_PREV. Writing the list that is already there changes
-    /// nothing, so a retry keeps the real previous one. Returns whether the
-    /// list changed.
-    pub fn pin_snapshot(&self, date: &str) -> Result<bool> {
-        let new = mirrorlist(date)?;
-        let path = self.path(MIRRORLIST);
-        let cur = match fs::read(&path) {
-            Ok(b) => Some(b),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(Error::from(e).wrap(format!("open {}", path.display()))),
-        };
-        if cur.as_deref() == Some(new.as_bytes()) {
-            return Ok(false);
-        }
-        fsx::mkdir_all(fsx::dir(&path), 0o755)?;
-        if let Some(cur) = cur {
-            write_atomic(&self.path(MIRRORLIST_PREV), &cur, 0o644)?;
-        }
-        write_atomic(&path, new.as_bytes(), 0o644)?;
-        Ok(true)
-    }
-
-    /// Puts the list from before the last pin back. That changes only
-    /// where pacman looks next: the packages stay as they are (going back
-    /// on packages is a signed rollback). Returns the day the restored list
-    /// pins, when it pins one.
-    pub fn unpin_snapshot(&self) -> Result<Option<String>> {
-        let prev = fsx::read(self.path(MIRRORLIST_PREV)).map_err(|e| e.wrap("no previous mirrorlist to go back to"))?;
-        write_atomic(&self.path(MIRRORLIST), &prev, 0o644)?;
-        Ok(pinned_date(&String::from_utf8_lossy(&prev)))
-    }
 }
 
 // ---- checks before pacman runs ----
@@ -481,6 +447,17 @@ pub enum Stage {
 pub struct Failure {
     pub stage: Stage,
     pub reason: Error,
+    /// A problem that may pass by itself: the archive slow or down, too
+    /// little room for now, another pacman at work. Worth another try
+    /// later; the others (weakened signatures, foreign servers, an
+    /// unmounted /boot) need the admin.
+    pub again: bool,
+}
+
+impl Failure {
+    fn refused(reason: Error, again: bool) -> Failure {
+        Failure { stage: Stage::Refused, reason, again }
+    }
 }
 
 /// One line of pacman's log: "upgraded openssh 9.9p1-1 -> 9.9p1-2".
@@ -520,6 +497,14 @@ pub struct ArchOutcome {
     pub failure: Option<Failure>,
     /// The end of the output of the pacman run that failed.
     pub tail: String,
+    /// Where pacman's log ended and which .pacnew files there were before
+    /// the run, and whether a pacman hook failed during it.
+    log_offset: u64,
+    pacnew_before: BTreeMap<String, SystemTime>,
+    hook_failed: bool,
+    /// arch_download got everything: arch_install may run. And it ran.
+    downloaded: bool,
+    installed: bool,
 }
 
 /// The most changes listed one by one.
@@ -556,7 +541,10 @@ impl ArchOutcome {
     pub fn summary(&self) -> String {
         let mut s = match &self.failure {
             Some(f) if f.stage == Stage::Refused => format!("Arch {}: refused: {}", show(&self.date), f.reason),
+            Some(f) if f.stage != Stage::Install => format!("Arch {}: not installed: {}", show(&self.date), f.reason),
             Some(f) => format!("Arch {}: {} package(s) changed, then failed: {}", show(&self.date), self.count, f.reason),
+            None if !self.downloaded => format!("Arch {}: checked, nothing loaded yet", self.date),
+            None if !self.installed => format!("Arch {}: the packages are loaded, not installed yet", self.date),
             None => format!("Arch {}: {} package(s) changed", self.date, self.count),
         };
         if self.downgrade {
@@ -576,14 +564,17 @@ impl ArchOutcome {
 }
 
 impl Host<'_> {
-    /// Updates Arch Linux to the snapshot of date (YYYY/MM/DD), from a
-    /// signed release; rollback is the release's flag.
+    /// An update of Arch Linux to the snapshot of date (YYYY/MM/DD), from a
+    /// signed release, in three steps; rollback is the release's flag.
     ///
-    /// The steps:
-    /// - refuse a malformed date, an older day than the pinned one without
-    ///   rollback, weakened signatures, an unmounted /boot, too little
-    ///   space, a running pacman; clear a stale lock;
-    /// - pin the mirrorlist to the day (the old list kept);
+    /// arch_check: refuses a malformed date, an older day than the pinned
+    /// one without rollback, weakened signatures, servers outside the
+    /// pinned snapshot, an unmounted /boot, too little space, a running
+    /// pacman; clears a stale lock. It changes nothing else.
+    ///
+    /// Then the caller pins MIRRORLIST to the day (mirrorlist), and
+    /// arch_download loads everything without installing anything but the
+    /// signing keys:
     /// - `pacman -Syy`: the lists of exactly that day. Forced, since pacman
     ///   otherwise keeps lists that look newer than the snapshot's (after
     ///   the install, or going back), and would ask for packages the
@@ -592,68 +583,100 @@ impl Host<'_> {
     ///   so packages signed by new keys pass, but only when the snapshot's
     ///   keyring is newer (`pacman -Qu`): -S installs the snapshot's
     ///   version even when it is older, and an older keyring would trust
-    ///   again keys revoked since. Never when going back, for that reason;
+    ///   again keys revoked since. Never when going back, for that reason.
+    ///   Keys only ever get newer this way, so they may stay when the
+    ///   update goes no further;
     /// - `pacman -Suw`: download only, safe to stop when the network is
-    ///   slow;
-    /// - `pacman -Su`: install from the cache. With rollback and an older
-    ///   (or the same) day, -Suu lets packages downgrade, all but the
-    ///   signing keys;
-    /// - read back what changed, new .pacnew files, whether the kernel was
-    ///   replaced and whether its boot image was made again.
-    pub fn arch_update(&self, ctx: &Ctx, date: &str, rollback: bool) -> ArchOutcome {
+    ///   slow.
+    ///
+    /// arch_install: `pacman -Su`, from the cache. With rollback and an
+    /// older (or the same) day, -Suu lets packages downgrade, all but the
+    /// signing keys. Then it reads back what changed, new .pacnew files,
+    /// whether the kernel was replaced and whether its boot images were
+    /// made again, and restarts sshd after a new openssh.
+    pub fn arch_check(&self, date: &str, rollback: bool) -> ArchOutcome {
         let mut out = ArchOutcome { date: date.to_string(), ..ArchOutcome::default() };
-        if let Err(e) = self.arch_checks(date, rollback, &mut out) {
-            out.failure = Some(Failure { stage: Stage::Refused, reason: e });
+        if let Err(f) = self.arch_checks(date, rollback, &mut out) {
+            out.failure = Some(f);
             self.say(&out.summary());
-            return out;
         }
-        let before = self.pacnew_files();
-        let offset = fs::metadata(self.path(PACMAN_LOG)).map(|m| m.len()).unwrap_or(0);
-        if let Err(e) = self.pin_snapshot(date) {
-            out.failure = Some(Failure { stage: Stage::Refused, reason: e.wrap("pin the snapshot") });
-            self.say(&out.summary());
-            return out;
+        out
+    }
+
+    /// The second step (see arch_check): MIRRORLIST pins out.date now.
+    pub fn arch_download(&self, ctx: &Ctx, out: &mut ArchOutcome) {
+        if out.failure.is_some() {
+            return;
         }
-        self.say(&format!("Arch: pacman now reads the snapshot of {date}{}", if out.downgrade { " (rollback)" } else { "" }));
-        let mut hook_failed = false;
-        let res = self.pacman_steps(ctx, &mut out, &mut hook_failed);
-        out.failure = res.err();
-        (out.count, out.changes) = self.changes_since(offset);
+        if pinned_date(&fsx::read_or_empty(self.path(MIRRORLIST))).as_deref() != Some(out.date.as_str()) {
+            out.failure = Some(Failure::refused(errf!("{MIRRORLIST} does not pin {}", show(&out.date)), false));
+            return;
+        }
+        out.pacnew_before = self.pacnew_files();
+        out.log_offset = fs::metadata(self.path(PACMAN_LOG)).map(|m| m.len()).unwrap_or(0);
+        self.say(&format!("Arch: pacman now reads the snapshot of {}{}", out.date, if out.downgrade { " (rollback)" } else { "" }));
+        match self.download_steps(ctx, out) {
+            Ok(()) => match self.at("arch loaded") {
+                Ok(()) => out.downloaded = true,
+                Err(e) => out.failure = Some(Failure { stage: Stage::Download, reason: e, again: true }),
+            },
+            Err(f) => {
+                out.failure = Some(f);
+                self.say(&out.summary());
+            }
+        }
+    }
+
+    /// The last step (see arch_check), after arch_download got everything.
+    pub fn arch_install(&self, ctx: &Ctx, out: &mut ArchOutcome) {
+        if out.failure.is_some() || !out.downloaded {
+            return;
+        }
+        let mut args = vec![if out.downgrade { "-Suu" } else { "-Su" }];
+        args.extend(upgrade_flags(out.downgrade));
+        out.failure = self.pacman_step(ctx, Stage::Install, &args, self.limits.install, out).err();
+        out.installed = true;
+        if let Err(e) = self.at("arch installed")
+            && out.failure.is_none()
+        {
+            out.failure = Some(Failure { stage: Stage::Install, reason: e, again: false });
+        }
+        (out.count, out.changes) = self.changes_since(out.log_offset);
         out.restart = restart_packages(&out.changes);
         if out.changes.iter().any(|c| c.name == "openssh" && c.action != "removed") {
-            self.restart_sshd(&mut out);
+            self.restart_sshd(out);
         }
         out.kernel_replaced = kernel_replaced(&self.root);
         let after = self.pacnew_files();
-        out.pacnew = after.iter().filter(|(p, t)| before.get(*p) != Some(t)).map(|(p, _)| p.clone()).collect();
+        out.pacnew = after.iter().filter(|(p, t)| out.pacnew_before.get(*p) != Some(t)).map(|(p, _)| p.clone()).collect();
         let kernels = self.kernels();
         let kernel_changed = out.kernel_replaced
             || out
                 .changes
                 .iter()
                 .any(|c| c.action != "removed" && (KERNEL_PACKAGES.contains(&c.name.as_str()) || kernels.contains_key(&c.name)));
-        out.boot_problem = self.boot_problem(hook_failed, kernel_changed, &kernels);
+        out.boot_problem = self.boot_problem(out.hook_failed, kernel_changed, &kernels);
         if out.failure.is_none() {
             // Old packages pile up in the cache with every update until the
             // disk is full; the archive keeps them for a rollback.
             let tctx = ctx.with_timeout(self.limits.sync);
             if let Err(e) = self.run.ok(&tctx, &pacman(&["-Sc", "--noconfirm"]).interrupt(Some(PACMAN_GRACE))) {
-                out.warnings.push(format!("cleaning the package cache failed: {e}"));
+                out.warnings.push(format!("cleaning the package cache failed: {}", one_line(&e.to_string(), 200)));
             }
         }
         self.say(&out.summary());
-        out
     }
 
-    fn arch_checks(&self, date: &str, rollback: bool, out: &mut ArchOutcome) -> Result<()> {
-        let day = release::arch_day(date)?;
+    fn arch_checks(&self, date: &str, rollback: bool, out: &mut ArchOutcome) -> Result<(), Failure> {
+        let no = |e: Error| Failure::refused(e, false);
+        let day = release::arch_day(date).map_err(no)?;
         let current = fsx::read_or_empty(self.path(MIRRORLIST));
         out.previous = pinned_date(&current);
         match &out.previous {
             Some(prev) => {
-                let prev_day = release::arch_day(prev)?;
+                let prev_day = release::arch_day(prev).map_err(no)?;
                 if day < prev_day && !rollback {
-                    bail!("Arch snapshot {date} is older than the pinned {prev}, and the release is not a rollback");
+                    return Err(no(errf!("Arch snapshot {date} is older than the pinned {prev}, and the release is not a rollback")));
                 }
                 // The same day with rollback: a rollback that failed part
                 // way is tried again, downgrades included.
@@ -666,50 +689,31 @@ impl Host<'_> {
                 out.downgrade = rollback;
             }
         }
-        out.warnings.extend(self.check_pacman_conf()?);
-        self.check_boot_mounted()?;
-        self.check_space()?;
-        if let Some(w) = self.check_lock()? {
+        out.warnings.extend(self.check_pacman_conf().map_err(no)?);
+        self.check_boot_mounted().map_err(no)?;
+        // Room may be made, another pacman ends: worth another try.
+        self.check_space().map_err(|e| Failure::refused(e, true))?;
+        if let Some(w) = self.check_lock().map_err(|e| Failure::refused(e, true))? {
             out.warnings.push(w);
         }
         Ok(())
     }
 
-    fn pacman_steps(&self, ctx: &Ctx, out: &mut ArchOutcome, hook_failed: &mut bool) -> Result<(), Failure> {
-        let (u, rest): (&str, &[&str]) =
-            if out.downgrade { ("uu", &["--noconfirm", "--ignore", "archlinux-keyring"]) } else { ("u", &["--noconfirm"]) };
-        self.pacman_step(ctx, Stage::Sync, &["-Syy", "--noconfirm"], self.limits.sync, out, hook_failed)?;
+    fn download_steps(&self, ctx: &Ctx, out: &mut ArchOutcome) -> Result<(), Failure> {
+        self.pacman_step(ctx, Stage::Sync, &["-Syy", "--noconfirm"], self.limits.sync, out)?;
         if !out.downgrade {
             // Prints the keyring only when the snapshot has a newer one.
             let newer = self.run.output(&ctx.with_timeout(self.limits.sync), &pacman(&["-Qu", "archlinux-keyring"]).quiet());
             if newer.is_ok_and(|o| o.contains("archlinux-keyring")) {
-                self.pacman_step(
-                    ctx,
-                    Stage::Sync,
-                    &["-S", "--needed", "--noconfirm", "archlinux-keyring"],
-                    self.limits.sync,
-                    out,
-                    hook_failed,
-                )?;
+                self.pacman_step(ctx, Stage::Sync, &["-S", "--needed", "--noconfirm", "archlinux-keyring"], self.limits.sync, out)?;
             }
         }
-        let (download, install) = (format!("-S{u}w"), format!("-S{u}"));
-        let mut args = vec![download.as_str()];
-        args.extend(rest);
-        self.pacman_step(ctx, Stage::Download, &args, self.limits.download, out, hook_failed)?;
-        args[0] = install.as_str();
-        self.pacman_step(ctx, Stage::Install, &args, self.limits.install, out, hook_failed)
+        let mut args = vec![if out.downgrade { "-Suuw" } else { "-Suw" }];
+        args.extend(upgrade_flags(out.downgrade));
+        self.pacman_step(ctx, Stage::Download, &args, self.limits.download, out)
     }
 
-    fn pacman_step(
-        &self,
-        ctx: &Ctx,
-        stage: Stage,
-        args: &[&str],
-        limit: Duration,
-        out: &mut ArchOutcome,
-        hook_failed: &mut bool,
-    ) -> Result<(), Failure> {
+    fn pacman_step(&self, ctx: &Ctx, stage: Stage, args: &[&str], limit: Duration, out: &mut ArchOutcome) -> Result<(), Failure> {
         let tctx = ctx.with_timeout(limit);
         let (o, res) = if stage == Stage::Install {
             // Never killed (see Limits::install), and no shutdown while it
@@ -719,7 +723,7 @@ impl Host<'_> {
         } else {
             self.run.run(&tctx, &pacman(args).interrupt(Some(PACMAN_GRACE)))
         };
-        *hook_failed |= o.contains(HOOK_FAILED);
+        out.hook_failed |= o.contains(HOOK_FAILED);
         let Err(e) = res else {
             return Ok(());
         };
@@ -745,7 +749,9 @@ impl Host<'_> {
             Stage::Sync => errf!("refreshing the package lists of {} failed ({problem}); nothing was installed: {e}", out.date),
             _ => errf!("downloading the packages failed ({problem}); nothing was installed: {e}"),
         };
-        Err(Failure { stage, reason })
+        // Nothing was installed before the install: another try may well
+        // work (the archive back, a broken download loaded again).
+        Err(Failure { stage, reason, again: stage != Stage::Install })
     }
 
     /// Runs f while shutdowns, sleep and the power key are held off (a
@@ -962,6 +968,12 @@ impl Host<'_> {
         }
         None
     }
+}
+
+/// What -Su and -Suw get besides the operation. Going back: never the
+/// signing keys (see arch_check).
+fn upgrade_flags(downgrade: bool) -> &'static [&'static str] {
+    if downgrade { &["--noconfirm", "--ignore", "archlinux-keyring"] } else { &["--noconfirm"] }
 }
 
 /// pacman in the C locale: its messages are matched (hook failures, the
@@ -1844,6 +1856,20 @@ mod tests {
 
     type Logs = Arc<Mutex<Vec<String>>>;
 
+    impl Host<'_> {
+        /// The three steps in a row, pinning the mirrorlist between the
+        /// check and the download as update.rs does.
+        fn arch_update(&self, ctx: &Ctx, date: &str, rollback: bool) -> ArchOutcome {
+            let mut out = self.arch_check(date, rollback);
+            if out.ok() {
+                write_atomic(&self.path(MIRRORLIST), mirrorlist(date).unwrap().as_bytes(), 0o644).unwrap();
+            }
+            self.arch_download(ctx, &mut out);
+            self.arch_install(ctx, &mut out);
+            out
+        }
+    }
+
     fn host<'a>(root: &Path, run: &'a Fake) -> (Host<'a>, Logs) {
         let logs: Logs = Arc::default();
         let l = logs.clone();
@@ -1951,7 +1977,6 @@ mod tests {
             "\u{ff12}026/11/20",
         ] {
             assert!(mirrorlist(bad).is_err(), "{bad:?}");
-            assert!(h.pin_snapshot(bad).is_err(), "{bad:?}");
             let out = h.arch_update(&Ctx::new(), bad, false);
             let f = out.failure.as_ref().unwrap();
             assert_eq!(f.stage, Stage::Refused, "{bad:?}");
@@ -1967,29 +1992,22 @@ mod tests {
     }
 
     #[test]
-    fn pinning_keeps_the_previous_list_to_go_back_to() {
+    fn nothing_is_loaded_or_installed_out_of_order() {
+        // arch_download needs the day pinned first, arch_install needs
+        // everything loaded: a caller that skips a step gets nothing done.
         let dir = machine();
         let r = dir.path();
         let fake = Fake::new(r);
         let (h, _) = host(r, &fake);
-        assert!(h.pin_snapshot("2026/11/20").unwrap());
-        assert_eq!(get(r, MIRRORLIST), mirrorlist("2026/11/20").unwrap());
-        assert_eq!(get(r, MIRRORLIST_PREV), LIVE);
-        assert_eq!(fs::metadata(h.path(MIRRORLIST)).unwrap().permissions().mode() & 0o777, 0o644);
-        assert!(!h.path("/etc/pacman.d/mirrorlist.dryserver-tmp").exists());
-        // Again with the same day (a retry): the real previous list stays.
-        assert!(!h.pin_snapshot("2026/11/20").unwrap());
-        assert_eq!(get(r, MIRRORLIST_PREV), LIVE);
-        assert!(h.pin_snapshot("2026/11/21").unwrap());
-        assert_eq!(pinned_date(&get(r, MIRRORLIST_PREV)).as_deref(), Some("2026/11/20"));
-        assert_eq!(h.unpin_snapshot().unwrap().as_deref(), Some("2026/11/20"));
-        assert_eq!(get(r, MIRRORLIST), mirrorlist("2026/11/20").unwrap());
-        // A machine without any list yet.
-        let empty = TempDir::new();
-        let (h, _) = host(empty.path(), &fake);
-        assert!(h.pin_snapshot("2026/11/20").unwrap());
-        assert!(!h.path(MIRRORLIST_PREV).exists());
-        assert!(h.unpin_snapshot().unwrap_err().to_string().contains("no previous mirrorlist"));
+        let mut out = h.arch_check("2026/11/20", false);
+        assert!(out.ok() && !out.downloaded, "{}", out.summary());
+        let mut early = out.clone();
+        h.arch_install(&Ctx::new(), &mut early);
+        assert!(fake.pacman_lines().is_empty() && !early.installed, "{:?}", fake.lines());
+        h.arch_download(&Ctx::new(), &mut out);
+        let why = out.failure.as_ref().unwrap().reason.to_string();
+        assert!(why.contains("does not pin"), "{why}");
+        assert!(fake.pacman_lines().is_empty(), "{:?}", fake.lines());
     }
 
     #[test]
@@ -2174,7 +2192,7 @@ mod tests {
         let (h, _) = host(r, &fake);
         let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
         let f = out.failure.as_ref().unwrap();
-        assert_eq!(f.stage, Stage::Install);
+        assert!(f.stage == Stage::Install && !f.again, "past the point where another try is all it takes");
         let why = f.reason.to_string();
         assert!(why.contains("part way") && why.contains("Do not reboot") && why.contains("never overwrites"), "{why}");
         assert_eq!(out.count, 2, "what pacman did before it stopped");
@@ -2285,7 +2303,7 @@ mod tests {
         let (h, _) = host(r, &fake);
         let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
         let f = out.failure.as_ref().unwrap();
-        assert!(f.stage == Stage::Refused && f.reason.to_string().contains("pid 4242"), "{}", f.reason);
+        assert!(f.stage == Stage::Refused && f.again && f.reason.to_string().contains("pid 4242"), "{}", f.reason);
         assert!(h.path(PACMAN_LOCK).exists() && fake.lines().is_empty());
         assert_eq!(get(r, MIRRORLIST), LIVE, "nothing changed");
         // Once that pacman is gone, the lock it left is stale.
@@ -2328,7 +2346,7 @@ mod tests {
             let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
             let f = out.failure.as_ref().unwrap_or_else(|| panic!("accepted:\n{conf}"));
             let why = f.reason.to_string();
-            assert!(f.stage == Stage::Refused && why.contains("weakened") && why.contains(want), "{why}\n{conf}");
+            assert!(f.stage == Stage::Refused && !f.again && why.contains("weakened") && why.contains(want), "{why}\n{conf}");
             assert!(fake.lines().is_empty() && get(r, MIRRORLIST) == LIVE, "{conf}");
         }
         // The mirrorlist is read like any included file.
@@ -2400,7 +2418,7 @@ mod tests {
             h.limits.min_free_boot = boot;
             let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
             let why = out.failure.as_ref().unwrap().reason.to_string();
-            assert!(why.contains(want) && why.contains("make room"), "{why}");
+            assert!(why.contains(want) && why.contains("make room") && out.failure.as_ref().unwrap().again, "{why}");
             assert!(fake.lines().is_empty() && get(dir.path(), MIRRORLIST) == LIVE);
         }
         let dir = machine();
@@ -2421,7 +2439,7 @@ mod tests {
         let r = dir.path();
         let fake = Fake::new(r);
         let (h, _) = host(r, &fake);
-        h.pin_snapshot("2026/11/20").unwrap();
+        put(r, MIRRORLIST, mirrorlist("2026/11/20").unwrap());
         let out = h.arch_update(&Ctx::new(), "2026/11/01", false);
         let why = out.failure.as_ref().unwrap().reason.to_string();
         assert!(why.contains("older than the pinned 2026/11/20") && why.contains("not a rollback"), "{why}");
@@ -2439,7 +2457,7 @@ mod tests {
             ],
             "older packages, but the newer signing keys stay"
         );
-        assert_eq!(pinned_date(&get(r, MIRRORLIST_PREV)).as_deref(), Some("2026/11/20"));
+        assert_eq!(pinned_date(&get(r, MIRRORLIST)).as_deref(), Some("2026/11/01"));
         assert!(out.summary().contains("rollback"));
         // Again on the same day (a rollback that failed part way): still -uu.
         assert!(h.arch_update(&Ctx::new(), "2026/11/01", true).downgrade);
@@ -2462,7 +2480,10 @@ mod tests {
         let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
         let f = out.failure.as_ref().unwrap();
         let why = f.reason.to_string();
-        assert!(f.stage == Stage::Download && why.contains("nothing was installed") && why.contains("archive may be slow"), "{why}");
+        assert!(
+            f.stage == Stage::Download && f.again && why.contains("nothing was installed") && why.contains("archive may be slow"),
+            "{why}"
+        );
         assert!(!fake.lines().iter().any(|l| l == "pacman -Su --noconfirm"));
         assert_eq!(out.count, 0);
     }
