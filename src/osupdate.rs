@@ -736,7 +736,11 @@ impl Host<'_> {
         }
         if out.failure.is_none() {
             self.drop_split_owners(ctx, out);
-            if out.downgrade {
+            // A newer package that keeps its entry for now shares its files
+            // with the older one: removed, it would take them along.
+            if out.downgrade && fs::symlink_metadata(self.path(SPLIT)).is_ok() {
+                out.warnings.push("what the older snapshot lacks stays installed until the package split is done (the next update)".into());
+            } else if out.downgrade {
                 self.remove_foreign_orphans(ctx, out);
             }
         }
@@ -953,7 +957,8 @@ impl Host<'_> {
                     shown()
                 ));
             }
-            let record = SplitRecord { owners: owners.iter().cloned().collect(), paths: paths.clone() };
+            let targets = said.conflicts.iter().map(|c| (c.path.clone(), c.target.clone())).collect();
+            let record = SplitRecord { owners: owners.iter().cloned().collect(), paths: paths.clone(), targets };
             fsx::mkdir_all(fsx::dir(self.path(SPLIT)), 0o700)
                 .and_then(|_| write_atomic(&self.path(SPLIT), serde_json::to_string_pretty(&record).unwrap_or_default().as_bytes(), 0o600))
                 .map_err(|e| format!("{e}: nothing was overwritten"))?;
@@ -1031,9 +1036,11 @@ impl Host<'_> {
     /// packages that owned the files lose their database entry (pacman
     /// -Rdd --dbonly: their files stay, owned by the older package alone),
     /// each only while it is still installed and foreign, and once every
-    /// one of its files there is owned by another package as well. Then
-    /// pacman checks its database (-Dk). A power cut on the way leaves SPLIT,
-    /// and the next run that installs well does it again.
+    /// one of the files is in the file list of the older package that took
+    /// it over (pacman -Qlq TARGET). Then pacman checks its database (-Dk).
+    /// A power cut on the way leaves SPLIT, and the next run that installs
+    /// well does it again. While SPLIT is there, nothing is removed as an
+    /// orphan (remove_foreign_orphans): the newer package shares its files.
     fn drop_split_owners(&self, ctx: &Ctx, out: &mut ArchOutcome) {
         let Ok(text) = fs::read_to_string(self.path(SPLIT)) else { return };
         let Ok(record) = serde_json::from_str::<SplitRecord>(&text) else {
@@ -1049,17 +1056,30 @@ impl Host<'_> {
                 return;
             }
         };
-        let others_own = |path: &str| {
-            self.run
-                .output(&tctx, &pacman(&["-Qoq", path]).quiet())
-                .is_ok_and(|o| o.lines().map(str::trim).any(|p| package_name(p) && !record.owners.iter().any(|x| x == p)))
-        };
-        if let Some(p) = record.paths.iter().find(|p| !others_own(p)) {
-            out.warnings.push(format!(
-                "{p} is not owned by the package that took it over yet: {} keep(s) its database entry for now",
-                record.owners.join(", ")
-            ));
-            return;
+        // pacman -Qo names one owner of a file only (the first it finds), so
+        // it cannot say that the older package owns it too; the older
+        // package's own file list can. A record from before the targets has
+        // only -Qo: a file it names another owner of is that one's as well.
+        let mut lists: BTreeMap<String, Option<BTreeSet<String>>> = BTreeMap::new();
+        for p in &record.paths {
+            let taken = match record.targets.get(p) {
+                Some(t) if package_name(t) && !record.owners.contains(t) => {
+                    lists.entry(t.clone()).or_insert_with(|| self.installed_files(&tctx, t).ok()).as_ref().is_some_and(|l| l.contains(p))
+                }
+                Some(_) => false,
+                None if record.targets.is_empty() => self
+                    .run
+                    .output(&tctx, &pacman(&["-Qoq", p]).quiet())
+                    .is_ok_and(|o| o.lines().map(str::trim).any(|q| package_name(q) && !record.owners.iter().any(|x| x == q))),
+                None => false,
+            };
+            if !taken {
+                out.warnings.push(format!(
+                    "{p} is not owned by the package that took it over yet: {} keep(s) its database entry for now",
+                    record.owners.join(", ")
+                ));
+                return;
+            }
         }
         let drop: Vec<&str> = record.owners.iter().map(String::as_str).filter(|o| package_name(o) && foreign.contains(*o)).collect();
         if !drop.is_empty() {
@@ -1080,32 +1100,104 @@ impl Host<'_> {
         let _ = fs::remove_file(self.path(SPLIT));
     }
 
+    /// The files of the installed package (pacman -Qlq): absolute paths,
+    /// without the directories.
+    fn installed_files(&self, ctx: &Ctx, package: &str) -> Result<BTreeSet<String>> {
+        let list = self.run.output(ctx, &pacman(&["-Qlq", package]).quiet())?;
+        Ok(list.lines().map(str::trim).filter(|l| l.starts_with('/') && !l.ends_with('/')).map(str::to_string).collect())
+    }
+
     /// After a rollback: packages from the newer snapshot the older one
     /// does not have and nothing needs any more (orphans, pacman -Qdtq, that
-    /// are foreign, pacman -Qmq) go, in a normal transaction (pacman -Rns).
-    /// Never one installed on purpose: those are no orphans.
+    /// are foreign, pacman -Qmq) go, in a normal transaction (pacman -R),
+    /// round by round as their own dependencies turn into such orphans.
+    /// Never one installed on purpose: those are no orphans. Never one that
+    /// owns a file another installed package owns too (a package split not
+    /// done yet, or done by hand): pacman -R deletes every file of the
+    /// package it removes, also one that another package owns, and that may
+    /// be OpenSSL's libraries. Not with -n: a config file that was edited is
+    /// kept as .pacsave (and reported). Not with -s: each package that goes
+    /// is one looked at here.
     fn remove_foreign_orphans(&self, ctx: &Ctx, out: &mut ArchOutcome) {
         let tctx = ctx.with_timeout(self.limits.sync);
-        let (o, _) = self.run.run(&tctx, &pacman(&["-Qdtq"]).quiet());
-        let orphans: BTreeSet<String> = o.lines().map(str::trim).filter(|l| package_name(l)).map(str::to_string).collect();
-        if orphans.is_empty() {
-            return;
-        }
-        let Ok(foreign) = self.foreign(ctx) else { return };
-        let gone: Vec<&str> = orphans.iter().filter(|p| foreign.contains(*p)).map(String::as_str).collect();
-        if gone.is_empty() {
-            return;
-        }
-        let mut args = vec!["-Rns", "--noconfirm"];
-        args.extend(&gone);
-        match self.pacman_step(ctx, Stage::Install, &args, self.limits.install, out) {
-            Ok(()) => {
-                let msg = format!("removed what the older snapshot does not have and nothing needs: {}", gone.join(", "));
-                self.say(&format!("Arch: {msg}"));
-                out.repairs.push(msg);
+        let mut tried: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..MAX_ORPHAN_ROUNDS {
+            let (o, _) = self.run.run(&tctx, &pacman(&["-Qdtq"]).quiet());
+            let orphans: BTreeSet<String> =
+                o.lines().map(str::trim).filter(|l| package_name(l) && !tried.contains(*l)).map(str::to_string).collect();
+            if orphans.is_empty() {
+                return;
             }
-            Err(f) => out.warnings.push(format!("removing {} failed: {}", gone.join(", "), f.reason)),
+            let Ok(foreign) = self.foreign(ctx) else { return };
+            let candidates: BTreeSet<String> = orphans.into_iter().filter(|p| foreign.contains(p)).collect();
+            if candidates.is_empty() {
+                return;
+            }
+            tried.extend(candidates.iter().cloned());
+            let shared = match self.sharing(&tctx, &candidates) {
+                Ok(s) => s,
+                Err(e) => {
+                    let names = candidates.iter().cloned().collect::<Vec<_>>().join(", ");
+                    out.warnings.push(format!("{names} stay(s) installed: {e}"));
+                    return;
+                }
+            };
+            for (p, (file, other)) in &shared {
+                out.warnings.push(format!(
+                    "{p} stays installed although the older snapshot lacks it: its file {} belongs to {} too",
+                    printable(file),
+                    printable(other)
+                ));
+            }
+            let gone: Vec<&str> = candidates.iter().filter(|p| !shared.contains_key(*p)).map(String::as_str).collect();
+            if gone.is_empty() {
+                return;
+            }
+            let mut args = vec!["-R", "--noconfirm"];
+            args.extend(&gone);
+            match self.pacman_step(ctx, Stage::Install, &args, self.limits.install, out) {
+                Ok(()) => {
+                    let msg = format!("removed what the older snapshot does not have and nothing needs: {}", gone.join(", "));
+                    self.say(&format!("Arch: {msg}"));
+                    out.repairs.push(msg);
+                }
+                Err(f) => {
+                    out.warnings.push(format!("removing {} failed: {}", gone.join(", "), f.reason));
+                    return;
+                }
+            }
         }
+    }
+
+    /// Which of the packages own a file that another installed package
+    /// owns as well, each with one such file and that other package; from
+    /// every installed package's file list (pacman -Ql: -Qo names only the
+    /// first owner of a file). Err when the lists cannot be read whole.
+    fn sharing(&self, ctx: &Ctx, packages: &BTreeSet<String>) -> std::result::Result<BTreeMap<String, (String, String)>, String> {
+        let (o, res) = self.run.run(ctx, &pacman(&["-Ql"]).quiet());
+        if let Err(e) = res {
+            return Err(format!("the file lists of the installed packages cannot be read ({})", one_line(&e.to_string(), 200)));
+        }
+        if o.len() >= crate::runner::MAX_KEPT {
+            return Err("the file lists of the installed packages are too long to read whole".into());
+        }
+        let entries = || {
+            o.lines()
+                .filter_map(|l| l.split_once(' '))
+                .filter(|(pkg, path)| package_name(pkg) && path.starts_with('/') && !path.ends_with('/'))
+        };
+        let mut theirs: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (pkg, path) in entries().filter(|(pkg, _)| packages.contains(*pkg)) {
+            theirs.entry(path).or_default().insert(pkg);
+        }
+        let mut shared = BTreeMap::new();
+        for (pkg, path) in entries() {
+            let Some(owners) = theirs.get(path) else { continue };
+            for p in owners.iter().filter(|p| **p != pkg) {
+                shared.entry(p.to_string()).or_insert_with(|| (path.to_string(), pkg.to_string()));
+            }
+        }
+        Ok(shared)
     }
 
     fn pacman_step(&self, ctx: &Ctx, stage: Stage, args: &[&str], limit: Duration, out: &mut ArchOutcome) -> Result<(), Failure> {
@@ -1588,16 +1680,23 @@ pub struct PacmanSaid {
 }
 
 /// SPLIT: the newer packages whose files a rollback gave to the older
-/// ones, and the files.
+/// ones, the files, and which older package took each one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct SplitRecord {
     owners: Vec<String>,
     paths: Vec<String>,
+    /// Each path with the package of the older day that took it over (the
+    /// target in pacman's conflict line). Empty in a record a dryserver
+    /// from before it wrote.
+    targets: BTreeMap<String, String>,
 }
 
 const MAX_SAID: usize = 8;
 const MAX_CONFLICTS: usize = 64;
+/// The most rounds of removing what a rollback left (remove_foreign_orphans):
+/// a package that goes can leave its own dependencies as orphans.
+const MAX_ORPHAN_ROUNDS: usize = 4;
 
 /// A package name as pacman prints it.
 fn package_name(s: &str) -> bool {
@@ -3561,13 +3660,16 @@ mod tests {
                 "pacman -Qmq" if snapshot_has_owner => ok("libnew\n"),
                 "pacman -Qmq" if dropped => ok("libnew\n"),
                 "pacman -Qmq" => ok("openssl-3\nlibnew\n"),
-                l if l.starts_with("pacman -Qoq /usr/lib/lib") => ok("openssl\nopenssl-3\n"),
+                // The older openssl's own list has the files now.
+                "pacman -Qlq openssl" => ok("/usr/\n/usr/lib/\n/usr/lib/libcrypto.so.3\n/usr/lib/libssl.so.3\n"),
                 "pacman -Rdd --dbonly --noconfirm openssl-3" => {
                     put(root, "/var/lib/pacman/local/openssl-3-dropped", "");
                     ok("")
                 }
                 "pacman -Dk" => ok("No database errors have been found!\n"),
                 "pacman -Qdtq" => ok("libnew\nlibold\n"),
+                "pacman -Ql" => ok("libnew /usr/\nlibnew /usr/lib/libnew.so.1\nlibold /usr/lib/libold.so.1\nopenssl /usr/\n\
+                    openssl /usr/lib/libcrypto.so.3\nopenssl /usr/lib/libssl.so.3\n"),
                 _ => ok(""),
             }
         }
@@ -3594,13 +3696,17 @@ mod tests {
                 // linux-lts in a run of its own, once the rest went in.
                 "pacman -Suu --noconfirm --ignore archlinux-keyring",
                 "pacman -Qmq",
-                "pacman -Qoq /usr/lib/libcrypto.so.3",
-                "pacman -Qoq /usr/lib/libssl.so.3",
+                "pacman -Qlq openssl",
                 "pacman -Rdd --dbonly --noconfirm openssl-3",
                 "pacman -Dk",
                 "pacman -Qdtq",
                 "pacman -Qmq",
-                "pacman -Rns --noconfirm libnew",
+                "pacman -Ql",
+                // No -n: an edited config file stays as .pacsave.
+                "pacman -R --noconfirm libnew",
+                // Its own dependencies may be orphans now: another round.
+                "pacman -Qdtq",
+                "pacman -Qmq",
                 "pacman -Sc --noconfirm",
             ]
         );
@@ -3623,43 +3729,174 @@ mod tests {
     fn a_power_cut_after_the_files_were_taken_over_finishes_next_time() {
         // The overwrite went in; the power went before the newer package
         // lost its database entry. The next run installs well and does it.
+        let paths = vec!["/usr/lib/libcrypto.so.3".to_string(), "/usr/lib/libssl.so.3".to_string()];
+        let targets = paths.iter().map(|p| (p.clone(), "openssl".to_string())).collect();
+        let record = SplitRecord { owners: vec!["openssl-3".into()], paths: paths.clone(), targets };
+        let run = |record: &SplitRecord, f: fn(&Cmd) -> Option<&'static str>| {
+            let dir = two_kernels();
+            put(dir.path(), MIRRORLIST, mirrorlist("2026/11/08").unwrap());
+            put(dir.path(), SPLIT, serde_json::to_string(record).unwrap());
+            let fake = Fake::with_pacman(dir.path(), move |_, _, c| match (c.args[0].as_str(), f(c)) {
+                ("-Qmq", _) => ("openssl-3\n".into(), Ok(())),
+                (_, Some(o)) => (o.into(), Ok(())),
+                _ => (String::new(), Ok(())),
+            });
+            let (h, _) = host(dir.path(), &fake);
+            let mut out = h.arch_check("2026/11/08", true);
+            out.downloaded = true;
+            h.arch_install(&Ctx::new(), &mut out);
+            let split = h.path(SPLIT).exists();
+            (out, fake.pacman_lines(), split, dir)
+        };
+        // The older openssl's file list has them.
+        let (out, lines, split, _dir) = run(&record, |c| {
+            (c.to_string() == "pacman -Qlq openssl").then_some("/usr/lib/\n/usr/lib/libcrypto.so.3\n/usr/lib/libssl.so.3\n")
+        });
+        assert!(out.ok() && lines.iter().filter(|l| *l == "pacman -Rdd --dbonly --noconfirm openssl-3").count() == 1, "{lines:?}");
+        assert!(!split && !lines.iter().any(|l| l.starts_with("pacman -Qo")), "{lines:?}");
+        // Files not in the older package's list yet: the entry stays, and so
+        // does the record, for the next run.
+        let (out, lines, split, _dir) = run(&record, |c| (c.args[0] == "-Qlq").then_some("/usr/lib/libcrypto.so.3\n"));
+        assert!(!lines.iter().any(|l| l.starts_with("pacman -Rdd")) && split, "{lines:?}");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("/usr/lib/libssl.so.3") && w.contains("keep(s) its database entry")),
+            "{:?}",
+            out.warnings
+        );
+        // A record of a dryserver from before the targets: pacman -Qo names
+        // the first owner only, and only another one says the file is taken.
+        let old = SplitRecord { targets: BTreeMap::new(), ..record.clone() };
+        let (_, lines, split, _dir) = run(&old, |c| (c.args[0] == "-Qoq").then_some("openssl\n"));
+        assert!(!split && lines.iter().any(|l| l == "pacman -Rdd --dbonly --noconfirm openssl-3"), "{lines:?}");
+        let (_, lines, split, _dir) = run(&old, |c| (c.args[0] == "-Qoq").then_some("openssl-3\n"));
+        assert!(split && !lines.iter().any(|l| l.starts_with("pacman -Rdd")), "{lines:?}");
+    }
+
+    #[test]
+    fn review_a_kept_split_owner_is_never_removed_as_an_orphan() {
+        // The split owner kept its entry (its files are not the older
+        // package's yet, -Rdd failed, or -Qmq did): it is a foreign orphan,
+        // and pacman -R would delete the files the older openssl shares,
+        // libcrypto.so.3 and libssl.so.3 among them: no SSH, no pacman.
+        let paths = vec!["/usr/lib/libcrypto.so.3".to_string(), "/usr/lib/libssl.so.3".to_string()];
+        let targets = paths.iter().map(|p| (p.clone(), "openssl".to_string())).collect();
+        for record in [
+            SplitRecord { owners: vec!["openssl-3".into()], paths: paths.clone(), ..SplitRecord::default() },
+            SplitRecord { owners: vec!["openssl-3".into()], paths: paths.clone(), targets },
+        ] {
+            let dir = two_kernels();
+            let r = dir.path();
+            put(r, MIRRORLIST, mirrorlist("2026/11/08").unwrap());
+            put(r, SPLIT, serde_json::to_string(&record).unwrap());
+            let fake = Fake::with_pacman(r, |_, _, c| match c.args[0].as_str() {
+                // As real pacman: -Qo names the first owner only.
+                "-Qoq" | "-Qmq" | "-Qdtq" => ("openssl-3\n".into(), Ok(())),
+                _ => (String::new(), Ok(())),
+            });
+            let (h, _) = host(r, &fake);
+            let mut out = h.arch_check("2026/11/08", true);
+            out.downloaded = true;
+            h.arch_install(&Ctx::new(), &mut out);
+            let lines = fake.pacman_lines();
+            assert!(!lines.iter().any(|l| l.starts_with("pacman -R")), "the split owner's files are deleted: {lines:?}");
+            assert!(h.path(SPLIT).exists(), "tried again at the next update");
+            assert!(out.warnings.iter().any(|w| w.contains("until the package split is done")), "{:?}", out.warnings);
+        }
+    }
+
+    #[test]
+    fn review_an_orphan_that_shares_files_with_another_package_stays() {
+        // The split record is gone (damaged, or the split done by hand) while
+        // the newer package still owns files with the older one: it stays.
+        // What shares nothing goes, and its own orphaned dependency after it.
         let dir = two_kernels();
         let r = dir.path();
         put(r, MIRRORLIST, mirrorlist("2026/11/08").unwrap());
-        let record =
-            SplitRecord { owners: vec!["openssl-3".into()], paths: vec!["/usr/lib/libcrypto.so.3".into(), "/usr/lib/libssl.so.3".into()] };
-        put(r, SPLIT, serde_json::to_string(&record).unwrap());
-        let fake = Fake::with_pacman(r, |_, _, c| match c.args[0].as_str() {
-            "-Qmq" => ("openssl-3\n".into(), Ok(())),
-            "-Qoq" => ("openssl\nopenssl-3\n".into(), Ok(())),
+        put(r, SPLIT, "{damaged");
+        let fake = Fake::with_pacman(r, |_, root, c| {
+            let line = c.to_string();
+            let gone = fsx::under(root, "/var/lib/pacman/local/libnew-removed").exists();
+            let ok = |s: &str| (s.to_string(), Ok(()));
+            match line.as_str() {
+                "pacman -Qmq" if gone => ok("openssl-3\nlibnewdep\n"),
+                "pacman -Qmq" => ok("openssl-3\nlibnew\nlibnewdep\n"),
+                "pacman -Qdtq" if gone => ok("openssl-3\nlibnewdep\n"),
+                "pacman -Qdtq" => ok("openssl-3\nlibnew\n"),
+                "pacman -Ql" if gone => {
+                    ok("libnewdep /usr/lib/libnewdep.so\nopenssl /usr/lib/libssl.so.3\nopenssl-3 /usr/lib/libssl.so.3\n")
+                }
+                "pacman -Ql" => ok("libnew /usr/bin/new\nlibnewdep /usr/lib/libnewdep.so\nopenssl /usr/lib/libcrypto.so.3\n\
+                    openssl /usr/lib/libssl.so.3\nopenssl-3 /usr/lib/libcrypto.so.3\nopenssl-3 /usr/lib/libssl.so.3\n"),
+                "pacman -R --noconfirm libnew" => {
+                    put(root, "/var/lib/pacman/local/libnew-removed", "");
+                    ok("")
+                }
+                _ => ok(""),
+            }
+        });
+        let (h, _) = host(r, &fake);
+        let mut out = h.arch_check("2026/11/08", true);
+        out.downloaded = true;
+        h.arch_install(&Ctx::new(), &mut out);
+        let removals: Vec<String> = fake.pacman_lines().into_iter().filter(|l| l.starts_with("pacman -R")).collect();
+        assert_eq!(removals, ["pacman -R --noconfirm libnew", "pacman -R --noconfirm libnewdep"]);
+        let w = out.warnings.join("\n");
+        assert!(w.contains("openssl-3 stays installed") && w.contains("/usr/lib/libcrypto.so.3 belongs to openssl too"), "{w}");
+        // File lists that cannot be read whole: nothing goes.
+        let dir = two_kernels();
+        let fake = Fake::with_pacman(dir.path(), |_, _, c| match c.args[0].as_str() {
+            "-Qmq" | "-Qdtq" => ("libnew\n".into(), Ok(())),
+            "-Ql" => (String::new(), Err("pacman failed: exit status 1".into())),
             _ => (String::new(), Ok(())),
         });
-        let (h, _) = host(r, &fake);
+        let (h, _) = host(dir.path(), &fake);
         let mut out = h.arch_check("2026/11/08", true);
         out.downloaded = true;
         h.arch_install(&Ctx::new(), &mut out);
-        assert!(out.ok() && fake.count("pacman -Rdd --dbonly --noconfirm openssl-3") == 1, "{:?}", fake.pacman_lines());
-        assert!(!h.path(SPLIT).exists());
-        // Files not owned by the older package yet: the entry stays, and so
-        // does the record, for the next run.
+        assert!(!fake.pacman_lines().iter().any(|l| l.starts_with("pacman -R")), "{:?}", fake.pacman_lines());
+        assert!(out.warnings.iter().any(|w| w.contains("libnew stay(s) installed")), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn review_a_split_owner_that_sorts_first_still_leaves_the_database() {
+        // pacman -Qo names the first owner of a file, by name: libcrypto3
+        // before openssl. The older package's own file list says it is
+        // openssl's too.
+        let out_text = "checking for file conflicts...\nerror: failed to commit transaction (conflicting files)\n\
+            openssl: /usr/lib/libcrypto.so.3 exists in filesystem (owned by libcrypto3)\nErrors occurred, no packages were upgraded.\n";
         let dir = two_kernels();
         let r = dir.path();
-        put(r, SPLIT, serde_json::to_string(&record).unwrap());
-        let fake = Fake::with_pacman(r, |_, _, c| {
-            if c.args[0] == "-Qoq" {
-                return ("openssl-3\n".into(), Ok(()));
+        put(r, MIRRORLIST, mirrorlist("2026/11/22").unwrap());
+        let fake = Fake::with_pacman(r, move |_, root, c| {
+            let line = c.to_string();
+            let dropped = fsx::under(root, "/var/lib/pacman/local/libcrypto3-dropped").exists();
+            let overwritten = fsx::under(root, "/var/lib/pacman/local/openssl-3.6").exists();
+            match c.args[0].as_str() {
+                "-Suu" if line.contains("--overwrite /usr/lib/libcrypto.so.3") => {
+                    put(root, "/var/lib/pacman/local/openssl-3.6", "");
+                    (String::new(), Ok(()))
+                }
+                "-Suu" if line.contains("--ignore linux-lts") => (out_text.into(), Err(SPLIT_ERR.into())),
+                "-Qmq" if dropped => (String::new(), Err("pacman failed: exit status 1".into())),
+                "-Qmq" => ("libcrypto3\n".into(), Ok(())),
+                "-Qoq" if dropped => ("openssl\n".into(), Ok(())),
+                "-Qoq" => ("libcrypto3\n".into(), Ok(())),
+                "-Qlq" if overwritten && c.args[1] == "openssl" => ("/usr/lib/\n/usr/lib/libcrypto.so.3\n".into(), Ok(())),
+                "-Rdd" => {
+                    put(root, "/var/lib/pacman/local/libcrypto3-dropped", "");
+                    (String::new(), Ok(()))
+                }
+                "-Qdtq" if !dropped => ("libcrypto3\n".into(), Ok(())),
+                _ => (String::new(), Ok(())),
             }
-            if c.args[0] == "-Qmq" {
-                return ("openssl-3\n".into(), Ok(()));
-            }
-            (String::new(), Ok(()))
         });
         let (h, _) = host(r, &fake);
-        let mut out = h.arch_check("2026/11/08", true);
-        out.downloaded = true;
-        h.arch_install(&Ctx::new(), &mut out);
-        assert!(fake.count("pacman -Rdd") == 0 && h.path(SPLIT).exists(), "{:?}", fake.pacman_lines());
-        assert!(out.warnings.iter().any(|w| w.contains("keep(s) its database entry")), "{:?}", out.warnings);
+        let out = h.arch_update(&Ctx::new(), "2026/11/08", true);
+        assert!(out.ok(), "{}", out.summary());
+        let lines = fake.pacman_lines();
+        assert!(lines.iter().any(|l| l == "pacman -Rdd --dbonly --noconfirm libcrypto3"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("pacman -R ") || l.starts_with("pacman -Rns")), "{lines:?}");
+        assert!(!h.path(SPLIT).exists());
     }
 
     #[test]

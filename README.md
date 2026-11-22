@@ -859,8 +859,11 @@ release that brings it. Step by step:
    Files in the way are taken over in two cases only, each file named: a
    rollback across a package split (Arch moved files into a new package
    the older day does not have, like openssl-3; the older package takes
-   them back, the new one leaves pacman's database, and what the older day
-   lacks and nothing needs is removed), and an install cut off by a power
+   them back, the new one leaves pacman's database once the older package's
+   own file list has them, and what the older day lacks and nothing needs
+   is removed, never a package that shares a file with another one and
+   never before the split is done; an edited config file it had stays as
+   `.pacsave`), and an install cut off by a power
    cut in the middle of a package (its own files, owned by no package).
    Anything else is refused with the files, for you to look at. A machine
    installed after the release, whose packages are of a newer day, keeps
