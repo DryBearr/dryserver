@@ -441,8 +441,22 @@ fn save_json<T: Serialize>(m: &Machine, path: &str, v: &T) -> Result<()> {
     write_atomic(m, &m.path(path), (serde_json::to_string_pretty(v)? + "\n").as_bytes(), 0o600, None)
 }
 
+/// The update that waits, when there is one. Its id names a backup
+/// directory a revert removes and goes into the timer's shell command: a
+/// record whose id is not what apply makes (16 lowercase hex digits) is
+/// damaged.
 pub fn load_pending(m: &Machine) -> Result<Option<Pending>> {
-    read_json(m, PENDING)
+    let p: Option<Pending> = read_json(m, PENDING)?;
+    if let Some(p) = &p
+        && !valid_id(&p.id)
+    {
+        bail!("{PENDING} is damaged: its id {:?} is not 16 hex digits", p.id.chars().take(40).collect::<String>());
+    }
+    Ok(p)
+}
+
+fn valid_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn save_pending(m: &Machine, p: &Pending) -> Result<()> {
@@ -518,6 +532,7 @@ fn sync_dir(dir: &Path) -> Result<()> {
 fn write_atomic(m: &Machine, path: &Path, data: &[u8], mode: u32, owner: Option<(u32, u32)>) -> Result<()> {
     let dir = fsx::dir(path);
     fsx::mkdir_all(&dir, 0o755)?;
+    check_dir_chain(m, &dir)?;
     let tmp = tmp_of(path);
     remove_if_exists(&tmp)?;
     let fail = |op: &str, e: io::Error| Error::from(e).wrap(format!("{op} {}", tmp.display()));
@@ -630,6 +645,21 @@ fn check_owned(m: &Machine, path: &Path, dir: bool) -> Result<()> {
         bail!("{p} has {} names (hard links); an update takes only a file of its own", md.nlink());
     }
     Ok(())
+}
+
+/// dir and every directory above it, up to the machine's root, belong to
+/// root and nobody else may write them: nobody else can rename one away
+/// and put a link or a directory of their own in its place while an
+/// update writes a file there as root.
+fn check_dir_chain(m: &Machine, dir: &Path) -> Result<()> {
+    let mut d = dir;
+    loop {
+        check_owned(m, d, true)?;
+        match d.parent() {
+            Some(up) if d != m.root && up.starts_with(&m.root) => d = up,
+            _ => return Ok(()),
+        }
+    }
 }
 
 /// The staging directory and every directory above it belong to root and
@@ -836,6 +866,7 @@ fn restore(m: &Machine, f: &Replaced) -> Result<()> {
             write_atomic(m, &dst, &data, f.mode, Some((f.uid, f.gid)))?;
         }
         None => {
+            check_dir_chain(m, &fsx::dir(&dst))?;
             remove_if_exists(&dst)?;
             sync_dir(&fsx::dir(&dst))?;
         }
@@ -1858,14 +1889,25 @@ fn revert(m: &Machine, ctx: &Ctx, mut p: Pending, why: &str, boot: bool, now: i6
     // Once it is done, the record is read again, so the files it added are
     // put back too; marked reverting, it lets no activate start after.
     let _mesh = fsx::lock(m.path(quarantine::MESH_LOCK)).ok();
-    if let Ok(Some(q)) = load_pending(m)
-        && q.id == p.id
-    {
-        p = q;
-    }
-    p.stage = STAGE_REVERTING.into();
-    let _ = save_pending(m, &p);
     let mut problems = Vec::new();
+    // A record that cannot be read may list files the one in hand does
+    // not: what is known is put back, but the record and the backups stay
+    // for a look, and the revert says it did not finish.
+    let damaged = match load_pending(m) {
+        Ok(Some(q)) if q.id == p.id => {
+            p = q;
+            false
+        }
+        Ok(_) => false,
+        Err(e) => {
+            problems.push(format!("{e}: it stays, with the backups, until someone looks (dryserver update status)"));
+            true
+        }
+    };
+    if !damaged {
+        p.stage = STAGE_REVERTING.into();
+        let _ = save_pending(m, &p);
+    }
     match restore_binary(m, &p) {
         Ok(s) => say(out, s),
         Err(e) => problems.push(e.to_string()),
@@ -1907,10 +1949,14 @@ fn revert(m: &Machine, ctx: &Ctx, mut p: Pending, why: &str, boot: bool, now: i6
     if let Err(e) = reloaded {
         problems.push(e.to_string());
     }
-    if let Err(e) = clear_pending(m) {
-        problems.push(e.to_string());
+    if !damaged {
+        if let Err(e) = clear_pending(m) {
+            problems.push(e.to_string());
+        }
+        if valid_id(&p.id) {
+            let _ = fs::remove_dir_all(m.path(&format!("{BACKUPS}/{}", p.id)));
+        }
     }
-    let _ = fs::remove_dir_all(m.path(&format!("{BACKUPS}/{}", p.id)));
     let before = p.previous.map(|s| format!("release {s}")).unwrap_or_else(|| "the dryserver it was installed with".into());
     let (action, done) = match undo {
         Undo::Revert => ("reverted", format!("release {} reverted ({why}); this machine runs {before} again", p.serial)),
@@ -2703,6 +2749,13 @@ mod tests {
 
     impl Lab {
         fn new() -> Lab {
+            // Updates write only where root alone may: whatever the umask
+            // of whoever runs the tests, the directories made here are so.
+            static UMASK: std::sync::Once = std::sync::Once::new();
+            // SAFETY: umask only sets the process's file mode mask.
+            UMASK.call_once(|| unsafe {
+                libc::umask(0o022);
+            });
             let dir = TempDir::new();
             let root = dir.path().to_path_buf();
             let fake = Arc::new(Fake {
@@ -3969,6 +4022,79 @@ mod tests {
         let lab = Lab::new();
         let f = Replaced { path: FIREWALL.into(), backup: Some("/etc/shadow".into()), ..Replaced::default() };
         assert!(restore(&lab.m(), &f).unwrap_err().to_string().contains("outside"));
+    }
+
+    #[test]
+    fn a_damaged_record_is_kept_for_a_look() {
+        // Damaged while the apply ran: what is known goes back (the
+        // binary), but the record and the backups stay, and the way back
+        // says it did not finish.
+        let lab = Lab::new();
+        let pending = lab.p(PENDING);
+        lab.hook(Arc::new(move |p| {
+            if p == "binary switched" {
+                fs::write(&pending, "{ damaged").unwrap();
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            Ok(())
+        }));
+        let e = lab.apply(&rel(7, NEW)).unwrap_err().to_string();
+        lab.hook(noop());
+        assert!(e.contains("way back did not finish") && e.contains("pending.json is damaged"), "{e}");
+        assert_eq!(lab.bytes(SERVER_BIN), OLD, "the binary is back");
+        assert_eq!(lab.get(PENDING), "{ damaged", "the record stays for a look");
+        assert!(status(&lab.m(), now()).problems.iter().any(|p| p.contains("damaged")));
+        // Damaged after activate wrote files: they are not lost.
+        let lab = Lab::new();
+        lab.apply(&rel(7, NEW)).unwrap();
+        let p = lab.pending().unwrap();
+        lab.write(PENDING, b"[]", 0o600);
+        let e = revert(&lab.m(), &Ctx::new(), p.clone(), "test", false, now(), &mut Vec::new(), Undo::Revert).unwrap_err().to_string();
+        assert!(e.contains("with the backups"), "{e}");
+        assert!(lab.p(&format!("{BACKUPS}/{}", p.id)).is_dir(), "the backups stay");
+        assert_eq!(lab.get(PENDING), "[]");
+    }
+
+    #[test]
+    fn a_record_whose_id_is_not_apply_s_is_damaged() {
+        // The id names a directory a revert removes and goes into the
+        // timer's shell command.
+        for id in ["x; rm -rf /", "../../etc", "0123456789ABCDEF", "0123456789abcde", ""] {
+            let lab = Lab::new();
+            lab.apply(&rel(7, NEW)).unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(&lab.get(PENDING)).unwrap();
+            v["id"] = id.into();
+            lab.write(PENDING, v.to_string().as_bytes(), 0o600);
+            let e = load_pending(&lab.m()).unwrap_err().to_string();
+            assert!(e.contains("not 16 hex digits"), "{id:?}: {e}");
+            lab.fake.ran.lock().unwrap().clear();
+            assert!(guard_boot(&lab.m(), &Ctx::new(), now(), &mut Vec::new()).is_err(), "{id:?}");
+            assert!(revert_by_hand(&lab.m(), &Ctx::new(), now(), &mut Vec::new()).is_err(), "{id:?}");
+            assert!(lab.fake.ran().is_empty(), "{id:?}: {:?}", lab.fake.ran());
+            assert!(lab.p(BACKUPS).is_dir() && lab.p(DIR).is_dir());
+        }
+    }
+
+    #[test]
+    fn files_are_written_only_where_root_alone_writes() {
+        // Someone else could swap a directory on the way while root writes.
+        let lab = Lab::new();
+        let dir = fsx::dir(lab.p(SSHD_DROPIN));
+        fsx::chmod(&dir, 0o777).unwrap();
+        let e = lab.apply(&rel(7, NEW)).unwrap_err().to_string();
+        assert!(e.contains("can be written by others than root"), "{e}");
+        fsx::chmod(&dir, 0o755).unwrap();
+        assert_eq!(lab.get(SSHD_DROPIN), OLD_SSHD, "never written");
+        assert_eq!(lab.bytes(SERVER_BIN), OLD);
+        assert!(lab.pending().is_none());
+        // A link on the way is refused as well.
+        let lab = Lab::new();
+        let etc_ssh = lab.p("/etc/ssh");
+        fs::rename(&etc_ssh, lab.p("/etc/ssh-real")).unwrap();
+        std::os::unix::fs::symlink(lab.p("/etc/ssh-real"), &etc_ssh).unwrap();
+        let e = lab.apply(&rel(7, NEW)).unwrap_err().to_string();
+        assert!(e.contains("symbolic link"), "{e}");
+        assert_eq!(lab.bytes(SERVER_BIN), OLD);
     }
 
     // ---- k3s and the Arch packages ----
