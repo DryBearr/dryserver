@@ -78,6 +78,12 @@ struct Sim {
     refuse: Option<String>,
     /// The apply stopped part way (killed): its record stays installing.
     dies: bool,
+    /// `update revert` cannot finish this many more times: the record
+    /// stays, its stage reverting.
+    revert_fails: u32,
+    reverting: bool,
+    /// The release brought a new main kernel (pending.kernel).
+    kernel: bool,
     /// The apply rebooted the machine for new packages; restarts since.
     reboot: bool,
     boots: u32,
@@ -205,6 +211,13 @@ impl Runner for Fake {
                 (String::new(), Ok(()))
             }
             (quarantine::SERVER_BIN, ["update", "revert"]) => {
+                if s.pending != 0 && s.revert_fails > 0 {
+                    s.revert_fails -= 1;
+                    s.reverting = true;
+                    let e = "dryserver failed: exit status 1: putting back /usr/local/bin/dryserver failed: No space left on device";
+                    return (String::new(), Err(e.into()));
+                }
+                s.reverting = false;
                 s.revert("reverted by hand");
                 (String::new(), Ok(()))
             }
@@ -222,9 +235,16 @@ impl Runner for Fake {
                 let pending = if s.pending == 0 {
                     serde_json::Value::Null
                 } else {
-                    let stage = if s.dies { "installing" } else { "armed" };
+                    let stage = if s.reverting {
+                        "reverting"
+                    } else if s.dies {
+                        "installing"
+                    } else {
+                        "armed"
+                    };
                     serde_json::json!({"serial": s.pending, "previous": if s.installed == 0 { serde_json::Value::Null } else { s.installed.into() },
-                        "stage": stage, "step": "", "reboot": s.reboot, "deadline": 0, "seconds_left": 300, "boots": s.boots, "files": []})
+                        "stage": stage, "step": "", "reboot": s.reboot, "deadline": 0, "seconds_left": 300, "boots": s.boots, "files": [],
+                        "kernel": s.kernel})
                 };
                 let busy = s.busy > 0;
                 if busy {
@@ -3388,5 +3408,35 @@ fn the_brain_reads_what_the_real_sshd_says() {
     ] {
         let e = sshd_lets_in(&Ctx::new(), &node(conf(bad)), "admin", "192.168.1.50", None).unwrap_err();
         assert!(e.contains(want), "{bad}: {e}");
+    }
+}
+
+/// Seen on a VM: after the coordinator's apply stopped part way and its
+/// revert did not finish, its report said "updating (release N):
+/// installing" for good: settle returned on the revert's error before it
+/// said why, and the note the apply's start left stayed. Now the note says
+/// the way back did not finish, and it is tried again at each sync (update
+/// revert is safe to repeat while the record says reverting).
+#[test]
+fn a_revert_that_does_not_finish_says_so_and_is_tried_again() {
+    for host in [1, 2] {
+        let mut sw = Swarm::new(1);
+        let fake = if host == 1 { sw.brain.fake.clone() } else { sw.server(2).fake.clone() };
+        (fake.sim().dies, fake.sim().revert_fails) = (true, 2);
+        sw.publish(10, true);
+        sw.until(10, |_| fake.sim().pending == 10 && fake.sim().reverting);
+        sw.tick();
+        let local = |sw: &Swarm| Machine::new(if host == 1 { &sw.brain.node } else { &sw.server(2).node }, host == 1).load();
+        let l = local(&sw);
+        assert!(l.note.contains("going back did not finish yet") && l.note.contains("No space left"), "{host}: {l:?}");
+        let rep = sw.store.read().unwrap().members.iter().find(|m| m.host == host).unwrap().report.clone().unwrap();
+        assert!(rep.update == "pending" && !rep.update_note.contains("installing"), "{host}: {rep:?}");
+        assert!(rep.update_note.contains("going back did not finish yet"), "{host}: {rep:?}");
+        // It finishes: recorded as gone back, and the rollout stops.
+        sw.until(5, |s| !s.rollout().paused.is_empty() || s.rollout().phase == Phase::Failed);
+        assert_eq!(fake.sim().pending, 0);
+        let l = local(&sw);
+        assert!(l.pending == 0 && l.failed == 10 && l.outcome == "reverted", "{host}: {l:?}");
+        assert!(fake.sim().confirmed.is_empty());
     }
 }

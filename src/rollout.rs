@@ -1540,9 +1540,16 @@ impl<'a> Machine<'a> {
         if let Some(p) = mine {
             if p.stage != "armed" {
                 // Nothing runs, so its apply stopped part way (killed, or it
-                // crashed): back now, not when its timer fires. The next sync
-                // finds it reverted (or postponed, when it was loading).
-                up.revert(&Ctx::new().with_timeout(CONFIRM_TIMEOUT))?;
+                // crashed), or a revert did not finish (reverting): back
+                // now, not when its timer fires, and again at every sync
+                // until it is (update revert is safe to repeat). The next
+                // sync finds it reverted (or postponed, when it was
+                // loading). The note says which, not what the apply's
+                // start left there.
+                if let Err(e) = up.revert(&Ctx::new().with_timeout(CONFIRM_TIMEOUT)) {
+                    self.wait(l, &format!("its apply stopped part way, and going back did not finish yet: {e}"))?;
+                    return Err(e.wrap("going back"));
+                }
                 return self.wait(l, "its apply stopped part way; it went back");
             }
             if p.reboot && p.boots == 0 {
