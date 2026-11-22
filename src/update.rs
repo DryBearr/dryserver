@@ -1252,6 +1252,33 @@ fn arm_args(m: &Machine, t: Timer, id: &str, serial: u64, secs: i64, boot: bool)
     args
 }
 
+/// Whether a step that failed this way may work on another try: the disk
+/// is full or read-only for now, or the system is short of something.
+fn passing(e: &Error) -> bool {
+    let t = e.to_string();
+    [
+        "no space left on device",
+        "disk quota exceeded",
+        "read-only file system",
+        "input/output error",
+        "too many open files",
+        "cannot allocate memory",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
+}
+
+/// How long until a revert that did not finish is tried again.
+const REVERT_RETRY: i64 = 5 * 60;
+
+/// Arms a timer that tries a revert that did not finish again, under a
+/// name of its own: the timer whose revert failed may still be running.
+fn arm_retry(m: &Machine, ctx: &Ctx, p: &Pending) -> Result<()> {
+    let mut args = arm_args(m, Timer::Window, &p.id, p.serial, REVERT_RETRY, false);
+    args[0] = format!("--unit={}{}-retry-{}", TIMER_PREFIX, p.id, fsx::hex(&fsx::random_bytes(3)));
+    m.cmd(ctx, "systemd-run", &args.iter().map(String::as_str).collect::<Vec<_>>()).map(drop)
+}
+
 /// Stops an update's revert timers, both of them.
 fn disarm(m: &Machine, ctx: &Ctx, id: &str) {
     for t in [Timer::Window, Timer::Apply] {
@@ -2243,7 +2270,12 @@ enum Undo {
 /// mirrorlist among them), then the k3s that ran before when this update
 /// swapped it, then reloads, then the record goes. Each step can run again
 /// after a power cut; the record says "reverting" until the end, so the
-/// boot unit finishes the job. At boot nothing has started yet, so only
+/// boot unit finishes the job. When the binary, a file or k3s cannot be
+/// put back (a full disk), the record and the backups stay as well, so
+/// nothing says the machine runs what it ran before while it does not: a
+/// retry timer (REVERT_RETRY), the next boot, a sync's settle or `update
+/// revert` tries again. A reload that fails does not keep them: the files
+/// are back, and the next boot loads them. At boot nothing has started yet, so only
 /// systemd reloads its units (k3s starts after the boot unit, with the
 /// binary that is back). The packages are not put back: that is a signed
 /// rollback release's work.
@@ -2274,14 +2306,24 @@ fn revert(m: &Machine, ctx: &Ctx, mut p: Pending, why: &str, boot: bool, now: i6
     };
     if !damaged {
         p.stage = STAGE_REVERTING.into();
+        p.step = "going back".into();
         let _ = save_pending(m, &p);
     }
+    // The binary, a file or k3s that is not back for a reason that may
+    // pass (a full disk): the record stays, and it is tried again. One
+    // that will not pass (dryserver.prev gone, a backup lost) is said, and
+    // the record goes: trying again would only hold every later update up.
+    let mut unfinished = false;
     match restore_binary(m, &p) {
         Ok(s) => say(out, s),
-        Err(e) => problems.push(e.to_string()),
+        Err(e) => {
+            unfinished |= passing(&e);
+            problems.push(e.to_string());
+        }
     }
     for f in p.files.iter().rev() {
         if let Err(e) = restore(m, f) {
+            unfinished |= passing(&e);
             problems.push(format!("{}: {e}", f.path));
         }
     }
@@ -2294,7 +2336,10 @@ fn revert(m: &Machine, ctx: &Ctx, mut p: Pending, why: &str, boot: bool, now: i6
         let log = HostLog::default();
         match host(m, &log).k3s_put_back(&p.k3s_prev_sha256) {
             Ok(back) => k3s_back = back,
-            Err(e) => problems.push(format!("k3s: {e}")),
+            Err(e) => {
+                unfinished |= passing(&e);
+                problems.push(format!("k3s: {e}"));
+            }
         }
         log.flush(m, out);
         if k3s_back {
@@ -2317,7 +2362,7 @@ fn revert(m: &Machine, ctx: &Ctx, mut p: Pending, why: &str, boot: bool, now: i6
     if let Err(e) = reloaded {
         problems.push(e.to_string());
     }
-    if !damaged {
+    if !damaged && !unfinished {
         if let Err(e) = clear_pending(m) {
             problems.push(e.to_string());
         }
@@ -2325,8 +2370,29 @@ fn revert(m: &Machine, ctx: &Ctx, mut p: Pending, why: &str, boot: bool, now: i6
             let _ = fs::remove_dir_all(m.path(&format!("{BACKUPS}/{}", p.id)));
         }
     }
+    if !damaged && unfinished {
+        p.step = format!(
+            "going back did not finish: {} problem(s); tried again by a timer, at the next boot, or by dryserver update revert",
+            problems.len()
+        );
+        let _ = save_pending(m, &p);
+        if !boot && let Err(e) = arm_retry(m, ctx, &p) {
+            problems.push(format!("the timer that tries again: {e}"));
+        }
+    }
     let before = p.previous.map(|s| format!("release {s}")).unwrap_or_else(|| "the dryserver it was installed with".into());
     let (action, done) = match undo {
+        _ if unfinished && !damaged => (
+            match undo {
+                Undo::Revert => "reverted",
+                Undo::Postpone => POSTPONED,
+                Undo::Refuse => REFUSED,
+            },
+            format!(
+                "release {} is going back ({why}), but that did not finish; its record and backups stay, and it is tried again",
+                p.serial
+            ),
+        ),
         Undo::Revert => ("reverted", format!("release {} reverted ({why}); this machine runs {before} again", p.serial)),
         Undo::Postpone => {
             (POSTPONED, format!("release {} not applied for now, nothing was installed ({why}); it is tried again later", p.serial))
@@ -2803,7 +2869,9 @@ pub fn print_status(s: &Status, out: &mut dyn Write) {
     }
     if let Some(p) = &s.pending {
         let step = if p.step.is_empty() { String::new() } else { format!(", {}", p.step) };
-        let when_back = if p.stage == STAGE_ARMED {
+        let when_back = if p.stage == STAGE_REVERTING {
+            "it goes back; a timer, the next boot or dryserver update revert tries again".to_string()
+        } else if p.stage == STAGE_ARMED {
             format!(
                 "reverts by itself at {} (in {}) unless confirmed: dryserver update confirm",
                 when(p.deadline),
@@ -5019,6 +5087,77 @@ mod tests {
         let _held = try_lock(&lab.m()).unwrap().unwrap();
         let e = start_detached(&lab.m(), &Ctx::new(), &a, &mut Vec::new()).unwrap_err().to_string();
         assert!(e.contains("another update is running"), "{e}");
+    }
+
+    #[test]
+    fn review_a_revert_that_cannot_write_keeps_its_record() {
+        const NEWER: &[u8] = b"\x7fELF dryserver 0.2.0, the next build";
+        let lab = Lab::new();
+        lab.apply(&rel(7, NEW)).unwrap();
+        confirm(&lab.m(), &Ctx::new(), Some(7), now(), &mut Vec::new()).unwrap();
+        apply(&lab.m(), &Ctx::new(), &lab.opts(&rel(8, NEWER), lab.staged(NEWER)), now(), &mut Vec::new()).unwrap();
+        lab.hook(Arc::new(|p| if p == "write" { Err(io::Error::from_raw_os_error(libc::ENOSPC)) } else { Ok(()) }));
+        let id = lab.pending().unwrap().id;
+        assert!(guard_timer(&lab.m(), &Ctx::new(), &id, false, now() + WINDOW, &mut Vec::new()).is_err());
+        assert_eq!(lab.bytes(SERVER_BIN), NEW);
+        let installed = load_installed(&lab.m()).unwrap().map(|(_, r)| r.serial);
+        assert!(lab.pending().is_some() || installed == Some(7), "record gone, says it runs {installed:?}");
+        // The backups stay, and a timer of its own tries again.
+        assert!(lab.p(&format!("{BACKUPS}/{id}")).is_dir());
+        assert!(lab.fake.has(&format!("systemd-run --unit=dryserver-update-revert-{id}-retry-")), "{:#?}", lab.fake.ran());
+        // Room again: the next try finishes it, and status says so.
+        lab.hook(noop());
+        let id2 = lab.pending().unwrap().id;
+        guard_timer(&lab.m(), &Ctx::new(), &id2, false, now() + WINDOW + 300, &mut Vec::new()).unwrap();
+        assert!(lab.pending().is_none() && load_installed(&lab.m()).unwrap().unwrap().1.serial == 7);
+        assert!(!lab.p(&format!("{BACKUPS}/{id}")).exists());
+        let s = status(&lab.m(), now());
+        assert!(!s.busy && s.pending.is_none() && s.last.as_ref().unwrap().action == "reverted", "{s:?}");
+    }
+
+    #[test]
+    fn a_revert_that_does_not_finish_says_so_in_status() {
+        // A file that cannot be put back: the record says it goes back, not
+        // what the apply was doing, and the rollout can rely on it.
+        let lab = Lab::new();
+        lab.apply_os(&os_rel(8, K3S_NEW, NEXT_DAY), Some(K3S_NEW)).unwrap();
+        lab.hook(Arc::new(|p| if p == "write" { Err(io::Error::from_raw_os_error(libc::EDQUOT)) } else { Ok(()) }));
+        assert!(revert_by_hand(&lab.m(), &Ctx::new(), now(), &mut Vec::new()).is_err());
+        lab.hook(noop());
+        // The record could not take the new stage either: it is written
+        // once there is room, by the next try.
+        let mut p = lab.pending().unwrap();
+        p.stage = STAGE_REVERTING.into();
+        p.step = "going back did not finish: 3 problem(s); tried again by a timer, at the next boot, or by dryserver update revert".into();
+        save_pending(&lab.m(), &p).unwrap();
+        let s = status(&lab.m(), now());
+        let pend = s.pending.as_ref().unwrap();
+        assert!(pend.stage == STAGE_REVERTING && pend.step.contains("going back did not finish"), "{pend:?}");
+        assert!(!s.busy);
+        // last.json could not be written on the full disk; the log line
+        // could (it needs no new file).
+        assert!(fs::read_to_string(lab.p(LOG)).unwrap().contains("but that did not finish"));
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["pending"]["stage"], STAGE_REVERTING);
+        // The rest is back: the binary and k3s; the next try does the files.
+        assert!(lab.bytes(SERVER_BIN) == OLD && lab.bytes(K3S_BIN) == K3S_OLD);
+        revert_by_hand(&lab.m(), &Ctx::new(), now(), &mut Vec::new()).unwrap();
+        lab.assert_os_old("the next try");
+        // A backup that is gone will not come back: said, and the record
+        // goes, so it does not hold every later update up.
+        let lab = Lab::new();
+        lab.apply(&rel(7, NEW)).unwrap();
+        let p = lab.pending().unwrap();
+        fs::remove_file(lab.p(p.files[0].backup.as_deref().unwrap())).unwrap();
+        let e = revert_by_hand(&lab.m(), &Ctx::new(), now(), &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("is lost") && lab.pending().is_none(), "{e}");
+        // A reload that fails does not keep the record: the files are back.
+        let lab = Lab::new();
+        lab.apply(&rel(7, NEW)).unwrap();
+        lab.script(|s| s.sshd_fails = Some("older dryserver"));
+        let e = revert_by_hand(&lab.m(), &Ctx::new(), now(), &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("problems on the way back") && e.contains("sshd -t"), "{e}");
+        assert!(lab.pending().is_none() && lab.get(SSHD_DROPIN) == OLD_SSHD);
     }
 
     #[test]
