@@ -58,6 +58,8 @@ struct Sim {
     confirmed: Vec<Vec<String>>,
     /// What ran before the pending release, for a revert.
     before: Vec<u8>,
+    /// kubectl calls that kill the sync right after they ran.
+    die_on: Vec<String>,
 }
 
 struct Fake(Mutex<Sim>);
@@ -92,6 +94,11 @@ impl Runner for Fake {
             }
             ("k3s", ["kubectl", rest @ ..]) => {
                 s.kubectl.push(rest.join(" "));
+                if let Some(i) = s.die_on.iter().position(|d| *d == rest.join(" ")) {
+                    s.die_on.remove(i);
+                    drop(s);
+                    panic!("the sync was killed");
+                }
                 if rest[0] == "cordon" && s.cordon_fails.iter().any(|n| Some(n.as_str()) == rest.last().copied()) {
                     return (String::new(), Err("k3s failed: exit status 1: the server is currently unable to handle the request".into()));
                 }
@@ -1067,6 +1074,340 @@ fn a_kill_switch_that_goes_on_in_its_turn_passes_the_turn_on() {
     sw.until(30, |s| s.installed(3) == 10);
 }
 
+// ---- gaps in the rollout ----
+
+impl Swarm {
+    /// A server the admin approved: in the member list, and syncing.
+    fn join(&mut self, host: u32, name: &str) {
+        let m = machine(host, name);
+        let now = self.now;
+        self.store
+            .update(|s| {
+                s.members.push(Member {
+                    host,
+                    name: name.into(),
+                    wg_key: crate::admin::tests::key32(host as u8),
+                    last_seen: time(now),
+                    ..Member::default()
+                });
+                Ok(())
+            })
+            .unwrap();
+        self.servers.push(m);
+    }
+
+    /// A server the admin removed from the member list.
+    fn remove(&mut self, host: u32) {
+        self.store
+            .update(|s| {
+                s.members.retain(|m| m.host != host);
+                Ok(())
+            })
+            .unwrap();
+        self.servers.retain(|m| m.host != host);
+    }
+}
+
+/// Off for days (past the release's expiry, too): passed over while it is,
+/// and it catches up once it is back; in the window for a normal release.
+#[test]
+fn a_server_off_for_days_catches_up() {
+    for urgent in [true, false] {
+        let mut sw = Swarm::new(2);
+        sw.offline.push(2);
+        sw.publish(10, urgent);
+        sw.until(60, |s| s.installed(3) == 10);
+        sw.now += 40 * release::DAY;
+        sw.minute = DAYTIME;
+        sw.offline.clear();
+        sw.ticks(10);
+        if !urgent {
+            assert_eq!(sw.installed(2), 0, "it updated outside the window");
+            sw.minute = IN_WINDOW;
+        }
+        sw.until_unpaused(30, |s| s.everyone_on(10));
+    }
+}
+
+/// A server approved while a rollout runs, or after it finished, gets the
+/// release too: one at a time, after the others.
+#[test]
+fn a_server_that_joins_during_or_after_a_rollout_updates() {
+    let mut sw = Swarm::new(2);
+    sw.publish(10, true);
+    sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.host == 2));
+    sw.join(4, "node-c");
+    sw.until_unpaused(40, |s| s.everyone_on(10));
+    sw.ticks(2);
+    assert_eq!(sw.rollout().done, vec![2, 3, 4]);
+    // Joined after it was done.
+    sw.join(5, "node-d");
+    sw.until_unpaused(20, |s| s.everyone_on(10));
+    sw.ticks(2);
+    assert_eq!(sw.rollout().done, vec![2, 3, 4, 5]);
+    assert!(sw.lines().contains("4 of 4 servers on this release."), "{}", sw.lines());
+}
+
+/// Removed while the rollout is stopped at it: there is nothing left to
+/// wait for, and the rollout goes on by itself.
+#[test]
+fn a_server_removed_while_the_rollout_is_stopped_at_it() {
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().apply_fails = Some("dryserver failed: exit status 1: broken disk".into());
+    sw.publish(10, true);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    sw.remove(2);
+    sw.until_unpaused(30, |s| s.installed(3) == 10);
+    let r = sw.rollout();
+    assert!(r.warnings.iter().any(|w| w == "node-a left the swarm; the rollout goes on"), "{r:#?}");
+    assert!(!r.cordoned.contains(&"node-a".to_string()));
+}
+
+/// The lists name host numbers, and a machine that joins later may get the
+/// number of one that left: it must not count as done, nor as passed over.
+#[test]
+fn a_new_machine_with_the_host_number_of_one_that_left_updates() {
+    let mut sw = Swarm::new(2);
+    sw.publish(10, true);
+    sw.until(30, |s| s.everyone_on(10));
+    sw.ticks(2);
+    assert_eq!(sw.rollout().done, vec![2, 3]);
+    sw.remove(2);
+    sw.tick();
+    sw.join(2, "node-x");
+    sw.until_unpaused(20, |s| s.everyone_on(10));
+    sw.ticks(2);
+    assert_eq!(sw.rollout().done, vec![3, 2]);
+}
+
+/// One passed over that runs the release after all (the admin updated it
+/// by hand, or its update came through late) counts as done.
+#[test]
+fn a_server_passed_over_that_updates_after_all_counts_as_done() {
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().apply_fails = Some("dryserver failed: exit status 1: broken disk".into());
+    sw.publish(10, true);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    sw.skip();
+    sw.until(30, |s| s.installed(3) == 10);
+    assert!(sw.lines().contains("Passed over: node-a"), "{}", sw.lines());
+    // The admin updated it by hand: it runs the release after all.
+    let m = Machine::new(&sw.server(2).node, false);
+    m.save(&Local { installed: 10, ..Local::default() }).unwrap();
+    sw.until(10, |s| s.rollout().done.contains(&2));
+    assert!(sw.rollout().skipped.is_empty() && sw.lines().contains("2 of 2 servers on this release."), "{}", sw.lines());
+}
+
+/// A turn that timed out, and the server then confirms (its update took
+/// long): the rollout goes on by itself.
+#[test]
+fn a_server_that_confirms_after_its_turn_timed_out() {
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().broken = true;
+    sw.publish(10, true);
+    sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+    sw.until(TURN_TIMEOUT as usize / 60 + 5, |s| s.rollout().pause == Pause::Timeout);
+    std::fs::copy(sw.server(2).node.path(STORE).join(INCOMING).join(DRYSERVER_FILE), exe(&sw.server(2).node.root)).unwrap();
+    sw.until(10, |s| s.rollout().paused.is_empty());
+    assert!(sw.rollout().warnings.iter().any(|w| w.contains("node-a finished its update after all")), "{:#?}", sw.rollout());
+    sw.until_unpaused(30, |s| s.everyone_on(10));
+}
+
+/// A new release while a server is in the middle of the old one (installed,
+/// not confirmed yet): the brain waits for it before it updates itself, so
+/// never two machines update at once (one_at_a_time checks every minute).
+/// A server that says it is in the middle for ever holds it up for
+/// TURN_TIMEOUT at most.
+#[test]
+fn a_new_release_waits_for_the_server_in_the_middle_of_the_old_one() {
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().broken = true;
+    sw.publish(10, true);
+    sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+    sw.publish(11, true);
+    sw.ticks(5);
+    let r = sw.rollout();
+    assert!(r.serial == 11 && r.phase == Phase::Brain && r.wait_for == 2, "{r:#?}");
+    assert_eq!(sw.brain.fake.sim().applied.len(), 1, "the brain updated while node-a did");
+    assert!(sw.lines().contains("The coordinator updates itself first, once node-a finished the update it is in."), "{}", sw.lines());
+    // node-a's revert guard: back to its old release. Then the brain.
+    sw.server(2).fake.revert();
+    sw.server(2).fake.sim().broken = false;
+    sw.until(60, |s| s.everyone_on(11));
+
+    // A lie: pending for ever, nothing installed.
+    let mut sw = Swarm::new(2);
+    sw.ignore_turn.push(2);
+    sw.publish(10, true);
+    sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.ready && t.host == 2));
+    Machine::new(&sw.server(2).node, false).save(&Local { pending: 10, applied: sw.now, ..Local::default() }).unwrap();
+    sw.publish(11, true);
+    let start = sw.now;
+    sw.until(TURN_TIMEOUT as usize / 60 + 5, |s| s.brain.fake.sim().applied.len() == 2);
+    assert!(sw.now - start >= TURN_TIMEOUT, "it waited {}s", sw.now - start);
+}
+
+/// The brain's sync killed (or the brain switched off) right after it
+/// cordoned a server: the cordon was not written down, and once another
+/// server got the turn the first stayed cordoned for good.
+#[test]
+fn a_sync_killed_after_the_cordon_still_uncordons() {
+    let mut sw = Swarm::new(2);
+    // The brain's sync dies in the cordon.
+    sw.brain.fake.sim().die_on.push("cordon -- node-a".into());
+    sw.publish(10, true);
+    let mut died = false;
+    for _ in 0..10 {
+        sw.now += 60;
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sw.brain_sync())).is_err() {
+            died = true;
+            break;
+        }
+        for i in 0..sw.servers.len() {
+            let _ = sw.server_sync(i);
+        }
+    }
+    assert!(died && sw.kubectl().contains(&"cordon -- node-a".to_string()));
+    // Off before it ever got the turn: another one does.
+    sw.offline.push(2);
+    sw.store
+        .update(|s| {
+            s.members.iter_mut().find(|m| m.host == 2).unwrap().last_seen = time(0);
+            Ok(())
+        })
+        .unwrap();
+    sw.until(30, |s| s.installed(3) == 10);
+    sw.ticks(3);
+    let k = sw.kubectl();
+    let last = |verb: &str| k.iter().rposition(|l| l == &format!("{verb} -- node-a"));
+    assert!(last("uncordon") > last("cordon"), "node-a stays cordoned: {k:?}");
+    assert!(!sw.rollout().cordoned.contains(&"node-a".to_string()));
+}
+
+/// The sync killed after `update apply` and before it wrote down that it
+/// did: the next sync takes the installed release over and confirms it.
+#[test]
+fn a_sync_killed_after_apply_takes_its_update_over() {
+    for host in [1, 2] {
+        let mut sw = Swarm::new(1);
+        sw.publish(10, true);
+        let b = if host == 1 { &sw.brain } else { sw.server(2) };
+        let (fake, dir) = (b.fake.clone(), b.node.path(STORE));
+        sw.until(10, |_| fake.sim().pending == 10);
+        // What step wrote after apply is lost.
+        std::fs::remove_file(dir.join(STATE_FILE)).unwrap();
+        sw.until(10, |s| s.everyone_on(10));
+        assert_eq!(fake.sim().applied.len(), 1, "{host}: installed twice");
+        assert_eq!(fake.sim().confirmed.len(), 1);
+    }
+}
+
+/// Disk full: the release waits for room, a few syncs, then the update
+/// failed there; room made in time and it goes on.
+#[test]
+fn a_full_disk_waits_for_room_then_fails() {
+    let mut sw = Swarm::new(1);
+    sw.full_disk.push(2);
+    sw.publish(10, true);
+    sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.ready));
+    sw.ticks(3);
+    let l = Machine::new(&sw.server(2).node, false).load();
+    assert!(l.failed == 0 && l.note.contains("must stay free"), "{l:?}");
+    sw.full_disk.clear();
+    sw.until_unpaused(20, |s| s.everyone_on(10));
+
+    let mut sw = Swarm::new(1);
+    sw.full_disk.push(2);
+    sw.publish(10, true);
+    sw.until(MAX_TRIES as usize + 10, |s| !s.rollout().paused.is_empty());
+    assert!(sw.rollout().paused.contains("update failed: this machine has 100 MiB free"), "{}", sw.rollout().paused);
+
+    // The brain's own disk: its update fails, no server is touched.
+    let mut sw = Swarm::new(1);
+    sw.full_disk.push(1);
+    sw.publish(10, true);
+    sw.until(MAX_TRIES as usize + 5, |s| s.rollout().phase == Phase::Failed);
+    assert!(sw.rollout().paused.contains("must stay free"), "{}", sw.rollout().paused);
+    assert!(sw.kubectl().is_empty());
+}
+
+/// The release's k3s file on the coordinator is gone or another one: every
+/// server with another k3s would refuse it in turn. The brain finds out
+/// before the first server.
+#[test]
+fn a_release_whose_k3s_is_gone_on_the_brain_touches_no_server() {
+    for damage in [None, Some(&b"another k3s"[..])] {
+        let mut sw = Swarm::new(1);
+        sw.publish(10, true);
+        let at = sw.served.path(10, K3S_FILE);
+        match damage {
+            None => std::fs::remove_file(&at).unwrap(),
+            Some(b) => std::fs::write(&at, b).unwrap(),
+        }
+        sw.until(10, |s| s.rollout().phase == Phase::Failed);
+        let r = sw.rollout();
+        assert!(r.paused.contains("release 10 cannot go to the servers") && r.paused.contains("k3s v1.37.2+k3s1"), "{}", r.paused);
+        assert!(sw.lines().contains("FAILED:"), "{}", sw.lines());
+        assert!(sw.kubectl().is_empty() && sw.servers.iter().all(|m| m.fake.sim().applied.is_empty()));
+        // Put back and resumed.
+        std::fs::write(&at, K3S).unwrap();
+        sw.resume();
+        sw.until(30, |s| s.everyone_on(10));
+    }
+
+    // Gone after the check, while a server that needs it loads: it asks
+    // again, a few times, and goes on once it is back.
+    let mut sw = Swarm::new(1);
+    put(&sw.server(2).node.root, K3S_BIN, b"k3s v1.36.0+k3s1, older");
+    sw.publish(10, true);
+    sw.brain_until(10, |s| s.rollout().phase == Phase::Servers);
+    let at = sw.served.path(10, K3S_FILE);
+    std::fs::remove_file(&at).unwrap();
+    sw.ticks(4);
+    let l = Machine::new(&sw.server(2).node, false).load();
+    assert!(l.failed == 0 && l.note.contains("the coordinator has no k3s v1.37.2+k3s1 for release 10"), "{l:?}");
+    std::fs::write(&at, K3S).unwrap();
+    sw.until_unpaused(20, |s| s.everyone_on(10));
+}
+
+/// What the registry account may write in its copy of the rollout: root
+/// reads back only the admin's counts, and passes over or tries again only
+/// the server it stopped at itself.
+#[test]
+fn the_registry_account_cannot_choose_what_is_passed_over() {
+    let mut sw = Swarm::new(3);
+    sw.server(2).fake.sim().apply_fails = Some("dryserver failed: exit status 1: broken disk".into());
+    sw.publish(10, true);
+    sw.until(20, |s| !s.rollout().paused.is_empty());
+    // It names another server, gives it a retry, and counts a skip.
+    sw.store
+        .update(|s| {
+            s.rollout.pause_host = 3;
+            s.rollout.pause_name = "node-b".into();
+            s.rollout.skipped.push(Skip { host: 4, name: "node-c".into(), why: "x".into() });
+            s.rollout.again.push(4);
+            s.rollout.skip_asked += 3;
+            Ok(())
+        })
+        .unwrap();
+    sw.tick();
+    let r = sw.rollout();
+    assert_eq!(r.skipped.iter().map(|s| s.host).collect::<Vec<_>>(), vec![2], "{r:#?}");
+    assert!(r.again.is_empty(), "{r:#?}");
+    sw.until_unpaused(30, |s| s.installed(3) == 10 && s.installed(4) == 10);
+    // A count that goes back is no ask; the next one counts again.
+    sw.store
+        .update(|s| {
+            s.rollout.resume_asked = 0;
+            s.rollout.skip_asked = 0;
+            Ok(())
+        })
+        .unwrap();
+    sw.tick();
+    let r = sw.rollout();
+    assert!(r.paused.is_empty() && (r.resume_done, r.skip_done) == (0, 0), "{r:#?}");
+}
+
 // ---- resuming ----
 
 /// `release resume` used to pass a failed server over and never try it
@@ -1601,8 +1942,48 @@ fn a_clock_that_goes_back_does_not_freeze_a_turn() {
     sw.publish(10, true);
     sw.until(10, |s| s.rollout().turn.is_some_and(|t| t.ready));
     sw.now -= 30 * 24 * 3600;
-    sw.ticks(TURN_TIMEOUT as usize / 60 + 2);
+    // The minutes the members need to report in again do not count.
+    sw.ticks((TURN_TIMEOUT + OFFLINE) as usize / 60 + 2);
     assert_eq!(sw.rollout().pause, Pause::Timeout, "{:#?}", sw.rollout());
+    assert!(sw.rollout().warnings.iter().any(|w| w.contains("clock went back 29d")), "{:#?}", sw.rollout());
+}
+
+/// A brain that was down for half an hour (or whose clock jumped ahead)
+/// stopped the rollout at the server whose turn it was: the turn's time
+/// ran out while nobody could reach the brain. And the canary was "silent"
+/// at the first tick after, before it could report in. The timers now
+/// stand still across the gap and while the members report in again.
+#[test]
+fn a_brain_that_was_down_does_not_count_the_time_against_a_turn() {
+    for jump in [30 * 60, 2 * 3600] {
+        let mut sw = Swarm::new(2);
+        sw.server(2).fake.sim().broken = true;
+        sw.publish(10, true);
+        sw.until(10, |s| s.server(2).fake.sim().pending == 10);
+        sw.ticks(TURN_TIMEOUT as usize / 60 - 5);
+        // Down: no sync anywhere reaches it.
+        sw.now += jump;
+        sw.ticks(2);
+        let r = sw.rollout();
+        assert!(r.paused.is_empty(), "{jump}: {r:#?}");
+        assert!(r.warnings.iter().any(|w| w.contains("did not run the rollout for")), "{r:#?}");
+        // It comes up: the turn goes on with the minutes it had left.
+        sw.server(2).fake.sim().broken = false;
+        std::fs::copy(sw.server(2).node.path(STORE).join(INCOMING).join(DRYSERVER_FILE), exe(&sw.server(2).node.root)).unwrap();
+        sw.until_unpaused(30, |s| s.everyone_on(10));
+    }
+
+    // The canary under watch: not judged silent before it could report.
+    let mut sw = Swarm::new(2);
+    sw.publish(10, false);
+    sw.until(30, |s| s.rollout().done == vec![2]);
+    assert!(sw.rollout().canary_until > sw.now);
+    let left = sw.rollout().canary_until - sw.now;
+    sw.now += 3600;
+    sw.brain_sync();
+    // Still watched for the time it had left.
+    assert_eq!(sw.rollout().canary_until - sw.now, left);
+    sw.until_unpaused(30, |s| s.everyone_on(10));
 }
 
 // ---- drains ----

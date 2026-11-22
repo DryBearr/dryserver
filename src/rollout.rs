@@ -1473,6 +1473,25 @@ pub struct Rollout {
     pub skip_asked: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub skip_done: u64,
+    /// The server a release this one replaced was updating: the brain
+    /// waits for it to finish before it updates itself (one machine at a
+    /// time), at most TURN_TIMEOUT. 0: none.
+    #[serde(skip_serializing_if = "is_zero32")]
+    pub wait_for: u32,
+    /// Root's last tick on the brain's clock (not handed to the registry),
+    /// and when its ticks went on after a gap or a jump of its clock.
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub ticked: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub back: i64,
+}
+
+fn is_zero32(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_i64(n: &i64) -> bool {
+    *n == 0
 }
 
 impl Rollout {
@@ -1556,6 +1575,7 @@ fn brain_tick_with(ctx: &Ctx, n: &Node, store: &Store, served: &Served, rep: &Re
     b.r.skip_asked = s.rollout.skip_asked;
     b.take_upload();
     if b.r.serial != 0 {
+        b.mind_the_gap();
         b.resume();
         b.advance();
     }
@@ -1567,8 +1587,10 @@ fn brain_tick_with(ctx: &Ctx, n: &Node, store: &Store, served: &Served, rep: &Re
         eprintln!("dryserver: rollout: cannot save its state: {e}");
         return;
     }
-    // The registry's counts of the admin's asks are the registry's.
-    let copy = |s: &Rollout| Rollout { resume_asked: s.resume_asked, skip_asked: s.skip_asked, ..r.clone() };
+    // The registry's counts of the admin's asks are the registry's; root's
+    // clock at each tick is root's alone (and would rewrite the registry
+    // every minute).
+    let copy = |s: &Rollout| Rollout { resume_asked: s.resume_asked, skip_asked: s.skip_asked, ticked: 0, ..r.clone() };
     if copy(&s.rollout) != s.rollout {
         let res = store.update(|s| {
             // A resume asked while this tick ran stays asked.
@@ -1624,6 +1646,47 @@ impl Brain<'_> {
         !m.last_seen.is_zero() && self.now.unix - m.last_seen.0.timestamp() <= OFFLINE
     }
 
+    /// The brain's syncs come a minute apart. A longer gap (it was down, or
+    /// its sync failed before it got here) or a jump of its clock is no
+    /// time a server had for its turn or the canary was watched: the timers
+    /// stand still across it, and for OFFLINE after it (settling), while
+    /// the members report in again.
+    fn mind_the_gap(&mut self) {
+        let now = self.now.unix;
+        let last = std::mem::replace(&mut self.r.ticked, now);
+        if last == 0 {
+            return;
+        }
+        let gap = now.saturating_sub(last);
+        let jumped = !(0..=OFFLINE).contains(&gap);
+        let timing = self.r.turn.is_some() || self.r.canary_until > last;
+        if jumped {
+            self.r.back = now;
+            if timing {
+                let what = if gap < 0 {
+                    format!("the coordinator's clock went back {}", report::short_age(gap.unsigned_abs()))
+                } else {
+                    format!("the coordinator did not run the rollout for {}", report::short_age(gap as u64))
+                };
+                self.r.warn(format!("{what}: the turn and the canary's watch do not count that time"));
+            }
+        }
+        if jumped || self.settling() {
+            if let Some(t) = &mut self.r.turn {
+                t.since = t.since.saturating_add(gap);
+            }
+            if self.r.canary_until > last {
+                self.r.canary_until = self.r.canary_until.saturating_add(gap);
+            }
+        }
+    }
+
+    /// Just after a gap: members may not have reported since, so none is
+    /// judged silent and no new turn begins.
+    fn settling(&self) -> bool {
+        self.r.back != 0 && (0..OFFLINE).contains(&(self.now.unix - self.r.back))
+    }
+
     fn in_window(&self) -> bool {
         self.r.urgent || in_window(self.now.minute, WINDOW)
     }
@@ -1650,6 +1713,14 @@ impl Brain<'_> {
                 if old.serial != 0 && (old.phase == Phase::Brain || old.turn.is_some()) {
                     fresh.warn(format!("release {} replaced release {} while it rolled out", rel.serial, old.serial));
                 }
+                // A server may be in the middle of the old release: the brain
+                // does not start its own update before it is done.
+                fresh.wait_for = match &old.turn {
+                    Some(t) if t.ready => t.host,
+                    _ if matches!(old.pause, Pause::Failed | Pause::Timeout) => old.pause_host,
+                    _ => 0,
+                };
+                (fresh.ticked, fresh.back) = (old.ticked, old.back);
                 self.r = fresh;
                 // The old rollout's cordons go; the new one starts clean.
                 for name in old.cordoned {
@@ -1777,13 +1848,36 @@ impl Brain<'_> {
 
     /// The brain updates itself, from its registry's copy.
     fn brain_step(&mut self) {
-        let m = self.machine();
+        let m = Machine { n: self.n, brain: true, free: self.free };
+        if self.r.wait_for != 0 && m.load().pending == 0 && m.installed_serial() < self.r.serial {
+            // Its report is made before its sync steps: one sent up to a
+            // minute after the switch may come from a sync that still had
+            // the old turn and installs it right after. A later one shows
+            // whether it did. Switched off in the middle (a reboot of its
+            // update) is waited for too.
+            let settled = self.member(self.r.wait_for).is_none_or(|s| {
+                s.last_seen.0.timestamp() >= self.r.started.saturating_add(60) && s.report.as_ref().is_none_or(|r| r.update != "pending")
+            });
+            // A hacked server could say it is in the middle for ever:
+            // TURN_TIMEOUT at most.
+            if !settled && self.now.unix.saturating_sub(self.r.started) < TURN_TIMEOUT {
+                return;
+            }
+            self.r.wait_for = 0;
+        }
         // The brain's own k3s is the control plane's.
         let offer = Offer { serial: self.r.serial, turn: true, brain_k3s: self.rep.k3s.clone(), retry: 0 };
         if let Err(e) = m.step(self.ctx, &LocalSource(self.served), &offer, self.rep, self.now.unix) {
             eprintln!("dryserver: rollout: the coordinator's own update: {e}");
         }
         if m.installed_serial() >= self.r.serial {
+            if let Some(why) = self.served_k3s_problem() {
+                // Every server that runs another k3s would refuse it, one
+                // after the other: better to know before the first.
+                self.r.phase = Phase::Failed;
+                self.r.paused = format!("release {} cannot go to the servers: {why}. No server was touched", self.r.serial);
+                return;
+            }
             self.r.phase = Phase::Servers;
             return;
         }
@@ -1799,6 +1893,24 @@ impl Brain<'_> {
         }
     }
 
+    /// What is wrong with the k3s file the servers load with the release,
+    /// if anything: it has to be the one the signed release names. Root
+    /// checks the release's signature itself; the file is the registry
+    /// account's.
+    fn served_k3s_problem(&self) -> Option<String> {
+        let serial = self.r.serial;
+        let rel = match self.served.envelope(serial).and_then(|env| release::open(self.n.verifier.as_ref(), &env, self.now.unix)) {
+            Ok(r) if r.serial == serial => r,
+            Ok(r) => return Some(format!("the coordinator's copy of it holds release {}", r.serial)),
+            Err(e) => return Some(format!("the coordinator's copy of it cannot be read ({e})")),
+        };
+        match release::hash_file(&self.served.path(serial, K3S_FILE), MAX_K3S) {
+            Ok((sha, _)) if sha == rel.k3s.sha256 => None,
+            Ok(_) => Some(format!("the coordinator's copy of k3s {} is not the release's", rel.k3s.version)),
+            Err(e) => Some(format!("the coordinator has no copy of k3s {} for it ({e})", rel.k3s.version)),
+        }
+    }
+
     /// A server's update is done when it runs the release, confirmed, and
     /// is healthy.
     fn updated(r: &Report, target: u64) -> bool {
@@ -1806,6 +1918,7 @@ impl Brain<'_> {
     }
 
     fn servers(&mut self) {
+        self.tidy_lists();
         self.tidy_cordons();
         if !self.r.paused.is_empty() {
             return self.watch_paused();
@@ -1814,12 +1927,37 @@ impl Brain<'_> {
             return self.turn();
         }
         if self.now.unix < self.r.canary_until {
-            return self.watch_canary();
+            if !self.settling() {
+                self.watch_canary();
+            }
+            return;
         }
-        if !self.in_window() {
+        if !self.in_window() || self.settling() {
             return;
         }
         self.next();
+    }
+
+    /// Servers that left are dropped from the rollout's lists: a machine
+    /// that joins later may get the same host number. One that was passed
+    /// over but runs the release now counts as done.
+    fn tidy_lists(&mut self) {
+        let (members, target) = (self.members, self.r.serial);
+        let here = |h: &u32| members.iter().any(|m| m.host == *h);
+        self.r.done.retain(here);
+        self.r.deferred.retain(here);
+        self.r.force.retain(here);
+        self.r.again.retain(here);
+        self.r.skipped.retain(|s| members.iter().any(|m| m.host == s.host && m.name == s.name));
+        let on: Vec<u32> = self
+            .r
+            .skipped
+            .iter()
+            .filter(|s| members.iter().any(|m| m.host == s.host && m.report.as_ref().is_some_and(|r| r.release >= target)))
+            .map(|s| s.host)
+            .collect();
+        self.r.skipped.retain(|s| !on.contains(&s.host));
+        self.r.done.extend(on);
     }
 
     /// Nodes cordoned earlier that nothing holds any more (an uncordon
@@ -1867,33 +2005,45 @@ impl Brain<'_> {
 
     /// Gives host its turn: cordons it and starts draining.
     fn start_turn(&mut self, host: u32, name: String) {
+        let before = self.r.clone();
         let retry = if self.r.again.contains(&host) {
             self.r.retries += 1;
             self.r.retries
         } else {
             0
         };
+        // The turn and the cordon are written down before kubectl runs: a
+        // sync killed (or a brain switched off) right after the cordon would
+        // otherwise not know of it, and the node could stay cordoned for
+        // good once another server got the turn. Draining cordons it too,
+        // so it is uncordoned in any case.
+        if !self.r.cordoned.contains(&name) {
+            self.r.cordoned.push(name.clone());
+        }
+        self.r.deferred.retain(|d| *d != host);
+        self.r.turn = Some(Turn { host, name: name.clone(), since: self.now.unix, ready: false, retry, cleared: false });
+        if let Err(e) = self.machine().save_rollout(&self.r) {
+            eprintln!("dryserver: rollout: cannot save its state, so {name} gets no turn yet: {e}");
+            self.r = before;
+            return;
+        }
         // The turn begins whatever the cordon does: a server that is no node
         // (its agent never joined, or the cluster dropped it) has nothing to
         // drain, and any other failure counts against DRAIN_LIMIT like a
         // drain that does not finish. Trying the same server again at every
         // sync without a turn would stall the rollout for ever.
-        let mut ready = false;
         match self.kubectl(&["cordon"], &name) {
             Ok(()) => {}
             Err(e) if e.is_not_found() => {
                 eprintln!("dryserver: rollout: {e}: {name} updates without being drained");
                 self.r.warn(format!("{name} is not a node of the cluster: it updates without being drained"));
-                ready = true;
+                self.r.cordoned.retain(|c| *c != name);
+                if let Some(t) = &mut self.r.turn {
+                    t.ready = true;
+                }
             }
             Err(e) => self.r.warn(format!("cannot cordon {name} ({e}); trying again")),
         }
-        if !ready && !self.r.cordoned.contains(&name) {
-            // Draining cordons it too, so it is uncordoned in any case.
-            self.r.cordoned.push(name.clone());
-        }
-        self.r.deferred.retain(|d| *d != host);
-        self.r.turn = Some(Turn { host, name, since: self.now.unix, ready, retry, cleared: false });
         self.turn();
     }
 
@@ -2099,6 +2249,9 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
     match r.phase {
         Phase::None => {}
         Phase::Waiting => out.push((format!("Waiting for the update window {window} on the coordinator's clock."), false)),
+        Phase::Brain if r.wait_for != 0 => {
+            out.push((format!("The coordinator updates itself first, once {} finished the update it is in.", name(r.wait_for)), false))
+        }
         Phase::Brain => out.push(("The coordinator updates itself first.".into(), false)),
         Phase::Failed => {
             out.push((format!("FAILED: {}.", shown(&r.paused, 300)), true));
