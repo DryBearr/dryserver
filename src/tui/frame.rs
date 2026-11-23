@@ -239,16 +239,11 @@ pub fn too_small(w: u16, h: u16) -> bool {
 }
 
 /// How wide the body is in a window w columns wide.
-/// The blank line under the bars: there in windows taller than the
-/// smallest, where a row can be spared.
-fn gap(h: usize) -> usize {
-    usize::from(h > MIN_H as usize)
-}
-
 /// The rows the body gets in a window h rows high, with no tabs and a
-/// notice of one line.
+/// notice of one line: all but the bars, the blank line under them and
+/// the notice.
 pub fn body_rows(h: u16) -> usize {
-    (h as usize).saturating_sub(3 + gap(h as usize))
+    (h as usize).saturating_sub(4)
 }
 
 pub fn body_width(w: u16) -> usize {
@@ -751,8 +746,8 @@ pub fn draw(page: &Page, scroll: &Scroll, w: u16, h: u16) -> Doc {
         }
         row += 1;
     }
-    // A blank line under the bars, when the window has a row to spare.
-    row += gap(h);
+    // A blank line under the bars.
+    row += 1;
     let body_top = row;
 
     // The notice and footer at the bottom.

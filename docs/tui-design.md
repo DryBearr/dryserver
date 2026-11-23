@@ -83,7 +83,7 @@ Every desktop screen is one frame, the full terminal:
   and `shift+tab` (or `←` `→`) switch.
 - **Body**: everything else, three columns in from the left (the
   selection's `▌` sits in the second), at most 100 columns wide, under a
-  blank line when the window has more than 24 rows. It scrolls when it does not fit, and the selected row
+  blank line. It scrolls when it does not fit, and the selected row
   always stays in view; a thin thumb on the right edge shows where you
   are. Long lines wrap at word boundaries and keep their indent; table
   cells are cut with `…` and shown whole in the details.

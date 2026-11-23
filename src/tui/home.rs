@@ -364,7 +364,12 @@ pub fn body(f: &Facts, cursor: usize, width: usize, rows: usize) -> (Doc, usize)
         next_lines(&mut title, width.saturating_sub(snake_w + 3));
     }
     let mut d = Doc::beside(snake, 3, title);
-    d.nl().nl();
+    d.nl();
+    // The pixel snake ends in a dark outline, which spaces it from what
+    // follows when a blank line does not fit.
+    if snake_rows + 1 + item_rows <= rows {
+        d.nl();
+    }
     let top = d.lines.len() - 1;
     d.append(items);
     if full {
