@@ -870,7 +870,12 @@ release that brings it. Step by step:
    rollback across a package split (Arch moved files into a new package
    the older day does not have, like openssl-3; the older package takes
    them back, the new one leaves pacman's database once the older package's
-   own file list has them, and what the older day lacks and nothing needs
+   own file list has them, and the rest of its files, now owned by no
+   package, are deleted as `pacman -R` would: only regular files and links
+   in /usr, /etc, /var/lib and /opt, never through a link, an edited config
+   file kept as `.pacsave`, then its empty directories; its file list is
+   noted before its entry goes, so a power cut loses nothing, and what
+   stays is said. What the older day lacks and nothing needs
    is removed, never a package that shares a file with another one and
    never before the split is done; an edited config file it had stays as
    `.pacsave`; a split left half done is finished before the next update

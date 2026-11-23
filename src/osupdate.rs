@@ -34,13 +34,17 @@
 //! holds the update lock for the whole release.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::ctx::Ctx;
 use crate::err::{Error, Result};
@@ -1044,7 +1048,7 @@ impl Host<'_> {
                 ));
             }
             let targets = said.conflicts.iter().map(|c| (c.path.clone(), c.target.clone())).collect();
-            let record = SplitRecord { owners: owners.iter().cloned().collect(), paths: paths.clone(), targets };
+            let record = SplitRecord { owners: owners.iter().cloned().collect(), paths: paths.clone(), targets, left: BTreeMap::new() };
             fsx::mkdir_all(fsx::dir(self.path(SPLIT)), 0o700)
                 .and_then(|_| write_atomic(&self.path(SPLIT), serde_json::to_string_pretty(&record).unwrap_or_default().as_bytes(), 0o600))
                 .map_err(|e| format!("{e}: nothing was overwritten"))?;
@@ -1194,13 +1198,18 @@ impl Host<'_> {
 
     /// After a rollback across a package split went in (SPLIT): the newer
     /// packages that owned the files lose their database entry (pacman
-    /// -Rdd --dbonly: their files stay, owned by the older package alone),
-    /// each only while it is still installed and foreign, and once every
-    /// one of the files is in the file list of the older package that took
-    /// it over (pacman -Qlq TARGET). Then pacman checks its database (-Dk).
-    /// A power cut on the way leaves SPLIT, and the next run that installs
-    /// well does it again. While SPLIT is there, nothing is removed as an
-    /// orphan (remove_foreign_orphans): the newer package shares its files.
+    /// -Rdd --dbonly), each only while it is still installed and foreign,
+    /// and once every one of the files is in the file list of the older
+    /// package that took it over (pacman -Qlq TARGET). Then pacman checks
+    /// its database (-Dk). The files taken over stay, the older package's
+    /// alone. The rest of what the newer package had stays on disk owned by
+    /// no package, and a later install of it would refuse over those files:
+    /// its file list is noted in SPLIT before its entry goes (note_left),
+    /// and afterwards what no package owns is deleted as pacman -R would
+    /// (clean_left). A power cut on the way leaves SPLIT, and the next run
+    /// that installs well does each step again that is not done. While
+    /// SPLIT is there, nothing is removed as an orphan
+    /// (remove_foreign_orphans): the newer package shares its files.
     ///
     /// any: before a run that goes forward again (arch_install), the newer
     /// packages leave the database whether the snapshot has them or not:
@@ -1209,7 +1218,7 @@ impl Host<'_> {
     /// package of the newer day that needs the newer one brings it back.
     fn drop_split_owners(&self, ctx: &Ctx, out: &mut ArchOutcome, any: bool) -> Split {
         let Ok(text) = fs::read_to_string(self.path(SPLIT)) else { return Split::Done };
-        let Ok(record) = serde_json::from_str::<SplitRecord>(&text) else {
+        let Ok(mut record) = serde_json::from_str::<SplitRecord>(&text) else {
             out.warnings.push(format!("{SPLIT} is damaged: the packages it names keep their database entry"));
             let _ = fs::remove_file(self.path(SPLIT));
             return Split::Done;
@@ -1217,13 +1226,8 @@ impl Host<'_> {
         let tctx = ctx.with_timeout(self.limits.sync);
         let older: BTreeSet<&str> = record.targets.values().map(String::as_str).collect();
         let older = if older.is_empty() { "the older packages".to_string() } else { older.into_iter().collect::<Vec<_>>().join(", ") };
-        let both = |why: &str| {
-            format!(
-                "{} and {older} both own {} (a package split a rollback left), and {why}",
-                record.owners.join(", "),
-                record.paths.join(" ")
-            )
-        };
+        let (owners, paths) = (record.owners.join(", "), listed(&record.paths, 8));
+        let both = |why: &str| format!("{owners} and {older} both own {paths} (a package split a rollback left), and {why}");
         let candidates = if any {
             self.installed_names(ctx).ok_or_else(|| "cannot tell which packages are installed (pacman -Qq failed)".to_string())
         } else {
@@ -1272,25 +1276,200 @@ impl Host<'_> {
                 Split::Shared(both(&format!("{p} is the newer one's alone")))
             };
         }
-        let drop: Vec<&str> = record.owners.iter().map(String::as_str).filter(|o| package_name(o) && candidates.contains(*o)).collect();
+        let drop: Vec<String> = record.owners.iter().filter(|o| package_name(o) && candidates.contains(*o)).cloned().collect();
         if !drop.is_empty() {
+            // What each one has, noted on disk before its entry goes: what
+            // of it no package owns afterwards is deleted below, also by
+            // the next run after a power cut.
+            for o in &drop {
+                match self.note_left(&tctx, o) {
+                    Ok(l) => {
+                        record.left.insert(o.clone(), l);
+                    }
+                    Err(e) => out.warnings.push(format!(
+                        "{e}: what {o} leaves on disk stays there (an install of {o} later takes over only what is byte for byte its own)"
+                    )),
+                }
+            }
+            let json = serde_json::to_string_pretty(&record).unwrap_or_default();
+            if let Err(e) = write_atomic(&self.path(SPLIT), json.as_bytes(), 0o600) {
+                out.warnings.push(format!(
+                    "{SPLIT} cannot be written ({e}): after a power cut now, what {} leave(s) on disk stays there",
+                    drop.join(", ")
+                ));
+            }
+            let _ = self.at("split noted");
             let mut args = vec!["-Rdd", "--dbonly", "--noconfirm"];
-            args.extend(&drop);
+            args.extend(drop.iter().map(String::as_str));
             if let Err(f) = self.pacman_step(ctx, Stage::Install, &args, self.limits.install, out) {
                 let why = both(&format!("removing the database entry of {} failed: {}", drop.join(", "), f.reason));
                 out.warnings.push(why.clone());
                 return Split::Shared(why);
             }
-            let msg = format!("{} left pacman's database (their files stay, owned by the older packages)", drop.join(", "));
+            let msg = format!("{} left pacman's database; {}", drop.join(", "), taken_over(&record));
             self.say(&format!("Arch: {msg}"));
             out.repairs.push(msg);
+            let _ = self.at("split dropped");
         }
         let (o, res) = self.run.run(&tctx, &pacman(&["-Dk"]));
         if res.is_err() {
             out.warnings.push(format!("pacman -Dk finds problems in its database: {}", one_line(&o, 600)));
         }
+        for (package, left) in &record.left {
+            self.clean_left(&tctx, package, left, &record.paths, out);
+        }
         let _ = fs::remove_file(self.path(SPLIT));
         Split::Done
+    }
+
+    /// What package has, before it leaves pacman's database
+    /// (drop_split_owners): its entries (pacman -Qlq), and which are backup
+    /// files (pacman -Qii), each that pacman finds as the package brought
+    /// it with the sha256 of its content now. Err when pacman cannot list
+    /// its files whole.
+    fn note_left(&self, ctx: &Ctx, package: &str) -> std::result::Result<Leftover, String> {
+        let (o, res) = self.run.run(ctx, &pacman(&["-Qlq", package]).quiet().stdout_only());
+        if res.is_err() || o.len() >= crate::runner::MAX_KEPT {
+            return Err(format!("the file list of {package} cannot be read whole (pacman -Qlq)"));
+        }
+        let mut left = Leftover::default();
+        for l in o.lines().filter(|l| l.starts_with('/')) {
+            match l.strip_suffix('/') {
+                Some("") => {}
+                Some(d) => left.dirs.push(d.to_string()),
+                None => left.files.push(l.to_string()),
+            }
+        }
+        let (o, res) = self.run.run(ctx, &pacman(&["-Qii", package]).quiet().stdout_only());
+        match res.ok().and_then(|_| backup_files(&o)) {
+            Some(list) => {
+                for (path, unmodified) in list {
+                    let hash = if unmodified { look(&self.root, &path).ok().flatten().and_then(|f| f.sha256().ok()) } else { None };
+                    left.backup.insert(path, hash);
+                }
+            }
+            None => left.backup_unknown = true,
+        }
+        Ok(left)
+    }
+
+    /// What package left on disk once it left pacman's database, deleted as
+    /// pacman -R would have, and said (drop_split_owners). Of its files:
+    /// each regular file and symbolic link that no package owns now (pacman
+    /// -Qoq), found without following a link on the way, and only in /usr,
+    /// /etc, /var/lib and /opt (CLEANABLE); a backup file that was edited is
+    /// kept as NAME.pacsave. Anything else stays and is said: a directory
+    /// or special file where it had a file, a link on the way, a place
+    /// outside those. Then its directories that are empty and that no
+    /// package owns, the deepest first. Run again after a power cut, it
+    /// passes over what is gone already. taken: the files the older
+    /// packages took over (said elsewhere).
+    fn clean_left(&self, ctx: &Ctx, package: &str, left: &Leftover, taken: &[String], out: &mut ArchOutcome) {
+        let mut removed = Vec::new();
+        let mut saved = Vec::new();
+        let mut kept = Vec::new();
+        let mut others = 0;
+        let files: BTreeSet<&String> = left.files.iter().collect();
+        for p in files {
+            let shown = printable(p);
+            let found = match look(&self.root, p) {
+                Ok(Some(f)) => f,
+                Ok(None) => continue,
+                Err(why) => {
+                    kept.push(format!("{shown} ({why})"));
+                    continue;
+                }
+            };
+            match found.kind {
+                Kind::Dir => kept.push(format!("{shown} (a directory now)")),
+                Kind::Other => kept.push(format!("{shown} (a special file now)")),
+                _ if !cleanable(p) => kept.push(format!("{shown} (outside {}, where dryserver deletes nothing)", CLEANABLE.join(" "))),
+                _ => match self.owned(ctx, p) {
+                    Some(true) => others += usize::from(!taken.contains(p)),
+                    None => kept.push(format!("{shown} (pacman cannot say whether a package owns it)")),
+                    Some(false) => {
+                        let edited = match left.backup.get(p) {
+                            Some(Some(h)) => found.kind != Kind::File || found.sha256().ok().as_ref() != Some(h),
+                            Some(None) => true,
+                            None => left.backup_unknown && p.starts_with("/etc/"),
+                        };
+                        let res = if edited {
+                            found.save().map(|n| saved.push(format!("{}/{n}", fsx::dir(&shown).display())))
+                        } else {
+                            found.unlink(false)
+                        };
+                        match res {
+                            Ok(()) if !edited => removed.push(shown),
+                            Ok(()) => {}
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                            Err(e) => kept.push(format!("{shown} ({e})")),
+                        }
+                        let _ = self.at("left deleted");
+                    }
+                },
+            }
+        }
+        // The deepest first: a directory empties as those in it go.
+        let mut dirs: Vec<&String> = left.dirs.iter().filter(|d| cleanable(d)).collect();
+        dirs.sort_by(|a, b| b.matches('/').count().cmp(&a.matches('/').count()).then(b.cmp(a)));
+        dirs.dedup();
+        let mut gone_dirs = 0;
+        for d in dirs {
+            // A link on the way: what was under it is said above.
+            let Ok(Some(found)) = look(&self.root, d) else { continue };
+            if found.kind != Kind::Dir {
+                kept.push(format!("{}/ (no directory now)", printable(d)));
+                continue;
+            }
+            if self.owned(ctx, d) != Some(false) {
+                continue;
+            }
+            match found.unlink(true) {
+                Ok(()) => gone_dirs += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY) | Some(libc::EEXIST)) => {
+                    kept.push(format!("{}/ (not empty)", printable(d)))
+                }
+                Err(e) => kept.push(format!("{}/ ({e})", printable(d))),
+            }
+        }
+        if !removed.is_empty() || gone_dirs > 0 {
+            let mut msg = format!("deleted what {package} left on disk that no package owns: {} file(s)", removed.len());
+            if !removed.is_empty() {
+                msg += &format!(" ({})", listed(&removed, 6));
+            }
+            if gone_dirs > 0 {
+                msg += &format!(" and {gone_dirs} empty director(y/ies)");
+            }
+            if others > 0 {
+                msg += &format!("; {others} other file(s) of it belong to other packages now and stay");
+            }
+            self.say(&format!("Arch: {msg}"));
+            out.repairs.push(msg);
+        }
+        if !saved.is_empty() {
+            let msg = format!("{package}'s edited config file(s) kept as {}", saved.join(" "));
+            self.say(&format!("Arch: {msg}"));
+            out.repairs.push(msg);
+        }
+        if !kept.is_empty() {
+            out.warnings.push(format!(
+                "{package} left {} path(s) on disk that no package owns and dryserver did not delete: {}. Look at them; an install of {package} later takes over only what is byte for byte its own",
+                kept.len(),
+                listed(&kept, 8)
+            ));
+        }
+    }
+
+    /// Whether a package owns path (pacman -Qoq); None when pacman does
+    /// not say.
+    fn owned(&self, ctx: &Ctx, path: &str) -> Option<bool> {
+        let (o, res) = self.run.run(ctx, &pacman(&["-Qoq", path]).quiet());
+        match res {
+            Ok(()) => Some(true),
+            Err(_) if o.contains("No package owns") => Some(false),
+            Err(_) => None,
+        }
     }
 
     /// The names of the installed packages (pacman -Qq); None when pacman
@@ -1933,6 +2112,25 @@ struct SplitRecord {
     /// target in pacman's conflict line). Empty in a record a dryserver
     /// from before it wrote.
     targets: BTreeMap<String, String>,
+    /// What each newer package had, noted just before it left pacman's
+    /// database (Host::note_left): what of it no package owns afterwards
+    /// is deleted (Host::clean_left), also by the next run after a power
+    /// cut. Empty in a record a dryserver from before wrote.
+    left: BTreeMap<String, Leftover>,
+}
+
+/// A package's own entries as pacman lists them (pacman -Qlq), and its
+/// backup files (pacman -Qii): each with the sha256 of its content when
+/// pacman found it as the package brought it, None when it was edited.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct Leftover {
+    files: Vec<String>,
+    dirs: Vec<String>,
+    backup: BTreeMap<String, Option<String>>,
+    /// pacman -Qii did not say which are its backup files: every file of
+    /// it in /etc is taken for an edited one.
+    backup_unknown: bool,
 }
 
 /// Where a package split a rollback left stands (Host::drop_split_owners).
@@ -1954,6 +2152,72 @@ const MAX_CONFLICTS: usize = 64;
 const MAX_ORPHAN_ROUNDS: usize = 4;
 /// The most of an install's marker read back (a few thousand names).
 const MAX_MARKER: u64 = 1 << 20;
+
+/// Where dryserver deletes what a package left (Host::clean_left): the
+/// trees pacman installs programs, settings and their state to. Never
+/// pacman's own database, nor dryserver's state.
+const CLEANABLE: [&str; 4] = ["/usr/", "/etc/", "/var/lib/", "/opt/"];
+
+fn cleanable(p: &str) -> bool {
+    plain_path(p)
+        && CLEANABLE.iter().any(|r| p.len() > r.len() && p.starts_with(r))
+        && !p.starts_with("/var/lib/pacman/")
+        && !p.starts_with("/var/lib/dryserver")
+}
+
+/// An absolute path without empty, . or .. parts, as pacman names files.
+fn plain_path(p: &str) -> bool {
+    p.len() > 1 && p.starts_with('/') && !p.contains('\0') && p[1..].split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// Who has the files a rollback across a package split took over, for
+/// the status: "/usr/lib/libcrypto.so.3 /usr/lib/libssl.so.3 are
+/// openssl's now".
+fn taken_over(record: &SplitRecord) -> String {
+    let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for p in &record.paths {
+        let t = record.targets.get(p).map(|t| format!("{t}'s")).unwrap_or_else(|| "the older packages'".into());
+        by.entry(t).or_default().push(p.clone());
+    }
+    by.iter().map(|(t, ps)| format!("{} are {t} now", listed(ps, 8))).collect::<Vec<_>>().join("; ")
+}
+
+/// At most max of the items, then how many more there are.
+fn listed(items: &[String], max: usize) -> String {
+    let mut s = items.iter().take(max).map(|i| printable(i)).collect::<Vec<_>>().join(" ");
+    if items.len() > max {
+        s += &format!(" and {} more", items.len() - max);
+    }
+    s
+}
+
+/// The backup files pacman -Qii lists, each with whether pacman finds it
+/// as the package brought it: "Backup Files    : /etc/a.conf [modified]",
+/// one more a line after it, or "None". pacman before 5 printed
+/// "MODIFIED\t/etc/a.conf". None when there is no such field, or a line in
+/// it that reads neither way.
+fn backup_files(o: &str) -> Option<Vec<(String, bool)>> {
+    let mut lines = o.lines().skip_while(|l| !l.starts_with("Backup Files"));
+    let (_, first) = lines.next()?.split_once(':')?;
+    let rest = lines.take_while(|l| l.starts_with([' ', '\t']) && !l.trim().is_empty());
+    let mut list = Vec::new();
+    for item in std::iter::once(first).chain(rest) {
+        let item = item.trim();
+        if item.is_empty() || item == "None" {
+            continue;
+        }
+        let (path, state) = match (item.rsplit_once(" ["), item.split_once('\t')) {
+            (Some((p, s)), _) if s.ends_with(']') => (p, &s[..s.len() - 1]),
+            (_, Some((s, p))) => (p.trim(), s.trim_matches(['[', ']'])),
+            _ => return None,
+        };
+        if !path.starts_with('/') {
+            return None;
+        }
+        list.push((path.to_string(), state.eq_ignore_ascii_case("unmodified")));
+    }
+    Some(list)
+}
 
 /// A package name as pacman prints it.
 fn package_name(s: &str) -> bool {
@@ -2631,6 +2895,162 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 fn sync_dir(path: &Path) -> Result<()> {
     let d = fsx::dir(path);
     File::open(&d).and_then(|f| f.sync_all()).map_err(|e| Error::from(e).wrap(format!("sync {}", d.display())))
+}
+
+/// What a name in a directory is, the name itself (a link not followed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    File,
+    Link,
+    Dir,
+    Other,
+}
+
+/// A path found under a root without following a symbolic link anywhere
+/// (look): the directory holding it, opened one name at a time, and its
+/// last name. Everything is done through them (openat and friends), never
+/// by the path looked up again.
+struct Found {
+    dir: OwnedFd,
+    name: CString,
+    kind: Kind,
+}
+
+fn os_err() -> io::Error {
+    io::Error::last_os_error()
+}
+
+/// Opens name in the directory dir as a directory, never through a link.
+fn open_dir_at(dir: &OwnedFd, name: &CStr) -> io::Result<OwnedFd> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: a valid directory descriptor and C string.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(os_err());
+    }
+    // SAFETY: fd was just opened and nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// What is at path (absolute, as pacman names it) under root, without
+/// following a link: Ok(None) when it is not there (nor a directory on
+/// its way); Err when path is not plain, or a directory on its way is a
+/// symbolic link or no directory.
+fn look(root: &Path, path: &str) -> std::result::Result<Option<Found>, String> {
+    if !plain_path(path) {
+        return Err("not a plain path".into());
+    }
+    let c = CString::new(root.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    // SAFETY: a valid C string; the descriptor is owned below. The root
+    // itself ("/", a test's directory) is trusted.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(format!("open {}: {}", root.display(), os_err()));
+    }
+    // SAFETY: fd was just opened and nothing else owns it.
+    let mut dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut names: Vec<&str> = path[1..].split('/').collect();
+    let last = names.pop().unwrap_or_default();
+    let mut on_way = String::new();
+    for n in names {
+        on_way = format!("{on_way}/{n}");
+        let c = CString::new(n).map_err(|e| e.to_string())?;
+        dir = match open_dir_at(&dir, &c) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => {
+                return Err(format!("{} on its way is a symbolic link or no directory, not followed", printable(&on_way)));
+            }
+            Err(e) => return Err(format!("{}: {e}", printable(&on_way))),
+        };
+    }
+    let name = CString::new(last).map_err(|e| e.to_string())?;
+    // SAFETY: an all-zero stat is a valid value to be filled in.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid directory descriptor, C string and out pointer.
+    if unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        let e = os_err();
+        return if e.kind() == io::ErrorKind::NotFound { Ok(None) } else { Err(e.to_string()) };
+    }
+    let kind = match st.st_mode & libc::S_IFMT {
+        libc::S_IFREG => Kind::File,
+        libc::S_IFLNK => Kind::Link,
+        libc::S_IFDIR => Kind::Dir,
+        _ => Kind::Other,
+    };
+    Ok(Some(Found { dir, name, kind }))
+}
+
+impl Found {
+    /// The sha256 of a regular file's content (lowercase hex).
+    fn sha256(&self) -> io::Result<String> {
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: a valid directory descriptor and C string.
+        let fd = unsafe { libc::openat(self.dir.as_raw_fd(), self.name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(os_err());
+        }
+        // SAFETY: fd was just opened and nothing else owns it.
+        let mut f = unsafe { File::from_raw_fd(fd) };
+        if !f.metadata()?.is_file() {
+            return Err(io::Error::other("not a regular file"));
+        }
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; 64 << 10];
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => h.update(&buf[..k]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(fsx::hex(&h.finalize()))
+    }
+
+    /// Removes the name itself: a link, never what it points to; a
+    /// directory only when it is empty.
+    fn unlink(&self, dir: bool) -> io::Result<()> {
+        // SAFETY: a valid directory descriptor and C string.
+        if unsafe { libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), if dir { libc::AT_REMOVEDIR } else { 0 }) } != 0 {
+            return Err(os_err());
+        }
+        Ok(())
+    }
+
+    /// Renames it to NAME.pacsave, or NAME.pacsave.1 and on when that is
+    /// taken, as pacman keeps an edited config file of a package it
+    /// removes; never over anything. The new name.
+    fn save(&self) -> io::Result<String> {
+        let fd = self.dir.as_raw_fd();
+        for n in 0..100 {
+            let suffix = if n == 0 { ".pacsave".to_string() } else { format!(".pacsave.{n}") };
+            let to = CString::new([self.name.as_bytes(), suffix.as_bytes()].concat()).map_err(io::Error::other)?;
+            // SAFETY: a valid directory descriptor and C strings.
+            let res = match unsafe { libc::renameat2(fd, self.name.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) } {
+                0 => Ok(()),
+                _ => Err(os_err()),
+            };
+            let res = match res {
+                // A file system without RENAME_NOREPLACE: a hard link fails
+                // rather than replace, and does not follow a link.
+                // SAFETY: a valid directory descriptor and C strings.
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    match unsafe { libc::linkat(fd, self.name.as_ptr(), fd, to.as_ptr(), 0) } {
+                        0 => self.unlink(false),
+                        _ => Err(os_err()),
+                    }
+                }
+                res => res,
+            };
+            match res {
+                Ok(()) => return Ok(to.to_string_lossy().into_owned()),
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::other("every NAME.pacsave name is taken"))
+    }
 }
 
 fn kind(m: &fs::Metadata) -> &'static str {
@@ -3981,6 +4401,9 @@ mod tests {
                 "pacman -Suu --noconfirm --ignore archlinux-keyring",
                 "pacman -Qmq",
                 "pacman -Qlq openssl",
+                // What openssl-3 has, noted before its entry goes.
+                "pacman -Qlq openssl-3",
+                "pacman -Qii openssl-3",
                 "pacman -Rdd --dbonly --noconfirm openssl-3",
                 "pacman -Dk",
                 "pacman -Qdtq",
@@ -4013,7 +4436,7 @@ mod tests {
         // lost its database entry. The next run installs well and does it.
         let paths = vec!["/usr/lib/libcrypto.so.3".to_string(), "/usr/lib/libssl.so.3".to_string()];
         let targets = paths.iter().map(|p| (p.clone(), "openssl".to_string())).collect();
-        let record = SplitRecord { owners: vec!["openssl-3".into()], paths: paths.clone(), targets };
+        let record = SplitRecord { owners: vec!["openssl-3".into()], paths: paths.clone(), targets, ..SplitRecord::default() };
         let run = |record: &SplitRecord, f: fn(&Cmd) -> Option<&'static str>| {
             let dir = two_kernels();
             put(dir.path(), MIRRORLIST, mirrorlist("2026/11/08").unwrap());
@@ -4054,6 +4477,505 @@ mod tests {
         assert!(split && !lines.iter().any(|l| l.starts_with("pacman -Rdd")), "{lines:?}");
     }
 
+    /// The openssl split as the lab machines met it. Arch 2026/11/08 has
+    /// openssl 3.6.5 with libcrypto.so.3 and libssl.so.3; 2026/11/22 has
+    /// openssl 4.1 without them, and the compatibility package openssl-3
+    /// with them, its headers, a link and a pkgconfig file. Plays pacman
+    /// over the files on disk: its database, its check for files in the way
+    /// (a file that moves between two packages of one run is none),
+    /// --overwrite, -Rdd --dbonly, -Qo, -Ql, and the package cache.
+    struct SplitLab {
+        installed: Mutex<BTreeMap<String, String>>,
+    }
+
+    const LAB_OLD: &str = "2026/11/08";
+    const LAB_NEW: &str = "2026/11/22";
+    /// What openssl-3 has that neither openssl has.
+    const OPENSSL_3_ALONE: [&str; 5] = [
+        "/usr/include/openssl-3/openssl/aes.h",
+        "/usr/include/openssl-3/openssl/evp.h",
+        "/usr/lib/openssl-3/libcrypto.so",
+        "/usr/lib/openssl-3/pkgconfig/libcrypto.pc",
+        "/usr/share/licenses/openssl-3/LICENSE",
+    ];
+
+    fn lab_day(day: &str) -> Vec<(&'static str, &'static str)> {
+        if day == LAB_OLD {
+            vec![("filesystem", "2025.10-1"), ("openssl", "3.6.5-1")]
+        } else {
+            vec![("filesystem", "2025.10-1"), ("openssl", "4.1.0-1"), ("openssl-3", "3.5.9-2")]
+        }
+    }
+
+    /// A package's entries as pacman lists them, with every directory on
+    /// the way (ending in /); a link is "PATH -> TARGET".
+    fn lab_entries(name: &str, version: &str) -> Vec<String> {
+        let own: &[&str] = match (name, version) {
+            ("filesystem", _) => &["/etc/", "/usr/bin/", "/usr/include/", "/usr/lib/", "/usr/share/licenses/"],
+            ("openssl", "3.6.5-1") => {
+                &["/usr/bin/openssl", "/usr/include/openssl/aes.h", "/usr/lib/libcrypto.so.3", "/usr/lib/libssl.so.3"]
+            }
+            ("openssl", _) => &["/usr/bin/openssl", "/usr/include/openssl/aes.h", "/usr/lib/libcrypto.so.4", "/usr/lib/libssl.so.4"],
+            _ => &[
+                "/usr/include/openssl-3/openssl/aes.h",
+                "/usr/include/openssl-3/openssl/evp.h",
+                "/usr/lib/libcrypto.so.3",
+                "/usr/lib/libssl.so.3",
+                "/usr/lib/openssl-3/libcrypto.so -> ../libcrypto.so.3",
+                "/usr/lib/openssl-3/pkgconfig/libcrypto.pc",
+                "/usr/share/licenses/openssl-3/LICENSE",
+            ],
+        };
+        let mut all = BTreeSet::new();
+        for e in own {
+            let path = lab_path(e);
+            for (i, _) in path.match_indices('/').skip(1) {
+                all.insert(format!("{}/", &path[..i]));
+            }
+            all.insert(e.to_string());
+        }
+        all.into_iter().collect()
+    }
+
+    fn lab_path(entry: &str) -> &str {
+        entry.split(" -> ").next().unwrap()
+    }
+
+    fn lab_file(name: &str, version: &str) -> String {
+        format!("{name}-{version}-x86_64.pkg.tar.zst")
+    }
+
+    fn lab_content(name: &str, version: &str, path: &str) -> String {
+        format!("{name} {version} {path}\n")
+    }
+
+    /// A path as pacman reads an --overwrite pattern of exact_pattern's.
+    fn unescape(p: &str) -> String {
+        let mut s = String::new();
+        let mut esc = false;
+        for ch in p.chars() {
+            if !esc && ch == '\\' {
+                esc = true;
+                continue;
+            }
+            esc = false;
+            s.push(ch);
+        }
+        s
+    }
+
+    impl SplitLab {
+        /// A machine on day, every package of it installed.
+        fn new(root: &Path, day: &str) -> Arc<SplitLab> {
+            let lab = SplitLab { installed: Mutex::default() };
+            for (n, v) in lab_day(day) {
+                lab.place(root, n, v);
+                lab.installed.lock().unwrap().insert(n.into(), v.into());
+            }
+            Arc::new(lab)
+        }
+
+        fn fake(self: &Arc<Self>, root: &Path) -> Fake {
+            let lab = self.clone();
+            let mut fake = Fake::with_pacman(root, move |_, root, c| lab.run(root, c));
+            fake.keyring_newer = false;
+            fake
+        }
+
+        /// The package's files on disk, as pacman unpacks it.
+        fn place(&self, root: &Path, name: &str, version: &str) {
+            for e in lab_entries(name, version) {
+                if let Some(d) = e.strip_suffix('/') {
+                    fs::create_dir_all(fsx::under(root, d)).unwrap();
+                    continue;
+                }
+                let p = fsx::under(root, lab_path(&e));
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                let _ = fs::remove_file(&p);
+                match e.split_once(" -> ") {
+                    Some((_, t)) => std::os::unix::fs::symlink(t, &p).unwrap(),
+                    None => fs::write(&p, lab_content(name, version, &e)).unwrap(),
+                }
+            }
+        }
+
+        /// The owner pacman -Qo names: the first by name.
+        fn owner(db: &BTreeMap<String, String>, path: &str) -> Option<String> {
+            let has = |n: &str, v: &str| lab_entries(n, v).iter().any(|e| lab_path(e) == path || e.strip_suffix('/') == Some(path));
+            db.iter().find(|(n, v)| has(n, v)).map(|(n, _)| n.clone())
+        }
+
+        fn installed(&self) -> Vec<(String, String)> {
+            self.installed.lock().unwrap().clone().into_iter().collect()
+        }
+
+        fn run(&self, root: &Path, c: &Cmd) -> (String, Result<()>) {
+            let ok = |s: String| (s, Ok(()));
+            let fail = |s: String| (s, Err("pacman failed: exit status 1".into()));
+            let day = pinned_date(&get(root, MIRRORLIST)).unwrap_or_default();
+            let mut db = self.installed.lock().unwrap();
+            let args: Vec<&str> = c.args.iter().map(String::as_str).collect();
+            match args.as_slice() {
+                ["-Qq"] => ok(db.keys().map(|n| format!("{n}\n")).collect()),
+                ["-Qmq"] => {
+                    let names: Vec<&str> = lab_day(&day).into_iter().map(|(n, _)| n).collect();
+                    let f: String = db.keys().filter(|n| !names.contains(&n.as_str())).map(|n| format!("{n}\n")).collect();
+                    if f.is_empty() { fail(f) } else { ok(f) }
+                }
+                ["-Qlq", n] => match db.get(*n) {
+                    Some(v) => ok(lab_entries(n, v).iter().map(|e| format!("{}\n", lab_path(e))).collect()),
+                    None => fail(format!("error: package '{n}' was not found\n")),
+                },
+                ["-Qii", n] if db.contains_key(*n) => ok(format!("Name            : {n}\nBackup Files    : None\n\n")),
+                ["-Qoq", p] => match SplitLab::owner(&db, p) {
+                    Some(o) => ok(format!("{o}\n")),
+                    None => fail(format!("error: No package owns {p}\n")),
+                },
+                ["-Ql"] => {
+                    ok(db.iter().flat_map(|(n, v)| lab_entries(n, v).into_iter().map(move |e| format!("{n} {}\n", lab_path(&e)))).collect())
+                }
+                ["-Rdd", "--dbonly", "--noconfirm", names @ ..] => {
+                    for n in names {
+                        db.remove(*n);
+                    }
+                    ok(String::new())
+                }
+                ["-Sddp", "--print-format", "%f", n] => match lab_day(&day).into_iter().find(|(x, _)| x == n) {
+                    Some((n, v)) => ok(format!("{}\n", lab_file(n, v))),
+                    None => fail(format!("error: target not found: {n}\n")),
+                },
+                [op, ..] if *op == "-Suw" || *op == "-Suuw" => {
+                    for (n, v) in lab_day(&day) {
+                        put(root, &format!("{PKG_CACHE}/{}", lab_file(n, v)), "package");
+                    }
+                    ok(String::new())
+                }
+                [op, rest @ ..] if *op == "-Su" || *op == "-Suu" => self.transaction(root, &mut db, &day, rest),
+                _ => ok(String::new()),
+            }
+        }
+
+        /// -Su: every package of the day that is not installed at its
+        /// version, all or nothing.
+        fn transaction(&self, root: &Path, db: &mut BTreeMap<String, String>, day: &str, rest: &[&str]) -> (String, Result<()>) {
+            let overwrite: BTreeSet<String> = rest.windows(2).filter(|w| w[0] == "--overwrite").map(|w| unescape(w[1])).collect();
+            let targets: Vec<(&str, &str)> = lab_day(day).into_iter().filter(|(n, v)| db.get(*n).map(String::as_str) != Some(*v)).collect();
+            let brings = |n: &str, p: &str| targets.iter().any(|(x, v)| *x == n && lab_entries(x, v).iter().any(|e| lab_path(e) == p));
+            let mut conflicts = String::new();
+            for (n, v) in &targets {
+                for e in lab_entries(n, v).iter().filter(|e| !e.ends_with('/')) {
+                    let p = lab_path(e);
+                    if fs::symlink_metadata(fsx::under(root, p)).is_err() || overwrite.contains(p) {
+                        continue;
+                    }
+                    match SplitLab::owner(db, p) {
+                        Some(o) if o == *n => {}
+                        // It moves: its owner is upgraded in this run to a
+                        // version without it.
+                        Some(o) if targets.iter().any(|(x, _)| *x == o) && !brings(&o, p) => {}
+                        Some(o) => conflicts += &format!("{n}: {p} exists in filesystem (owned by {o})\n"),
+                        None => conflicts += &format!("{n}: {p} exists in filesystem\n"),
+                    }
+                }
+            }
+            if !conflicts.is_empty() {
+                let o = format!(
+                    "checking for file conflicts...\nerror: failed to commit transaction (conflicting files)\n{conflicts}Errors occurred, no packages were upgraded.\n"
+                );
+                return (o, Err(SPLIT_ERR.into()));
+            }
+            let before = db.clone();
+            for (n, v) in &targets {
+                db.insert(n.to_string(), v.to_string());
+            }
+            // What the versions before had that no package has now goes.
+            for (n, old) in before.iter().filter(|(n, _)| targets.iter().any(|(x, _)| x == n)) {
+                for e in lab_entries(n, old).iter().filter(|e| !e.ends_with('/')) {
+                    if SplitLab::owner(db, lab_path(e)).is_none() {
+                        let _ = fs::remove_file(fsx::under(root, lab_path(e)));
+                    }
+                }
+            }
+            for (n, v) in &targets {
+                self.place(root, n, v);
+                let what = match before.get(*n) {
+                    None => format!("installed {n} ({v})"),
+                    Some(o) => format!("{} {n} ({o} -> {v})", if o.as_str() > *v { "downgraded" } else { "upgraded" }),
+                };
+                append(root, PACMAN_LOG, &format!("[2026-11-23T03:00:02+0000] [ALPM] {what}\n"));
+            }
+            (String::new(), Ok(()))
+        }
+    }
+
+    fn lab_has(root: &Path, path: &str) -> bool {
+        fs::symlink_metadata(fsx::under(root, path)).is_ok()
+    }
+
+    /// The machine as a rollback across the split leaves it, and nothing in
+    /// the way of going forward again.
+    fn assert_rolled_back(root: &Path, lab: &SplitLab) {
+        let installed: Vec<(String, String)> = lab_day(LAB_OLD).into_iter().map(|(n, v)| (n.into(), v.into())).collect();
+        assert_eq!(lab.installed(), installed);
+        assert_eq!(get(root, "/usr/lib/libcrypto.so.3"), lab_content("openssl", "3.6.5-1", "/usr/lib/libcrypto.so.3"));
+        for p in OPENSSL_3_ALONE.iter().chain(&["/usr/include/openssl-3", "/usr/lib/openssl-3", "/usr/share/licenses/openssl-3"]) {
+            assert!(!lab_has(root, p), "{p} is left");
+        }
+        for p in ["/usr/include/openssl/aes.h", "/usr/include", "/usr/share/licenses", "/usr/lib/libssl.so.3"] {
+            assert!(lab_has(root, p), "{p} went too");
+        }
+        assert!(!fsx::under(root, SPLIT).exists());
+    }
+
+    #[test]
+    fn a_rollback_across_a_package_split_leaves_nothing_in_the_way_of_going_forward() {
+        // On the lab: back to 11/08 took the .so.3 files over and dropped
+        // openssl-3's entry, but its headers, link and pkgconfig file stayed
+        // on disk owned by no package; going forward again, pacman refused
+        // to install openssl-3 over them, for good.
+        let dir = two_kernels();
+        let r = dir.path();
+        put(r, MIRRORLIST, mirrorlist(LAB_NEW).unwrap());
+        let lab = SplitLab::new(r, LAB_NEW);
+        let fake = lab.fake(r);
+        let (h, _) = host(r, &fake);
+        let out = h.arch_update(&Ctx::new(), LAB_OLD, true);
+        assert!(out.ok(), "{}", out.summary());
+        assert_rolled_back(r, &lab);
+        // What happened, said as it is: who has the libraries, what went.
+        let s = out.summary();
+        assert!(s.contains("openssl take(s) over /usr/lib/libcrypto.so.3 /usr/lib/libssl.so.3 from openssl-3"), "{s}");
+        assert!(s.contains("openssl-3 left pacman's database; /usr/lib/libcrypto.so.3 /usr/lib/libssl.so.3 are openssl's now"), "{s}");
+        assert!(
+            s.contains(
+                "deleted what openssl-3 left on disk that no package owns: 5 file(s) (/usr/include/openssl-3/openssl/aes.h \
+                 /usr/include/openssl-3/openssl/evp.h /usr/lib/openssl-3/libcrypto.so /usr/lib/openssl-3/pkgconfig/libcrypto.pc \
+                 /usr/share/licenses/openssl-3/LICENSE) and 5 empty director(y/ies)"
+            ),
+            "{s}"
+        );
+        assert!(!s.contains("their files stay") && out.warnings.is_empty(), "{s} {:?}", out.warnings);
+        // The link went, not what it points to.
+        assert!(lab_has(r, "/usr/lib/libcrypto.so.3"));
+
+        // Forward again: pacman moves the .so.3 files from openssl to
+        // openssl-3 in one run, nothing is in its way.
+        let before = fake.lines().len();
+        let out = h.arch_update(&Ctx::new(), LAB_NEW, false);
+        assert!(out.ok(), "{}", out.summary());
+        let lines: Vec<String> = fake.lines()[before..].iter().filter(|l| l.starts_with("pacman")).cloned().collect();
+        let installs: Vec<&String> = lines.iter().filter(|l| l.starts_with("pacman -Su ")).collect();
+        assert_eq!(installs, ["pacman -Su --noconfirm --ignore linux-lts"], "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("--overwrite") || l.starts_with("pacman -R")), "{lines:?}");
+        let installed: Vec<(String, String)> = lab_day(LAB_NEW).into_iter().map(|(n, v)| (n.into(), v.into())).collect();
+        assert_eq!(lab.installed(), installed);
+        for p in OPENSSL_3_ALONE {
+            assert!(lab_has(r, p), "{p}");
+        }
+    }
+
+    #[test]
+    fn a_power_cut_between_the_steps_of_a_package_split_is_finished_next_time() {
+        quiet_power_cuts();
+        // Noted, not dropped; dropped, nothing deleted; deleted in part.
+        // Then the same release again, or one that goes forward at once.
+        for (cut, nth, forward) in [
+            ("split noted", 1, false),
+            ("split dropped", 1, false),
+            ("left deleted", 2, false),
+            ("split noted", 1, true),
+            ("split dropped", 1, true),
+        ] {
+            let dir = two_kernels();
+            let r = dir.path();
+            put(r, MIRRORLIST, mirrorlist(LAB_NEW).unwrap());
+            let lab = SplitLab::new(r, LAB_NEW);
+            let fake = lab.fake(r);
+            let (mut h, _) = host(r, &fake);
+            let seen = Arc::new(AtomicUsize::new(0));
+            let s = seen.clone();
+            h.hook = Arc::new(move |p| {
+                if p == cut && s.fetch_add(1, Ordering::SeqCst) + 1 == nth {
+                    std::panic::panic_any(PowerCut);
+                }
+                Ok(())
+            });
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.arch_update(&Ctx::new(), LAB_OLD, true)));
+            assert!(res.is_err(), "{cut}: the power did not go");
+            h.hook = Arc::new(|_| Ok(()));
+            let record: SplitRecord = serde_json::from_str(&get(r, SPLIT)).unwrap();
+            let left = &record.left["openssl-3"];
+            assert!(left.files.iter().any(|f| f == OPENSSL_3_ALONE[0]) && left.dirs.iter().any(|d| d == "/usr/lib/openssl-3"), "{cut}");
+            let dropped = !lab.installed().iter().any(|(n, _)| n == "openssl-3");
+            assert_eq!(dropped, cut != "split noted", "{cut}");
+            let gone = OPENSSL_3_ALONE.iter().filter(|p| !lab_has(r, p)).count();
+            assert_eq!(gone, if cut == "left deleted" { 2 } else { 0 }, "{cut}");
+            // The machine starts again, the update runs again.
+            if !forward {
+                let out = h.arch_update(&Ctx::new(), LAB_OLD, true);
+                assert!(out.ok(), "{cut}: {}", out.summary());
+                assert_rolled_back(r, &lab);
+                let s = out.summary();
+                assert!(s.contains(&format!("{} file(s)", 5 - gone)) && s.contains("and 5 empty director(y/ies)"), "{cut}: {s}");
+                assert_eq!(s.contains("left pacman's database"), cut == "split noted", "{cut}: {s}");
+            }
+            // Forward: the split is settled first, nothing is in the way.
+            let before = fake.lines().len();
+            let out = h.arch_update(&Ctx::new(), LAB_NEW, false);
+            assert!(out.ok(), "{cut}: {}", out.summary());
+            let lines = &fake.lines()[before..];
+            assert!(!lines.iter().any(|l| l.contains("--overwrite")), "{cut}: {lines:?}");
+            if forward {
+                let s = out.summary();
+                assert!(s.contains("deleted what openssl-3 left on disk that no package owns: 5 file(s)"), "{cut}: {s}");
+                let at = |p: &str| lines.iter().position(|l| l.starts_with(p));
+                assert!(at("pacman -Qoq /usr/include/openssl-3/openssl/aes.h") < at("pacman -Su "), "{cut}: {lines:?}");
+            }
+            let installed: Vec<(String, String)> = lab_day(LAB_NEW).into_iter().map(|(n, v)| (n.into(), v.into())).collect();
+            assert_eq!(lab.installed(), installed, "{cut}");
+        }
+    }
+
+    #[test]
+    fn what_a_split_owner_leaves_is_deleted_only_where_that_is_safe() {
+        // openssl-3's list as pacman had it, and the disk as it is when its
+        // entry has gone: each kind of leftover dryserver may meet.
+        let list = "/usr/\n/usr/include/\n/usr/include/openssl-3/\n/usr/include/openssl-3/openssl/\n\
+            /usr/include/openssl-3/openssl/aes.h\n/usr/include/openssl-3/openssl/now-a-dir.h\n\
+            /usr/lib/\n/usr/lib/libcrypto.so.3\n/usr/lib/libssl.so.3\n/usr/lib/taken.so\n\
+            /usr/lib/openssl-3/\n/usr/lib/openssl-3/libcrypto.so\n/usr/lib/openssl-3/fifo\n\
+            /usr/lib/openssl-3/sub/\n/usr/lib/openssl-3/sub/x.pc\n\
+            /etc/\n/etc/ssl/\n/etc/ssl/edited.cnf\n/etc/ssl/plain.cnf\n/etc/ssl/later.cnf\n/srv/openssl-3/data\n";
+        let qii = "Name            : openssl-3\nBackup Files    : /etc/ssl/edited.cnf [modified]\n                  \
+            /etc/ssl/plain.cnf [unmodified]\n                  /etc/ssl/later.cnf [unmodified]\n\nName : x\n";
+        let run = |qlq_fails: bool| {
+            let dir = two_kernels();
+            let r = dir.path();
+            put(r, MIRRORLIST, mirrorlist(LAB_OLD).unwrap());
+            for p in ["/usr/include/openssl-3/openssl/aes.h", "/usr/lib/libcrypto.so.3", "/usr/lib/libssl.so.3", "/usr/lib/taken.so"] {
+                put(r, p, "x");
+            }
+            put(r, "/usr/include/openssl-3/openssl/now-a-dir.h/mine", "the admin's");
+            // Once a file, now a link to something that must stay.
+            put(r, "/keep/target", "keep");
+            fs::create_dir_all(fsx::under(r, "/usr/lib/openssl-3")).unwrap();
+            std::os::unix::fs::symlink("/keep/target", fsx::under(r, "/usr/lib/openssl-3/libcrypto.so")).unwrap();
+            let fifo = CString::new(fsx::under(r, "/usr/lib/openssl-3/fifo").as_os_str().as_bytes()).unwrap();
+            // SAFETY: a valid C string.
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            // A directory on the way is a link now: never followed.
+            put(r, "/keep/dir/x.pc", "keep");
+            std::os::unix::fs::symlink(fsx::under(r, "/keep/dir"), fsx::under(r, "/usr/lib/openssl-3/sub")).unwrap();
+            for p in ["/etc/ssl/edited.cnf", "/etc/ssl/plain.cnf", "/etc/ssl/later.cnf", "/srv/openssl-3/data"] {
+                put(r, p, "as packaged");
+            }
+            put(r, "/etc/ssl/edited.cnf.pacsave", "an older one");
+            let paths = vec!["/usr/lib/libcrypto.so.3".to_string(), "/usr/lib/libssl.so.3".to_string()];
+            let targets = paths.iter().map(|p| (p.clone(), "openssl".to_string())).collect();
+            let record = SplitRecord { owners: vec!["openssl-3".into()], paths, targets, ..SplitRecord::default() };
+            put(r, SPLIT, serde_json::to_string(&record).unwrap());
+            let fake = Fake::with_pacman(r, move |_, root, c| {
+                let dropped = fsx::under(root, "/var/lib/pacman/local/openssl-3-dropped").exists();
+                let ok = |s: &str| (s.to_string(), Ok(()));
+                match (c.args[0].as_str(), c.args.get(1).map(String::as_str).unwrap_or("")) {
+                    ("-Qmq", _) if dropped => (String::new(), Err("pacman failed: exit status 1".into())),
+                    ("-Qmq", _) => ok("openssl-3\n"),
+                    ("-Qlq", "openssl") => ok("/usr/\n/usr/lib/\n/usr/lib/libcrypto.so.3\n/usr/lib/libssl.so.3\n"),
+                    ("-Qlq", "openssl-3") if qlq_fails => (String::new(), Err("pacman failed: exit status 1".into())),
+                    ("-Qlq", "openssl-3") => ok(list),
+                    ("-Qii", "openssl-3") => ok(qii),
+                    ("-Rdd", _) => {
+                        put(root, "/var/lib/pacman/local/openssl-3-dropped", "");
+                        // Edited after pacman found it as packaged.
+                        put(root, "/etc/ssl/later.cnf", "edited since");
+                        ok("")
+                    }
+                    ("-Qoq", p) => match p {
+                        "/usr/lib/libcrypto.so.3" | "/usr/lib/libssl.so.3" => ok("openssl\n"),
+                        "/usr/lib/taken.so" => ok("libtaken\n"),
+                        "/usr" | "/usr/include" | "/usr/lib" | "/etc" => ok("filesystem\n"),
+                        p => (format!("error: No package owns {p}\n"), Err("pacman failed: exit status 1".into())),
+                    },
+                    _ => ok(""),
+                }
+            });
+            let (h, _) = host(r, &fake);
+            let mut out = h.arch_check(LAB_OLD, true);
+            out.downloaded = true;
+            h.arch_install(&Ctx::new(), &mut out);
+            (out, fake.pacman_lines(), dir)
+        };
+        let (out, lines, dir) = run(false);
+        let r = dir.path();
+        assert!(out.ok() && !r.join(&SPLIT[1..]).exists(), "{}", out.summary());
+        // Deleted: a plain file, a link (not what it points to), an
+        // unedited config file, and the directories that are empty now.
+        for gone in ["/usr/include/openssl-3/openssl/aes.h", "/usr/lib/openssl-3/libcrypto.so", "/etc/ssl/plain.cnf"] {
+            assert!(!lab_has(r, gone), "{gone}");
+        }
+        assert_eq!(get(r, "/keep/target"), "keep");
+        // Kept: what other packages own, what is a directory or a special
+        // file now, what is under a link, what is outside /usr /etc
+        // /var/lib /opt; and the directories that are not empty.
+        for stays in [
+            "/usr/lib/libcrypto.so.3",
+            "/usr/lib/taken.so",
+            "/usr/include/openssl-3/openssl/now-a-dir.h/mine",
+            "/usr/lib/openssl-3/fifo",
+            "/keep/dir/x.pc",
+            "/srv/openssl-3/data",
+        ] {
+            assert!(lab_has(r, stays), "{stays}");
+        }
+        // Edited config files are kept as pacman would, never over one.
+        assert_eq!(get(r, "/etc/ssl/edited.cnf.pacsave"), "an older one");
+        assert_eq!(get(r, "/etc/ssl/edited.cnf.pacsave.1"), "as packaged");
+        assert_eq!(get(r, "/etc/ssl/later.cnf.pacsave"), "edited since");
+        assert!(!lab_has(r, "/etc/ssl/edited.cnf") && !lab_has(r, "/etc/ssl/later.cnf"));
+        assert!(lab_has(r, "/etc/ssl") && lab_has(r, "/usr/include/openssl-3/openssl"));
+        assert!(!lines.iter().any(|l| l.starts_with("pacman -Qoq /srv") || l.starts_with("pacman -Qoq /keep")), "{lines:?}");
+        let s = out.summary();
+        assert!(s.contains("deleted what openssl-3 left on disk that no package owns: 3 file(s)"), "{s}");
+        assert!(s.contains("1 other file(s) of it belong to other packages now and stay"), "{s}");
+        assert!(s.contains("openssl-3's edited config file(s) kept as /etc/ssl/edited.cnf.pacsave.1 /etc/ssl/later.cnf.pacsave"), "{s}");
+        assert!(out.pacnew.iter().any(|p| p == "/etc/ssl/later.cnf.pacsave"), "{:?}", out.pacnew);
+        let w = out.warnings.join("\n");
+        for said in [
+            "/usr/include/openssl-3/openssl/now-a-dir.h (a directory now)",
+            "/usr/lib/openssl-3/fifo (a special file now)",
+            "/usr/lib/openssl-3/sub/x.pc (/usr/lib/openssl-3/sub on its way is a symbolic link or no directory, not followed)",
+            "/srv/openssl-3/data (outside /usr/ /etc/ /var/lib/ /opt/, where dryserver deletes nothing)",
+            "/usr/include/openssl-3/openssl/ (not empty)",
+            "/usr/lib/openssl-3/sub/ (no directory now)",
+        ] {
+            assert!(w.contains(said), "{said}: {w}");
+        }
+        // pacman cannot list its files: it leaves the database all the
+        // same, its files stay, and that is said.
+        let (out, lines, dir) = run(true);
+        assert!(out.ok() && lines.iter().any(|l| l == "pacman -Rdd --dbonly --noconfirm openssl-3"), "{lines:?}");
+        assert!(lab_has(dir.path(), "/usr/include/openssl-3/openssl/aes.h"));
+        assert!(out.warnings.iter().any(|w| w.contains("file list of openssl-3 cannot be read whole")), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn backup_files_are_read_as_pacman_lists_them() {
+        let o = "Name            : x\nBackup Files    : /etc/a.conf [modified]\n                  /etc/b c.conf [unmodified]\n\
+            \nName            : y\n";
+        assert_eq!(backup_files(o), Some(vec![("/etc/a.conf".into(), false), ("/etc/b c.conf".into(), true)]));
+        assert_eq!(backup_files("Name : x\nBackup Files    : None\n\n"), Some(vec![]));
+        // pacman before 5.
+        assert_eq!(backup_files("Backup Files    : MODIFIED\t/etc/a.conf\n"), Some(vec![("/etc/a.conf".into(), false)]));
+        // No such field, or a line read neither way: not known.
+        assert_eq!(backup_files("Name : x\n"), None);
+        assert_eq!(backup_files("Backup Files    : something else\n"), None);
+        assert!(cleanable("/usr/lib/x") && cleanable("/etc/ssl/a") && cleanable("/var/lib/foo/b") && cleanable("/opt/x"));
+        for never in ["/usr", "/srv/x", "/var/lib/pacman/local/x", "/var/lib/dryserver-update/arch-split.json", "/usr/../etc/x", "/usr//x"]
+        {
+            assert!(!cleanable(never), "{never}");
+        }
+    }
+
     #[test]
     fn review_a_split_a_rollback_left_is_settled_before_going_forward() {
         // A rollback across the openssl split left SPLIT (a power cut, or
@@ -4063,7 +4985,7 @@ mod tests {
         // files openssl-3 owns too: no SSH logins, no pacman. Settled first.
         let paths = vec!["/usr/lib/libcrypto.so.3".to_string(), "/usr/lib/libssl.so.3".to_string()];
         let targets = paths.iter().map(|p| (p.clone(), "openssl".to_string())).collect();
-        let record = SplitRecord { owners: vec!["openssl-3".into()], paths, targets };
+        let record = SplitRecord { owners: vec!["openssl-3".into()], paths, targets, ..SplitRecord::default() };
         let run = |qlq: &'static str, rdd_fails: bool| {
             let dir = two_kernels();
             put(dir.path(), MIRRORLIST, mirrorlist("2026/11/08").unwrap());
@@ -4108,7 +5030,7 @@ mod tests {
         let targets = paths.iter().map(|p| (p.clone(), "openssl".to_string())).collect();
         for record in [
             SplitRecord { owners: vec!["openssl-3".into()], paths: paths.clone(), ..SplitRecord::default() },
-            SplitRecord { owners: vec!["openssl-3".into()], paths: paths.clone(), targets },
+            SplitRecord { owners: vec!["openssl-3".into()], paths: paths.clone(), targets, ..SplitRecord::default() },
         ] {
             let dir = two_kernels();
             let r = dir.path();
