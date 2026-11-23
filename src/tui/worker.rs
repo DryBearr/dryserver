@@ -92,6 +92,11 @@ impl Waiting {
         self.jobs.iter().find(|j| j.change).map(|j| j.label.as_str())
     }
 
+    /// The job that runs: what it does, and whether it changes something.
+    pub fn running(&self) -> Option<(&str, bool)> {
+        self.jobs.front().map(|j| (j.label.as_str(), j.change))
+    }
+
     /// How long the running job has been running.
     pub fn running_for(&self) -> Duration {
         self.since.map(|t| t.elapsed()).unwrap_or_default()

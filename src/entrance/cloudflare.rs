@@ -308,10 +308,7 @@ impl Entrance for Cloudflare {
     fn open_question(&self, seen: &Overview) -> Result<String> {
         self.saved_token()?;
         let what = if seen.tunnel.is_some() { "Give the tunnel the token from" } else { "Open the tunnel with the token from" };
-        Ok(format!(
-            "{what} {}? Cloudflare then sends what arrives for your public host names to the ingress. y to confirm",
-            self.token_file.display()
-        ))
+        Ok(format!("{what} {}? Cloudflare then sends what arrives for your public host names to the ingress.", self.token_file.display()))
     }
     fn open(&self, ctx: &Ctx, c: &dyn Cluster) -> Result<String> {
         connect_tunnel(ctx, c, &self.saved_token()?)?;

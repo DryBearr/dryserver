@@ -246,7 +246,9 @@ impl<S: 'static> Form<S> {
         self
     }
 
-    /// esc leaves at once from any step.
+    /// esc leaves at once from any step. No screen uses it since Apps
+    /// got its review; the form's tests keep it working.
+    #[allow(dead_code)]
     pub fn esc_cancels(mut self) -> Form<S> {
         self.esc_cancels = true;
         self
@@ -564,7 +566,7 @@ impl<S: 'static> Form<S> {
 
     fn review_body(&self, d: &mut Doc, width: usize) {
         let p = theme::palette();
-        d.add(dim("Every answer, before it is saved. enter saves them; esc goes back to change one.")).nl();
+        d.add(dim(format!("Every answer, before anything is done: enter to {}, esc to change one.", self.done_label))).nl();
         let label_w = self
             .steps()
             .iter()

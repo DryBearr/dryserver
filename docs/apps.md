@@ -20,21 +20,30 @@ the dead copy and fails.
 ./dryserver apps           # or "Apps" in the menu
 ```
 
-`n` starts an app from a container image: a name (it starts with a letter),
-the image, the port it listens on, and, if it should be reachable from outside, a public host name.
-The screen shows what runs on which server; `d` removes an app; `o` goes to
-the ways in from outside. Under it is plain Kubernetes: on the coordinator,
-`k3s kubectl` works for you without sudo.
+`n` starts an app from a container image, one step at a time: a name (it
+starts with a letter), the image, the port it listens on, a public host name
+if it should be reachable from outside, and how many copies run. The last
+step shows every answer; `enter` there starts the app, `esc` goes back to
+change one. The screen shows what runs on which server and how each app is
+reached from outside; `enter` shows an app's details, long names whole, and
+what can be done to it; `d` removes an app after saying what that does (its
+containers stop, its host name stops answering); `o` goes to the ways in from
+outside. Under it is plain Kubernetes: on the coordinator, `k3s kubectl`
+works for you without sudo.
 
 The screen never waits for the coordinator: every question and change runs
 in the background with a time limit (15 seconds for a look, a minute for a
-change), and the screen says when the coordinator does not answer. Both
+change), a change shows its steps as it goes, and the screen says when the
+coordinator does not answer, or answers with another host key (then `m`
+opens Machines to look at it). What did not work stays on a card with the
+key that tries again. Both
 screens share one SSH connection, which ends by itself 20 seconds after the
 last call. Its socket lives in `dryserver/` in your runtime directory
 (`$XDG_RUNTIME_DIR`), made for you alone; when that directory is a link,
 someone else's or open to others, nothing is shared and each call connects
 by itself. Switching between the two screens (`o`, `a`) waits until a
-change that runs (a deploy and its DNS sync) is done.
+change that runs (a deploy and its DNS sync) is done; going back (`esc`)
+while one runs asks once, since it would stop half way.
 
 What dryserver sets up around every app (namespace `apps`):
 
@@ -75,7 +84,9 @@ Setting it up, step by step, is in the README:
 
 No machine opens a port to the internet. What comes in arrives through an
 entrance, and the Outside screen shows them all, how each is doing and
-which host names come in through it:
+which host names come in through it. `enter` on one shows its details and
+what can be done to it: open it with the token you saved (`o`), sync it
+(`s`), take a name over (`t`), close it (`x`); `a` goes back to the apps:
 
 ```sh
 ./dryserver outside        # or "Outside" in the menu, or o on the apps screen
@@ -99,8 +110,10 @@ API token, or by hand in the dashboard.
 
 ### What `s` does in `./dryserver outside`
 
-The same every time, so running it again changes nothing and a run cut
-off half way is finished by the next one:
+It first lists every change it would make, in order, and makes exactly
+those on `y` (any other key changes nothing; a plan that changed since is
+not made). The same every time, so running it again changes nothing and a
+run cut off half way is finished by the next one:
 
 - checks the token (a revoked or expired one is named as such), finds the
   zone of each host name (only names inside a zone the token can see are
@@ -123,8 +136,8 @@ the name over: like `s`, it lists every change first and asks. A single
 CNAME is changed into dryserver's in place, so the name keeps resolving.
 Other records are deleted first and dryserver's CNAME is added right
 after: a CNAME shares its name with no other record, so the name does not
-resolve for that moment, and the list says so. When a call is refused, the message names the
-permission the token lacks. When Cloudflare is down, nothing is changed and
+resolve for that moment, and the list says so. When a call is refused, the card names the
+permission the token lacks, or says the token was revoked. When Cloudflare is down, nothing is changed and
 the running tunnel keeps working. With the API token saved, starting or
 removing an app with a Cloudflare host name syncs by itself, but only while
 the cluster runs the tunnel `dryserver`: a name pointed at a tunnel that no

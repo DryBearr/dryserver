@@ -88,9 +88,9 @@ pub enum Overlay {
     Confirm { question: String, consequences: Vec<String> },
     /// The page's help.
     Help,
-    /// What can be done to the selected row. The redrawn Machines, Apps
-    /// and Outside screens use it; nothing here does yet.
-    #[allow(dead_code)]
+    /// What can be done to the selected row. The title's first line heads
+    /// it; any line after it is a detail of the row, "label\tvalue",
+    /// shown whole (sheet_title makes them).
     Sheet { title: String, items: Vec<Item>, cursor: usize },
 }
 
@@ -502,8 +502,9 @@ fn panel(lines: &[Vec<Seg>], width: usize) -> Vec<Vec<Seg>> {
     out
 }
 
-/// The overlay's lines, before they go into a panel.
-fn overlay_lines(o: &Overlay, help: Option<&Help>) -> Vec<Vec<Seg>> {
+/// The overlay's lines, before they go into a panel whose text is inner
+/// cells wide.
+fn overlay_lines(o: &Overlay, help: Option<&Help>, inner: usize) -> Vec<Vec<Seg>> {
     let p = theme::palette();
     let mut out: Vec<Vec<Seg>> = Vec::new();
     match o {
@@ -539,7 +540,25 @@ fn overlay_lines(o: &Overlay, help: Option<&Help>) -> Vec<Vec<Seg>> {
             out.push(vec![Seg("Any key closes this.".into(), p.hint())]);
         }
         Overlay::Sheet { title, items, cursor } => {
-            out.push(vec![Seg(title.clone(), p.title())]);
+            // The title's first line heads the sheet; each line after it
+            // is a detail, "label\tvalue", with the value whole.
+            let mut parts = title.split('\n');
+            out.push(vec![Seg(parts.next().unwrap_or_default().into(), p.title())]);
+            let details: Vec<(&str, &str)> = parts.map(|l| l.split_once('\t').unwrap_or(("", l))).collect();
+            if !details.is_empty() {
+                out.push(Vec::new());
+                let lw = details.iter().map(|(l, _)| l.width()).max().unwrap_or(0).min(12);
+                // A long value wraps under itself, not under the labels.
+                let room = inner.saturating_sub(lw + 2).max(10);
+                for (label, value) in details {
+                    for (i, part) in wrap_line(&[Seg(value.into(), p.text())], room).into_iter().enumerate() {
+                        let head = if i == 0 { label } else { "" };
+                        let mut l = vec![Seg(format!("{head}{}", " ".repeat(lw.saturating_sub(head.width()) + 2)), p.hint())];
+                        l.extend(part);
+                        out.push(l);
+                    }
+                }
+            }
             out.push(Vec::new());
             for (i, it) in items.iter().enumerate() {
                 let pointer = if i == *cursor { Seg(format!("{} ", theme::BAR), p.selected()) } else { Seg("  ".into(), Style::new()) };
@@ -810,7 +829,7 @@ pub fn draw(page: &Page, scroll: &Scroll, w: u16, h: u16) -> Doc {
             g.dim(r);
         }
         let pw = bw.saturating_sub(2).min(MAX_PANEL);
-        let lines = panel(&overlay_lines(o, page.help.as_ref()), pw);
+        let lines = panel(&overlay_lines(o, page.help.as_ref(), pw.max(8) - 4), pw);
         let col = LEFT + (bw - pw) / 2;
         let shown = lines.len().min(rows);
         let first = body_top + (rows - shown) / 2;
@@ -1194,5 +1213,52 @@ pub mod tests {
         let c: String = cut(&[plain("node-a,node-b,node-c")], 12).iter().map(|s| s.0.clone()).collect();
         assert!(c.width() <= 12 && c.ends_with('…'), "{c}");
         assert!(cut(&[plain("abc")], 0).is_empty(), "no room, not even for the ellipsis");
+    }
+}
+
+// ---- the actions sheet's details (added for Apps and Outside) ----
+
+/// A sheet's title with the row's details under it, each a label and its
+/// whole value; Overlay::Sheet shows them between the title and the
+/// actions. A value's own line breaks become spaces.
+pub fn sheet_title(title: &str, details: &[(&str, String)]) -> String {
+    let mut t = title.replace(['\n', '\t'], " ");
+    for (label, value) in details {
+        t.push('\n');
+        t.push_str(&label.replace(['\n', '\t'], " "));
+        t.push('\t');
+        t.push_str(&value.replace(['\n', '\t'], " "));
+    }
+    t
+}
+
+#[cfg(test)]
+mod sheet_tests {
+    use super::tests::rows;
+    use super::*;
+
+    #[test]
+    fn a_sheet_shows_details_whole() {
+        for (tier, console) in [(Tier::True, false), (Tier::Console, true), (Tier::Plain, false)] {
+            let _g = theme::force(tier, console);
+            let mut p = Page::new("Apps");
+            p.body.add(super::super::plain("under"));
+            let long = format!("registry.example.com/{}", "very-long-name/".repeat(8));
+            p.overlay = Some(Overlay::Sheet {
+                title: sheet_title("blog", &[("Image", long.clone()), ("Runs", "2 of 2\non node-a".into())]),
+                items: vec![Item { key: "d".into(), label: "remove blog".into(), why_not: None }],
+                cursor: 0,
+            });
+            let r = rows(&draw(&p, &Scroll::default(), 80, 24));
+            let flat: String = r.iter().map(|l| l.replace('│', "").trim().to_string()).collect::<Vec<_>>().join("");
+            assert!(flat.contains(&long), "the value is whole: {r:#?}");
+            assert!(r.iter().any(|l| l.contains("Runs   2 of 2 on node-a")), "{r:#?}");
+            assert!(r.iter().any(|l| l.contains("remove blog")));
+            for l in &r {
+                assert_eq!(l.width(), 80);
+            }
+        }
+        // A plain title is as before.
+        assert_eq!(sheet_title("blog", &[]), "blog");
     }
 }

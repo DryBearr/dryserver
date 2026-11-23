@@ -245,7 +245,7 @@ DNS records for you:
    make it yours alone: `chmod 600 secrets/cloudflare_api_token`.
    dryserver refuses it while other users can read it.
 3. In `./dryserver outside`, press `s` on the Cloudflare Tunnel. It lists
-   every change it would make, in order (`↑↓` scrolls a long list). `y`
+   every change it would make, in order (`pgdn` scrolls a long list). `y`
    makes exactly those; when something changed since it looked, it makes
    none and says so.
 

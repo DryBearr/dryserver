@@ -716,44 +716,6 @@ impl PlaceScreen for super::admin::Screen {
     }
 }
 
-impl PlaceScreen for super::apps::Screen {
-    type Msg = super::apps::Msg;
-    fn init(&mut self, emit: &Emit<Self::Msg>) {
-        Model::init(self, emit);
-    }
-    fn update(&mut self, ev: Event<Self::Msg>, emit: &Emit<Self::Msg>) -> Flow {
-        Model::update(self, legacy(ev), emit)
-    }
-    fn page(&self, _: Size) -> Page {
-        legacy_page("Apps", Model::view(self))
-    }
-    fn next(&self) -> Option<Place> {
-        self.next.map(|p| if p == super::Place::Outside { Place::Outside } else { Place::Apps })
-    }
-    fn typing(&self) -> bool {
-        true
-    }
-}
-
-impl PlaceScreen for super::outside::Screen {
-    type Msg = super::outside::Msg;
-    fn init(&mut self, emit: &Emit<Self::Msg>) {
-        Model::init(self, emit);
-    }
-    fn update(&mut self, ev: Event<Self::Msg>, emit: &Emit<Self::Msg>) -> Flow {
-        Model::update(self, legacy(ev), emit)
-    }
-    fn page(&self, _: Size) -> Page {
-        legacy_page("Outside", Model::view(self))
-    }
-    fn next(&self) -> Option<Place> {
-        self.next.map(|p| if p == super::Place::Apps { Place::Apps } else { Place::Outside })
-    }
-    fn typing(&self) -> bool {
-        true
-    }
-}
-
 // ---- Config ----
 
 /// What the config form edits: the config plus the tool list, joined into
@@ -1102,7 +1064,7 @@ mod tests {
         let (mut a, calls) = app(&dir);
         press(&mut a, &[Key::Char('5')]);
         assert_eq!(a.place(), Place::Apps);
-        assert!(screen(&a).contains("apps"), "{}", screen(&a));
+        assert!(screen(&a).starts_with(" dryserver  Apps"), "{}", screen(&a));
         press(&mut a, &[Key::Char('o')]);
         assert_eq!(a.place(), Place::Outside, "o goes to Outside, as before");
         press(&mut a, &[Key::Char('a')]);
@@ -1112,6 +1074,57 @@ mod tests {
         assert_eq!(a.place(), Place::Home);
         press(&mut a, &[Key::Char('6')]);
         assert_eq!(calls.lock().unwrap().len(), 2, "a new link after Home");
+    }
+
+    #[test]
+    fn apps_in_the_hub() {
+        let _g = theme::force(Tier::True, false);
+        let dir = TempDir::new();
+        ready(&dir);
+        std::fs::write(test_paths(&dir).secrets.join(crate::admin::KNOWN_HOSTS), "x").unwrap();
+        let (mut a, _) = app(&dir);
+        press(&mut a, &[Key::Char('5')]);
+        let s = screen(&a);
+        assert!(s.starts_with(" dryserver  Apps") && s.contains("coordinator"), "the frame's own header: {s}");
+        assert!(rows(&a.view()).last().unwrap().contains("n  new app"), "the footer has the place's keys:\n{s}");
+        // ? is help, and any key closes it.
+        press(&mut a, &[Key::Char('?')]);
+        assert!(screen(&a).contains("Any key closes this."));
+        press(&mut a, &[Key::Char('n')]);
+        assert!(!screen(&a).contains("Step 1 of"), "the key only closed the help");
+        // In a text field q and ? are letters; a paste where a key is
+        // expected does nothing.
+        press(&mut a, &[Key::Paste("n".into())]);
+        assert!(!screen(&a).contains("Step 1 of"));
+        press(&mut a, &[Key::Char('n'), Key::Char('q'), Key::Char('?')]);
+        assert_eq!(a.place(), Place::Apps);
+        assert!(screen(&a).contains("> q?"), "{}", screen(&a));
+        press(&mut a, &[Key::Esc]);
+        assert!(screen(&a).contains("Leave the new app?"), "{}", screen(&a));
+        press(&mut a, &[Key::Char('y')]);
+        assert!(screen(&a).contains("Nothing started."));
+        // A deploy that runs: ctrl+c asks once and names it.
+        press(&mut a, &[Key::Char('n')]);
+        press(&mut a, &crate::tui::type_text("web"));
+        press(&mut a, &[Key::Enter]);
+        press(&mut a, &crate::tui::type_text("nginx:1.27"));
+        press(&mut a, &[Key::Enter]);
+        press(&mut a, &crate::tui::type_text("80"));
+        press(&mut a, &[Key::Enter, Key::Enter, Key::Enter, Key::Enter]);
+        assert!(screen(&a).contains("Starting web"), "{}", screen(&a));
+        assert_eq!(press(&mut a, &[Key::Ctrl('c')]), Flow::Continue);
+        assert!(screen(&a).contains("ctrl+c again quits, and the start of web stops."), "{}", screen(&a));
+        // q is esc here: it asks once too, then goes back.
+        press(&mut a, &[Key::Char('q')]);
+        assert!(screen(&a).contains("Still starting web. esc again goes back"), "{}", screen(&a));
+        assert_eq!(a.place(), Place::Apps);
+        press(&mut a, &[Key::Char('q')]);
+        assert_eq!(a.place(), Place::Home);
+        // Outside the same way.
+        press(&mut a, &[Key::Char('6')]);
+        assert!(screen(&a).starts_with(" dryserver  Outside") && screen(&a).contains("knows no way in from outside"), "{}", screen(&a));
+        press(&mut a, &[Key::Char('q')]);
+        assert_eq!(a.place(), Place::Home);
     }
 
     #[test]

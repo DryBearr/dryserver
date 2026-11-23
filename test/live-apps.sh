@@ -74,7 +74,7 @@ chmod +x "$S/bin/ssh"
 export PATH="$S/bin:$PATH" XDG_RUNTIME_DIR="$S/r"
 
 # Drives the apps screen (or SCREEN=outside) at 80x24: pairs of WAIT_FOR
-# KEYS, then q. A small terminal in Python keeps what is on the screen,
+# KEYS, then q (back to Home) and q (quit). A small terminal in Python keeps what is on the screen,
 # since only changed cells are drawn. Prints every screen it saw (squeezed
 # to one line each), then "exit after N ms" for how long the last q took.
 screen_raw() {
@@ -145,6 +145,10 @@ for i in range(0, len(steps), 2):
     os.write(fd, steps[i + 1].encode())
 time.sleep(0.3)
 start = time.time()
+# q goes back to Home, where q quits.
+try: os.write(fd, b"q")
+except OSError: pass
+read_until("your own server swarm", 5)
 try: os.write(fd, b"q")
 except OSError: pass
 gone = None
@@ -166,14 +170,15 @@ clients() { pgrep -fc "[s]sh .*-p $PORT .*k3s kubectl" || true; }
 masters() { pgrep -fc "[s]sh .*-p $PORT .*-M -N -f" || true; }
 
 echo "== the screen lists the apps over one shared connection"
-out=$(screen "blog" "r" "1/1 running" "" 2>&1)
-check "the screen shows the app from the coordinator" grep -q "blog .*1/1 running" <<<"$out"
+out=$(screen "blog" "r" "1 of 1 running" "" 2>&1)
+check "the screen shows the app from the coordinator" grep -q "blog .*1 of 1 running" <<<"$out"
 check "it ended at once" grep -Eq "exit after [0-9]{1,3} ms" <<<"$out"
 check "the calls went through the shared connection ($(masters))" test "$(masters)" -eq 1
 check "no call is left running" test "$(clients)" -eq 0
 
 echo "== a new app"
-out=$(screen "blog" "n" "Name" $'web\r' "Image" $'nginx:1.27\r' "Port" $'80\r' "Public host name" $'\r\r' "web is starting|Not started" "" 2>&1)
+out=$(screen "blog" "n" "Name" $'web\r' "Image" $'nginx:1.27\r' "Port" $'80\r' "Public host name" $'\r\r' "Review" $'\r' "web is starting|not started" "" 2>&1)
+check "the review shows every answer first" grep -q "Review.*web.*nginx:1.27.*80" <<<"$out"
 check "the screen says it is starting" grep -q "web is starting" <<<"$out"
 check "the coordinator got the manifest on stdin" grep -q 'name: "web"' "$S/applied"
 check "still one shared connection ($(masters))" test "$(masters)" -eq 1
@@ -182,7 +187,7 @@ echo "== the ways in from outside"
 out=$(screen "blog" "o" "Your VPS +not set up" "a" "n new app" "" 2>&1)
 check "o goes to the Outside screen" grep -q "Cloudflare Tunnel .*not set up" <<<"$out"
 check "a comes back to the apps" grep -Eq "Your VPS.*n new app" <<<"$(tr '\n' ' ' <<<"$out")"
-out=$(SCREEN=outside screen "Your VPS +not set up" "j" "> Your VPS" "x" "nothing to close" "" 2>&1)
+out=$(SCREEN=outside screen "Your VPS +not set up" "j" "▌ · Your VPS" "x" "nothing to close" "" 2>&1)
 check "./dryserver outside opens it directly" grep -q "Your VPS is not set up; there is nothing to close" <<<"$out"
 check "both screens share one connection" test "$(masters)" -eq 1
 
@@ -197,7 +202,7 @@ echo "== the coordinator stops answering"
 echo slow > "$S/mode"
 out=$(screen "asking the coordinator" "r" "Already asking the coordinator" "" "not answering \([0-9]+s\)" "" "did not answer within 15s" "" 2>&1)
 check "keys work while the call hangs" grep -q "Already asking the coordinator" <<<"$out"
-check "the screen says the coordinator is not answering" grep -q "the coordinator is not answering (" <<<"$out"
+check "the screen says the coordinator is not answering" grep -q "coordinator is not answering (" <<<"$out"
 check "the call gives up after 15 seconds" grep -q "did not answer within 15s" <<<"$out"
 check "no call is left running after the give-up" test "$(clients)" -eq 0
 out=$(screen "not answering \([0-9]+s\)" "" 2>&1)

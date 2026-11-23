@@ -314,6 +314,12 @@ pub struct Running {
 /// screen closes.
 pub trait Cluster: Send + Sync {
     fn kubectl(&self, ctx: &Ctx, args: &[&str], stdin: &str) -> Result<String>;
+
+    /// Where the coordinator is, for the screens' header ("10.1.0.60");
+    /// empty when it is not an address.
+    fn address(&self) -> String {
+        String::new()
+    }
 }
 
 /// The most kubectl may answer: a full listing of a busy cluster is a
@@ -519,7 +525,7 @@ fn quiet(ctx: &Ctx, mut cmd: Command) -> bool {
 impl Cluster for SshCluster {
     fn kubectl(&self, ctx: &Ctx, args: &[&str], stdin: &str) -> Result<String> {
         if !self.known_hosts.exists() {
-            bail!("this computer has not met the coordinator yet; run ./dryserver approve first");
+            bail!("this computer has not met the coordinator yet; open Machines (4) once: it checks the coordinator and remembers its key");
         }
         ctx.check()?;
         let target = format!("{}@{}", self.user, self.host);
@@ -562,11 +568,31 @@ impl Cluster for SshCluster {
             return Ok(String::from_utf8_lossy(&ran.out).into_owned());
         }
         let msg: String = String::from_utf8_lossy(&ran.err).chars().filter(|c| !c.is_control() || *c == '\n').take(400).collect();
+        if host_key_changed(&msg) {
+            return Err(Error::with_kind(
+                Kind::HostKey,
+                format!(
+                    "The machine at {} does not have the SSH key this computer saw before. Either the coordinator was \
+                     reinstalled, or something else answers at its address. Nothing was sent.",
+                    self.host
+                ),
+            ));
+        }
         if ran.status.code() == Some(255) {
             bail!("cannot log in to the coordinator at {} with your SSH key: {}", self.host, msg.trim());
         }
         Err(errf!("kubectl: {}", msg.trim()))
     }
+
+    fn address(&self) -> String {
+        self.host.clone()
+    }
+}
+
+/// What ssh says when the machine at the address has another host key
+/// than the one pinned.
+fn host_key_changed(msg: &str) -> bool {
+    msg.contains("Host key verification failed") || msg.contains("HOST IDENTIFICATION HAS CHANGED")
 }
 
 #[derive(Deserialize, Default)]
@@ -858,6 +884,13 @@ pub mod tests {
       {"kind":"Pod","metadata":{"name":"blog-2","namespace":"apps","labels":{"app":"blog"}},"spec":{"nodeName":"node-b"}},
       {"kind":"Pod","metadata":{"name":"blog-3","namespace":"apps","labels":{"app":"blog"}},"spec":{"nodeName":"node-a"}}
     ]}"#;
+
+    #[test]
+    fn another_host_key_is_named() {
+        assert!(host_key_changed("Host key verification failed."));
+        assert!(host_key_changed("@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @"));
+        assert!(!host_key_changed("Permission denied (publickey)."));
+    }
 
     #[test]
     fn list_deploy_remove() {

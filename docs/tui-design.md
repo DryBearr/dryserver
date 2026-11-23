@@ -110,9 +110,10 @@ Every desktop screen is one frame, the full terminal:
   first sentence in alarm bold, the rest in bone), then what to do, then
   the key that does it. Used for an unreachable
   coordinator, a changed host key, a missing key file, a stopped rollout.
-- **Actions sheet**: `enter` on a row opens a raised panel listing what can
-  be done to it, each with its key. Something that cannot be done now is
-  listed in ash with the reason.
+- **Actions sheet**: `enter` on a row opens a raised panel with the row's
+  details (a label in violet, the value whole in bone, wrapped under
+  itself) and what can be done to it, each with its key. Something that
+  cannot be done now is listed in ash with the reason.
 - **Panels** (confirm, help, actions sheet) go over the body, with a cell
   of plain screen round them; what is under them recedes toward the coal,
   so only the panel reads.
@@ -216,7 +217,8 @@ the others are shown in ash with "open dryserver without sudo".
   `enter` details; the way in from outside per app.
 - **Outside**: each way in with its state and its host names; `enter`
   for its actions (open, sync, take a name over, close); a plan always
-  shows every change before `y`.
+  shows every change before `y`, and the names it leaves alone. A plan
+  is a page of its own, not a panel, so a long one scrolls (`pgdn`).
 - **Updates**: opens Machines on its Updates tab.
 - **Backups**: the copies on this computer (newest first, age, size);
   `p` pulls newer ones from the coordinator with progress.
