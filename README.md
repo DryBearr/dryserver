@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/img/banner.svg" width="800" alt="dryserver: an ouroboros, a snake biting its own tail, ember red at the head, gold along the body, violet at the tail">
+  <img src="docs/img/banner.svg" width="860" alt="dryserver: an ouroboros, a snake biting its own tail, ember red at the head, gold along the body, violet at the tail">
 </p>
 
 <p align="center">
@@ -56,11 +56,11 @@ up a swarm goes around the same way.
 
 | | Stage | Where |
 |:-:|---|---|
-| <img src="docs/img/ring-1.svg" width="33" alt="Stage 1 of 5"> | [1. Get ready](#1-get-ready) | your desktop and the laptops |
-| <img src="docs/img/ring-2.svg" width="33" alt="Stage 2 of 5"> | [2. Build the stick](#2-build-the-stick) | your desktop, about 6 minutes |
-| <img src="docs/img/ring-3.svg" width="33" alt="Stage 3 of 5"> | [3. Install the coordinator](#3-install-the-coordinator) | the first laptop |
-| <img src="docs/img/ring-4.svg" width="33" alt="Stage 4 of 5"> | [4. Add servers](#4-add-servers) | every other laptop |
-| <img src="docs/img/ring-5.svg" width="33" alt="Stage 5 of 5"> | [5. Run apps and keep them updated](#5-run-apps-and-keep-them-updated) | your desktop, from then on |
+| <img src="docs/img/ring-1.svg" width="40" alt="Stage 1 of 5"> | [1. Get ready](#1-get-ready) | your desktop and the laptops |
+| <img src="docs/img/ring-2.svg" width="40" alt="Stage 2 of 5"> | [2. Build the stick](#2-build-the-stick) | your desktop, about 6 minutes |
+| <img src="docs/img/ring-3.svg" width="40" alt="Stage 3 of 5"> | [3. Install the coordinator](#3-install-the-coordinator) | the first laptop |
+| <img src="docs/img/ring-4.svg" width="40" alt="Stage 4 of 5"> | [4. Add servers](#4-add-servers) | every other laptop |
+| <img src="docs/img/ring-5.svg" width="40" alt="Stage 5 of 5"> | [5. Run apps and keep them updated](#5-run-apps-and-keep-them-updated) | your desktop, from then on |
 
 Want to see the laptop's setup screen first? `./dryserver install --demo`
 shows it and changes nothing.

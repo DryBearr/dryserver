@@ -6,10 +6,10 @@ Run from the repository root: python3 docs/img/draw.py docs/img
 The snake of src/tui/theme.rs as a sprite: the head at the top right, the
 body growing clockwise through the eight colours the installer uses, from
 ember through flame and gold to the violet tail, which ends in the snake's
-own open jaws. Each pixel is one cell of a grid, all of one size; the body
-is lit from the top left like a tube (plum in the shadows, warm in the
-light), its colour bands meet in an ordered dither, and its shadow side
-has a darker edge. The progress rings grow the way the installer's ring
+own open jaws. Simple, dark pixel art: one pixel size throughout, three
+tones per colour (a plum shadow, a deep base, a light edge where the light
+from the top left falls), no dither, and an outline darker than the
+background. The progress rings grow the way the installer's ring
 does (theme::ring): the snake reaches further around an ash track, its
 colours squeezed into the part that has grown.
 """
@@ -24,13 +24,9 @@ BONE = "#E6DCCF"
 GOLD = "#E8B341"
 ASH = "#5E534F"
 PLUM = "#2A0E24"  # where shadows lean
-WARM = "#FFE4AE"  # where light leans
+OUTLINE = "#070304"  # darker than the background
 MOUTH_IN = "#5A1622"
 PUPIL = "#160A0C"
-
-# Ordered dither, 4x4 Bayer.
-BAYER = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]
-
 
 def rgb(h):
     return [int(h[i:i + 2], 16) for i in (1, 3, 5)]
@@ -42,8 +38,8 @@ def mix(a, b, f):
 
 
 def ramp(base):
-    """Five tones of one colour: deep shadow, shadow, base, light, highlight."""
-    return [mix(base, PLUM, 0.58), mix(base, PLUM, 0.3), base, mix(base, WARM, 0.3), mix(base, WARM, 0.62)]
+    """Three tones of one colour, kept dark: shadow, base, light."""
+    return [mix(base, PLUM, 0.55), mix(base, COAL, 0.2), base]
 
 
 RAMPS = [ramp(c) for c in BODY]
@@ -51,11 +47,11 @@ LIGHT = (lambda v: [x / math.sqrt(sum(y * y for y in v)) for x in v])([-0.55, -0
 
 
 def tone(value):
-    """Which of the five tones a lit value takes."""
-    for i, edge in enumerate((0.08, 0.42, 0.8, 0.94)):
+    """Which of the three tones a lit value takes."""
+    for i, edge in enumerate((0.3, 0.93)):
         if value < edge:
             return i
-    return 4
+    return 2
 
 
 class Sprite:
@@ -146,6 +142,36 @@ class Sprite:
         """The grid: a colour, ("ash",) or None per cell."""
         n = self.n
         info = [[self.cell(x, y) for x in range(n)] for y in range(n)]
+        # Clean the edge: a cell with fewer than two neighbours of the snake
+        # is a stray step, not part of the shape.
+        changed = True
+        while changed:
+            changed = False
+            for py in range(n):
+                for px in range(n):
+                    if info[py][px] is None or info[py][px][0] == "head":
+                        continue
+                    count = sum(
+                        1
+                        for ax, ay in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                        if 0 <= px + ax < n and 0 <= py + ay < n and info[py + ay][px + ax] is not None
+                    )
+                    if count < 2:
+                        info[py][px] = None
+                        changed = True
+        # And fill a one-cell dent: an empty cell with three neighbours of
+        # the body takes the body's place.
+        for py in range(n):
+            for px in range(n):
+                if info[py][px] is not None:
+                    continue
+                around = [
+                    info[py + ay][px + ax]
+                    for ax, ay in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                    if 0 <= px + ax < n and 0 <= py + ay < n and info[py + ay][px + ax] is not None
+                ]
+                if len(around) >= 3 and all(a[0] == "body" for a in around):
+                    info[py][px] = around[0]
         near = lambda px, py: [
             info[py + ay][px + ax] if 0 <= px + ax < n and 0 <= py + ay < n else None
             for ax, ay in ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -164,46 +190,34 @@ class Sprite:
                     continue
                 band = 0
                 if part == "body":
-                    f = u * (len(BODY) - 1) + (BAYER[py % 4][px % 4] / 16 - 0.47) * 0.55
-                    band = max(0, min(len(BODY) - 1, round(f)))
+                    band = max(0, min(len(BODY) - 1, round(u * (len(BODY) - 1))))
                 level = tone(self.lit(px, py, y, half))
                 around = near(px, py)
-                # The shadow side's edge is darker; the lit side keeps its light.
-                if any(a is None for a in around) and level <= 2:
-                    level = max(0, level - 1)
                 # A lip where the head closes on the tail.
                 if part == "head" and any(a and a[0] in ("body", "mouth") and (a[0] == "mouth" or a[1] > 0.5) for a in around):
                     level = 0
                 grid[py][px] = RAMPS[band][level]
         self.face(grid, info)
+        # The outline: every empty cell that touches the snake.
+        for py in range(n):
+            for px in range(n):
+                if info[py][px] is None and any(a and a[0] != "mouth" for a in near(px, py)):
+                    grid[py][px] = OUTLINE
         return grid
 
-    def scales(self, grid, info):
-        """A lattice of scale edges along the body's middle."""
-        for py in range(self.n):
-            for px in range(self.n):
-                c = info[py][px]
-                if not c or c[0] != "body" or c[1] > 0.9:
-                    continue
-                _, u, y, half = c
-                if abs(y) > half * 0.62:
-                    continue
-                a = u * self.span() * self.r / 2.2
-                b = (y + half) / 2.2
-                if (math.floor(a + b) + math.floor(a - b)) % 2 == 0 and (a + b) % 1 < 0.42:
-                    grid[py][px] = mix(grid[py][px], PLUM, 0.22)
-
     def face(self, grid, info):
+        """The eye: the one head cell nearest to where it sits, in gold."""
+        best = None
         for py in range(self.n):
             for px in range(self.n):
                 c = info[py][px]
-                if not c or c[0] != "head":
-                    continue
-                x, y = self.head_local(px, py)
-                if ((x - 11.6) / 1.7) ** 2 + ((y - 2.1) / 1.3) ** 2 <= 1:
-                    grid[py][px] = PUPIL if abs(x - 11.9) < 0.55 else GOLD
-                elif self.detail and math.hypot(x - 15.4, y - 1.6) <= 0.6:
-                    grid[py][px] = mix(BODY[0], PLUM, 0.6)
+                if c and c[0] == "head":
+                    x, y = self.head_local(px, py)
+                    d = math.hypot(x - 11.8, y - 2.4)
+                    if best is None or d < best[0]:
+                        best = (d, px, py)
+        if best:
+            grid[best[2]][best[1]] = GOLD
 
 
 def rects(grid, x0, y0, px):
@@ -258,15 +272,15 @@ def word_cells(word, scale):
 
 
 def write_banner():
-    px = 3
-    n = 72
-    grid = Sprite(n, 24.5, 11.0).render()
-    width, height = 800, 240
-    sx, sy = 18, (height - n * px) // 2
+    px = 5
+    n = 40
+    grid = Sprite(n, 13.4, 6.4).render()
+    width, height = 860, 240
+    sx, sy = 30, (height - n * px) // 2
     body = rects(grid, sx, sy, px)
-    scale = 3
+    scale = 2
     cells, wcells = word_cells("dryserver", scale)
-    left = sx + n * px + 30
+    left = sx + n * px + 40
     wx = left + ((width - 30 - left) - wcells * px) // 2
     wx -= wx % px
     wy = sy + (n * px) // 2 - 4 * scale * px
@@ -290,9 +304,9 @@ def write_banner():
 
 def write_ring(k):
     px = 2
-    grid = Sprite(28, 9.6, 5.0, grown=k / 5, detail=False).render()
+    grid = Sprite(20, 6.4, 3.4, grown=k / 5, detail=False).render()
     done = "the snake bites its tail" if k == 5 else f"the snake {k} fifths of the way around"
-    size = 28 * px
+    size = 20 * px
     body = rects(grid, 0, 0, px)
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" width="{size}" height="{size}" role="img" shape-rendering="crispEdges">
   <title>Stage {k} of 5: {done}</title>
