@@ -513,8 +513,13 @@ fn overlay_lines(o: &Overlay, help: Option<&Help>, inner: usize) -> Vec<Vec<Seg>
             if !consequences.is_empty() {
                 out.push(Vec::new());
             }
+            // A long consequence wraps under its own text, not the dot.
             for c in consequences {
-                out.push(vec![Seg("  · ".into(), p.faint()), Seg(c.clone(), p.text())]);
+                for (i, part) in wrap_line(&[Seg(c.clone(), p.text())], inner.saturating_sub(4).max(10)).into_iter().enumerate() {
+                    let mut l = vec![Seg((if i == 0 { "  · " } else { "    " }).into(), p.faint())];
+                    l.extend(part);
+                    out.push(l);
+                }
             }
             out.push(Vec::new());
             let mut keys = vec![theme::cap("y"), Seg(" yes   ".into(), p.hint())];
@@ -827,6 +832,8 @@ pub fn draw(page: &Page, scroll: &Scroll, w: u16, h: u16) -> Doc {
     if let Some(o) = &page.overlay {
         for r in body_top..notice_top {
             g.dim(r);
+            // The selected row's bar would stand alone beside the gutter.
+            g.fill(r, 0, LEFT, Style::new());
         }
         let pw = bw.saturating_sub(2).min(MAX_PANEL);
         let lines = panel(&overlay_lines(o, page.help.as_ref(), pw.max(8) - 4), pw);
@@ -1130,6 +1137,23 @@ pub mod tests {
         p.help = None;
         let r = rows(&draw(&p, &Scroll::default(), 80, 24));
         assert!(!r.last().unwrap().contains("help"));
+    }
+
+    #[test]
+    fn a_long_consequence_wraps_under_itself() {
+        let _g = theme::force(Tier::Console, true);
+        let mut p = page_with(40);
+        let long = "blog, shop, photos and wiki still come in through it: nothing from outside reaches them after that";
+        p.overlay = Some(Overlay::Confirm { question: "Close Cloudflare Tunnel?".into(), consequences: vec![long.into()] });
+        let r = rows(&draw(&p, &Scroll::default(), 80, 24));
+        let col = |l: &str, w: &str| l.find(w).map(|b| l[..b].chars().count());
+        let first = r.iter().position(|l| l.contains("· blog")).expect("the consequence");
+        let word = r[first + 1].trim_start_matches([' ', '│']).split(' ').next().unwrap().to_string();
+        assert_eq!(col(&r[first + 1], &word), col(&r[first], "blog"), "{r:#?}");
+        assert!(
+            !r.iter().any(|l| l.starts_with(" ▌") || l.starts_with("▌") || l.chars().nth(1) == Some('▌')),
+            "no bar beside the gutter: {r:#?}"
+        );
     }
 
     #[test]

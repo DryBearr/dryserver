@@ -510,17 +510,19 @@ pub fn dimmed(s: Style, picture: bool) -> Style {
                 }
                 _ => p.ash,
             };
-            out.fg = out.fg.map(fade);
+            // Text in the terminal's own colour is bone: it fades too.
+            out.fg = Some(fade(out.fg.or(p.bone).unwrap_or(p.ash)));
             out.bg = out.bg.map(fade);
         }
         // Indexed colours do not mix: text goes ash, a picture one dark
         // grey, so it keeps its shape.
         Tier::C256 => {
-            out.fg = out.fg.map(|_| if picture { Color::Indexed(236) } else { p.ash });
+            out.fg = Some(if picture { Color::Indexed(236) } else { p.ash });
             out.bg = out.bg.map(|_| Color::Indexed(236));
         }
+        // Bone is the console's own colour (None): it goes ash as well.
         Tier::Console => {
-            out.fg = out.fg.map(|_| p.ash);
+            out.fg = Some(p.ash);
             out.bg = None;
         }
     }
@@ -751,6 +753,9 @@ mod tests {
         let _g = force(Tier::Console, true);
         let s = dimmed(Style::new().fg(Color::LightRed).bg(Color::Red), false);
         assert_eq!((s.fg, s.bg), (Some(palette().ash), None));
+        assert_eq!(dimmed(Style::new(), false).fg, Some(palette().ash), "text in the console's own colour dims");
+        let _g = force(Tier::True, false);
+        assert!(dimmed(Style::new(), false).fg.is_some(), "and bone fades in true colour");
     }
 
     #[test]
