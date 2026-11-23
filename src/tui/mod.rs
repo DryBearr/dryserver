@@ -161,13 +161,6 @@ pub fn sel(s: impl Into<String>) -> Seg {
 pub fn err(s: impl Into<String>) -> Seg {
     Seg(s.into(), err_style())
 }
-pub fn err_bold(s: impl Into<String>) -> Seg {
-    Seg(s.into(), err_style().add_modifier(Modifier::BOLD))
-}
-/// Structure that should recede: rules, empty progress.
-pub fn faint(s: impl Into<String>) -> Seg {
-    Seg(s.into(), theme::palette().faint())
-}
 pub fn ok(s: impl Into<String>) -> Seg {
     Seg(s.into(), ok_style())
 }
@@ -255,35 +248,6 @@ impl Doc {
         line.iter().map(|s| s.0.width()).sum()
     }
 
-    /// The doc inside a border, without a trailing empty line.
-    pub fn boxed(mut self, border: Border, color: Color, pad_x: usize, pad_y: usize, bold: bool) -> Doc {
-        while self.lines.len() > 1 && self.lines.last().is_some_and(|l| l.is_empty()) {
-            self.lines.pop();
-        }
-        let (tl, tr, bl, br, h, v) = match border {
-            // The console font has no rounded corners.
-            Border::Rounded if theme::palette().console => ('┌', '┐', '└', '┘', '─', '│'),
-            Border::Rounded => ('╭', '╮', '╰', '╯', '─', '│'),
-            Border::Double => ('╔', '╗', '╚', '╝', '═', '║'),
-        };
-        let inner = self.lines.iter().map(|l| Doc::line_width(l)).max().unwrap_or(0) + 2 * pad_x;
-        let bs = Style::new().fg(color);
-        let content_style = |s: Style| if bold { s.add_modifier(Modifier::BOLD) } else { s };
-        let mut out = Doc::new();
-        out.add(Seg(format!("{tl}{}{tr}", h.to_string().repeat(inner)), bs)).nl();
-        let empty = vec![];
-        let rows = (0..pad_y).map(|_| &empty).chain(self.lines.iter()).chain((0..pad_y).map(|_| &empty));
-        for line in rows {
-            out.add(Seg(v.to_string(), bs)).s(" ".repeat(pad_x));
-            for seg in line {
-                out.add(Seg(seg.0.clone(), content_style(seg.1)));
-            }
-            out.s(" ".repeat(inner - 2 * pad_x - Doc::line_width(line) + pad_x)).add(Seg(v.to_string(), bs)).nl();
-        }
-        out.add(Seg(format!("{bl}{}{br}", h.to_string().repeat(inner)), bs));
-        out
-    }
-
     pub fn into_text(self) -> Text<'static> {
         Text::from(
             self.lines
@@ -292,20 +256,6 @@ impl Doc {
                 .collect::<Vec<_>>(),
         )
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Border {
-    Rounded,
-    Double,
-}
-
-/// Cuts s to n characters, adding "…" when cut.
-pub fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        return s.to_string();
-    }
-    s.chars().take(n).collect::<String>() + "…"
 }
 
 /// s in at most n cells: cut with an ellipsis the console font has.
@@ -677,14 +627,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn doc_lines_and_boxes() {
+    fn doc_lines() {
         let mut d = Doc::new();
         d.add(title("a\nb")).s("c\n").add(dim("d"));
         assert_eq!(d.plain(), "a\nbc\nd");
-        let mut inner = Doc::new();
-        inner.s("hi\nthere\n");
-        let b = inner.boxed(Border::Rounded, Color::Red, 1, 0, false).plain();
-        assert_eq!(b, "╭───────╮\n│ hi    │\n│ there │\n╰───────╯");
     }
 
     #[test]
@@ -696,7 +642,6 @@ mod tests {
         assert_eq!(t.value, "axyb", "the limit stops the paste");
         t.handle(&Key::Ctrl('u'));
         assert_eq!(t.value, "b");
-        assert_eq!(truncate("abcdef", 3), "abc…");
     }
 
     #[test]

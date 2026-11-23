@@ -653,8 +653,9 @@ impl<S: 'static> Form<S> {
         }
     }
 
-    /// The form on its own, for the screens not drawn in the frame yet:
-    /// the step, then its keys.
+    /// The form on its own, the step then its keys: every screen now draws
+    /// it in the frame, so only the tests read it this way.
+    #[cfg(test)]
     pub fn view(&self) -> Doc {
         let (mut d, _) = self.body(76);
         if self.leaving {

@@ -310,12 +310,6 @@ pub fn mark(m: Mark) -> Seg {
     Seg(glyph.into(), style)
 }
 
-/// The mark in front of a finished step. The console font has no check
-/// mark; it has the root sign.
-pub fn done_mark() -> &'static str {
-    if palette().console { "√" } else { "✓" }
-}
-
 /// "…", which the console font does not have.
 pub fn ellipsis() -> &'static str {
     if palette().console { "..." } else { "…" }
@@ -549,18 +543,6 @@ pub fn header(place: &str) -> Doc {
     let mut d = Doc::new();
     d.add(Seg("dryserver".into(), p.title())).s("  ").s(place);
     d
-}
-
-/// The top of an entry screen: the ring with the name and one line about
-/// the screen beside it.
-pub fn brand(place: &str, line: &str) -> Doc {
-    let p = palette();
-    let mut text = Doc::new();
-    text.nl();
-    text.add(Seg("dryserver".into(), p.title())).nl();
-    text.s(place).nl();
-    text.add(Seg(line.into(), p.hint()));
-    Doc::beside(ring(None), 3, text)
 }
 
 /// The keys of a screen: each key in gold, what it does in violet.
@@ -856,9 +838,5 @@ mod tests {
         let ash = palette().ash;
         let done = b.lines[0].iter().filter(|s| s.1.fg != Some(ash)).map(|s| s.0.chars().count()).sum::<usize>();
         assert_eq!(done, 4);
-        let b = brand("server setup", "hello").plain();
-        let lines: Vec<&str> = b.lines().collect();
-        assert_eq!(lines.len(), 5, "{b}");
-        assert!(lines[1].ends_with("   dryserver") && lines[2].ends_with("   server setup") && lines[3].ends_with("   hello"), "{b}");
     }
 }

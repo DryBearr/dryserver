@@ -1262,3 +1262,198 @@ mod sheet_tests {
         assert_eq!(sheet_title("blog", &[]), "blog");
     }
 }
+
+// ---- any size, for the installer ----
+
+/// Where the compact frame's body starts.
+const ANY_LEFT: usize = 2;
+
+/// The body's width for draw_any: the frame's in a window it fits, else
+/// every column but the edges.
+pub fn any_body_width(w: u16, h: u16) -> usize {
+    if too_small(w, h) { (w as usize).saturating_sub(ANY_LEFT + 1).max(1) } else { body_width(w) }
+}
+
+/// The body's rows for draw_any, with a notice of one line.
+pub fn any_body_rows(w: u16, h: u16) -> usize {
+    if too_small(w, h) {
+        let h = h as usize;
+        h.saturating_sub(1 + usize::from(h >= 2) + usize::from(h >= 5))
+    } else {
+        body_rows(h)
+    }
+}
+
+/// The page laid out for a window of any size: the frame where it fits,
+/// and in a smaller window a compact frame instead of asking for a bigger
+/// one. That is for the installer: the Linux console cannot be made
+/// bigger. The header and the footer stay, the body takes the rows
+/// between them (no blank line, one line of notice) and scrolls, and a
+/// panel starts at the top of the body. Exactly h lines of w cells, for
+/// any w and h.
+pub fn draw_any(page: &Page, scroll: &Scroll, w: u16, h: u16) -> Doc {
+    if !too_small(w, h) {
+        return draw(page, scroll, w, h);
+    }
+    let p = theme::palette();
+    let (bw, rows) = (any_body_width(w, h), any_body_rows(w, h));
+    let (w, h) = (w as usize, h as usize);
+    let mut g = Grid::new(w, h);
+    if w == 0 || h == 0 {
+        return g.into_doc();
+    }
+    let bar_style = p.on_raised(Style::new());
+
+    // The header, with what the place depends on when there is room.
+    g.fill(0, 0, w, bar_style);
+    let mut left = vec![Seg(" ".into(), bar_style), Seg("dryserver".into(), p.on_raised(p.title()))];
+    if !page.place.is_empty() {
+        left.push(Seg("  ".into(), bar_style));
+        left.push(Seg(page.place.clone(), p.on_raised(p.text())));
+    }
+    let left_end = g.put(0, 0, &left, w);
+    if let Some(first) = page.status.lines.first() {
+        let room = w.saturating_sub(left_end + 3);
+        if room >= 4 {
+            let status: Vec<Seg> = cut(first, room).into_iter().map(|s| Seg(s.0, p.on_raised(s.1))).collect();
+            let sw = seg_width(&status);
+            g.put(0, w - 1 - sw, &status, w - 1);
+        }
+    }
+    if h < 2 {
+        return g.into_doc();
+    }
+
+    // The footer, and one line of notice above it when there is room.
+    let footer_row = h - 1;
+    g.fill(footer_row, 0, w, bar_style);
+    let keys: Vec<Seg> = footer(page, w.saturating_sub(2)).into_iter().map(|s| Seg(s.0, p.on_raised(s.1))).collect();
+    g.put(footer_row, 1, &keys, w.saturating_sub(1));
+    let body_top = 1;
+    if h >= 5
+        && let Some(n) = &page.notice
+    {
+        let one = Notice { tone: n.tone, text: n.text.replace('\n', " ") };
+        if let Some(l) = notice_lines(&one, usize::MAX / 4).first() {
+            g.put(body_top + rows, 1, &cut(l, w.saturating_sub(2)), w.saturating_sub(1));
+        }
+    }
+
+    // The body.
+    let mut body: Vec<Vec<Seg>> = Vec::new();
+    let mut starts = Vec::with_capacity(page.body.lines.len() + 1);
+    let mut lines = page.body.lines.as_slice();
+    while let Some((last, rest)) = lines.split_last() {
+        if !last.is_empty() {
+            break;
+        }
+        lines = rest;
+    }
+    for l in lines {
+        starts.push(body.len());
+        body.extend(wrap_line(l, bw));
+    }
+    starts.push(body.len());
+    let focus = page.focus.as_ref().map(|f| {
+        let at = |i: usize| starts[i.min(starts.len() - 1)];
+        (at(f.lines.start)..at(f.lines.end).max(at(f.lines.start) + 1), f.paint)
+    });
+    let top = scroll.place(body.len(), rows, bw, focus.as_ref().map(|f| &f.0));
+    for (i, l) in body.iter().enumerate().skip(top).take(rows) {
+        let r = body_top + i - top;
+        g.put(r, ANY_LEFT, l, ANY_LEFT + bw);
+        if let Some((f, true)) = &focus
+            && f.contains(&i)
+        {
+            if let Some(bg) = p.shade {
+                g.shade(r, 0, ANY_LEFT + bw, Style::new().bg(bg));
+            }
+            let mut st = p.selected();
+            if let Some(bg) = p.shade {
+                st = st.bg(bg);
+            }
+            g.put(r, 0, &[Seg(theme::BAR.into(), st)], 1);
+        }
+    }
+    if body.len() > rows && rows > 0 {
+        let size = (rows * rows / body.len()).max(1);
+        let most = body.len() - rows;
+        let at = (top * (rows - size)).checked_div(most).unwrap_or(0);
+        for r in at..at + size {
+            g.put(body_top + r, w - 1, &[Seg("▐".into(), p.faint())], w);
+        }
+    }
+
+    // A panel over the body, from its top: there is no room to centre it.
+    if let Some(o) = &page.overlay {
+        for r in body_top..body_top + rows {
+            g.dim(r);
+        }
+        let pw = bw.min(MAX_PANEL);
+        let lines = panel(&overlay_lines(o, page.help.as_ref(), pw.max(8) - 4), pw);
+        for (i, l) in lines.iter().take(rows).enumerate() {
+            g.fill(body_top + i, 0, w, Style::new());
+            g.put(body_top + i, 1, l, w.saturating_sub(1));
+        }
+    }
+    g.into_doc()
+}
+
+#[cfg(test)]
+mod any_size_tests {
+    use super::tests::rows;
+    use super::*;
+    use crate::tui::plain;
+
+    fn page(n: usize) -> Page {
+        let mut p = Page::new("Install");
+        p.status.add(plain("Step 2 of 5"));
+        for i in 0..n {
+            p.body.add(plain(format!("line {i}"))).nl();
+        }
+        p.key("enter", "next");
+        p.notice = Some(Notice::bad("The check failed.\nr tries again."));
+        p
+    }
+
+    #[test]
+    fn any_size_fills_the_window_and_never_panics() {
+        for (tier, console) in [(Tier::True, false), (Tier::Console, true), (Tier::Plain, true)] {
+            let _g = theme::force(tier, console);
+            for w in [0u16, 1, 2, 3, 5, 9, 10, 20, 40, 79, 80] {
+                for h in [0u16, 1, 2, 3, 4, 5, 8, 12, 23, 24, 25] {
+                    let mut pg = page(40);
+                    pg.focus = Some(Focus::row(30));
+                    for overlay in [false, true] {
+                        pg.overlay = overlay.then(|| Overlay::Confirm { question: "Stop?".into(), consequences: vec!["It stops.".into()] });
+                        let r = rows(&draw_any(&pg, &Scroll::default(), w, h));
+                        assert_eq!(r.len(), h as usize, "{tier:?} {w}x{h}");
+                        for l in &r {
+                            assert_eq!(l.width(), w as usize, "{tier:?} {w}x{h}: {l:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_console_keeps_the_header_the_keys_and_the_focus() {
+        let _g = theme::force(Tier::Console, true);
+        let mut pg = page(40);
+        pg.focus = Some(Focus::row(30));
+        let r = rows(&draw_any(&pg, &Scroll::default(), 60, 20));
+        assert!(r[0].starts_with(" dryserver  Install") && r[0].trim_end().ends_with("Step 2 of 5"), "{:?}", r[0]);
+        assert!(r[19].contains("[enter] next"), "{:?}", r[19]);
+        assert!(r[18].contains("! The check failed. r tries again."), "the notice on one line: {:?}", r[18]);
+        assert!(r.iter().any(|l| l.starts_with("▌ line 30")), "the focus is in view: {r:#?}");
+        assert!(!r.iter().any(|l| l.contains("Make this window")), "no request for a bigger window");
+        // Where the frame fits, it is the frame.
+        let a = rows(&draw_any(&pg, &Scroll::default(), 80, 25));
+        let b = rows(&draw(&pg, &Scroll::default(), 80, 25));
+        assert_eq!(a, b);
+        assert_eq!(any_body_width(80, 25), body_width(80));
+        assert_eq!(any_body_rows(80, 25), body_rows(25));
+        assert_eq!((any_body_width(60, 20), any_body_rows(60, 20)), (57, 17));
+    }
+}

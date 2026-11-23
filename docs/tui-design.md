@@ -235,6 +235,20 @@ its network, the role it will get), WiFi when needed, the form, the
 checks, confirm with `YES`, the install with progress, then the pairing
 code in large digits until the desktop approves it.
 
+The five steps are This machine (with WiFi), Your answers, Checks, Erase
+and install (YES, then the progress), and Join the mesh (a coordinator:
+Sign it). Every screen but the install's progress opens with the ring
+grown one fifth per finished step and the five steps beside it: done in
+gold, this one in ember with what it does, the rest in ash; done, the
+snake bites its tail. A problem that stops the install (no network, no
+disk) is a card right under the steps. Nothing writes to a disk before
+`YES`, and a paste never fills the `YES` field.
+
+The console cannot be made bigger, so under 80 × 24 the installer does
+not ask for a bigger window: it draws a compact frame (`frame::draw_any`)
+with the header, the body scrolling between them, one line of notice and
+the keys.
+
 ## Edge cases every screen handles
 
 - A terminal under 80 × 24, and a resize at any moment.
