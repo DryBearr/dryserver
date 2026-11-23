@@ -132,6 +132,34 @@ pub struct Request {
     pub from: String,
 }
 
+/// What root on the coordinator applied last: the version and the
+/// SHA-256 of the signed list its mesh and cluster follow, and when (its
+/// clock), signed with its SSH host key (signed::NS_RECEIPT). The
+/// registry account could take the admin's new list, answer the desktop
+/// with it and never keep it: root would go on with the older one, and a
+/// server the admin removed would stay. The desktop checks the receipt
+/// against the coordinator's key in the list it signed itself, and says
+/// when the coordinator lags (admin.rs).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Receipt {
+    pub version: u64,
+    pub sha256: String,
+    pub time: i64,
+    pub sig: String,
+}
+
+impl Receipt {
+    pub fn is_empty(&self) -> bool {
+        self.sig.is_empty()
+    }
+
+    /// What root signs.
+    pub fn text(version: u64, sha256: &str, time: i64) -> String {
+        format!("dryserver-receipt-v1\nversion {version}\nsha256 {sha256}\ntime {time}\n")
+    }
+}
+
 /// A join request the registry turned down because its name or key is
 /// taken, kept for the admin's screen: a machine installed again under a
 /// member's name would otherwise wait unseen.
@@ -194,6 +222,9 @@ pub struct State {
     /// last: at most MAX_REFUSED, for request_ttl.
     #[serde(deserialize_with = "report::lenient", skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<Refused>,
+    /// Root's receipt for the list it applied last.
+    #[serde(deserialize_with = "report::lenient", skip_serializing_if = "Receipt::is_empty")]
+    pub receipt: Receipt,
 }
 
 /// The 6-digit code both sides show. It covers the new node's keys and the
@@ -961,6 +992,9 @@ pub struct AdminState {
     /// Requests turned down because their name or key is taken.
     #[serde(deserialize_with = "report::lenient", skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<Refused>,
+    /// Root's receipt for the list it applied last.
+    #[serde(deserialize_with = "report::lenient", skip_serializing_if = "Receipt::is_empty")]
+    pub receipt: Receipt,
 }
 
 /// Answers "status". When approved it carries what the node needs to bring
@@ -1205,6 +1239,7 @@ pub fn serve(
                     rollout: s.rollout.clone(),
                     now: now.0.timestamp(),
                     refused: s.refused.clone(),
+                    receipt: s.receipt.clone(),
                 })
             })?;
             send(out, &reply)
@@ -1608,9 +1643,13 @@ mod tests {
             update_serial: crate::release::MAX_SERIAL,
             // Quotes take two bytes each in JSON.
             update_note: "\"".repeat(report::MAX_NOTE),
+            lan: "255.255.255.255".into(),
+            // The longest signature kept; one by an ed25519 key is 300 bytes.
+            sig: format!("-----BEGIN SSH SIGNATURE-----{}", "A".repeat(512 - 29)),
             ..report(&[])
         }
         .sanitized(|_| true);
+        assert!(r.sig.len() == 512 && !r.lan.is_empty(), "cut down: {r:?}");
         let cuts = (0..MAX_CUT_REPORTS).map(|i| CutReport { name: format!("{i:02}{}", "n".repeat(61)), auto: true }).collect();
         let hb = Heartbeat { lan_ip: "255.255.255.255".into(), switch: true, cuts, report: Some(r) };
         let len = serde_json::to_string(&hb).unwrap().len() as u64;

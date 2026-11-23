@@ -202,6 +202,12 @@ pub fn open_request(v: &dyn Verifier, e: &Envelope, op: &str, now_unix: i64) -> 
 /// What root on the coordinator signs a server's turn as, with the
 /// coordinator's SSH host key (rollout::Grant).
 pub const NS_TURN: &str = "dryserver-rollout-turn";
+/// What a server signs its report as, with its own SSH host key
+/// (report::Report::sign): the registry account relays it.
+pub const NS_REPORT: &str = "dryserver-report";
+/// What root on the coordinator signs its receipt for the list it applied
+/// as (registry::Receipt).
+pub const NS_RECEIPT: &str = "dryserver-receipt";
 /// The signer name in the allowed-signers file of a host key check.
 const HOST_SIGNER: &str = "dryserver-host";
 

@@ -274,6 +274,35 @@ impl Join {
 }
 /// What the coordinator's last sync could not seal; a change is logged.
 pub const K3S_SHARE_STATUS: &str = "/run/dryserver-k3s-share.status";
+/// Whether this server could sign its report at the last sync; a change
+/// is logged.
+pub const REPORT_STATUS: &str = "/run/dryserver-report.status";
+/// Which servers' reports the coordinator's last sync did not take; a
+/// change is logged.
+pub const REPORTS_STATUS: &str = "/run/dryserver-reports.status";
+/// On the coordinator: from which release on servers sign their reports,
+/// and the newest signed report taken from each (ReportCheck).
+pub const SIGNED_REPORTS: &str = "/etc/dryserver/signed-reports.json";
+/// A receipt (registry::Receipt) is made again this often while the list
+/// stays the same: its time says the coordinator's sync runs.
+pub const RECEIPT_EVERY: i64 = 300;
+/// A signed report older than this is not taken.
+pub const REPORT_MAX_AGE: i64 = 86_400;
+
+/// What root on the coordinator keeps of the reports it took
+/// (SIGNED_REPORTS).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct ReportCheck {
+    /// The release this coordinator ran when it first checked reports (at
+    /// least 1): from it on every server's release signs its reports, so
+    /// an unsigned report that says it runs one of them is not taken. One
+    /// of an older release is, as before: that server cannot sign yet.
+    since: u64,
+    /// By host number: the WireGuard key and the time of the newest
+    /// signed report taken. An older one is not taken again.
+    seen: BTreeMap<u32, (String, i64)>,
+}
 /// What a server made of the token the coordinator sent at the last sync;
 /// a change is logged.
 pub const K3S_TOKEN_STATUS: &str = "/run/dryserver-k3s-token.status";
@@ -1126,6 +1155,97 @@ impl Node {
         self.note(K3S_SHARE_STATUS, &format!("k3s: {status}"), &status);
     }
 
+    /// Signs this machine's report, as member host, with its host key:
+    /// the registry account relays it, to root on the coordinator and to
+    /// the admin. Unsigned when that fails, which is logged once.
+    fn sign_report(&self, ctx: &Ctx, host: u32, r: &mut Report) {
+        match self.read(WG_PUB).and_then(|wg| r.sign(ctx, self.run.as_ref(), &self.path(HOST_KEY), host, &wg)) {
+            Ok(()) => self.note(REPORT_STATUS, "report: signed", ""),
+            Err(e) => self.note(REPORT_STATUS, &format!("report: sent unsigned: {e}"), &e.to_string()),
+        };
+    }
+
+    /// On the coordinator, once its mesh follows the list in SIGNED_FILE:
+    /// a receipt for that list in the registry, signed with its host key
+    /// (registry::Receipt). Made again when the list changed or the last
+    /// one is RECEIPT_EVERY old.
+    fn receipt(&self, ctx: &Ctx, store: &Store, now: i64) {
+        let Ok(Some((version, env))) = self.seen_list() else { return };
+        let sha = fsx::hex(&sha2::Sha256::digest(env.doc.as_bytes()));
+        let had = store.read().map(|s| s.receipt).unwrap_or_default();
+        if had.version == version && had.sha256 == sha && (0..RECEIPT_EVERY).contains(&(now - had.time)) {
+            return;
+        }
+        let text = registry::Receipt::text(version, &sha, now);
+        let sig = match signed::host_sign(ctx, self.run.as_ref(), &self.path(HOST_KEY), signed::NS_RECEIPT, &text) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("dryserver: cannot sign the receipt for list version {version}: {e}");
+                return;
+            }
+        };
+        let r = registry::Receipt { version, sha256: sha, time: now, sig };
+        if let Err(e) = store.update(|s| {
+            s.receipt = r;
+            Ok(())
+        }) {
+            eprintln!("dryserver: cannot leave the receipt for list version {version} in the registry: {e}");
+        }
+    }
+
+    /// On the coordinator, for the rollout: members with only the reports
+    /// they signed themselves (report::Report::verify, with their keys in
+    /// the list the admin signed). The registry account relays them and
+    /// could have a server pass for updated. A report that is not signed by
+    /// its server, older than one taken before or than REPORT_MAX_AGE, or
+    /// unsigned from a release that signs (ReportCheck::since) is none: the
+    /// rollout waits for that server. own: this coordinator's report.
+    fn trusted_reports(&self, ctx: &Ctx, members: Vec<Member>, own: &Report, now: i64) -> Vec<Member> {
+        let was: Option<ReportCheck> = serde_json::from_str(&fsx::read_or_empty(self.path(SIGNED_REPORTS))).ok();
+        let mut check = was.clone().unwrap_or(ReportCheck { since: own.release.max(1), ..ReportCheck::default() });
+        let tmp = self.tmp_dir.clone().unwrap_or_else(|| PathBuf::from("/run"));
+        let mut refused = Vec::new();
+        let mut out = Vec::new();
+        for mut m in members {
+            let Some(r) = m.report.take().filter(|_| m.host >= 2) else {
+                out.push(m);
+                continue;
+            };
+            let why = if r.sig.is_empty() {
+                (r.release >= check.since)
+                    .then(|| format!("unsigned, though it says it runs release {} (from {} on reports are signed)", r.release, check.since))
+            } else if let Err(e) = r.verify(ctx, self.run.as_ref(), &tmp, m.host, &m.wg_key, &m.ssh_host_key) {
+                Some(format!("not signed by it ({e})"))
+            } else if check.seen.get(&m.host).is_some_and(|(k, t)| *k == m.wg_key && r.time < *t) {
+                Some("older than one it sent before".to_string())
+            } else if now - r.time > REPORT_MAX_AGE {
+                Some("more than a day old".to_string())
+            } else {
+                check.seen.insert(m.host, (m.wg_key.clone(), r.time));
+                None
+            };
+            match why {
+                Some(why) => refused.push(format!("{}: {why}", m.name)),
+                None => m.report = Some(r),
+            }
+            out.push(m);
+        }
+        check.seen.retain(|h, (k, _)| out.iter().any(|m| m.host == *h && m.wg_key == *k));
+        if was.as_ref() != Some(&check)
+            && let Ok(text) = serde_json::to_string(&check)
+        {
+            let _ = self.write(SIGNED_REPORTS, 0o600, &(text + "\n"));
+        }
+        let status = refused.join("; ");
+        let line = if status.is_empty() {
+            "reports: every server's report checks out".to_string()
+        } else {
+            format!("reports not taken (the rollout waits for those servers): {status}")
+        };
+        self.note(REPORTS_STATUS, &line, &status);
+        out
+    }
+
     /// The node-password secrets in the cluster (k3s's, in kube-system).
     fn k3s_passwords(&self, ctx: &Ctx) -> Result<Passwords> {
         let selector = format!("type={}", k3stoken::PASSWORD_TYPE);
@@ -1938,7 +2058,10 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     let mut alone: Option<Error> = None;
     let members = if coordinator {
         me.host = 1;
-        rep = n.full_report(ctx, true);
+        let mut r = n.full_report(ctx, true);
+        r.lan = n.cfg.coord_lan_ip.clone();
+        n.sign_report(ctx, 1, &mut r);
+        rep = r;
         let hb = Heartbeat { lan_ip: n.cfg.coord_lan_ip.clone(), switch: sw, cuts, report: Some(rep.clone()) };
         let read = store.update(|s| {
             s.heartbeat(1, hb, Time::now())?;
@@ -2009,7 +2132,10 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
             });
         }
         let lan = local_ip(ctx, n.run.as_ref(), &n.cfg.coord_lan_ip).unwrap_or_default();
-        rep = n.full_report(ctx, false);
+        let mut r = n.full_report(ctx, false);
+        r.lan = lan.clone();
+        n.sign_report(ctx, host, &mut r);
+        rep = r;
         let hb = Heartbeat { lan_ip: lan, switch: sw, cuts, report: Some(rep.clone()) };
         let fetched = match n.fetch_members(ctx, &hb) {
             Ok(f) => f,
@@ -2072,6 +2198,9 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
         // Only from a list the admin signed does a machine leave the
         // cluster. Before the first one there is nobody but the
         // coordinator, and nobody to share the token with.
+        if signed && alone.is_none() {
+            n.receipt(ctx, store, Time::now().0.timestamp());
+        }
         if signed {
             n.k3s_share(ctx, alone.is_none().then_some(store), &all, Time::now().0.timestamp());
         }
@@ -2080,7 +2209,9 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
             return Err(why);
         }
         // The rollout of the newest release: the coordinator first, then
-        // one server at a time, among the members the admin signed.
+        // one server at a time, among the members the admin signed. What
+        // each says about its update counts only signed by it.
+        let all = n.trusted_reports(ctx, all, &rep, Time::now().0.timestamp());
         let served = rollout::Served::beside(store, n.path(rollout::K3S_BIN));
         rollout::brain_tick(ctx, n, store, &served, &rep, rollout::Now::current(), &all);
     } else {
@@ -2551,7 +2682,10 @@ mod tests {
                         return (String::new(), Err("exec: \"age\": executable file not found in $PATH".into()));
                     }
                     // A turn root on the coordinator signed (rollout::Grant).
-                    if c.args.iter().any(|a| a == crate::signed::NS_TURN) {
+                    if c.args
+                        .iter()
+                        .any(|a| [crate::signed::NS_TURN, crate::signed::NS_REPORT, crate::signed::NS_RECEIPT].contains(&a.as_str()))
+                    {
                         return crate::signed::fake::host_run(c).unwrap_or_else(|| (String::new(), Err("unknown".into())));
                     }
                     return k3stoken::fake::run(c).unwrap_or_else(|| (String::new(), Err("unknown".into())));
@@ -4635,5 +4769,127 @@ mod tests {
         let st = store.read().unwrap();
         assert!(st.members[0].report.as_ref().is_some_and(|r| r.dryserver == env!("CARGO_PKG_VERSION")));
         assert_eq!(st.members[1].report, None, "the coordinator wrote a report for another machine");
+    }
+
+    /// A server signs its report, with its LAN address, with its own host
+    /// key: the registry account relays it to root and to the admin.
+    #[test]
+    fn a_server_signs_its_report() {
+        let (_dir, tmp, n, fc) = joined();
+        assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
+        let hb: Heartbeat = serde_json::from_str(&fc.heartbeat.lock().unwrap()).unwrap();
+        let r = hb.report.unwrap();
+        assert_eq!((r.lan.as_str(), hb.lan_ip.as_str()), ("192.168.1.23", "192.168.1.23"));
+        let check = |r: &Report, host: u32, wg: &str, key: &str| r.verify(&Ctx::new(), fc.as_ref(), tmp.path(), host, wg, key).is_ok();
+        assert!(check(&r, 2, WG_PUBKEY, NODE_KEY), "{:?}", r.sig);
+        // As the registry keeps it (sanitized), still.
+        let kept = r.clone().sanitized(|h| h == 1);
+        assert!(check(&kept, 2, WG_PUBKEY, NODE_KEY));
+        // Not for another machine, and not changed.
+        assert!(!check(&r, 3, WG_PUBKEY, NODE_KEY) && !check(&r, 2, OTHER_WG, NODE_KEY) && !check(&r, 2, WG_PUBKEY, COORD_KEY));
+        for changed in [
+            Report { release: 99, ..r.clone() },
+            Report { lan: "192.168.1.66".into(), ..r.clone() },
+            Report { update: "pending".into(), ..r.clone() },
+        ] {
+            assert!(!check(&changed, 2, WG_PUBKEY, NODE_KEY), "{changed:?}");
+        }
+        assert!(get(&n.root, REPORT_STATUS).trim().is_empty());
+        // Without its host key it sends the report unsigned, and says so.
+        std::fs::remove_file(n.path(HOST_KEY)).unwrap();
+        assert!(sync(&Ctx::new(), &n, false, &Store::new("/nonexistent")).unwrap());
+        let hb: Heartbeat = serde_json::from_str(&fc.heartbeat.lock().unwrap()).unwrap();
+        assert!(hb.report.unwrap().sig.is_empty() && get(&n.root, REPORT_STATUS).contains("host key"));
+    }
+
+    /// The review's case: the registry account could have a server pass
+    /// for updated (release, update state) for the rollout. Root takes a
+    /// server's report only signed by that server; an older server's
+    /// unsigned one only while it says it runs a release from before
+    /// reports were signed.
+    #[test]
+    fn review_the_rollout_takes_only_reports_servers_signed() {
+        let (_dir, tmp, coord, fc, _sd, _store) = brain();
+        let ctx = Ctx::new();
+        let now = Time::now().0.timestamp();
+        // node-a's real report, and the registry account's.
+        let (_d2, t2, server, sfc) = joined();
+        let mut real = Report { time: now, release: 4, ..Report::default() };
+        real.sign(&ctx, sfc.as_ref(), &server.path(HOST_KEY), 2, WG_PUBKEY).unwrap();
+        drop(t2);
+        let with = |r: Option<Report>| vec![coord_member(), Member { report: r, ..node_member(2) }];
+        let taken =
+            |r: Option<Report>| coord.trusted_reports(&ctx, with(r), &Report { release: 5, ..Report::default() }, now)[1].report.clone();
+        assert_eq!(taken(Some(real.clone())), Some(real.clone()), "its own signed report");
+        let forged = [
+            Report { release: 6, ..real.clone() },
+            Report { update: String::new(), update_serial: 0, release: 9, sig: String::new(), ..real.clone() },
+            Report {
+                sig: signed::fake::host_sig(COORD_KEY, signed::NS_REPORT, &Report { release: 6, ..real.clone() }.signed_text(2, WG_PUBKEY)),
+                release: 6,
+                ..real.clone()
+            },
+            Report { sig: signed::fake::host_sig(NODE_KEY, signed::NS_TURN, &real.signed_text(2, WG_PUBKEY)), ..real.clone() },
+        ];
+        for f in forged {
+            assert_eq!(taken(Some(f.clone())), None, "{f:?}");
+        }
+        assert!(get(&coord.root, REPORTS_STATUS).contains("node-a: "), "{}", get(&coord.root, REPORTS_STATUS));
+        // Since: the release this coordinator ran when it first checked
+        // (5). An older server says it runs 4, unsigned: taken as before.
+        assert!(get(&coord.root, SIGNED_REPORTS).contains(r#""since":5"#), "{}", get(&coord.root, SIGNED_REPORTS));
+        let old = Report { sig: String::new(), ..real.clone() };
+        assert_eq!(taken(Some(old.clone())), Some(old));
+        // An older signed report than one taken: not taken again.
+        let mut older = Report { time: now - 600, ..real.clone() };
+        older.sig.clear();
+        older.sign(&ctx, sfc.as_ref(), &server.path(HOST_KEY), 2, WG_PUBKEY).unwrap();
+        assert_eq!(taken(Some(older)), None, "a replayed older report");
+        let mut stale = Report { time: now - REPORT_MAX_AGE - 1, ..real.clone() };
+        stale.sig.clear();
+        stale.sign(&ctx, sfc.as_ref(), &server.path(HOST_KEY), 2, WG_PUBKEY).unwrap();
+        std::fs::remove_file(coord.path(SIGNED_REPORTS)).unwrap();
+        assert_eq!(taken(Some(stale)), None, "a day old");
+        // The coordinator's own report and members without one pass.
+        let out = coord.trusted_reports(&ctx, with(None), &Report::default(), now);
+        assert_eq!(out.len(), 2);
+        let _ = (tmp, fc);
+    }
+
+    /// Root leaves a receipt for the list its mesh follows, signed with its
+    /// host key, made again when the list changes or every five minutes.
+    #[test]
+    fn the_coordinator_leaves_a_receipt_for_the_list_it_follows() {
+        let (_dir, tmp, b, fc, _sd, store) = brain();
+        let env = sign(&ADMIN, 5, vec![coord_entry(), node_entry(2)]);
+        registry(&store, vec![coord_member(), node_member(2)], env.clone());
+        sync(&Ctx::new(), &b, true, &store).unwrap();
+        let r = store.read().unwrap().receipt;
+        let sha = fsx::hex(&sha2::Sha256::digest(env.doc.as_bytes()));
+        assert_eq!((r.version, r.sha256.as_str()), (5, sha.as_str()));
+        let text = registry::Receipt::text(r.version, &r.sha256, r.time);
+        assert!(signed::host_verify(&Ctx::new(), fc.as_ref(), tmp.path(), COORD_KEY, signed::NS_RECEIPT, &text, &r.sig).is_ok());
+        // Nothing new: the same receipt.
+        sync(&Ctx::new(), &b, true, &store).unwrap();
+        assert_eq!(store.read().unwrap().receipt, r);
+        // The registry account puts another one there: root makes its own
+        // again. A newer list: a receipt for it.
+        store
+            .update(|s| {
+                s.receipt.version = 7;
+                Ok(())
+            })
+            .unwrap();
+        sync(&Ctx::new(), &b, true, &store).unwrap();
+        assert_eq!(store.read().unwrap().receipt.version, 5);
+        let env6 = sign(&ADMIN, 6, vec![coord_entry()]);
+        registry(&store, vec![coord_member()], env6);
+        sync(&Ctx::new(), &b, true, &store).unwrap();
+        assert_eq!(store.read().unwrap().receipt.version, 6);
+        // A registry that holds an older list back: root follows its own
+        // newest, and leaves no receipt for the old one (it cannot write).
+        registry(&store, vec![coord_member(), node_member(2)], env);
+        assert!(sync(&Ctx::new(), &b, true, &store).is_err());
+        assert_eq!(store.read().unwrap().receipt.version, 6);
     }
 }

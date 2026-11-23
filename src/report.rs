@@ -149,6 +149,15 @@ pub struct Report {
     /// BOOT_STATES, "" when the machine cannot tell.
     #[serde(deserialize_with = "lenient", skip_serializing_if = "String::is_empty")]
     pub boot: String,
+    /// Its address on the home network, as it reaches the coordinator
+    /// there: where the admin's `NAME.lan` and the kill switch go.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "String::is_empty")]
+    pub lan: String,
+    /// The machine's SSH host key's signature over signed_text: the
+    /// registry account relays the report and could change it. None from
+    /// a machine of an older version.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "String::is_empty")]
+    pub sig: String,
 }
 
 /// How a machine boots (see install/boot.rs):
@@ -174,6 +183,10 @@ pub const BOOT_STATES: [&str; 5] = ["ready", "fallback", "no-fallback", "manual"
 pub const UPDATE_STATES: [&str; 6] = ["fetching", "pending", "failed", "reverted", "refused", "held"];
 /// The longest update note kept.
 pub const MAX_NOTE: usize = 160;
+/// The longest signature kept (one by an ed25519 key is about 300 bytes):
+/// the heartbeat must stay well within what coordinators read.
+const MAX_SIG: usize = 512;
+const SIG_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
@@ -293,7 +306,38 @@ impl Report {
             update_serial: if self.update_serial <= crate::release::MAX_SERIAL { self.update_serial } else { 0 },
             update_note: note(&self.update_note),
             boot: if BOOT_STATES.contains(&self.boot.as_str()) { self.boot } else { String::new() },
+            lan: if parse_ip4(&self.lan).is_some() { self.lan } else { String::new() },
+            sig: if self.sig.len() <= MAX_SIG && self.sig.starts_with(SIG_BEGIN) { self.sig } else { String::new() },
         }
+    }
+
+    /// What the machine signs of its report (sig): who it is (its host
+    /// number and WireGuard key, as the admin signed them), when, its
+    /// update and its LAN address. Taken from the report as sanitized
+    /// leaves it, on both sides.
+    pub fn signed_text(&self, host: u32, wg_key: &str) -> String {
+        format!(
+            "dryserver-report-v1\nhost {host}\nkey {wg_key}\ntime {}\nrelease {}\nupdate {}\nupdate_serial {}\nlan {}\n",
+            self.time, self.release, self.update, self.update_serial, self.lan
+        )
+    }
+
+    /// Signs the report with this machine's SSH host key at key_file, as
+    /// member host with WireGuard key wg_key.
+    pub fn sign(&mut self, ctx: &Ctx, run: &dyn Runner, key_file: &Path, host: u32, wg_key: &str) -> crate::err::Result<()> {
+        let text = self.clone().sanitized(|_| true).signed_text(host, wg_key);
+        self.sig = crate::signed::host_sign(ctx, run, key_file, crate::signed::NS_REPORT, &text)?;
+        Ok(())
+    }
+
+    /// Checks sig: made by the member host (WireGuard key wg_key) with its
+    /// SSH host key host_key, both from the list the admin signed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify(&self, ctx: &Ctx, run: &dyn Runner, tmp_dir: &Path, host: u32, wg_key: &str, host_key: &str) -> crate::err::Result<()> {
+        if self.sig.is_empty() {
+            return Err("not signed".into());
+        }
+        crate::signed::host_verify(ctx, run, tmp_dir, host_key, crate::signed::NS_REPORT, &self.signed_text(host, wg_key), &self.sig)
     }
 
     /// Whether its last update did not work.
@@ -447,6 +491,9 @@ pub fn gather(ctx: &Ctx, run: &dyn Runner, root: &Path, wg_subnet: &str) -> Repo
         update_serial: 0,
         update_note: String::new(),
         boot: crate::install::boot::state(root).into(),
+        // The caller's, with its signature (sync).
+        lan: String::new(),
+        sig: String::new(),
     };
     // What this machine sends is what every reader accepts, so nothing of
     // it is dropped on the way and it stays within the heartbeat's size.

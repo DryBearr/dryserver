@@ -248,7 +248,11 @@ Servers refuse agent forwarding even if you ask for it with `ssh -A`.
 
 `ssh-config` also writes `<name>.lan` entries, for example `ssh node-a.lan`:
 straight to the server's WiFi/router address, not through the coordinator,
-checked against the same pinned host key. The kill switch uses them.
+checked against the same pinned host key. The kill switch uses them. The
+address is the one the server signed in its report with its own host key
+(your desktop remembers the newest one), so the coordinator's registry
+account cannot point the kill switch elsewhere; for a server of an older
+version, which signs nothing, it is the coordinator's word.
 
 Host keys are checked against `~/.ssh/known_hosts.d/dryserver` alone, which
 holds the keys from the list you signed, and a server with any other key
@@ -996,7 +1000,14 @@ ended.
   list): the coordinator's own sync then keeps to the newest list it has
   seen, so a server you removed stays out of its mesh and out of the
   cluster, and its console shows an alarm until the registry is right
-  again (servers get no newer list meanwhile, and updates wait). Limit: a
+  again (servers get no newer list meanwhile, and updates wait). The
+  registry account could also take your newest list, answer your desktop
+  with it and never keep it: root on the coordinator leaves a receipt for
+  the list it follows, signed with its SSH host key, and `./dryserver
+  approve` and `release status` check it against the coordinator's key in
+  the list you signed. Three minutes after you signed a list the
+  coordinator does not follow, they say so plainly (also with no receipt,
+  a forged one, or none newer than 15 minutes). Limit: a
   hacked coordinator can hold back a newer list from servers that have not
   seen it yet, so a removal may not arrive; cut the machine off with
   `./dryserver quarantine-all -name NAME` then.
@@ -1108,6 +1119,17 @@ lies, or was broken into, can only change its own line: the coordinator
 and the desktop both check every field, and nothing in a report names
 another machine. Reports go to your desktop only; no server sees another
 one's report. A machine with an older dryserver sends none.
+
+Each server signs its report (its release, how its update stands, its
+LAN address, when) with its own SSH host key, as the registry account
+relays it. Root on the coordinator checks the signature with the key in
+the list you signed before the rollout takes a server for updated, and
+takes none older than one it took before; your desktop checks it too and
+does not show a report that fails. A server of an older version signs
+nothing: its report is shown as "Unsigned report" and taken as before,
+until it runs a release that signs (from the release the coordinator ran
+when it first checked, `/etc/dryserver/signed-reports.json`). Your
+desktop takes no unsigned report again from a machine that signed one.
 
 ## FAQ
 

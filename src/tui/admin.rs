@@ -861,7 +861,7 @@ impl Model for Screen {
         if !self.view.warnings.is_empty() {
             b.nl();
             for w in &self.view.warnings {
-                b.add(err(format!("! {w}"))).nl();
+                b.add(err(super::wrap(&format!("! {w}"), 78))).nl();
             }
         }
         b.nl();

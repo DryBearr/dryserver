@@ -33,6 +33,16 @@ pub const RELEASE_COPY: &str = "release.signed.json";
 const CLOCK_OFF: i64 = 120;
 /// The coordinator's SSH host key as first seen from this desktop.
 pub const KNOWN_HOSTS: &str = "coordinator_known_hosts";
+/// By WireGuard key, the LAN address in the newest report each member
+/// signed itself, in secrets/. A member that signed once is never taken
+/// unsigned again, and its `NAME.lan` (the kill switch's way in) stays
+/// where it said it is, whatever the registry account says.
+pub const SIGNERS: &str = "report-signers.json";
+/// After this long, a list the coordinator has not applied is called out.
+pub const RECEIPT_LAG: i64 = 180;
+/// A receipt older than this says the coordinator's sync does not run (it
+/// makes one at least every five minutes), or the registry holds them.
+pub const RECEIPT_OLD: i64 = 900;
 /// Host numbers of members this desktop removed, oldest first, in
 /// secrets/. A new machine gets none of them while another is free:
 /// servers that cut a removed machine off (quarantine) drop its mesh
@@ -459,6 +469,12 @@ pub struct Admin {
     /// host (0: the coordinator's own update). A resume or a skip names
     /// it, and the coordinator carries out only an ask for its own stop.
     stop: Option<(u64, u32)>,
+    /// Runs ssh-keygen for the checks of the machines' own signatures
+    /// (reports, the coordinator's receipt).
+    pub run: std::sync::Arc<dyn crate::runner::Runner>,
+    /// LAN addresses from the members' signed reports (SIGNERS), as last
+    /// loaded.
+    lans: std::collections::BTreeMap<String, String>,
 }
 
 impl Admin {
@@ -478,7 +494,135 @@ impl Admin {
             release: None,
             went_back: None,
             stop: None,
+            run: std::sync::Arc::new(crate::runner::ExecRunner::silent()),
+            lans: Default::default(),
         }
+    }
+
+    /// The members' signed LAN addresses (SIGNERS).
+    fn signers(&self) -> std::collections::BTreeMap<String, String> {
+        serde_json::from_str(&fsx::read_or_empty(self.secrets.join(SIGNERS))).unwrap_or_default()
+    }
+
+    /// Checks what each member says about itself against its own host key
+    /// in the list this desktop signed: the registry account relays it. A
+    /// report that does not check out is dropped, with a warning; one that
+    /// is not signed is kept, named, as the word of a server of an older
+    /// version, unless that member has signed one before.
+    fn check_reports(&mut self, members: &mut [Member], warnings: &mut Vec<String>) {
+        let was = self.signers();
+        let mut lans = was.clone();
+        let (mut unsigned, mut forged) = (Vec::new(), Vec::new());
+        let ctx = crate::ctx::Ctx::new();
+        let tmp = std::env::temp_dir();
+        for m in members.iter_mut() {
+            let Some(e) = self.base.members.iter().find(|e| e.matches(m)) else { continue };
+            let Some(r) = &m.report else { continue };
+            if r.sig.is_empty() {
+                if was.contains_key(&m.wg_key) {
+                    forged.push(m.name.clone());
+                    m.report = None;
+                } else {
+                    unsigned.push(m.name.clone());
+                }
+                continue;
+            }
+            match r.verify(&ctx, self.run.as_ref(), &tmp, e.host, &e.wg_key, &e.ssh_host_key) {
+                Ok(()) => {
+                    lans.insert(m.wg_key.clone(), r.lan.clone());
+                }
+                Err(_) => {
+                    forged.push(m.name.clone());
+                    m.report = None;
+                }
+            }
+        }
+        lans.retain(|k, _| self.base.members.iter().any(|e| e.wg_key == *k));
+        if lans != was {
+            let path = self.secrets.join(SIGNERS);
+            let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+            let _ = std::fs::remove_file(&tmp);
+            let saved = serde_json::to_string(&lans)
+                .map_err(Error::from)
+                .and_then(|t| fsx::write_new(&tmp, t + "\n", 0o600))
+                .and_then(|_| fsx::rename(&tmp, &path));
+            if let Err(e) = saved {
+                warnings.push(format!("Cannot keep the members' signed addresses in {}: {e}", path.display()));
+            }
+        }
+        if !forged.is_empty() {
+            warnings.push(format!(
+                "Not signed by the machine it is about, so not shown: the report of {}. The coordinator's registry account may \
+                 be broken into.",
+                forged.join(", ")
+            ));
+        }
+        if !unsigned.is_empty() {
+            warnings.push(format!(
+                "Unsigned report (a dryserver from before reports were signed): {}. What it says about itself is the \
+                 coordinator's word until it updates.",
+                unsigned.join(", ")
+            ));
+        }
+        self.lans = lans;
+    }
+
+    /// Whether the coordinator applied the list this desktop signed last,
+    /// by its receipt, checked against the coordinator's key in that list;
+    /// a warning when it did not, RECEIPT_LAG after the signature.
+    fn check_receipt(&self, r: &registry::Receipt, now: i64) -> Option<String> {
+        let coord = self.base.members.iter().find(|e| e.host == 1)?;
+        let signed_at = std::fs::metadata(self.copy_path())
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(now, |d| d.as_secs() as i64);
+        let late = now - signed_at > RECEIPT_LAG;
+        let v = self.base.version;
+        let removed = "A server you removed may still be in its mesh and its cluster: cut it off with \
+                       ./dryserver quarantine-all -name NAME.";
+        if r.is_empty() {
+            return late.then(|| {
+                format!(
+                    "The coordinator has sent no receipt for the list you signed (version {v}): it is older than this \
+                     dryserver, or its registry account holds the receipt back. Nothing shows that it applied your last \
+                     change. {removed}"
+                )
+            });
+        }
+        let text = registry::Receipt::text(r.version, &r.sha256, r.time);
+        let ctx = crate::ctx::Ctx::new();
+        if signed::host_verify(&ctx, self.run.as_ref(), &std::env::temp_dir(), &coord.ssh_host_key, signed::NS_RECEIPT, &text, &r.sig)
+            .is_err()
+        {
+            return Some(format!(
+                "The coordinator's receipt for the list it follows is not signed by the coordinator you signed: its \
+                 registry account may be broken into. {removed}"
+            ));
+        }
+        let sha = std::fs::read(self.copy_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Envelope>(&b).ok())
+            .map(|e| fsx::hex(&<sha2::Sha256 as sha2::Digest>::digest(e.doc.as_bytes())));
+        if r.version < v && late {
+            let ago = crate::report::short_age((now - signed_at).max(0) as u64);
+            return Some(format!(
+                "The coordinator has not applied list version {v}, which you signed {ago} ago: it follows version {}. Its \
+                 registry account may be holding your list back. {removed}",
+                r.version
+            ));
+        }
+        if r.version == v && sha.is_some_and(|s| s != r.sha256) {
+            return Some(format!("The coordinator follows another list under version {v} than the one you signed. {removed}"));
+        }
+        if now - r.time > RECEIPT_OLD && late {
+            let ago = crate::report::short_age((now - r.time).max(0) as u64);
+            return Some(format!(
+                "The coordinator's newest receipt is {ago} old: its sync does not run, or its registry account holds its \
+                 receipts back. Whether it follows your list is not known."
+            ));
+        }
+        None
     }
 
     /// The join secret installers used, from secrets/.
@@ -617,6 +761,10 @@ impl Admin {
             (None, None) => List::default(),
         };
         v.version = self.base.version;
+        if let Some(w) = self.check_receipt(&st.receipt, now) {
+            v.warnings.push(w);
+        }
+        self.check_reports(&mut members, &mut v.warnings);
 
         let missing: Vec<&str> =
             self.base.members.iter().filter(|e| !members.iter().any(|m| e.matches(m))).map(|e| e.name.as_str()).collect();
@@ -969,7 +1117,12 @@ impl Admin {
             .map(|e| crate::mesh::Server {
                 name: e.name.clone(),
                 mesh_ip: crate::mesh::ip(&self.subnet, e.host),
-                lan_ip: self.members.iter().find(|m| e.matches(m)).map(|m| m.lan_ip.clone()).unwrap_or_default(),
+                // What the member signed itself; the coordinator's word only
+                // for one that never signed a report (an older version).
+                lan_ip: match self.lans.get(&e.wg_key) {
+                    Some(lan) => lan.clone(),
+                    None => self.members.iter().find(|m| e.matches(m)).map(|m| m.lan_ip.clone()).unwrap_or_default(),
+                },
                 host_key: e.ssh_host_key.clone(),
             })
             .collect()
@@ -1141,6 +1294,7 @@ impl Admin {
 pub mod tests {
     use super::*;
     use crate::registry::{Mesh, Status, Store};
+    use crate::report::Report;
     use crate::signed::fake::Key;
     use crate::testutil::TempDir;
     use base64::Engine;
@@ -1306,6 +1460,146 @@ pub mod tests {
     /// when there is none).
     pub fn by_id(a: &Admin, id: &str) -> Request {
         a.pending.iter().find(|r| r.id == id).cloned().unwrap_or(Request { id: id.into(), ..Request::default() })
+    }
+
+    /// ssh-keygen as signed::fake::host_run answers it.
+    struct HostKeys;
+
+    impl crate::runner::Runner for HostKeys {
+        fn run(&self, _: &crate::ctx::Ctx, c: &crate::runner::Cmd) -> (String, Result<()>) {
+            signed::fake::host_run(c).unwrap_or_else(|| (String::new(), Err(Error::new("unknown"))))
+        }
+    }
+
+    /// Puts the copy of the signed list secs into the past, as if signed
+    /// then.
+    fn signed_ago(a: &Admin, secs: u64) {
+        let f = std::fs::File::options().write(true).open(a.copy_path()).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs)).unwrap();
+    }
+
+    /// A receipt by the coordinator with SSH host key key.
+    fn receipt(key: &str, version: u64, doc: &str, time: i64) -> registry::Receipt {
+        let sha256 = fsx::hex(&<sha2::Sha256 as sha2::Digest>::digest(doc.as_bytes()));
+        let sig = signed::fake::host_sig(key, signed::NS_RECEIPT, &registry::Receipt::text(version, &sha256, time));
+        registry::Receipt { version, sha256, time, sig }
+    }
+
+    /// The review's case: the registry account takes the admin's newest
+    /// list, answers the desktop with it, and never keeps it for root. The
+    /// coordinator's receipt, signed with its host key, says what root
+    /// follows: the approval screen (and release status) say so plainly.
+    #[test]
+    fn review_a_list_the_registry_holds_back_is_called_out() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        a.run = Arc::new(HostKeys);
+        let id = ask(&store, "node-a", 2);
+        a.load().unwrap();
+        a.approve(&by_id(&a, &id)).unwrap();
+        let now = Time::now().0.timestamp();
+        let doc = store.read().unwrap().signed.doc;
+        let v1 = a.base.version;
+        let warned = |a: &mut Admin, want: &str| a.load().unwrap().warnings.iter().any(|w| w.contains(want));
+        let set = |r: registry::Receipt| {
+            store
+                .update(|s| {
+                    s.receipt = r;
+                    Ok(())
+                })
+                .unwrap()
+        };
+        // Signed a moment ago: nothing to say yet, even without a receipt.
+        assert!(!warned(&mut a, "receipt") && !warned(&mut a, "not applied"));
+        signed_ago(&a, 600);
+        assert!(warned(&mut a, "sent no receipt for the list you signed"), "an older coordinator, or one held back");
+        set(receipt(COORD_KEY, v1, &doc, now));
+        assert!(a.load().unwrap().warnings.iter().all(|w| !w.contains("receipt") && !w.contains("applied")));
+        // The admin removes node-a; the registry account keeps the old list.
+        a.remove("node-a").unwrap();
+        store
+            .update(|s| {
+                s.signed.doc = doc.clone();
+                s.signed_version = v1;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!warned(&mut a, "has not applied"), "signed a moment ago");
+        signed_ago(&a, 300);
+        let w = a.load().unwrap().warnings.join("\n");
+        assert!(
+            w.contains(&format!("has not applied list version {}", a.base.version)) && w.contains(&format!("it follows version {v1}")),
+            "{w}"
+        );
+        assert!(w.contains("quarantine-all -name NAME"), "{w}");
+        // A receipt the registry account made itself, or one it put back
+        // from another list under the version.
+        set(receipt("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIevil", a.base.version, "{}", now));
+        assert!(warned(&mut a, "not signed by the coordinator you signed"));
+        set(receipt(COORD_KEY, a.base.version, "another list", now));
+        assert!(warned(&mut a, "follows another list under version"));
+        // Root applied it: nothing to say. Then its sync stops.
+        let doc2 = std::fs::read_to_string(a.copy_path()).unwrap();
+        let env: Envelope = serde_json::from_str(&doc2).unwrap();
+        set(receipt(COORD_KEY, a.base.version, &env.doc, now));
+        assert!(a.load().unwrap().warnings.iter().all(|w| !w.contains("receipt") && !w.contains("applied")));
+        set(receipt(COORD_KEY, a.base.version, &env.doc, now - 3600));
+        assert!(warned(&mut a, "newest receipt is 1h old"));
+    }
+
+    /// What a server says about itself counts only signed by it: one the
+    /// registry account changed is not shown, and the kill switch's way to
+    /// it stays the address it signed.
+    #[test]
+    fn a_report_counts_only_signed_by_its_machine() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        a.run = Arc::new(HostKeys);
+        let id = ask(&store, "node-a", 2);
+        a.load().unwrap();
+        a.approve(&by_id(&a, &id)).unwrap();
+        let key = request("node-a", 2).ssh_host_key;
+        let signed_report = |lan: &str, release: u64| {
+            let r = Report { time: 1_800_000_000, release, lan: lan.into(), ..Report::default() };
+            Report { sig: signed::fake::host_sig(&key, signed::NS_REPORT, &r.signed_text(2, &key32(2))), ..r }
+        };
+        let send = |r: Option<Report>, lan: &str| {
+            store
+                .update(|s| {
+                    let m = s.members.iter_mut().find(|m| m.host == 2).unwrap();
+                    m.report = r;
+                    m.lan_ip = lan.into();
+                    Ok(())
+                })
+                .unwrap()
+        };
+        let lan = |a: &Admin| a.servers().into_iter().find(|s| s.name == "node-a").unwrap().lan_ip;
+        // An older server: unsigned, said so, the coordinator's address.
+        send(Some(Report { release: 3, ..Report::default() }), "192.168.1.23");
+        let v = a.load().unwrap();
+        assert!(v.warnings.iter().any(|w| w.contains("Unsigned report") && w.contains("node-a")), "{:?}", v.warnings);
+        assert_eq!(lan(&a), "192.168.1.23");
+        // Updated: signed. Shown, and its own address taken.
+        send(Some(signed_report("192.168.1.24", 4)), "192.168.1.24");
+        let v = a.load().unwrap();
+        assert!(v.warnings.iter().all(|w| !w.contains("report")), "{:?}", v.warnings);
+        assert_eq!(v.members.iter().find(|(m, _)| m.host == 2).unwrap().0.report.as_ref().unwrap().release, 4);
+        assert_eq!(lan(&a), "192.168.1.24");
+        // The registry account changes it, points the address elsewhere,
+        // or drops the signature: not shown, and the address stays.
+        for (r, at, good) in [
+            (Report { release: 9, ..signed_report("192.168.1.24", 4) }, "192.168.1.24", false),
+            (signed_report("192.168.1.24", 4), "192.168.1.66", true),
+            (Report { lan: "192.168.1.66".into(), ..signed_report("192.168.1.24", 4) }, "192.168.1.66", false),
+            (Report { sig: String::new(), ..signed_report("192.168.1.24", 9) }, "192.168.1.66", false),
+        ] {
+            send(Some(r.clone()), at);
+            let v = a.load().unwrap();
+            let shown = v.members.iter().find(|(m, _)| m.host == 2).unwrap().0.report.is_some();
+            let warned = v.warnings.iter().any(|w| w.contains("Not signed by the machine") && w.contains("node-a"));
+            assert_eq!((shown, warned), (good, !good), "{r:?}");
+            assert_eq!(lan(&a), "192.168.1.24", "{r:?}");
+        }
     }
 
     /// A removed member's number is not given to the next machine while
