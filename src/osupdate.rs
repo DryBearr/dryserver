@@ -3178,8 +3178,10 @@ impl Found {
         for n in 0..100 {
             let suffix = if n == 0 { ".pacsave".to_string() } else { format!(".pacsave.{n}") };
             let to = CString::new([self.name.as_bytes(), suffix.as_bytes()].concat()).map_err(io::Error::other)?;
+            // The system call itself: musl, which the static binary is
+            // built with, has no renameat2 wrapper.
             // SAFETY: a valid directory descriptor and C strings.
-            let res = match unsafe { libc::renameat2(fd, self.name.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) } {
+            let res = match unsafe { libc::syscall(libc::SYS_renameat2, fd, self.name.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) } {
                 0 => Ok(()),
                 _ => Err(os_err()),
             };
