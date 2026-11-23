@@ -543,6 +543,9 @@ pub struct ArchOutcome {
     /// main kernel changed in this one (or did not boot well yet), and only
     /// one kernel is ever in flight.
     pub lts_waits: bool,
+    /// The main kernel's update waits for the next run the same way: the
+    /// fallback kernel was put back in this one (lost_packages).
+    pub main_waits: bool,
     pub warnings: Vec<String>,
     /// The pacman run that failed changed nothing (pacman refused before it
     /// began: files in the way, a damaged package, no room): the packages
@@ -563,10 +566,15 @@ pub struct ArchOutcome {
     #[serde(skip)]
     cut_off: bool,
     /// Packages that install left out of pacman's database (lost_packages):
-    /// installed again by name in this run. And what the install run that
-    /// goes now is to install (INSTALLING lists them).
+    /// installed again by name in this run; and every name of that kind,
+    /// which the marker keeps until they are back (carry). And what the
+    /// install run that goes now upgrades (INSTALLING lists them).
     #[serde(skip)]
     lost: Vec<String>,
+    #[serde(skip)]
+    carry: Vec<String>,
+    #[serde(skip)]
+    unverified: bool,
     #[serde(skip)]
     marker: Vec<String>,
     /// The end of the output of the pacman run that failed.
@@ -632,6 +640,9 @@ impl ArchOutcome {
         }
         if self.lts_waits {
             s += ", the fallback kernel linux-lts follows at the next update";
+        }
+        if self.main_waits {
+            s += ", the main kernel linux follows at the next update";
         }
         for r in &self.repairs {
             s += &format!(", {r}");
@@ -723,16 +734,35 @@ impl Host<'_> {
         if fallback {
             args.extend(["--ignore", "linux-lts"]);
         }
+        // A package split a rollback before left (SPLIT): the older package
+        // and the newer one both own its files. Going on, an upgrade of the
+        // older package would delete them, though the newer one still owns
+        // them: settled first.
+        if !out.downgrade && fs::symlink_metadata(self.path(SPLIT)).is_ok() {
+            if let Split::Shared(why) = self.drop_split_owners(ctx, out, true) {
+                out.failure = Some(Failure::refused(errf!("{why}: going on now would delete those files"), true));
+                self.say(&out.summary());
+                return;
+            }
+            let _ = fs::remove_file(self.path(SPLIT));
+        }
         let marker = self.cut_off_targets();
         out.cut_off = marker.is_some();
-        out.lost = self.lost_packages(ctx, marker.as_deref().unwrap_or_default(), &args, out);
+        self.lost_packages(ctx, marker.as_deref().unwrap_or_default(), &args, out);
         let lts_lost = out.lost.iter().any(|p| p == "linux-lts");
         let lost: Vec<String> = out.lost.iter().filter(|p| *p != "linux-lts").cloned().collect();
         args.extend(lost.iter().map(String::as_str));
         if lts_lost {
             // The fallback kernel is broken as it is: it goes back in a run
-            // of its own, first, while the main kernel is untouched.
+            // of its own, first, while the main kernel is untouched; and the
+            // main kernel's update waits for the next run (one kernel in
+            // flight at a time).
             out.failure = self.install_run(ctx, &["-S", "--noconfirm", "linux-lts"], out).err();
+            if !lost.iter().any(|p| p == "linux") && self.package_due(ctx, "linux", out.downgrade) {
+                args.extend(["--ignore", "linux"]);
+                out.main_waits = true;
+                self.say("Arch: the main kernel linux waits for the next update: the fallback kernel was put back in this one, one kernel at a time");
+            }
         }
         if out.failure.is_none() {
             out.failure = self.install_run(ctx, &args, out).err();
@@ -758,7 +788,7 @@ impl Host<'_> {
             }
         }
         if out.failure.is_none() {
-            self.drop_split_owners(ctx, out);
+            self.drop_split_owners(ctx, out, false);
             // A newer package that keeps its entry for now shares its files
             // with the older one: removed, it would take them along.
             if out.downgrade && fs::symlink_metadata(self.path(SPLIT)).is_ok() {
@@ -817,14 +847,19 @@ impl Host<'_> {
         self.say(&out.summary());
     }
 
-    /// Whether linux-lts changes with this snapshot: pacman -Qu says so
-    /// going forward; going back, it may, so it counts as changing.
+    /// Whether linux-lts changes with this snapshot (package_due).
     fn fallback_due(&self, ctx: &Ctx, downgrade: bool) -> bool {
+        self.package_due(ctx, "linux-lts", downgrade)
+    }
+
+    /// Whether package changes with this snapshot: pacman -Qu says so
+    /// going forward; going back, it may, so it counts as changing.
+    fn package_due(&self, ctx: &Ctx, package: &str, downgrade: bool) -> bool {
         if downgrade {
             return true;
         }
-        let q = self.run.output(&ctx.with_timeout(self.limits.sync), &pacman(&["-Qu", "linux-lts"]).quiet());
-        q.is_ok_and(|o| o.contains("linux-lts"))
+        let q = self.run.output(&ctx.with_timeout(self.limits.sync), &pacman(&["-Qu", package]).quiet());
+        q.is_ok_and(|o| o.split_whitespace().next() == Some(package))
     }
 
     /// Whether the main kernel booted well (main_known_good): only then may
@@ -833,12 +868,14 @@ impl Host<'_> {
         self.main_known_good()
     }
 
-    /// The fallback kernel runs, or the main kernel's image failed: a run
-    /// of arch_install looks at every kernel's image then, and makes one
-    /// that was never made (a run cut off before pacman's hook), whatever
-    /// it installs.
+    /// The fallback kernel runs, or the main kernel's image failed, and a
+    /// kernel's image is older than the kernel (a run cut off before
+    /// pacman's hook made it): a run of arch_install makes it, whatever it
+    /// installs. Not for every start of the fallback kernel: a main kernel
+    /// that does not work on this machine would otherwise send every
+    /// release through pacman, and a dead mirror hold even an urgent one.
     pub fn boot_needs_look(&self) -> bool {
-        self.fallback_runs() || self.main_image_bad()
+        (self.fallback_runs() || self.main_image_bad()) && self.boot_problem(false, true, &self.kernels()).is_some()
     }
 
     /// The main kernel runs, is the one on disk (not replaced), and booted
@@ -929,10 +966,17 @@ impl Host<'_> {
     /// one (overwrite_plan), it runs once more with exactly those paths
     /// allowed (--overwrite, each path matching itself only). Never more.
     fn install_run(&self, ctx: &Ctx, args: &[&str], out: &mut ArchOutcome) -> Result<(), Failure> {
-        // What it installs, for its marker (with what an install before it
-        // left out of the database, until that is back).
-        let mut marker = self.run_targets(ctx, args);
-        marker.extend(out.lost.iter().filter(|p| !marker.contains(p)).cloned().collect::<Vec<_>>());
+        // What it upgrades, for its marker: of what it installs, only what
+        // is installed now has an entry in pacman's database to lose (a new
+        // dependency it does not get to is no loss). And what an install
+        // before it left out of the database, until that is back.
+        let targets = self.run_targets(ctx, args);
+        let installed = if targets.is_empty() { None } else { self.installed_names(ctx) };
+        let mut marker: Vec<String> = match installed {
+            Some(installed) => targets.into_iter().filter(|p| installed.contains(p)).collect(),
+            None => targets,
+        };
+        marker.extend(out.carry.iter().filter(|p| !marker.contains(p)).cloned().collect::<Vec<_>>());
         out.marker = marker;
         let res = self.install_run_marked(ctx, args, out);
         out.marker.clear();
@@ -1061,40 +1105,51 @@ impl Host<'_> {
     /// database. pacman removes a package's old entry before it writes the
     /// new one: a power cut in between leaves its files without an owner,
     /// and -Su never installs it again (for linux: the main kernel gone for
-    /// good). They are what the cut-off run was to install (its marker),
-    /// is not installed now (pacman -Qq) and this run would not bring
-    /// either (pacman -Sup, args): those are new dependencies of a package
-    /// it did not get to, which come with it. They are installed by name,
-    /// over their own files (overwrite_plan); their install reason is lost
-    /// with the entry, and they come back as installed on purpose.
-    fn lost_packages(&self, ctx: &Ctx, cut: &[String], args: &[&str], out: &mut ArchOutcome) -> Vec<String> {
+    /// good). They are what the cut-off run was to upgrade (its marker:
+    /// packages installed as it began), is not installed now (pacman -Qq)
+    /// and this run would not bring either (pacman -Sup, args). They are
+    /// installed by name, over their own files (overwrite_plan), when the
+    /// snapshot has them; their install reason is lost with the entry, and
+    /// they come back as installed on purpose. Sets out.lost (by name now)
+    /// and out.carry (all of them: the marker keeps them until they are
+    /// back, also across a run that fails; and the whole marker when pacman
+    /// cannot say what is installed).
+    fn lost_packages(&self, ctx: &Ctx, cut: &[String], args: &[&str], out: &mut ArchOutcome) {
         if cut.is_empty() {
-            return Vec::new();
+            return;
         }
-        let tctx = ctx.with_timeout(self.limits.sync);
-        let installed: BTreeSet<String> =
-            match self.run.output(&tctx, &pacman(&["-Qq"]).quiet().stdout_only().interrupt(Some(PACMAN_GRACE))) {
-                Ok(o) => o.lines().map(str::trim).map(str::to_string).collect(),
-                Err(e) => {
-                    out.warnings.push(format!(
-                        "cannot tell whether the install that was cut off left packages out of pacman's database (pacman -Qq: {})",
-                        one_line(&e.to_string(), 200)
-                    ));
-                    return Vec::new();
-                }
-            };
+        let Some(installed) = self.installed_names(ctx) else {
+            out.warnings.push("cannot tell whether the install that was cut off left packages out of pacman's database (pacman -Qq failed): the next update looks again".into());
+            out.carry = cut.to_vec();
+            out.unverified = true;
+            return;
+        };
         let missing: Vec<String> = cut.iter().filter(|p| !installed.contains(*p)).cloned().collect();
         if missing.is_empty() {
-            return missing;
+            return;
         }
         let coming = self.run_targets(ctx, args);
-        let lost: Vec<String> = missing.into_iter().filter(|p| !coming.contains(p)).collect();
-        if !lost.is_empty() {
-            let msg = format!("an install cut off half way left {} out of pacman's database: installed again by name", lost.join(", "));
+        out.carry = missing.into_iter().filter(|p| !coming.contains(p)).collect();
+        // By name only what this snapshot has: a name it lacks would stop
+        // the whole run (target not found).
+        let tctx = ctx.with_timeout(self.limits.sync);
+        let (here, gone): (Vec<String>, Vec<String>) = out.carry.iter().cloned().partition(|p| {
+            let cmd = pacman(&["-Sddp", "--print-format", "%n", p]).quiet().stdout_only().interrupt(Some(PACMAN_GRACE));
+            self.run.output(&tctx, &cmd).is_ok_and(|o| o.lines().any(|l| l.trim() == p))
+        });
+        if !here.is_empty() {
+            let msg = format!("an install cut off half way left {} out of pacman's database: installed again by name", here.join(", "));
             self.say(&format!("Arch: {msg}"));
             out.repairs.push(msg);
         }
-        lost
+        if !gone.is_empty() {
+            out.warnings.push(format!(
+                "an install cut off half way left {} out of pacman's database, and the snapshot of {} lacks them: install them again by hand (pacman -S) once a release has them",
+                gone.join(", "),
+                out.date
+            ));
+        }
+        out.lost = here;
     }
 
     /// What pacman installs or upgrades with args (the same with -p:
@@ -1146,19 +1201,40 @@ impl Host<'_> {
     /// A power cut on the way leaves SPLIT, and the next run that installs
     /// well does it again. While SPLIT is there, nothing is removed as an
     /// orphan (remove_foreign_orphans): the newer package shares its files.
-    fn drop_split_owners(&self, ctx: &Ctx, out: &mut ArchOutcome) {
-        let Ok(text) = fs::read_to_string(self.path(SPLIT)) else { return };
+    ///
+    /// any: before a run that goes forward again (arch_install), the newer
+    /// packages leave the database whether the snapshot has them or not:
+    /// with both entries an upgrade of the older package deletes the files
+    /// the newer one still owns. That run is as after the older day, and a
+    /// package of the newer day that needs the newer one brings it back.
+    fn drop_split_owners(&self, ctx: &Ctx, out: &mut ArchOutcome, any: bool) -> Split {
+        let Ok(text) = fs::read_to_string(self.path(SPLIT)) else { return Split::Done };
         let Ok(record) = serde_json::from_str::<SplitRecord>(&text) else {
             out.warnings.push(format!("{SPLIT} is damaged: the packages it names keep their database entry"));
             let _ = fs::remove_file(self.path(SPLIT));
-            return;
+            return Split::Done;
         };
         let tctx = ctx.with_timeout(self.limits.sync);
-        let foreign = match self.foreign(ctx) {
+        let older: BTreeSet<&str> = record.targets.values().map(String::as_str).collect();
+        let older = if older.is_empty() { "the older packages".to_string() } else { older.into_iter().collect::<Vec<_>>().join(", ") };
+        let both = |why: &str| {
+            format!(
+                "{} and {older} both own {} (a package split a rollback left), and {why}",
+                record.owners.join(", "),
+                record.paths.join(" ")
+            )
+        };
+        let candidates = if any {
+            self.installed_names(ctx).ok_or_else(|| "cannot tell which packages are installed (pacman -Qq failed)".to_string())
+        } else {
+            self.foreign(ctx)
+        };
+        let candidates = match candidates {
             Ok(f) => f,
             Err(e) => {
-                out.warnings.push(e);
-                return;
+                let why = both(&e);
+                out.warnings.push(why.clone());
+                return Split::Shared(why);
             }
         };
         // pacman -Qo names one owner of a file only (the first it finds), so
@@ -1166,6 +1242,7 @@ impl Host<'_> {
         // package's own file list can. A record from before the targets has
         // only -Qo: a file it names another owner of is that one's as well.
         let mut lists: BTreeMap<String, Option<BTreeSet<String>>> = BTreeMap::new();
+        let mut not_taken = Vec::new();
         for p in &record.paths {
             let taken = match record.targets.get(p) {
                 Some(t) if package_name(t) && !record.owners.contains(t) => {
@@ -1179,20 +1256,30 @@ impl Host<'_> {
                 None => false,
             };
             if !taken {
-                out.warnings.push(format!(
-                    "{p} is not owned by the package that took it over yet: {} keep(s) its database entry for now",
-                    record.owners.join(", ")
-                ));
-                return;
+                not_taken.push(p.clone());
             }
         }
-        let drop: Vec<&str> = record.owners.iter().map(String::as_str).filter(|o| package_name(o) && foreign.contains(*o)).collect();
+        if let Some(p) = not_taken.first() {
+            out.warnings.push(format!(
+                "{p} is not owned by the package that took it over yet: {} keep(s) its database entry for now",
+                record.owners.join(", ")
+            ));
+            // None of the files is the older packages': the newer ones own
+            // them alone. Some are: both own those.
+            return if not_taken.len() == record.paths.len() {
+                Split::Apart
+            } else {
+                Split::Shared(both(&format!("{p} is the newer one's alone")))
+            };
+        }
+        let drop: Vec<&str> = record.owners.iter().map(String::as_str).filter(|o| package_name(o) && candidates.contains(*o)).collect();
         if !drop.is_empty() {
             let mut args = vec!["-Rdd", "--dbonly", "--noconfirm"];
             args.extend(&drop);
             if let Err(f) = self.pacman_step(ctx, Stage::Install, &args, self.limits.install, out) {
-                out.warnings.push(format!("removing the database entry of {} failed: {}", drop.join(", "), f.reason));
-                return;
+                let why = both(&format!("removing the database entry of {} failed: {}", drop.join(", "), f.reason));
+                out.warnings.push(why.clone());
+                return Split::Shared(why);
             }
             let msg = format!("{} left pacman's database (their files stay, owned by the older packages)", drop.join(", "));
             self.say(&format!("Arch: {msg}"));
@@ -1203,6 +1290,15 @@ impl Host<'_> {
             out.warnings.push(format!("pacman -Dk finds problems in its database: {}", one_line(&o, 600)));
         }
         let _ = fs::remove_file(self.path(SPLIT));
+        Split::Done
+    }
+
+    /// The names of the installed packages (pacman -Qq); None when pacman
+    /// does not say.
+    fn installed_names(&self, ctx: &Ctx) -> Option<BTreeSet<String>> {
+        let cmd = pacman(&["-Qq"]).quiet().stdout_only().interrupt(Some(PACMAN_GRACE));
+        let o = self.run.output(&ctx.with_timeout(self.limits.sync), &cmd).ok()?;
+        Some(o.lines().map(str::trim).filter(|l| package_name(l)).map(str::to_string).collect())
     }
 
     /// The files of the installed package (pacman -Qlq): absolute paths,
@@ -1305,6 +1401,36 @@ impl Host<'_> {
         Ok(shared)
     }
 
+    /// INSTALLING: the day, then one package a line (see lost_packages).
+    fn write_marker(&self, date: &str, names: &[String]) {
+        let mut text = format!("{date}\n");
+        for p in names {
+            text += &format!("{p}\n");
+        }
+        let _ = fsx::mkdir_all(fsx::dir(self.path(INSTALLING)), 0o700)
+            .and_then(|_| write_atomic(&self.path(INSTALLING), text.as_bytes(), 0o600));
+    }
+
+    /// After an install run returned. It went well: the marker goes. It
+    /// failed: when pacman changed something, what the run upgraded may be
+    /// out of the database as after a cut; and what an install before left
+    /// out still is (carry). The marker keeps those names, and the next run
+    /// finishes them.
+    fn end_marker(&self, out: &ArchOutcome, ok: bool) {
+        let keep = match (ok, out.untouched) {
+            // Names pacman could not check (-Qq failed) stay for the next run.
+            (true, _) => Some(out.carry.clone()).filter(|c| out.unverified && !c.is_empty()),
+            (false, true) => Some(out.carry.clone()).filter(|c| !c.is_empty()),
+            (false, false) => Some(out.marker.clone()),
+        };
+        match keep {
+            Some(names) => self.write_marker(&out.date, &names),
+            None => {
+                let _ = fs::remove_file(self.path(INSTALLING));
+            }
+        }
+    }
+
     fn pacman_step(&self, ctx: &Ctx, stage: Stage, args: &[&str], limit: Duration, out: &mut ArchOutcome) -> Result<(), Failure> {
         let tctx = ctx.with_timeout(limit);
         let log_before = fs::metadata(self.path(PACMAN_LOG)).map(|m| m.len()).unwrap_or(0);
@@ -1313,22 +1439,17 @@ impl Host<'_> {
             // runs: that would stop it half way through a package as well.
             // The marker stays only when it is cut off all the same.
             let cmd = pacman(args).interrupt(None).keep_fd(self.lock_fd);
-            // The day, then what the run installs (see lost_packages).
-            let mut text = format!("{}\n", out.date);
-            for p in &out.marker {
-                text += &format!("{p}\n");
-            }
-            let _ = fsx::mkdir_all(fsx::dir(self.path(INSTALLING)), 0o700)
-                .and_then(|_| write_atomic(&self.path(INSTALLING), text.as_bytes(), 0o600));
-            let r = self.inhibited("pacman installs an update", &mut out.warnings, || self.run.run(&tctx, &cmd));
-            let _ = fs::remove_file(self.path(INSTALLING));
-            r
+            self.write_marker(&out.date, &out.marker);
+            self.inhibited("pacman installs an update", &mut out.warnings, || self.run.run(&tctx, &cmd))
         } else {
             self.run.run(&tctx, &pacman(args).interrupt(Some(PACMAN_GRACE)))
         };
         out.hook_failed |= o.contains(HOOK_FAILED);
         let Err(e) = res else {
             out.untouched = false;
+            if stage == Stage::Install {
+                self.end_marker(out, true);
+            }
             return Ok(());
         };
         out.tail = tail(&o);
@@ -1336,6 +1457,9 @@ impl Host<'_> {
         // pacman says "no packages were upgraded" after any failed commit;
         // its log says whether one was all the same.
         out.untouched = said.none_upgraded && self.changes_since(log_before).0 == 0;
+        if stage == Stage::Install {
+            self.end_marker(out, false);
+        }
         let real = said.lines();
         out.said = said;
         // The error ends with pacman's last line of output: text from the
@@ -1809,6 +1933,18 @@ struct SplitRecord {
     /// target in pacman's conflict line). Empty in a record a dryserver
     /// from before it wrote.
     targets: BTreeMap<String, String>,
+}
+
+/// Where a package split a rollback left stands (Host::drop_split_owners).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Split {
+    /// There is none, or it is done: the newer packages left the database.
+    Done,
+    /// The older packages do not own the files (yet): the newer ones own
+    /// them alone.
+    Apart,
+    /// Both own some of them, and the newer ones keep their entry: why.
+    Shared(String),
 }
 
 const MAX_SAID: usize = 8;
@@ -2573,6 +2709,8 @@ mod tests {
         mkinitcpio_makes: Vec<&'static str>,
         /// linux-lts has an update in the snapshot (pacman -Qu says so).
         lts_newer: bool,
+        /// linux has an update in the snapshot.
+        main_newer: bool,
     }
 
     const SLOW: Duration = Duration::from_millis(200);
@@ -2600,6 +2738,7 @@ mod tests {
                 mkinitcpio_fails: false,
                 mkinitcpio_makes: Vec::new(),
                 lts_newer: false,
+                main_newer: false,
             }
         }
 
@@ -2636,6 +2775,7 @@ mod tests {
             match (c.name.as_str(), args.as_slice()) {
                 ("pacman", ["-Qu", "archlinux-keyring"]) if self.keyring_newer => ok("archlinux-keyring 20261001-1 -> 20261115-1\n"),
                 ("pacman", ["-Qu", "linux-lts"]) if self.lts_newer => ok("linux-lts 6.6.60-1 -> 6.6.63-1\n"),
+                ("pacman", ["-Qu", "linux"]) if self.main_newer => ok("linux 6.12.1.arch1-1 -> 6.12.4.arch1-1\n"),
                 ("pacman", ["-Qu", _]) => (String::new(), Err("pacman failed: exit status 1".into())),
                 ("mkinitcpio", ["-P"]) if self.mkinitcpio_fails => {
                     ("==> ERROR: no space left on device\n".into(), Err("mkinitcpio failed: exit status 1".into()))
@@ -3915,6 +4055,50 @@ mod tests {
     }
 
     #[test]
+    fn review_a_split_a_rollback_left_is_settled_before_going_forward() {
+        // A rollback across the openssl split left SPLIT (a power cut, or
+        // its linux-lts run failed before the drop). The next release goes
+        // forward: -Su upgrades openssl to the version without the .so.3
+        // files, and with openssl-3's entry still there pacman deletes the
+        // files openssl-3 owns too: no SSH logins, no pacman. Settled first.
+        let paths = vec!["/usr/lib/libcrypto.so.3".to_string(), "/usr/lib/libssl.so.3".to_string()];
+        let targets = paths.iter().map(|p| (p.clone(), "openssl".to_string())).collect();
+        let record = SplitRecord { owners: vec!["openssl-3".into()], paths, targets };
+        let run = |qlq: &'static str, rdd_fails: bool| {
+            let dir = two_kernels();
+            put(dir.path(), MIRRORLIST, mirrorlist("2026/11/08").unwrap());
+            put(dir.path(), SPLIT, serde_json::to_string(&record).unwrap());
+            let mut fake = Fake::with_pacman(dir.path(), move |_, _, c| match c.args[0].as_str() {
+                "-Qq" => ("glibc\nopenssl\nopenssl-3\n".into(), Ok(())),
+                "-Qlq" => (qlq.into(), Ok(())),
+                "-Rdd" if rdd_fails => (String::new(), Err("pacman failed: exit status 1: unable to lock database".into())),
+                _ => (String::new(), Ok(())),
+            });
+            fake.keyring_newer = false;
+            let (h, _) = host(dir.path(), &fake);
+            let out = h.arch_update(&Ctx::new(), "2026/11/22", false);
+            let split = h.path(SPLIT).exists();
+            (out, fake.pacman_lines(), split, dir)
+        };
+        // Both own the files: openssl-3 leaves the database before anything
+        // installs, though the snapshot has it (a package that needs it
+        // brings it back).
+        let (out, lines, split, _dir) = run("/usr/lib/\n/usr/lib/libcrypto.so.3\n/usr/lib/libssl.so.3\n", false);
+        assert!(out.ok() && !split, "{}", out.summary());
+        let at = |l: &str| lines.iter().position(|x| x.starts_with(l));
+        assert!(at("pacman -Rdd --dbonly --noconfirm openssl-3") < at("pacman -Su "), "{lines:?}");
+        // It cannot leave: nothing installs, and the reason says why.
+        let (out, lines, split, _dir) = run("/usr/lib/libcrypto.so.3\n/usr/lib/libssl.so.3\n", true);
+        let why = out.failure.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
+        assert!(why.contains("openssl-3 and openssl both own") && why.contains("would delete those files"), "{why}");
+        assert!(split && !lines.iter().any(|l| l.starts_with("pacman -Su ")), "{lines:?}");
+        // The older package does not own them: openssl-3 has them alone, and
+        // the record is done with.
+        let (out, lines, split, _dir) = run("", false);
+        assert!(out.ok() && !split && !lines.iter().any(|l| l.starts_with("pacman -Rdd")), "{lines:?}");
+    }
+
+    #[test]
     fn review_a_kept_split_owner_is_never_removed_as_an_orphan() {
         // The split owner kept its entry (its files are not the older
         // package's yet, -Rdd failed, or -Qmq did): it is a foreign orphan,
@@ -4132,63 +4316,96 @@ mod tests {
         // one: a power cut in between leaves its files without an owner and
         // -Su never installs it again (for linux, the main kernel is gone
         // for good). The marker lists what the run was to install.
-        let run = |marker: &str, installed: &'static str, coming: &'static str| {
+        // installed: what pacman -Qq says ("fails": it fails); coming: what
+        // pacman -Sup says; the snapshot has every package but "gone".
+        let run = |marker: &str, installed: &'static str, coming: &'static str, main_newer: bool| {
             let dir = two_kernels();
             put(dir.path(), INSTALLING, marker);
             let mut fake = Fake::with_pacman(dir.path(), move |_, _, c| match c.args[0].as_str() {
                 "-Qq" if installed == "fails" => (String::new(), Err("pacman failed: exit status 1".into())),
                 "-Qq" => (installed.into(), Ok(())),
                 "-Sup" => (coming.into(), Ok(())),
+                "-Sddp" if c.args.last().is_some_and(|a| a == "gone") => {
+                    ("error: target not found: gone\n".into(), Err("pacman failed: exit status 1".into()))
+                }
+                "-Sddp" => (format!("{}\n", c.args.last().unwrap()), Ok(())),
                 _ => (String::new(), Ok(())),
             });
             fake.keyring_newer = false;
+            fake.main_newer = main_newer;
             let (h, _) = host(dir.path(), &fake);
             let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
             let installs: Vec<String> =
                 fake.pacman_lines().into_iter().filter(|l| l.starts_with("pacman -S ") || l.starts_with("pacman -Su ")).collect();
             (out, installs, dir)
         };
-        // linux lost; foo is fine; newdep is a new dependency that comes
-        // with what is still to upgrade.
+        // linux lost; foo is fine; glibc is still to come.
         let (out, installs, _dir) =
-            run("2026/11/20\nlinux\nfoo\nnewdep\n", "foo\nglibc\nlinux-lts\n", ":: Starting full system upgrade...\nglibc\nnewdep\n");
+            run("2026/11/20\nlinux\nfoo\nglibc\n", "foo\nglibc\nlinux-lts\n", ":: Starting full system upgrade...\nglibc\n", false);
         assert!(out.ok(), "{}", out.summary());
         assert_eq!(installs, ["pacman -Su --noconfirm --ignore linux-lts linux"], "{installs:?}");
         assert!(out.summary().contains("left linux out of pacman's database: installed again by name"), "{}", out.summary());
         // The fallback kernel lost: put back first, in a run of its own,
-        // while the main kernel is untouched; no second run for it.
-        let (out, installs, _dir) = run("2026/11/20\nlinux-lts\n", "linux\nglibc\n", "");
-        assert!(out.ok(), "{}", out.summary());
+        // while the main kernel is untouched; no second run for it. And
+        // the main kernel's update waits for the next run: one kernel in
+        // flight at a time.
+        let (out, installs, _dir) = run("2026/11/20\nlinux-lts\n", "linux\nglibc\n", "", false);
+        assert!(out.ok() && !out.main_waits, "{}", out.summary());
         assert_eq!(installs, ["pacman -S --noconfirm linux-lts", "pacman -Su --noconfirm --ignore linux-lts"], "{installs:?}");
-        // pacman cannot say what is installed: nothing by name, said.
-        let (out, installs, _dir) = run("2026/11/20\nlinux\n", "fails", "");
+        let (out, installs, _dir) = run("2026/11/20\nlinux-lts\n", "linux\nglibc\n", "", true);
+        assert!(out.ok() && out.main_waits && out.summary().contains("the main kernel linux follows"), "{}", out.summary());
+        assert_eq!(installs, ["pacman -S --noconfirm linux-lts", "pacman -Su --noconfirm --ignore linux-lts --ignore linux"]);
+        // Not in the snapshot gone back to: not named (pacman would stop
+        // at "target not found"), said.
+        let (out, installs, _dir) = run("2026/11/20\ngone\n", "linux\n", "", false);
+        assert!(out.ok() && installs == ["pacman -Su --noconfirm --ignore linux-lts"], "{installs:?}");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("left gone out of pacman's database") && w.contains("lacks them")),
+            "{:?}",
+            out.warnings
+        );
+        // pacman cannot say what is installed: nothing by name, said, and
+        // the names stay for the next run.
+        let (out, installs, dir) = run("2026/11/20\nlinux\n", "fails", "", false);
         assert_eq!(installs, ["pacman -Su --noconfirm --ignore linux-lts"]);
         assert!(out.warnings.iter().any(|w| w.contains("cannot tell whether the install that was cut off")), "{:?}", out.warnings);
+        assert!(out.ok() && get(dir.path(), INSTALLING) == "2026/11/20\nlinux\n", "kept until a run can tell");
         // A marker from before the list (the day only): as before.
-        let (out, installs, _dir) = run("2026/11/20\n", "linux\n", "");
+        let (out, installs, _dir) = run("2026/11/20\n", "linux\n", "", false);
         assert!(out.ok() && installs == ["pacman -Su --noconfirm --ignore linux-lts"], "{installs:?}");
 
-        // The marker of a run lists what it installs, and what an install
-        // before it left out until it is back.
+        // The marker of a run lists what it upgrades (installed as it
+        // begins: a new dependency is no loss), and what an install before
+        // it left out, until that is back; also across a run that fails.
         let dir = two_kernels();
         put(dir.path(), INSTALLING, "2026/11/20\nlinux-lts\n");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s = seen.clone();
         let mut fake = Fake::with_pacman(dir.path(), move |_, root, c| match c.args[0].as_str() {
-            "-Qq" => ("linux\n".into(), Ok(())),
-            "-Sup" => ("glibc\nopenssh\n".into(), Ok(())),
+            "-Qq" => ("linux\nglibc\n".into(), Ok(())),
+            "-Sup" => ("glibc\nnewdep\n".into(), Ok(())),
             "-Sp" => ("linux-lts\n".into(), Ok(())),
-            "-S" | "-Su" => {
+            "-Sddp" => (format!("{}\n", c.args.last().unwrap()), Ok(())),
+            "-S" => {
                 s.lock().unwrap().push(get(root, INSTALLING));
                 (String::new(), Ok(()))
+            }
+            "-Su" => {
+                s.lock().unwrap().push(get(root, INSTALLING));
+                let o = "error: failed to commit transaction (conflicting files)\nfoo: /usr/bin/foo exists in filesystem (owned by bar)\nErrors occurred, no packages were upgraded.\n";
+                (o.into(), Err("pacman failed: exit status 1: Errors occurred, no packages were upgraded.".into()))
             }
             _ => (String::new(), Ok(())),
         });
         fake.keyring_newer = false;
         let (h, _) = host(dir.path(), &fake);
-        assert!(h.arch_update(&Ctx::new(), "2026/11/20", false).ok());
-        assert_eq!(*seen.lock().unwrap(), ["2026/11/20\nlinux-lts\n", "2026/11/20\nglibc\nopenssh\nlinux-lts\n"]);
-        assert!(!h.path(INSTALLING).exists());
+        let out = h.arch_update(&Ctx::new(), "2026/11/20", false);
+        assert!(!out.ok() && out.untouched, "{}", out.summary());
+        assert_eq!(*seen.lock().unwrap(), ["2026/11/20\nlinux-lts\n", "2026/11/20\nglibc\nlinux-lts\n"]);
+        // pacman changed nothing in the run that failed: only the names
+        // an install before it left out stay (linux-lts is back by now, but
+        // the next run looks again: pacman -Qq).
+        assert_eq!(get(dir.path(), INSTALLING), "2026/11/20\nlinux-lts\n");
     }
 
     // ---- k3s ----

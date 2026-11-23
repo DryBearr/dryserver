@@ -735,9 +735,10 @@ Then the coordinator rolls it out:
    once it runs and is healthy (k3s up, firewall loaded) and the ways in
    still work: the servers sync through it, sshd lets you in, and a server
    on the home network reaches its SSH at its LAN address, the way your
-   desktop comes in (with no server that can try, its firewall's rules
-   must take SSH from there, and `release status` says it was not proven
-   from outside). Otherwise it goes back to the old one by itself after 10
+   desktop comes in (a server with no way of its own to that address does
+   not count; with no server that can try, its firewall's rules must take
+   SSH from there, and `release status` says it was not proven from
+   outside). Otherwise it goes back to the old one by itself after 10
    minutes, and the rollout stops there with the reason. If its update
    fails, no server is touched.
 2. **Then one server at a time.** The coordinator drains the server
@@ -872,7 +873,9 @@ release that brings it. Step by step:
    own file list has them, and what the older day lacks and nothing needs
    is removed, never a package that shares a file with another one and
    never before the split is done; an edited config file it had stays as
-   `.pacsave`), and an install cut off by a power
+   `.pacsave`; a split left half done is finished before the next update
+   goes forward, or that update refuses with the reason), and an install
+   cut off by a power
    cut in the middle of a package (its own files, owned by no package; a
    package that left pacman's database that way, the main kernel among
    them, is installed again by name: each install run notes what it

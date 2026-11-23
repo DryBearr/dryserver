@@ -92,6 +92,12 @@
 //! - The record's fields only grow (PENDING_FORMAT); a binary keeps the
 //!   ones it does not know (Pending::rest), and the revert of any version
 //!   puts back what the files list says.
+//! - What a done update leaves, which the old binary checks (kept_in_hand):
+//!   the record armed, SERVER_BIN the release's binary, INSTALLED its
+//!   envelope, /usr/local/bin/k3s its k3s, and pacman's mirrorlist with a
+//!   Server line on the Arch archive of its day when it brought packages
+//!   (of the day before otherwise). A binary that moves k3s or stops
+//!   naming the day there is reverted by every binary before it.
 //! - The update lock is kept open across the handover (Cmd::keep_fd) and
 //!   by pacman's install: while any of them runs, the lock is held, also
 //!   when the process that took it died, and no revert starts under them.
@@ -399,6 +405,16 @@ pub struct Pending {
     pub applied: i64,
     pub deadline: i64,
     pub window: i64,
+    /// The deadline as seconds since the machine started, and the boot id
+    /// of that start: while it has not restarted, the guards go by these,
+    /// not by the wall clock (one that jumps ahead, NTP after a power cut
+    /// on a machine with a dead clock battery, would revert a good update
+    /// before its window ran out). 0 and "": not known (from a binary
+    /// before them, or no /proc).
+    #[serde(default)]
+    pub deadline_boot: i64,
+    #[serde(default)]
+    pub boot_id: String,
     /// Restarts seen while waiting for confirm.
     #[serde(default)]
     pub boots: u32,
@@ -545,6 +561,9 @@ pub struct ArchState {
     /// The fallback kernel's update waits for the next run, once the main
     /// kernel booted well (osupdate: one kernel at a time).
     pub lts_waits: bool,
+    /// The main kernel's update waits for the next run: this one put the
+    /// fallback kernel back (one kernel at a time).
+    pub main_waits: bool,
     /// The run failed, but pacman changed nothing (it refused before it
     /// began: files in the way, a damaged package): not done, and still
     /// safe to reboot.
@@ -618,6 +637,33 @@ pub fn started_it(m: &Machine, own: &Path) -> Result<()> {
         bail!("this dryserver did not start the update to release {}: the next one in line goes", p.serial);
     }
     Ok(())
+}
+
+/// Seconds since this machine started (/proc/uptime), and which start it
+/// is (the kernel's boot id): a wall clock that jumps moves neither.
+fn since_boot(m: &Machine) -> Option<(i64, String)> {
+    let up = fsx::read_or_empty(m.path("/proc/uptime")).split_whitespace().next()?.parse::<f64>().ok()?;
+    let id = fsx::read_or_empty(m.path("/proc/sys/kernel/random/boot_id")).trim().to_string();
+    (up.is_finite() && up >= 0.0 && !id.is_empty() && id.len() <= 64).then_some((up as i64, id))
+}
+
+/// Records the deadline, secs from now, in the record: by the wall clock,
+/// and since the start of this boot (Pending::deadline_boot).
+fn set_deadline(m: &Machine, p: &mut Pending, now: i64, secs: i64) {
+    p.deadline = now.saturating_add(secs);
+    (p.deadline_boot, p.boot_id) = match since_boot(m) {
+        Some((up, id)) => (up.saturating_add(secs), id),
+        None => (0, String::new()),
+    };
+}
+
+/// Seconds until the deadline of update p: by the time since this boot
+/// when the record has it for this boot, else by the wall clock.
+fn seconds_left(m: &Machine, p: &Pending, now: i64) -> i64 {
+    match since_boot(m) {
+        Some((up, id)) if p.deadline_boot > 0 && !p.boot_id.is_empty() && id == p.boot_id => p.deadline_boot - up,
+        _ => p.deadline - now,
+    }
 }
 
 /// The release this machine runs: the envelope and what it says.
@@ -1598,7 +1644,7 @@ fn arch_due(m: &Machine, date: &str, rollback: bool) -> bool {
     }
     match read_json::<ArchState>(m, ARCH_STATE) {
         Ok(Some(s)) if !(s.date == date && s.done) => true,
-        Ok(Some(s)) => s.lts_waits && host.main_booted_well(),
+        Ok(Some(s)) => s.main_waits || (s.lts_waits && host.main_booted_well()),
         Ok(None) => rollback,
         Err(_) => true,
     }
@@ -2030,7 +2076,8 @@ fn kept_in_hand(m: &Machine, i: &Intake, id: &str, before: &Before, new_armed: b
     }
     keep_boot_guard(m, &ctx, p.reboot)?;
     if new_armed && !p.reboot {
-        let secs = (p.deadline - m.now()).clamp(1, before.window);
+        let cap = before.window.saturating_add(REBOOT_WINDOW).min(MAX_WINDOW);
+        let secs = seconds_left(m, &p, m.now()).clamp(1, cap);
         arm(m, &ctx, Timer::Started, id, p.serial, secs, false)
             .map_err(|e| e.wrap("cannot arm the confirm window's timer of the binary that started the update"))?;
     }
@@ -2056,13 +2103,22 @@ fn applied_problem(m: &Machine, i: &Intake, p: &Pending, before: &Before) -> Opt
     if sha(K3S_BIN, osupdate::MAX_K3S).as_deref() != Some(rel.k3s.sha256.as_str()) {
         return Some(format!("{K3S_BIN} is not the release's k3s {}", rel.k3s.version));
     }
-    let pinned = osupdate::pinned_date(&fsx::read_or_empty(m.path(osupdate::MIRRORLIST)));
+    // Only that it names the day's archive (a Server line, not commented
+    // out): how a later binary writes the list beyond that is its own.
     let want = if p.arch_date.is_empty() { before.pinned.clone() } else { Some(rel.arch_date.clone()) };
-    if pinned != want {
-        let day = |d: &Option<String>| d.clone().unwrap_or_else(|| "no day".into());
-        return Some(format!("{} pins {} where the update leaves {}", osupdate::MIRRORLIST, day(&pinned), day(&want)));
+    let list = fsx::read_or_empty(m.path(osupdate::MIRRORLIST));
+    if let Some(day) = want.filter(|d| !names_day(&list, d)) {
+        return Some(format!("{} does not name the archive of {day}, where the update leaves pacman", osupdate::MIRRORLIST));
     }
     None
+}
+
+/// Whether a mirrorlist has a Server line on the Arch archive of day.
+fn names_day(list: &str, day: &str) -> bool {
+    let url = format!("{}{day}/", release::ARCH_ARCHIVE);
+    list.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .any(|l| l.split_once('=').is_some_and(|(k, v)| k.trim() == "Server" && v.trim().starts_with(&url)))
 }
 
 /// Puts this binary's boot unit back when the new binary's update wrote
@@ -2318,7 +2374,7 @@ fn install_work(
     let window = if reboot { (p.window + REBOOT_WINDOW).min(MAX_WINDOW) } else { p.window };
     arm(m, ctx, Timer::Window, id, rel.serial, window, false).map_err(|e| e.wrap("cannot arm the timer of the confirm window"))?;
     p.stage = STAGE_ARMED.into();
-    p.deadline = m.now().saturating_add(window);
+    set_deadline(m, &mut p, m.now(), window);
     p.window = window;
     p.step.clear();
     p.reboot = reboot;
@@ -2370,6 +2426,7 @@ fn save_arch_state(m: &Machine, o: &ArchOutcome) {
         boot_problem: o.boot_problem.clone().unwrap_or_default(),
         summary: o.summary(),
         lts_waits: o.lts_waits,
+        main_waits: o.main_waits,
         untouched: !o.ok() && o.untouched,
     };
     if let Err(e) = save_json(m, ARCH_STATE, &s) {
@@ -2795,7 +2852,7 @@ pub fn guard_timer(m: &Machine, ctx: &Ctx, id: &str, applying: bool, now: i64, o
         return revert(m, &rctx, p, &why, false, now, out, Undo::Revert);
     }
     match p.stage.as_str() {
-        STAGE_ARMED if now >= p.deadline => {
+        STAGE_ARMED if seconds_left(m, &p, now) <= 0 => {
             let why = format!("it was not confirmed by {}", when(p.deadline));
             revert(m, &rctx, p, &why, false, now, out, Undo::Revert)
         }
@@ -2804,7 +2861,7 @@ pub fn guard_timer(m: &Machine, ctx: &Ctx, id: &str, applying: bool, now: i64, o
             // started the update armed one of its own when the new one was
             // done (kept_in_hand), unless it died before: then this one
             // (it runs first) does; one that is there already stays.
-            let left = (p.deadline - now).clamp(1, p.window.clamp(MIN_WINDOW, MAX_WINDOW));
+            let left = seconds_left(m, &p, now).clamp(1, p.window.clamp(MIN_WINDOW, MAX_WINDOW));
             let _ = arm(m, &rctx, Timer::Started, &p.id, p.serial, left, false);
             say(out, format!("release {} finished applying; its confirm window has a timer of its own", p.serial));
             Ok(())
@@ -2841,6 +2898,11 @@ pub fn guard_boot(m: &Machine, ctx: &Ctx, now: i64, out: &mut dyn Write) -> Resu
     }
     let window = p.window.clamp(MIN_WINDOW, MAX_WINDOW);
     let left = (p.deadline - now).clamp(1, window);
+    // From here on in this boot, by the time since it started.
+    (p.deadline_boot, p.boot_id) = match since_boot(m) {
+        Some((up, id)) => (up.saturating_add(left), id),
+        None => (0, String::new()),
+    };
     p.boots += 1;
     save_pending(m, &p)?;
     disarm(m, ctx, &p.id);
@@ -4458,20 +4520,33 @@ mod tests {
 
     #[test]
     fn review_a_main_kernel_cut_off_before_its_image_is_due_on_the_same_day() {
-        // The fallback kernel runs, or the main image used up its tries: the
-        // next release on the same day runs pacman, which makes the image.
+        // The fallback kernel runs, or the main image used up its tries, and
+        // the main image is older than its kernel (a cut before pacman's
+        // hook): the next release on the same day runs pacman, which makes
+        // the image. With an image as new as its kernel there is nothing to
+        // make: a main kernel that does not work here sends no release
+        // through pacman (a dead mirror would hold urgent ones too).
         let lab = Lab::new();
         let m = lab.m();
+        let image = "/boot/EFI/Linux/arch-linux.efi";
+        let old = |p: &str| {
+            let f = OpenOptions::new().write(true).open(lab.p(p)).unwrap();
+            f.set_modified(std::time::SystemTime::now() - Duration::from_secs(86_400)).unwrap();
+        };
         save_json(&m, ARCH_STATE, &ArchState { date: DAY.into(), done: true, ..ArchState::default() }).unwrap();
         assert!(!arch_due(&m, DAY, false));
         lab.write("/proc/sys/kernel/osrelease", b"6.6.60-1-lts\n", 0o644);
         lab.write("/usr/lib/modules/6.6.60-1-lts/pkgbase", b"linux-lts\n", 0o644);
-        assert!(arch_due(&m, DAY, false), "the fallback kernel runs");
+        assert!(!arch_due(&m, DAY, false), "the fallback kernel runs, every image is current");
+        old(image);
+        assert!(arch_due(&m, DAY, false), "the fallback kernel runs, the main image is older than its kernel");
         lab.write("/proc/sys/kernel/osrelease", b"6.12.1-arch1-1\n", 0o644);
         assert!(!arch_due(&m, DAY, false));
-        let _ = fs::remove_file(lab.p("/boot/EFI/Linux/arch-linux.efi"));
+        let _ = fs::remove_file(lab.p(image));
         lab.write("/boot/EFI/Linux/arch-linux+0-3.efi", b"image", 0o644);
-        assert!(arch_due(&m, DAY, false), "the main image failed its tries");
+        assert!(!arch_due(&m, DAY, false), "a main image that failed its tries, but current");
+        old("/boot/EFI/Linux/arch-linux+0-3.efi");
+        assert!(arch_due(&m, DAY, false), "the main image failed its tries and is older than its kernel");
     }
 
     #[test]
@@ -5418,7 +5493,12 @@ mod tests {
         lab.script(|s| (s.new_kernel, s.reboot_fails) = (true, true));
         let a = Apply { reboot: true, ..lab.os_opts(&os_rel(8, K3S_OLD, NEXT_DAY), None) };
         apply(&lab.m(), &Ctx::new(), &a, now(), &mut Vec::new()).unwrap();
-        assert!(!lab.pending().unwrap().reboot);
+        let p = lab.pending().unwrap();
+        assert!(!p.reboot);
+        // The window the reboot would have needed stays the one said: the
+        // timer of the binary that started the update does not cut it.
+        let started = format!("systemd-run --unit=dryserver-update-revert-{}-started --on-active={}s", p.id, WINDOW + REBOOT_WINDOW);
+        assert!(lab.fake.has(&started), "{:#?}", lab.fake.ran());
     }
 
     #[test]
@@ -5854,6 +5934,43 @@ mod tests {
     }
 
     #[test]
+    fn review_a_clock_that_jumps_ahead_does_not_revert_a_good_update_early() {
+        // The apply's timer decides an armed update by its deadline. NTP
+        // after a power cut on a machine with a dead clock battery moves the
+        // wall clock hours ahead: the time since this boot decides instead.
+        let lab = Lab::new();
+        let boot = "0b5c2d3e-4f5a-6b7c-8d9e-0f1a2b3c4d5e";
+        lab.write("/proc/uptime", b"1000.25 3000.00\n", 0o644);
+        lab.write("/proc/sys/kernel/random/boot_id", format!("{boot}\n").as_bytes(), 0o644);
+        lab.apply(&rel(7, NEW)).unwrap();
+        let p = lab.pending().unwrap();
+        assert_eq!((p.deadline_boot, p.boot_id.as_str()), (1000 + WINDOW, boot));
+        lab.write("/proc/uptime", b"1300.00 3000.00\n", 0o644);
+        lab.fake.ran.lock().unwrap().clear();
+        guard_timer(&lab.m(), &Ctx::new(), &p.id, true, p.deadline + 3 * 3600, &mut Vec::new()).unwrap();
+        assert!(lab.pending().is_some(), "five minutes into its window");
+        assert!(
+            lab.fake.has(&format!("systemd-run --unit=dryserver-update-revert-{}-started --on-active=300s", p.id)),
+            "{:#?}",
+            lab.fake.ran()
+        );
+        lab.write("/proc/uptime", b"1601.00 3000.00\n", 0o644);
+        guard_timer(&lab.m(), &Ctx::new(), &p.id, true, p.deadline - 3 * 3600, &mut Vec::new()).unwrap();
+        assert!(lab.pending().is_none(), "past it, whatever the wall clock says");
+        // After a restart the boot unit counts the rest of the window from
+        // the new boot.
+        let lab = Lab::new();
+        lab.write("/proc/uptime", b"1000.00 3000.00\n", 0o644);
+        lab.write("/proc/sys/kernel/random/boot_id", format!("{boot}\n").as_bytes(), 0o644);
+        lab.apply(&rel(7, NEW)).unwrap();
+        lab.write("/proc/uptime", b"20.00 30.00\n", 0o644);
+        lab.write("/proc/sys/kernel/random/boot_id", b"a-later-boot\n", 0o644);
+        guard_boot(&lab.m(), &Ctx::new(), now() + 120, &mut Vec::new()).unwrap();
+        let p = lab.pending().unwrap();
+        assert_eq!((p.deadline_boot, p.boot_id.as_str()), (20 + WINDOW - 120, "a-later-boot"));
+    }
+
+    #[test]
     fn review_the_binary_that_started_the_update_checks_what_the_new_one_did() {
         // A new binary whose activate exits 0 while the update is not what
         // it says: the binary that started it reverts at once.
@@ -5862,7 +5979,7 @@ mod tests {
             ("binary", "/usr/local/bin/dryserver is not the binary of release 7"),
             ("installed", "installed.json does not record release 7"),
             ("k3s", "/usr/local/bin/k3s is not the release's k3s v1.37.2+k3s1"),
-            ("mirrorlist", "pins 2026/11/22 where the update leaves 2026/11/19"),
+            ("mirrorlist", "mirrorlist does not name the archive of 2026/11/19, where the update leaves pacman"),
         ] {
             let lab = Lab::new();
             lab.script(|s| s.activate_leaves = Some(leaves));
@@ -5876,6 +5993,11 @@ mod tests {
         let lab = Lab::new();
         lab.apply_os(&os_rel(8, K3S_NEW, NEXT_DAY), Some(K3S_NEW)).unwrap();
         assert_eq!(lab.pending().unwrap().stage, STAGE_ARMED);
+        // How a later binary writes the list beyond the day is its own: a
+        // second line, comments.
+        let day = osupdate::mirrorlist(DAY).unwrap();
+        assert!(names_day(&format!("# pinned by dryserver\n{day}Server = https://mirror.example.org/$repo/os/$arch\n"), DAY));
+        assert!(!names_day(&day.lines().map(|l| format!("#{l}\n")).collect::<String>(), DAY) && !names_day(&day, NEXT_DAY));
     }
 
     #[test]
