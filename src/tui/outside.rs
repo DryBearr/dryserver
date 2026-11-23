@@ -417,6 +417,7 @@ impl Model for Screen {
                 self.height = (h as usize).max(12);
                 Flow::Continue
             }
+            Event::Back(_) => Flow::Continue,
         }
     }
 

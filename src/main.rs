@@ -59,8 +59,8 @@ use crate::sysconf::{Params, Role};
 
 const USAGE: &str = r#"usage: dryserver [command] [flags]
 
-Run without a command for the interactive menu (config, build, flash).
-Use sudo when you want to flash: sudo dryserver
+Run without a command for the desktop app: config, installer, USB stick,
+machines, apps, the ways in, updates, backups and the kill switch.
 
 commands:
   install [--demo]    laptop setup screen (runs from the installer USB);
@@ -76,15 +76,13 @@ commands:
                       (onto the coordinator you signed last; -lift -same
                       after a false alarm), -status shows
 
-  approve             approve or reject machines, remove members, publish
-                      an update (u); every decision is signed with
-                      secrets/signing_ed25519
-  apps                what runs on your cluster: start an app from a
-                      container image, remove one
+  approve             the app at Machines: approve or reject machines,
+                      remove members, publish an update (u); every
+                      decision is signed with secrets/signing_ed25519
+  apps                the app at Apps: what runs on your cluster
   backup-pull         copy the coordinator's newest backups into
                       secrets/backups (encrypted; signed by the coordinator)
-  outside             the ways in from the internet: open, sync or close
-                      the Cloudflare Tunnel, see which names use it
+  outside             the app at Outside: the ways in from the internet
   release publish     check a release of this dryserver, show what changes,
                       sign it and send it to the coordinator: it updates
                       itself, then one server at a time (-urgent: at once,
@@ -263,23 +261,52 @@ impl Flags {
 // ---- desktop commands ----
 
 fn run_app() -> Result<()> {
-    loop {
-        let mut app = tui::app::App::new(paths());
-        tui::run(&mut app)?;
-        // "Machines", "Apps" and "Outside" in the menu: that screen, then
-        // the menu again.
-        let f = Flags::parse("approve", &[], DESKTOP_FLAGS);
-        let res = if app.open_machines {
-            machines_screen(&f)
-        } else if let Some(place) = app.open_cluster {
-            cluster_screens(&f, place)
-        } else {
-            return Ok(());
-        };
-        if let Err(e) = res {
-            eprintln!("dryserver: {}", report::printable(&e.to_string()));
-            return Ok(());
-        }
+    run_hub(&Flags::parse("dryserver", &[], DESKTOP_FLAGS), None)
+}
+
+/// The desktop app, at Home or at place. Every place runs inside it.
+fn run_hub(f: &Flags, place: Option<tui::app::Place>) -> Result<()> {
+    let mut p = paths();
+    p.config = PathBuf::from(f.get("config"));
+    let mut app = tui::app::App::new(p, factories(f));
+    if let Some(place) = place {
+        app = app.start_at(place);
+    }
+    let res = tui::run(&mut app);
+    for m in app.after() {
+        eprintln!("{}", report::printable(m));
+    }
+    res
+}
+
+/// What the app needs from this computer and the coordinator, made when
+/// a place opens.
+fn factories(f: &Flags) -> tui::app::Factories {
+    let (machines, cluster, pull, list) = (f.clone(), f.clone(), f.clone(), f.clone());
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    tui::app::Factories {
+        machines: Box::new(move || machines_model(&machines)),
+        cluster: Box::new(move || {
+            let c: Arc<dyn apps::Cluster> = Arc::new(desktop_cluster(&cluster, "apps")?);
+            Ok((c, desktop_doors()))
+        }),
+        pull: Arc::new(move |out| backup_pull(&pull, out)),
+        write_list: Arc::new(move || {
+            let done = ssh_config(&list)?;
+            Ok(done.summary)
+        }),
+        quarantine: Arc::new(|cut| {
+            use tui::kill::Switch;
+            let (lift, same, status) = match cut {
+                Switch::Cut => (false, false, false),
+                Switch::Status => (false, false, true),
+                Switch::Lift => (true, false, false),
+                Switch::LiftSame => (true, true, false),
+            };
+            quarantine_all(&[], lift, same, status)
+        }),
+        server_list: home.map(|h| h.join(".ssh/config.d/dryserver")),
+        exe: std::env::current_exe().ok(),
     }
 }
 
@@ -412,18 +439,36 @@ fn run_sysconf(args: &[String]) -> Result<()> {
 
 fn run_ssh_config(args: &[String]) -> Result<()> {
     let f = Flags::parse("ssh-config", args, DESKTOP_FLAGS);
-    let (mut a, host) = desktop_admin(&f, "ssh-config")?;
+    let done = ssh_config(&f)?;
+    for w in &done.warnings {
+        eprintln!("warning: {}", report::printable(w));
+    }
+    for l in &done.lines {
+        println!("{l}");
+    }
+    Ok(())
+}
+
+/// What ssh-config wrote: one line for the app, all of them for the
+/// terminal.
+struct SshConfigDone {
+    summary: String,
+    warnings: Vec<String>,
+    lines: Vec<String>,
+}
+
+/// Writes ~/.ssh/config.d/dryserver so "ssh <server>" works, and the
+/// kill switch can reach every server without the coordinator.
+fn ssh_config(f: &Flags) -> Result<SshConfigDone> {
+    let (mut a, host) = desktop_admin(f, "ssh-config")?;
     let port = f.get("port");
     // Names and SSH host keys come from the list you signed, never from
     // what the coordinator says; only LAN addresses are its word.
     let view = a.load()?;
-    for w in &view.warnings {
-        eprintln!("warning: {}", report::printable(w));
-    }
     let servers = a.servers();
     let coord_ip = mesh::ip(&a.subnet, 1);
     let Some(coord_name) = servers.iter().find(|s| s.mesh_ip == coord_ip).map(|s| s.name.clone()) else {
-        bail!("nothing is signed yet. Approve your machines first: ./dryserver approve");
+        bail!("nothing is signed yet: sign the coordinator in Machines first");
     };
     let cfg = Config::load(f.get("config"))?;
     let home = PathBuf::from(std::env::var("HOME").map_err(|_| errf!("$HOME is not defined"))?);
@@ -435,22 +480,24 @@ fn run_ssh_config(args: &[String]) -> Result<()> {
     fsx::write_file(&kh_path, mesh::desktop_known_hosts(&servers, &coord_name, &host, port), 0o644)?;
     let conf = mesh::desktop_ssh_config(&cfg.username, &coord_name, &host, port, "~/.ssh/known_hosts.d/dryserver", &servers);
     fsx::write_file(&conf_path, conf, 0o600)?;
-    println!("Wrote {} ({} servers) and {}.", conf_path.display(), servers.len(), kh_path.display());
+    let mut summary = format!("Wrote the server list {} ({} servers).", conf_path.display(), servers.len());
+    let mut lines = vec![format!("Wrote {} ({} servers) and {}.", conf_path.display(), servers.len(), kh_path.display())];
     let no_lan: Vec<&str> = servers.iter().filter(|s| s.name != coord_name && s.lan_ip.is_empty()).map(|s| s.name.as_str()).collect();
     if !no_lan.is_empty() {
-        println!(
-            "No LAN address yet for: {} (not reported to the coordinator yet).\n\
-             The kill switch (dryserver quarantine-all) cannot reach them; run ssh-config again later.",
-            no_lan.join(", ")
-        );
+        let names = no_lan.join(", ");
+        summary += &format!(" No LAN address yet for {names}: the kill switch cannot reach them; write it again later.");
+        lines.push(format!(
+            "No LAN address yet for: {names} (not reported to the coordinator yet).\n\
+             The kill switch (dryserver quarantine-all) cannot reach them; run ssh-config again later."
+        ));
     }
     if !fsx::read_or_empty(home.join(".ssh/config")).contains("config.d/") {
-        println!("Add this line at the top of ~/.ssh/config to use it:\n  Include config.d/*");
+        lines.push("Add this line at the top of ~/.ssh/config to use it:\n  Include config.d/*".into());
     }
     for s in &servers {
-        println!("  ssh {}", s.name);
+        lines.push(format!("  ssh {}", s.name));
     }
-    Ok(())
+    Ok(SshConfigDone { summary, warnings: view.warnings, lines })
 }
 
 const DESKTOP_FLAGS: &[(&str, &str, &str)] = &[
@@ -470,7 +517,7 @@ fn desktop_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
     let need = |name: &str, what: &str| -> Result<PathBuf> {
         let p = secrets.join(name);
         if !p.exists() {
-            bail!("{} is missing ({what}). It is created when you build the USB stick: ./dryserver build", p.display());
+            bail!("{} is missing ({what}). Building the installer makes it: dryserver, then Installer", p.display());
         }
         Ok(p)
     };
@@ -630,6 +677,13 @@ fn run_quarantine(args: &[String]) -> Result<()> {
 fn run_quarantine_all(args: &[String]) -> Result<()> {
     let f = Flags::parse("quarantine-all", args, QUARANTINE_FLAGS);
     let (names, lift, status) = quarantine_action(&f)?;
+    quarantine_all(&names, lift, f.on("same"), status)
+}
+
+/// The kill switch: cuts (or lifts, or shows) on every server in the
+/// server list, over the WiFi/router network. ssh runs on this terminal:
+/// sudo asks for the password on each server.
+fn quarantine_all(names: &[String], lift: bool, same: bool, status: bool) -> Result<()> {
     if fsx::is_root() {
         bail!("run quarantine-all as your normal user, not with sudo");
     }
@@ -664,13 +718,13 @@ fn run_quarantine_all(args: &[String]) -> Result<()> {
                 copy_path.display()
             ))
         })?;
-        action = quarantine::lift_args(&copy, f.on("same")).map_err(|e| e.wrap(copy_path.display().to_string()))?;
+        action = quarantine::lift_args(&copy, same).map_err(|e| e.wrap(copy_path.display().to_string()))?;
     } else if status {
         action.push("-status".to_string());
     } else if !names.is_empty() {
         action.extend(["-name".to_string(), names.join(",")]);
     }
-    let targets = if lift || status { all.clone() } else { quarantine::targets(&all, &names) };
+    let targets = if lift || status { all.clone() } else { quarantine::targets(&all, names) };
     let mut failed = Vec::new();
     for r in &targets {
         println!("\n== {} ({}){}", r.name, r.addr, if r.coordinator { ", the coordinator" } else { "" });
@@ -818,13 +872,27 @@ fn run_backup(args: &[String]) -> Result<()> {
 }
 
 fn run_backup_pull(args: &[String]) -> Result<()> {
-    use crate::admin::Link;
     let f = Flags::parse("backup-pull", args, DESKTOP_FLAGS);
-    if fsx::is_root() {
-        bail!("run backup-pull as your normal user, not with sudo");
-    }
     if Path::new(LIVE_CONFIG).exists() {
         bail!("backup-pull runs on your own computer:\n  ./dryserver backup-pull");
+    }
+    let r = backup_pull(&f, &mut std::io::stdout())?;
+    for n in &r.removed {
+        println!("removed {n} (older than the {} daily and {} weekly kept)", backup::KEEP_DAILY, backup::KEEP_WEEKLY);
+    }
+    println!("{} new backup(s) in {}.", r.fetched.len(), paths().secrets.join("backups").display());
+    if !r.problems.is_empty() {
+        bail!("not everything was copied:\n  {}", r.problems.join("\n  "));
+    }
+    Ok(())
+}
+
+/// Copies the coordinator's newest backups into secrets/backups, writing
+/// a line for each to out.
+fn backup_pull(f: &Flags, out: &mut dyn std::io::Write) -> Result<backup::Pulled> {
+    use crate::admin::Link;
+    if fsx::is_root() {
+        bail!("run backup-pull as your normal user, not with sudo");
     }
     let cfg = Config::load(f.get("config"))?;
     let secrets = paths().secrets;
@@ -838,24 +906,16 @@ fn run_backup_pull(args: &[String]) -> Result<()> {
         host: host.clone(),
         port: f.get("port").into(),
     };
-    let host_key = link.host_key().map_err(|e| e.wrap("this computer has not met the coordinator yet; run ./dryserver approve first"))?;
+    let host_key = link.host_key().map_err(|e| e.wrap("this computer has not met the coordinator yet; open Machines once first"))?;
     let dir = secrets.join("backups");
     fsx::mkdir_all(&dir, 0o700)?;
     let signer = dir.join(".coordinator.pub");
     fsx::write_new(&signer, format!("{host_key}\n"), 0o600)?;
     let verifier = signed::SshVerifier { pubkey: signer.clone(), tmp_dir: std::env::temp_dir() };
     let brain = backup::SshBrain::new(&host, f.get("port"), &cfg.username, known_hosts);
-    let res = backup::pull(&brain, &verifier, &dir, chrono::Utc::now(), &mut std::io::stdout());
+    let res = backup::pull(&brain, &verifier, &dir, chrono::Utc::now(), out);
     let _ = fsx::remove(&signer);
-    let r = res?;
-    for n in &r.removed {
-        println!("removed {n} (older than the {} daily and {} weekly kept)", backup::KEEP_DAILY, backup::KEEP_WEEKLY);
-    }
-    println!("{} new backup(s) in {}.", r.fetched.len(), dir.display());
-    if !r.problems.is_empty() {
-        bail!("not everything was copied:\n  {}", r.problems.join("\n  "));
-    }
-    Ok(())
+    res
 }
 
 /// kubectl on the coordinator over the admin's SSH login, with the host
@@ -880,36 +940,13 @@ fn run_apps(args: &[String], place: tui::Place) -> Result<()> {
     if Path::new(LIVE_CONFIG).exists() {
         bail!("{cmd} runs on your own computer:\n  ./dryserver {cmd}\nOn the coordinator itself, use: k3s kubectl");
     }
-    cluster_screens(&f, place)
+    run_hub(&f, Some(if place == tui::Place::Apps { tui::app::Place::Apps } else { tui::app::Place::Outside }))
 }
 
 /// The ways in from outside this desktop knows, with its secrets.
 fn desktop_doors() -> entrance::Entrances {
     let secrets = paths().secrets;
     Arc::new(vec![Box::new(entrance::cloudflare::Cloudflare::new(&secrets)), Box::new(entrance::Vps)])
-}
-
-/// The apps and outside screens, starting at place; each can switch to
-/// the other. They share one SSH connection to the coordinator.
-fn cluster_screens(f: &Flags, place: tui::Place) -> Result<()> {
-    let c: Arc<dyn apps::Cluster> = Arc::new(desktop_cluster(f, "apps")?);
-    let doors = desktop_doors();
-    let mut next = Some(place);
-    while let Some(place) = next {
-        next = match place {
-            tui::Place::Apps => {
-                let mut s = tui::apps::Screen::new(c.clone(), doors.clone());
-                tui::run(&mut s)?;
-                s.next
-            }
-            tui::Place::Outside => {
-                let mut s = tui::outside::Screen::new(c.clone(), doors.clone());
-                tui::run(&mut s)?;
-                s.next
-            }
-        };
-    }
-    Ok(())
 }
 
 fn run_approve(args: &[String]) -> Result<()> {
@@ -919,19 +956,19 @@ fn run_approve(args: &[String]) -> Result<()> {
         // the computer that holds the signing key can.
         bail!("approve runs on your own computer, where the signing key is:\n  ./dryserver approve");
     }
-    machines_screen(&f)
+    run_hub(&f, Some(tui::app::Place::Machines))
 }
 
 /// The approve screen, which also publishes releases and resumes a
 /// stopped rollout.
-fn machines_screen(f: &Flags) -> Result<()> {
+fn machines_model(f: &Flags) -> Result<tui::admin::Screen> {
     let (a, _) = desktop_admin(f, "approve")?;
     let key = paths().secrets.join(iso::SIGNING_KEY_NAME);
     if publish::has_passphrase(&key) {
         // ssh-keygen would ask for it on the terminal the screen draws on.
         bail!(
-            "{k} has a passphrase, and the approve screen signs every few seconds: it cannot ask for it.\n\
-             In a terminal, ./dryserver release publish, status and resume ask for it at each signature.\n\
+            "{k} has a passphrase, and Machines signs every few seconds: it cannot ask for it. \
+             In a terminal, dryserver release publish, status and resume ask for it at each signature. \
              Or remove the passphrase: ssh-keygen -p -f {k}",
             k = key.display()
         );
@@ -943,12 +980,7 @@ fn machines_screen(f: &Flags) -> Result<()> {
         parts: publish::Parts::this_program(&paths().out_dir, None)?,
         today: || chrono::Utc::now().date_naive(),
     };
-    let mut s = tui::admin::Screen::new(a).with_publisher(publisher);
-    let res = tui::run(&mut s);
-    if let Some(m) = s.after() {
-        eprintln!("{m}");
-    }
-    res
+    Ok(tui::admin::Screen::new(a).with_publisher(publisher))
 }
 
 const RELEASE_USAGE: &str = r#"usage: dryserver release publish|status|resume [flags]

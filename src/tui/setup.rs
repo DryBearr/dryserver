@@ -133,6 +133,7 @@ impl Setup {
             Event::Tick => {}
             Event::Key(k) => return self.key(k, emit),
             Event::Msg(m) => self.message(m, emit),
+            Event::Back(_) => {}
         }
         Flow::Continue
     }
@@ -312,7 +313,8 @@ impl Setup {
             ssid,
             Field::input("Password", |w: &Wifi| w.pass.clone(), |w, v| w.pass = v).password(),
         ]);
-        self.wifi_form = Some(Form::new(Wifi::default(), vec![group], "back"));
+        // One step: nothing to review, and the screen keeps nothing typed.
+        self.wifi_form = Some(Form::new(Wifi::default(), vec![group], "back").without_review().keeps_answers());
         self.state = State::Wifi;
     }
 
@@ -846,6 +848,10 @@ fn setup_form(m: &Machine, cfg: &Config, answers: Answers) -> Form<Answers> {
         ],
         "back",
     )
+    // The confirm step after the checks shows every answer, and the
+    // screen keeps them when the form is left.
+    .without_review()
+    .keeps_answers()
 }
 
 fn mesh_ip(cfg: &Config, n: u32) -> String {

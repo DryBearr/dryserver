@@ -5,11 +5,16 @@
 pub mod admin;
 pub mod app;
 pub mod apps;
+pub mod backups;
 pub mod build;
 pub mod flash;
 pub mod form;
+pub mod frame;
+pub mod home;
+pub mod kill;
 pub mod outside;
 pub mod setup;
+pub mod sprite;
 pub mod theme;
 pub mod worker;
 
@@ -161,7 +166,7 @@ pub fn err_bold(s: impl Into<String>) -> Seg {
 }
 /// Structure that should recede: rules, empty progress.
 pub fn faint(s: impl Into<String>) -> Seg {
-    Seg(s.into(), Style::new().fg(theme::palette().ash))
+    Seg(s.into(), theme::palette().faint())
 }
 pub fn ok(s: impl Into<String>) -> Seg {
     Seg(s.into(), ok_style())
@@ -365,11 +370,6 @@ pub fn spinner() -> &'static str {
     FRAMES[(ms / 130 % 6) as usize]
 }
 
-/// A progress bar of width cells for pct in 0..=1.
-pub fn progress_bar(pct: f64, width: usize) -> Doc {
-    theme::bar(pct, width)
-}
-
 /// Whole seconds since t, formatted like Go durations ("1m5s").
 pub fn since(t: Instant) -> String {
     let secs = crate::gotime::round_ms(t.elapsed().as_millis() as i64, 1000) / 1000;
@@ -486,7 +486,8 @@ pub fn line_view(value: &str, cursor: usize, placeholder: &str, focused: bool, p
         let mut ph = placeholder.chars();
         match (focused, ph.next()) {
             (true, Some(first)) => {
-                d.add(Seg(first.to_string(), rev.fg(Color::DarkGray))).add(dim(ph.collect::<String>()));
+                d.add(Seg(first.to_string(), theme::palette().fg(Color::DarkGray).add_modifier(Modifier::REVERSED)))
+                    .add(dim(ph.collect::<String>()));
             }
             (true, None) => {
                 d.add(Seg(" ".into(), rev));
@@ -526,12 +527,22 @@ pub enum Event<M> {
     /// About ten times a second, for spinners and timers.
     Tick,
     Resize(u16, u16),
+    /// The terminal is back after a Job, with how the job ended.
+    Back(Result<()>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
     Continue,
     Quit,
+}
+
+/// Work that needs the terminal itself: sudo asks for a password on each
+/// server. The screen gives the terminal to it and gets it back after.
+pub struct Job {
+    /// What runs, for the line printed above its output.
+    pub title: String,
+    pub run: Box<dyn FnOnce() -> Result<()>>,
 }
 
 pub trait Model {
@@ -543,6 +554,12 @@ pub trait Model {
     fn update(&mut self, ev: Event<Self::Msg>, emit: &Emit<Self::Msg>) -> Flow;
 
     fn view(&self) -> Doc;
+
+    /// A job to give the terminal to, asked after every update. How it
+    /// ended comes back as Event::Back.
+    fn job(&mut self) -> Option<Job> {
+        None
+    }
 }
 
 /// Runs a model full screen until it quits.
@@ -559,6 +576,32 @@ pub fn run<M: Model>(model: &mut M) -> Result<()> {
     res
 }
 
+/// Gives the terminal to the job: the screen goes, the job runs as any
+/// command would, and the screen comes back once enter is pressed, so its
+/// output can be read first.
+fn hand_over(term: &mut ratatui::DefaultTerminal, job: Job) -> Result<Result<()>> {
+    let _ = execute!(stdout(), DisableBracketedPaste);
+    ratatui::restore();
+    println!("\n== {}\n", job.title);
+    // ctrl+c stops what the job runs (ssh, sudo), not this program: a
+    // handler of our own is not passed on to the commands it starts.
+    let guard = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let res = (job.run)();
+    if let Ok(id) = guard {
+        signal_hook::low_level::unregister(id);
+    }
+    if let Err(e) = &res {
+        println!("\n{}", crate::report::printable(&e.to_string()));
+    }
+    println!("\nPress enter to go back to dryserver.");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    *term = ratatui::try_init()?;
+    let _ = execute!(stdout(), EnableBracketedPaste);
+    term.clear()?;
+    Ok(res)
+}
+
 fn event_loop<M: Model>(
     model: &mut M,
     term: &mut ratatui::DefaultTerminal,
@@ -573,17 +616,19 @@ fn event_loop<M: Model>(
     let tick = Duration::from_millis(100);
     let mut last_tick = Instant::now();
     loop {
+        // A job the last update asked for runs before the next draw.
+        while let Some(job) = model.job() {
+            let res = hand_over(term, job)?;
+            let size = term.size()?;
+            model.update(Event::Resize(size.width, size.height), emit);
+            if model.update(Event::Back(res), emit) == Flow::Quit {
+                return Ok(());
+            }
+        }
         term.draw(|f| {
-            // With true colour the whole screen is coal with bone text;
-            // otherwise the terminal keeps its own colours.
-            let p = theme::palette();
-            let mut base = Style::new();
-            if let Some(c) = p.coal {
-                base = base.bg(c);
-            }
-            if let Some(c) = p.bone {
-                base = base.fg(c);
-            }
+            // The tier paints the whole screen coal with bone text, or
+            // leaves the terminal its own colours.
+            let base = theme::palette().base();
             f.render_widget(Paragraph::new(model.view().into_text()).style(base), f.area());
         })?;
         let wait = tick.saturating_sub(last_tick.elapsed());

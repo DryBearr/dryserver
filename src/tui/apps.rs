@@ -215,6 +215,9 @@ fn new_app_form(taken: Vec<(String, String)>, doors: Vec<(String, String)>) -> F
         ],
         "back",
     )
+    // As before the steps came: esc leaves at once, nothing to review.
+    .without_review()
+    .esc_cancels()
 }
 
 pub struct Screen {
@@ -442,6 +445,7 @@ impl Model for Screen {
                 self.width = (w as usize).max(40);
                 Flow::Continue
             }
+            Event::Back(_) => Flow::Continue,
         }
     }
 
