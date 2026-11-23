@@ -1,19 +1,37 @@
-//! The admin's screen for join requests and members, on the desktop.
-//! Every decision made here is signed before it reaches the coordinator.
+//! Machines: who asks to join, the members and how each one is, the
+//! release they run, and what else is on the network, in three tabs.
+//! Every decision made here is signed with this computer's key before it
+//! reaches the coordinator, and each one asks for y first.
 //!
-//! Updates are published here too (u): the admin picks notes, urgent and
-//! rollback, the release is checked and shown with what it changes, and y
-//! signs and sends it. Checking and sending run on the screen's worker
-//! thread, so the screen keeps drawing while a binary of tens of MiB goes
-//! to the coordinator. R resumes a stopped rollout, after asking.
+//! The coordinator is asked on a thread of the screen's own, which owns
+//! the link to it: the screen keeps drawing and taking keys while the
+//! coordinator is slow or does not answer, and says how long it waits.
+//! Jobs run one at a time, in the order sent, and every change is followed
+//! by a fresh look. Closing the screen does not wait for the job that
+//! runs (only a look at a new coordinator, which moves the pinned key for
+//! a moment, is waited for): it ends by itself and its answer goes nowhere.
+//!
+//! Releases are published here too (p): the choices in a form, then what
+//! the release changes, then y. Checking and sending run on the same
+//! thread, so the screen keeps drawing while tens of MiB go to the
+//! coordinator. A stopped rollout is a card: try again (t) or skip the
+//! machine it stopped at (o).
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
+use ratatui::style::Modifier;
 
-use super::worker::{Waiting, Worker};
-use super::{Doc, Emit, Event, Flow, Key, Model, TextInput, dim, err, ok, sel, theme};
+use super::app::{PlaceScreen, Size};
+use super::form::{Field, Form, Group, Status};
+use super::frame::{self, Back, Focus, Help, Notice, Overlay, Page, col};
+use super::kill::WriteList;
+use super::theme::{self, Mark};
+use super::{Doc, Emit, Event, Flow, Key, Seg, dim, err, plain, spinner};
 use crate::admin::{Admin, NewCoordinator, View};
 use crate::ctx::Ctx;
 use crate::err::{Error, Kind, Result};
@@ -21,55 +39,59 @@ use crate::gotime::{Time, duration_string, round_ms};
 use crate::mesh;
 use crate::publish::{self, Choice, Days, Parts, Plan};
 use crate::registry::{Member, Request};
-use crate::release::{self, Release};
+use crate::release;
 use crate::report::{self, Concern, percent, short_age};
-use crate::rollout;
+use crate::rollout::{self, Pause, Phase};
 
+/// How often the screen looks again while the coordinator answers.
 const REFRESH: Duration = Duration::from_secs(5);
-/// After a failed load: do not freeze the screen on every tick.
+/// After a look that failed: not on every tick.
 const RETRY: Duration = Duration::from_secs(15);
+/// After this long without an answer the screen says it waits.
+const SLOW: Duration = Duration::from_secs(4);
 /// A member syncs every minute: three without a word and its report is
 /// old news.
 const STALE: i64 = 180;
 /// The most WireGuard peers named in the details; the rest are counted.
 const SHOWN_PEERS: usize = 24;
+/// Closing the screen while it looks at a new coordinator waits this long
+/// for the old pin to be put back.
+const PROBE_WAIT: Duration = Duration::from_secs(10);
+/// The snake shows progress in bodies this tall; smaller ones get a bar.
+const RING_ROWS: usize = 26;
+/// The widest a sheet gets.
+const SHEET: usize = 84;
 
-/// Text cut into lines of at most width columns, each starting with
-/// indent.
-fn wrap(text: &str, width: usize, indent: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut line = String::from(indent);
-    for word in text.split(' ') {
-        let fits = line.chars().count() + 1 + word.chars().count() <= width;
-        if line.len() > indent.len() && !fits {
-            out.push(std::mem::replace(&mut line, format!("{indent}  ")));
-        }
-        if line.len() > indent.len() && !line.ends_with(' ') {
-            line.push(' ');
-        }
-        line.push_str(word);
+const LOADING: &str = "asking the coordinator";
+const CHECKING: &str = "checking the release: binary, k3s file, Arch archive, coordinator";
+
+// ---- what members say about themselves ----
+
+/// "42s ago", "3m0s ago", "never".
+fn ago(t: Time, now: Time) -> String {
+    if t.is_zero() {
+        return "never".into();
     }
-    if !line.trim().is_empty() {
-        out.push(line);
+    let ms = now.since(t).num_milliseconds();
+    let secs = round_ms(ms, 1000) / 1000;
+    if secs < 60 {
+        return format!("{} ago", duration_string(secs));
     }
-    out
+    format!("{} ago", duration_string(round_ms(secs * 1000, 60_000) / 1000))
 }
 
-/// The second line under a member: what it says about itself. Values that
-/// need a look are in the alarm colour; the rest of what needs a look
-/// follows them. target is the release the swarm moves to.
-fn health(m: &Member, now: Time, target: u64) -> Doc {
-    let mut d = Doc::new();
+/// What a member says about itself, as short items; true marks what needs
+/// a look. target is the release the swarm moves to.
+fn health(m: &Member, now: Time, target: u64) -> Vec<(String, bool)> {
     let Some(r) = &m.report else {
-        d.s("    ").add(dim("no report: its dryserver, or the coordinator's, is older than this one"));
-        return d;
+        return vec![("no report: its dryserver is older".into(), false)];
     };
     let problems = r.problems(m.last_seen);
     let bad = |c: Concern| problems.iter().any(|(k, _)| *k == c);
     let mut items: Vec<(String, bool)> = Vec::new();
     let quiet = now.since(m.last_seen).num_seconds();
     if !m.last_seen.is_zero() && quiet > STALE {
-        items.push((format!("silent for {}:", short_age(quiet as u64)), true));
+        items.push((format!("silent for {}", short_age(quiet as u64)), true));
     }
     items.push((if r.dryserver.is_empty() { "?".into() } else { r.dryserver.clone() }, false));
     if let Some(item) = rollout::member_release(r, target) {
@@ -91,7 +113,7 @@ fn health(m: &Member, now: Time, target: u64) -> Doc {
     });
     items.push(match r.firewall {
         Some(true) => ("firewall on".into(), false),
-        Some(false) => ("firewall OFF".into(), true),
+        Some(false) => ("firewall off".into(), true),
         None => ("firewall ?".into(), false),
     });
     for (c, text) in &problems {
@@ -99,48 +121,54 @@ fn health(m: &Member, now: Time, target: u64) -> Doc {
             items.push((text.clone(), true));
         }
     }
-    // As many to a line as fit 80 columns.
-    let mut width = 0;
-    for (text, alarm) in items {
-        let w = text.chars().count();
-        if width > 4 && width + 2 + w > 80 {
-            d.nl();
-            width = 0;
-        }
-        d.s(if width == 0 { "    " } else { "  " });
-        width += if width == 0 { 4 } else { 2 } + w;
-        if alarm {
-            d.add(err(text));
-        } else {
-            d.s(text);
-        }
-    }
-    d
+    items
 }
 
-/// Everything a member says about itself, for the details under the list.
-/// names gives the member names by host number, for its WireGuard peers.
-fn details(m: &Member, names: &dyn Fn(u32) -> String, now: Time) -> Doc {
-    let mut d = Doc::new();
+/// A member's row: its mark and one line on how it is, alarm first.
+fn health_line(m: &Member, signed: bool, first: bool, now: Time, target: u64) -> (Mark, String, bool) {
+    if !signed && first && m.host == 1 {
+        return (Mark::Act, "not signed yet: s signs it".into(), false);
+    }
+    if !signed {
+        return (Mark::Bad, "not signed: put on the coordinator without you, servers ignore it".into(), true);
+    }
+    if m.report.is_none() {
+        return (Mark::Wait, "no report: its dryserver is older".into(), false);
+    }
+    let items = health(m, now, target);
+    let bad: Vec<&str> = items.iter().filter(|(_, a)| *a).map(|(t, _)| t.as_str()).collect();
+    if !bad.is_empty() {
+        return (Mark::Bad, bad.join(" · "), true);
+    }
+    let good: Vec<&str> = items.iter().map(|(t, _)| t.as_str()).filter(|t| !matches!(*t, "k3s on" | "firewall on")).collect();
+    (Mark::Done, format!("healthy · {}", good.join(" · ")), false)
+}
+
+/// Everything a member says about itself, for its sheet. names gives the
+/// member names by host number, for its WireGuard peers.
+fn report_lines(m: &Member, names: &dyn Fn(u32) -> String, now: Time) -> Vec<Vec<Seg>> {
+    let mut out: Vec<Vec<Seg>> = Vec::new();
     let Some(r) = &m.report else {
-        d.s(format!("{} sends no report: its dryserver, or the coordinator's, is older than this one.", m.name)).nl();
-        return d;
+        out.push(vec![dim(format!("{} sends no report: its dryserver, or the coordinator's, is older than this one.", m.name))]);
+        return out;
     };
-    d.s(format!("{}, as it reports itself", m.name)).add(dim(format!(" (relayed by the coordinator, {}):", ago(m.last_seen, now)))).nl();
+    out.push(vec![dim(format!("As it reports itself, relayed by the coordinator {}:", ago(m.last_seen, now)))]);
     let or = |s: &str| if s.is_empty() { "?".to_string() } else { s.to_string() };
-    let k3s = match (r.k3s.as_str(), r.k3s_active) {
-        ("", _) => "no k3s".to_string(),
-        (v, Some(true)) => format!("k3s {v}, running"),
-        (v, _) => format!("k3s {v}, STOPPED"),
-    };
-    let fw = match r.firewall {
-        Some(true) => "firewall loaded",
-        Some(false) => "FIREWALL NOT LOADED",
-        None => "firewall unknown",
-    };
-    d.s(format!("  dryserver {}   {k3s}   {fw}", or(&r.dryserver))).nl();
+    let mut l = vec![txt(format!("dryserver {}   ", or(&r.dryserver)))];
+    l.push(match (r.k3s.as_str(), r.k3s_active) {
+        ("", _) => txt("no k3s"),
+        (v, Some(true)) => txt(format!("k3s {v}, running")),
+        (v, _) => err(format!("k3s {v}, stopped")),
+    });
+    l.push(txt("   "));
+    l.push(match r.firewall {
+        Some(true) => txt("firewall loaded"),
+        Some(false) => err("firewall not loaded"),
+        None => dim("firewall unknown"),
+    });
+    out.push(l);
     if r.release != 0 || !r.update.is_empty() {
-        let mut line = if r.release == 0 { "  no release installed yet".to_string() } else { format!("  release {}", r.release) };
+        let mut line = if r.release == 0 { "no release installed yet".to_string() } else { format!("release {}", r.release) };
         if !r.update.is_empty() {
             line += &format!("; update {}", r.update);
             if r.update_serial != 0 {
@@ -150,19 +178,12 @@ fn details(m: &Member, names: &dyn Fn(u32) -> String, now: Time) -> Doc {
                 line += &format!(": {}", r.update_note);
             }
         }
-        for l in wrap(&line, 80, "") {
-            if r.update_failed() || r.update == "held" {
-                d.add(err(l));
-            } else {
-                d.s(l);
-            }
-            d.nl();
-        }
+        out.push(vec![if r.update_failed() || r.update == "held" { err(line) } else { txt(line) }]);
     }
     if r.reboot {
-        d.s(format!("  kernel {} running, {} installed: ", or(&r.kernel), or(&r.kernel_installed))).add(err("reboot needed")).nl();
+        out.push(vec![txt(format!("kernel {} running, {} installed: ", or(&r.kernel), or(&r.kernel_installed))), err("reboot needed")]);
     } else {
-        d.s(format!("  kernel {}", or(&r.kernel))).nl();
+        out.push(vec![txt(format!("kernel {}", or(&r.kernel)))]);
     }
     let upgraded = if r.upgraded > 0 && r.time >= r.upgraded {
         format!("upgraded {} ago", short_age((r.time - r.upgraded) as u64))
@@ -170,61 +191,109 @@ fn details(m: &Member, names: &dyn Fn(u32) -> String, now: Time) -> Doc {
         "last upgrade unknown".into()
     };
     let [l1, l5, l15] = r.load;
-    d.s(format!("  up {}   {upgraded}   load {l1:.2} {l5:.2} {l15:.2} on {} CPUs", short_age(r.uptime), r.cpus)).nl();
+    out.push(vec![txt(format!("up {}   {upgraded}   load {l1:.2} {l5:.2} {l15:.2} on {} CPUs", short_age(r.uptime), r.cpus))]);
     let share = |used: u64, total: u64| match percent(used, total) {
         Some(p) => format!("{} of {} ({p}%)", report::size(used), report::size(total)),
         None => "?".into(),
     };
     let temp = r.temp.map(|t| format!("   {t}°C")).unwrap_or_default();
-    d.s(format!("  memory {}   disk {}{temp}", share(r.mem_used, r.mem_total), share(r.disk_used, r.disk_total))).nl();
+    out.push(vec![txt(format!("memory {}   disk {}{temp}", share(r.mem_used, r.mem_total), share(r.disk_used, r.disk_total)))]);
     match r.clock_offset(m.last_seen) {
-        Some(0) => {
-            d.s("  clock in step with the coordinator's").nl();
-        }
-        Some(off) => {
-            d.s(format!("  clock {} {} the coordinator's", short_age(off.unsigned_abs()), if off > 0 { "ahead of" } else { "behind" }))
-                .nl();
-        }
+        Some(0) => out.push(vec![txt("clock in step with the coordinator's")]),
+        Some(off) => out.push(vec![txt(format!(
+            "clock {} {} the coordinator's",
+            short_age(off.unsigned_abs()),
+            if off > 0 { "ahead of" } else { "behind" }
+        ))]),
         None => {}
     }
     if r.peers.is_empty() {
-        d.s("  WireGuard: nothing reported").nl();
-        return d;
+        out.push(vec![txt("WireGuard: nothing reported")]);
+        return out;
     }
     // The silent ones first: they are what to look at.
     let silent = r.silent_peers();
     let mut peers: Vec<&report::Peer> = r.peers.iter().collect();
     peers.sort_by_key(|p| !silent.contains(&p.host));
-    d.s("  WireGuard, last handshake:");
-    let mut width = 30;
+    let mut l = vec![txt("WireGuard, last handshake:")];
     for p in peers.iter().take(SHOWN_PEERS) {
         let text = format!(" {} {}", names(p.host), p.age.map(short_age).unwrap_or_else(|| "never".into()));
-        if width + text.len() > 78 {
-            d.nl().s("   ");
-            width = 3;
-        }
-        width += text.len();
-        if silent.contains(&p.host) {
-            d.add(err(text));
-        } else {
-            d.s(text);
-        }
+        l.push(if silent.contains(&p.host) { err(text) } else { txt(text) });
     }
     if peers.len() > SHOWN_PEERS {
-        d.add(dim(format!(" and {} more", peers.len() - SHOWN_PEERS)));
+        l.push(dim(format!(" and {} more", peers.len() - SHOWN_PEERS)));
     }
-    d.nl();
-    d
+    out.push(l);
+    out
 }
 
-pub enum Msg {
-    /// The release to publish, checked, or why not.
-    Planned(Result<Box<Plan>>),
-    Published(Result<Release>),
+/// Error words for this screen: where the core says which command to run,
+/// the screen names its own key or place.
+fn words(s: &str) -> String {
+    let s = s
+        .replace("./dryserver release status shows what the coordinator has", "the Updates tab shows what the coordinator has")
+        .replace("./dryserver release resume tries it again", "try again (t) does that");
+    report::printable(&s)
 }
+
+/// s with its first letter in capitals, for an error that starts a sentence.
+fn sentence(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Body text, in bone where the tier has it.
+fn txt(s: impl Into<String>) -> Seg {
+    Seg(s.into(), theme::palette().text())
+}
+
+/// A mark, then text that wraps under itself, width cells wide.
+fn hang(width: usize, m: Mark, text: Vec<Seg>) -> Vec<Vec<Seg>> {
+    let parts = frame::wrap_line(&text, width.saturating_sub(3).max(10));
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let mut l = vec![if i == 0 { theme::mark(m) } else { plain(" ") }, plain("  ")];
+            l.extend(part);
+            l
+        })
+        .collect()
+}
+
+/// One blank line before what comes next, unless at the top or after one.
+fn space(d: &mut Doc) {
+    let n = d.lines.len();
+    match (n >= 2 && d.lines[n - 2].is_empty(), d.lines[n - 1].is_empty()) {
+        // At the top, or a blank line is there.
+        _ if n == 1 && d.lines[0].is_empty() => {}
+        (true, true) => {}
+        (false, true) => {
+            d.nl();
+        }
+        (_, false) => {
+            d.nl().nl();
+        }
+    }
+}
+
+/// Appends whole lines to d, and returns the range they took.
+fn put(d: &mut Doc, lines: Vec<Vec<Seg>>) -> std::ops::Range<usize> {
+    let start = d.lines.len() - 1;
+    for l in lines {
+        d.lines.last_mut().expect("a doc has a line").extend(l);
+        d.nl();
+    }
+    start..d.lines.len() - 1
+}
+
+// ---- the work on the screen's own thread ----
 
 /// What the screen needs to publish releases. Each job makes its own
-/// link to the coordinator on the worker's thread.
+/// link to the coordinator on the screen's thread.
 pub struct Publisher {
     /// A new Admin with this desktop's keys.
     pub admin: Arc<dyn Fn() -> Result<Admin> + Send + Sync>,
@@ -235,83 +304,9 @@ pub struct Publisher {
     pub today: fn() -> NaiveDate,
 }
 
-enum Job {
-    Plan(Choice),
-    Publish(Box<Plan>),
-}
-
-const CHECKING: &str = "checking the release: binary, k3s file, Arch archive, coordinator";
-
-impl Job {
-    fn label(&self) -> String {
-        match self {
-            Job::Plan(_) => CHECKING.into(),
-            Job::Publish(p) => format!("publishing release {}", p.release.serial),
-        }
-    }
-}
-
-fn work(ctx: &Ctx, p: &Publisher, job: Job) -> Msg {
-    match job {
-        Job::Plan(c) => Msg::Planned((|| {
-            let mut a = (p.admin)()?;
-            let v = a.load()?;
-            publish::plan(ctx, &a, &v, p.days.as_ref(), &p.parts, &c, (p.today)()).map(Box::new)
-        })()),
-        Job::Publish(plan) => Msg::Published((|| {
-            let mut a = (p.admin)()?;
-            publish::publish(&mut a, &plan)
-        })()),
-    }
-}
-
-/// The admin's choices for a new release, before anything is checked.
-struct Form {
-    notes: TextInput,
-    urgent: bool,
-    rollback: bool,
-    /// 0 the notes, 1 urgent, 2 rollback.
-    focus: usize,
-}
-
-impl Form {
-    fn new(c: &Choice) -> Form {
-        let mut notes = TextInput::new(release::MAX_NOTES);
-        notes.set_value(&c.notes);
-        notes.placeholder = "what it is for, like: fixes the join timeout".into();
-        notes.focus();
-        Form { notes, urgent: c.urgent, rollback: c.rollback, focus: 0 }
-    }
-
-    fn choice(&self) -> Choice {
-        Choice { notes: self.notes.value.trim().to_string(), urgent: self.urgent, rollback: self.rollback, ..Choice::default() }
-    }
-
-    fn move_focus(&mut self, by: usize) {
-        self.focus = (self.focus + by) % 3;
-        if self.focus == 0 {
-            self.notes.focus();
-        } else {
-            self.notes.blur();
-        }
-    }
-}
-
-/// "42s ago", "3m0s ago", "never".
-fn ago(t: Time, now: Time) -> String {
-    if t.is_zero() {
-        return "never".into();
-    }
-    let ms = now.since(t).num_milliseconds();
-    let secs = round_ms(ms, 1000) / 1000;
-    if secs < 60 {
-        return format!("{} ago", duration_string(secs));
-    }
-    format!("{} ago", duration_string(round_ms(secs * 1000, 60_000) / 1000))
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Action {
+/// A decision, as the admin confirmed it.
+#[derive(Debug, Clone)]
+enum Act {
     /// The waiting request as the admin saw it: its id, name and keys,
     /// which its code covers. The desktop signs exactly those.
     Approve(Request),
@@ -319,63 +314,411 @@ enum Action {
     Remove(String),
     /// The first signature: the coordinator's own entry.
     SignCoordinator,
+    /// The list signed again under a new version.
+    Resend,
     /// A reinstalled coordinator takes the old one's place.
     NewCoordinator(NewCoordinator),
-    Resend,
-    /// Let a stopped rollout go on.
+    /// A stopped rollout goes on: the machine it stopped at tries again.
     Resume,
+    /// A rollout stopped at a server goes on without it.
+    Skip,
+    Publish(Box<Plan>),
+}
+
+impl Act {
+    fn label(&self) -> String {
+        match self {
+            Act::Approve(r) => format!("approving {}", r.name),
+            Act::Reject(r) => format!("rejecting {}", r.name),
+            Act::Remove(n) => format!("removing {n}"),
+            Act::SignCoordinator => "signing the coordinator".into(),
+            Act::Resend => "sending your signed list again".into(),
+            Act::NewCoordinator(c) => format!("making {} your coordinator", c.name),
+            Act::Resume => "asking the coordinator to try again".into(),
+            Act::Skip => "asking the coordinator to skip the machine".into(),
+            Act::Publish(p) => format!("publishing release {}", p.release.serial),
+        }
+    }
+
+    /// The start of what a failure says.
+    fn failed(&self) -> &'static str {
+        match self {
+            Act::Approve(_) => "Not approved",
+            Act::Reject(_) => "Not rejected",
+            Act::Remove(_) => "Not removed",
+            Act::SignCoordinator => "Not signed",
+            Act::Resend => "Not sent",
+            Act::NewCoordinator(_) => "Nothing changed",
+            Act::Resume => "Not resumed",
+            Act::Skip => "Not skipped",
+            Act::Publish(_) => "Not published",
+        }
+    }
+}
+
+enum Job {
+    Load,
+    /// Looks at the machine that answers at the coordinator's address.
+    Probe,
+    /// Writes the server list for ssh and the kill switch.
+    Write,
+    Check(Choice),
+    Act(Act),
+}
+
+impl Job {
+    fn label(&self) -> String {
+        match self {
+            Job::Load => LOADING.into(),
+            Job::Probe => "looking at the machine at the coordinator's address".into(),
+            Job::Write => "writing the server list".into(),
+            Job::Check(_) => CHECKING.into(),
+            Job::Act(a) => a.label(),
+        }
+    }
+
+    fn change(&self) -> bool {
+        matches!(self, Job::Probe | Job::Write | Job::Act(_))
+    }
+}
+
+pub enum Msg {
+    Loaded(Result<View>),
+    Probed(Result<NewCoordinator>),
+    Wrote(Result<String>),
+    Checked(Result<Box<Plan>>),
+    /// A decision ran, then the screen looked again.
+    Did {
+        failed: &'static str,
+        /// The serial, when it was a publish.
+        publish: Option<u64>,
+        said: Result<String>,
+        view: Result<View>,
+    },
+    /// The thread stopped on a bug: what it said.
+    Lost(String),
+}
+
+struct Tools {
+    publisher: Option<Arc<Publisher>>,
+    write_list: Option<WriteList>,
+}
+
+fn run(admin: &mut Admin, tools: &Tools, act: Act) -> Result<String> {
+    let subnet = admin.subnet.clone();
+    match act {
+        Act::Approve(r) => admin
+            .approve(&r)
+            .map(|host| format!("{} approved and signed as {}. It joins within a minute.", r.name, mesh::ip(&subnet, host))),
+        Act::Reject(r) => admin.reject(&r).map(|_| format!("{} rejected: it does not join.", r.name)),
+        Act::Remove(name) => admin.remove(&name).map(|_| format!("{name} removed; servers drop it within a minute.")),
+        Act::SignCoordinator => admin.sign_coordinator().map(|_| "Coordinator signed. New machines can join now.".to_string()),
+        Act::Resend => admin.resend().map(|v| format!("Signed list sent again as version {v}.")),
+        Act::NewCoordinator(c) => admin.accept_new_coordinator(&c).map(|_| {
+            format!(
+                "{} is your coordinator now, with every machine you signed before. Lift the cut in Kill switch (9) so the \
+                 servers follow it.",
+                c.name
+            )
+        }),
+        Act::Resume => publish::resume(admin).map(|what| format!("Resumed: the coordinator {what}, at its next sync (within a minute).")),
+        Act::Skip => publish::skip(admin).map(|what| format!("Skipped: the coordinator {what}, at its next sync (within a minute).")),
+        Act::Publish(plan) => {
+            let p = tools.publisher.as_ref().ok_or_else(|| Error::new("this screen cannot publish"))?;
+            let mut a = (p.admin)()?;
+            publish::publish(&mut a, &plan).map(|r| {
+                format!(
+                    "Release {} is on the coordinator. It updates itself first, then one server at a time: this tab shows how it goes.",
+                    r.serial
+                )
+            })
+        }
+    }
+}
+
+fn work(ctx: &Ctx, admin: &mut Admin, tools: &Tools, job: Job) -> Msg {
+    match job {
+        Job::Load => Msg::Loaded(admin.load()),
+        Job::Probe => Msg::Probed(admin.probe_new_coordinator()),
+        Job::Write => Msg::Wrote(match &tools.write_list {
+            Some(w) => w(),
+            None => Err(Error::new("this screen cannot write the server list")),
+        }),
+        Job::Check(c) => Msg::Checked((|| {
+            let p = tools.publisher.as_ref().ok_or_else(|| Error::new("this screen cannot publish"))?;
+            let mut a = (p.admin)()?;
+            let v = a.load()?;
+            publish::plan(ctx, &a, &v, p.days.as_ref(), &p.parts, &c, (p.today)()).map(Box::new)
+        })()),
+        Job::Act(act) => {
+            let (failed, publish) = (act.failed(), if let Act::Publish(p) = &act { Some(p.release.serial) } else { None });
+            let said = run(admin, tools, act);
+            Msg::Did { failed, publish, said, view: admin.load() }
+        }
+    }
+}
+
+/// The screen's thread. Dropping it lets the job that runs end by itself,
+/// except a look at a new coordinator, which is waited for.
+struct Line {
+    jobs: mpsc::Sender<Job>,
+    ctx: Ctx,
+    probing: Arc<AtomicBool>,
+}
+
+impl Line {
+    fn start(admin: Admin, tools: Tools, emit: Emit<Msg>) -> Line {
+        let (tx, rx) = mpsc::channel::<Job>();
+        let ctx = Ctx::new();
+        let (c, probing) = (ctx.clone(), Arc::new(AtomicBool::new(false)));
+        let p = probing.clone();
+        std::thread::spawn(move || {
+            let mut admin = admin;
+            while let Ok(job) = rx.recv() {
+                if c.done() {
+                    break;
+                }
+                p.store(matches!(job, Job::Probe), Ordering::SeqCst);
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&c, &mut admin, &tools, job)));
+                p.store(false, Ordering::SeqCst);
+                match res {
+                    Ok(m) => emit(m),
+                    Err(e) => {
+                        let what = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned());
+                        emit(Msg::Lost(what.unwrap_or_else(|| "no word why".into())));
+                        break;
+                    }
+                }
+            }
+        });
+        Line { jobs: tx, ctx, probing }
+    }
+
+    fn send(&self, job: Job) -> bool {
+        self.jobs.send(job).is_ok()
+    }
+}
+
+impl Drop for Line {
+    fn drop(&mut self) {
+        self.ctx.cancel();
+        let t = Instant::now();
+        while self.probing.load(Ordering::SeqCst) && t.elapsed() < PROBE_WAIT {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// What the screen sent its thread and has not heard back about, in the
+/// order sent: each job answers with exactly one message.
+#[derive(Default)]
+struct Queue {
+    jobs: VecDeque<(String, bool)>,
+    /// When the oldest job started.
+    since: Option<Instant>,
+}
+
+impl Queue {
+    fn push(&mut self, label: String, change: bool) {
+        if self.jobs.is_empty() {
+            self.since = Some(Instant::now());
+        }
+        self.jobs.push_back((label, change));
+    }
+
+    fn pop(&mut self) {
+        self.jobs.pop_front();
+        self.since = if self.jobs.is_empty() { None } else { Some(Instant::now()) };
+    }
+
+    fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    fn has(&self, label: &str) -> bool {
+        self.jobs.iter().any(|(l, _)| l == label)
+    }
+
+    /// The first change that has not answered yet.
+    fn change(&self) -> Option<&str> {
+        self.jobs.iter().find(|(_, c)| *c).map(|(l, _)| l.as_str())
+    }
+
+    /// The job that runs, and for how long.
+    fn running(&self) -> Option<(&str, Duration)> {
+        self.jobs.front().map(|(l, _)| (l.as_str(), self.since.map(|t| t.elapsed()).unwrap_or_default()))
+    }
+}
+
+// ---- the screen ----
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Machines,
+    Updates,
+    Network,
+}
+
+const TABS: [Tab; 3] = [Tab::Machines, Tab::Updates, Tab::Network];
+
+impl Tab {
+    fn title(self) -> &'static str {
+        match self {
+            Tab::Machines => "Machines",
+            Tab::Updates => "Updates",
+            Tab::Network => "Network",
+        }
+    }
+
+    fn at(self) -> usize {
+        self as usize
+    }
+}
+
+/// Something on a tab that can be selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    Request(usize),
+    Member(usize),
+    /// The stopped rollout's card.
+    Stopped,
+    Device(usize),
+    Cut(usize),
+    Warning(usize),
+}
+
+/// What a key or a line of a sheet does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Do {
+    Approve,
+    Reject,
+    Remove,
+    Sign,
+    NewCoordinator,
+    WriteList,
+    TryAgain,
+    Skip,
+    Publish,
+}
+
+const DOS: [Do; 9] =
+    [Do::Approve, Do::Reject, Do::Remove, Do::Sign, Do::NewCoordinator, Do::WriteList, Do::TryAgain, Do::Skip, Do::Publish];
+
+impl Do {
+    fn key(self) -> char {
+        match self {
+            Do::Approve => 'a',
+            Do::Reject => 'x',
+            Do::Remove => 'd',
+            Do::Sign => 's',
+            Do::NewCoordinator => 'n',
+            Do::WriteList => 'w',
+            Do::TryAgain => 't',
+            Do::Skip => 'o',
+            Do::Publish => 'p',
+        }
+    }
+
+    fn of(c: char) -> Option<Do> {
+        DOS.into_iter().find(|d| d.key() == c)
+    }
+}
+
+/// A question before a change: y does it.
+struct Ask {
+    question: String,
+    consequences: Vec<String>,
+    act: Act,
+}
+
+/// A row's sheet, open in the body.
+struct Opened {
+    /// The row it is about (row_key), found again after each look.
+    key: String,
+    cursor: usize,
 }
 
 pub struct Screen {
-    admin: Admin,
+    /// Moved onto the screen's thread when it starts.
+    admin: Option<Admin>,
     subnet: String,
+    secrets: PathBuf,
+    /// The coordinator's address, for the header.
+    addr: String,
     now: fn() -> Time,
     view: View,
+    /// When the coordinator last answered.
+    answered: Option<Instant>,
+    /// When the last look ended, answered or not.
+    looked: Option<Instant>,
     err: Option<Error>,
-    cursor: usize,
-    /// A decision waiting for "y", with the question shown.
-    confirm: Option<(String, Action)>,
-    pub notice: String,
-    last_load: Option<Instant>,
-    /// Everything the selected member reports, under the list.
-    details: bool,
-    /// Publishing; None: this screen cannot (u says so).
+    /// Since when it has not answered.
+    down_since: Option<Instant>,
+    /// A key file of secrets/ that is not there.
+    missing: Option<PathBuf>,
+    /// The stopped rollout last seen (its release, machine and words):
+    /// a new one is selected.
+    stop: Option<String>,
+    tab: Tab,
+    sel: [usize; 3],
+    /// The selected row of each tab, by row_key: kept across looks.
+    pick: [Option<String>; 3],
+    opened: Option<Opened>,
+    ask: Option<Ask>,
+    notice: Option<Notice>,
+    /// A check or publish that failed: what happened, what to do.
+    failed: Option<(String, String)>,
     publisher: Option<Arc<Publisher>>,
-    worker: Option<Worker<Job>>,
-    waiting: Waiting,
+    write_list: Option<WriteList>,
+    line: Option<Line>,
+    queue: Queue,
     /// The choices for a new release, while the admin makes them; the
     /// last ones are kept for the next try.
-    form: Option<Form>,
+    form: Option<Form<Choice>>,
     choice: Choice,
-    /// A checked release waiting for "y".
+    /// A checked release: what it changes, before the confirm.
     plan: Option<Box<Plan>>,
-    /// q was pressed once while a publish ran.
-    quit_armed: bool,
+    /// esc was pressed once while a change runs.
+    leave_armed: bool,
+    /// A card has just appeared at the top: it is kept in view until the
+    /// next key, before the selected row.
+    fresh_card: bool,
     /// What to tell the admin after the screen closed.
-    after: Option<String>,
+    after: Option<Notice>,
 }
 
 impl Screen {
     pub fn new(admin: Admin) -> Screen {
-        let subnet = admin.subnet.clone();
+        let (subnet, secrets) = (admin.subnet.clone(), admin.secrets.clone());
         Screen {
-            admin,
+            admin: Some(admin),
             subnet,
+            secrets,
+            addr: String::new(),
             now: Time::now,
             view: View::default(),
+            answered: None,
+            looked: None,
             err: None,
-            cursor: 0,
-            confirm: None,
-            notice: String::new(),
-            last_load: None,
-            details: false,
+            down_since: None,
+            missing: None,
+            stop: None,
+            tab: Tab::Machines,
+            sel: [0; 3],
+            pick: Default::default(),
+            opened: None,
+            ask: None,
+            notice: None,
+            failed: None,
             publisher: None,
-            worker: None,
-            waiting: Waiting::default(),
+            write_list: None,
+            line: None,
+            queue: Queue::default(),
             form: None,
             choice: Choice::default(),
             plan: None,
-            quit_armed: false,
+            leave_armed: false,
+            fresh_card: false,
             after: None,
         }
     }
@@ -385,1177 +728,1457 @@ impl Screen {
         self
     }
 
-    /// What the admin should know once the screen is closed: a publish
-    /// it cut off.
-    pub fn after(&self) -> Option<&str> {
-        self.after.as_deref()
+    /// Writes the server list (ssh-config), from the actions.
+    pub fn with_write_list(mut self, w: WriteList) -> Screen {
+        self.write_list = Some(w);
+        self
     }
 
-    fn start(&mut self, emit: &Emit<Msg>) {
-        let Some(p) = self.publisher.clone() else { return };
-        let emit = emit.clone();
-        self.worker = Some(Worker::start(move |ctx, job| emit(work(ctx, &p, job))));
+    /// The coordinator's address, for the header.
+    pub fn at(mut self, addr: &str) -> Screen {
+        self.addr = addr.into();
+        self
     }
+
+    /// Opens on another tab (Updates opens Machines on its Updates tab).
+    pub fn on_tab(mut self, t: Tab) -> Screen {
+        self.tab = t;
+        self
+    }
+
+    // ---- the thread ----
 
     fn send(&mut self, job: Job) {
-        let (label, change) = (job.label(), matches!(job, Job::Publish(_)));
-        if self.worker.as_ref().is_some_and(|w| w.send(job)) {
-            self.waiting.push(label, change);
+        let (label, change) = (job.label(), job.change());
+        if self.line.as_ref().is_some_and(|l| l.send(job)) {
+            self.queue.push(label, change);
         } else {
-            self.notice = "The background worker stopped; quit and open the screen again.".into();
+            self.notice = Some(Notice::bad("The screen's link to the coordinator stopped: esc, then open Machines (4) again."));
         }
     }
 
-    fn answer(&mut self, m: Msg) {
-        self.waiting.pop();
-        match m {
-            Msg::Planned(Ok(p)) => {
-                self.notice.clear();
-                self.plan = Some(p);
-            }
-            Msg::Planned(Err(e)) => self.notice = format!("Not published, nothing was signed: {e}"),
-            Msg::Published(res) => {
-                self.quit_armed = false;
-                self.notice = match res {
-                    Ok(r) => {
-                        // The next release starts from fresh choices.
-                        self.choice = Choice::default();
-                        format!(
-                            "Release {} is on the coordinator. It updates itself first, then one server at a time; \
-                             Updates below shows how it goes.",
-                            r.serial
-                        )
-                    }
-                    Err(e) => format!("Not published: {e}"),
-                };
-                self.load();
-            }
+    fn look(&mut self) {
+        if !self.queue.has(LOADING) {
+            self.send(Job::Load);
         }
     }
 
-    /// u: the form for a new release, unless one is on its way.
-    fn open_form(&mut self) {
-        if self.publisher.is_none() {
-            self.notice = "This screen cannot publish; use ./dryserver release publish".into();
-        } else if let Some(what) = self.waiting.change() {
-            self.notice = format!("Still {what}: one release at a time.");
-        } else if self.waiting.has(CHECKING) {
-            self.notice = "Already checking a release: wait for it.".into();
-        } else {
-            self.notice.clear();
-            self.form = Some(Form::new(&self.choice));
-        }
-    }
-
-    fn form_key(&mut self, mut f: Form, k: Key) {
-        match k {
-            Key::Esc => {
-                self.choice = f.choice();
-                self.notice = "Nothing signed.".into();
-                return;
-            }
-            Key::Enter => {
-                self.choice = f.choice();
-                self.send(Job::Plan(self.choice.clone()));
-                return;
-            }
-            Key::Tab | Key::Down => f.move_focus(1),
-            Key::BackTab | Key::Up => f.move_focus(2),
-            Key::Char(' ') if f.focus == 1 => f.urgent = !f.urgent,
-            Key::Char(' ') if f.focus == 2 => f.rollback = !f.rollback,
-            k if f.focus == 0 => {
-                f.notes.handle(&k);
-            }
-            _ => {}
-        }
-        self.form = Some(f);
-    }
-
-    /// The form, in place of the screen.
-    fn form_view(&self, f: &Form) -> Doc {
-        let mut b = Doc::new();
-        let version = self.publisher.as_ref().map(|p| p.parts.version.clone()).unwrap_or_default();
-        b.s("Publish an update\n");
-        let intro = format!(
-            "A release of this dryserver ({version}) for every machine, with the k3s it pins and the newest Arch \
-             snapshot day. Nothing is signed before you have seen what changes."
-        );
-        b.add(dim(super::wrap(&format!("  {intro}"), 78))).nl().nl();
-        let label = |b: &mut Doc, i: usize, name: &str| {
-            if f.focus == i {
-                b.add(sel(format!("> {name:<9} ")));
-            } else {
-                b.s(format!("  {name:<9} "));
-            }
-        };
-        label(&mut b, 0, "notes");
-        b.append(f.notes.view()).nl();
-        let check = |on: bool| if on { "[x]" } else { "[ ]" };
-        label(&mut b, 1, "urgent");
-        b.s(format!("{} ", check(f.urgent)))
-            .add(dim(format!("roll out at once, not only in the window {}", rollout::window_text(rollout::WINDOW))))
-            .nl();
-        label(&mut b, 2, "rollback");
-        b.s(format!("{} ", check(f.rollback))).add(dim("allow older versions than the swarm runs (the way back)")).nl();
-        b.nl().append(theme::keys(&[("tab", "next"), ("space", "switch"), ("enter", "see what changes"), ("esc", "cancel")])).nl();
-        b
-    }
-
-    /// The checked release, in place of the screen, waiting for y.
-    fn plan_view(&self, p: &Plan) -> Doc {
-        let mut b = Doc::new();
-        b.add(err("Sign and send this release to the coordinator?")).nl();
-        for line in p.lines() {
-            b.s(super::wrap(&format!("  {line}"), 78)).nl();
-        }
-        b.nl().append(theme::keys(&[("y", "sign and send it"), ("other keys", "nothing is signed")])).nl();
-        b
-    }
-
-    pub fn load(&mut self) {
-        self.last_load = Some(Instant::now());
-        match self.admin.load() {
+    fn loaded(&mut self, res: Result<View>) {
+        self.looked = Some(Instant::now());
+        let (was_err, was_missing) = (self.err.is_some(), self.missing.is_some());
+        match res {
             Ok(v) => {
                 self.view = v;
                 self.err = None;
+                self.answered = Some(Instant::now());
+                self.down_since = None;
             }
-            Err(e) => self.err = Some(e),
+            Err(e) => {
+                if self.down_since.is_none() {
+                    self.down_since = Some(Instant::now());
+                }
+                self.err = Some(e);
+            }
         }
-        let n = self.view.pending.len() + self.view.members.len();
-        self.cursor = self.cursor.min(n.saturating_sub(1));
+        self.missing = super::home::ADMIN_KEYS.iter().map(|k| self.secrets.join(k)).find(|p| !p.exists());
+        if (self.err.is_some() && !was_err) || (self.missing.is_some() && !was_missing) {
+            self.fresh_card = true;
+        }
+        let r = &self.view.rollout;
+        let stop = publish::stopped(r).then(|| format!("{} {} {}", r.serial, r.pause_host, r.paused));
+        if stop.is_some() && stop != self.stop {
+            self.pick[Tab::Updates.at()] = Some("stopped".into());
+        }
+        self.stop = stop;
+        self.reselect();
     }
 
-    fn run(&mut self, a: Action) {
-        let res: Result<String> = match &a {
-            Action::Approve(r) => {
-                self.admin.approve(r).map(|host| format!("{} approved and signed as {}.", r.name, mesh::ip(&self.subnet, host)))
+    fn answer(&mut self, m: Msg) {
+        self.queue.pop();
+        match m {
+            Msg::Loaded(res) => self.loaded(res),
+            Msg::Probed(Ok(c)) => {
+                self.ask = Some(Ask {
+                    question: format!("Make {} your coordinator?", c.name),
+                    consequences: vec![
+                        format!(
+                            "The machine at {} was installed from your USB stick as coordinator {}.",
+                            self.addr_or("the coordinator's address"),
+                            c.name
+                        ),
+                        format!("Its screen must show the code {}.", c.code),
+                        "Every machine you signed before stays; lift the cut in Kill switch (9) after, so the servers follow it.".into(),
+                    ],
+                    act: Act::NewCoordinator(c),
+                });
             }
-            Action::Reject(r) => self.admin.reject(r).map(|_| format!("{} rejected.", r.name)),
-            Action::Remove(name) => self.admin.remove(name).map(|_| format!("{name} removed; servers drop it within a minute.")),
-            Action::SignCoordinator => self.admin.sign_coordinator().map(|_| "Coordinator signed. New machines can join now.".to_string()),
-            Action::NewCoordinator(c) => self.admin.accept_new_coordinator(c).map(|_| {
-                format!("{} is your coordinator now, with every machine you signed before. Let the servers follow it: ./dryserver quarantine-all -lift", c.name)
-            }),
-            Action::Resend => self.admin.resend().map(|v| format!("Signed list sent again as version {v}.")),
-            Action::Resume => publish::resume(&mut self.admin)
-                .map(|what| format!("Resumed: the coordinator {what}, at its next sync (within a minute)."))
-                .map_err(|e| e.wrap("not resumed")),
-        };
-        self.notice = res.unwrap_or_else(|e| format!("Failed: {e}"));
-        self.load();
-    }
-
-    /// R: asks first, saying what resuming does, or why there is nothing
-    /// to resume.
-    fn ask_resume(&mut self) {
-        match publish::resume_does(&self.view.rollout) {
-            Ok(what) => {
-                let q = format!("Resume the rollout of release {}? The coordinator then {what}.", self.view.rollout.serial);
-                self.confirm = Some((format!("{q} y to confirm"), Action::Resume));
+            Msg::Probed(Err(e)) => self.notice = Some(Notice::bad(format!("Not a coordinator of yours: {}", words(&e.to_string())))),
+            Msg::Wrote(Ok(said)) => self.notice = Some(Notice::ok(words(&said))),
+            Msg::Wrote(Err(e)) => self.notice = Some(Notice::bad(format!("The server list was not written: {}", words(&e.to_string())))),
+            Msg::Checked(Ok(p)) => {
+                self.failed = None;
+                self.tab = Tab::Updates;
+                self.plan = Some(p);
             }
-            Err(e) => self.notice = format!("Nothing to resume: {e}."),
+            Msg::Checked(Err(e)) => {
+                self.tab = Tab::Updates;
+                self.fresh_card = true;
+                self.failed = Some((
+                    format!("Not published, nothing was signed. {}", sentence(&words(&e.to_string()))),
+                    "Fix that, then p tries again with the same choices.".into(),
+                ));
+            }
+            Msg::Did { failed, publish, said, view } => {
+                match (said, publish) {
+                    (Ok(s), Some(_)) => {
+                        // The next release starts from fresh choices.
+                        self.choice = Choice::default();
+                        self.failed = None;
+                        self.notice = Some(Notice::ok(s));
+                    }
+                    (Ok(s), None) => self.notice = Some(Notice::ok(s)),
+                    (Err(e), Some(serial)) => {
+                        self.fresh_card = true;
+                        self.failed = Some((
+                            format!("Release {serial} was not published. {}", sentence(&words(&e.to_string()))),
+                            "p publishes again: a new release gets a higher serial.".into(),
+                        ));
+                    }
+                    (Err(e), None) => self.notice = Some(Notice::bad(format!("{failed}: {}", words(&e.to_string())))),
+                }
+                self.loaded(view);
+            }
+            Msg::Lost(why) => {
+                self.line = None;
+                self.queue = Queue::default();
+                self.notice = Some(Notice::bad(format!(
+                    "The screen's link to the coordinator stopped ({}): esc, then open Machines (4) again.",
+                    report::printable(&why)
+                )));
+            }
         }
     }
 
-    /// Runs a right away, or asks first when it would also drop members
-    /// that are on the coordinator but not signed.
-    fn decide(&mut self, a: Action, question: Option<String>, keep: &[String]) {
-        let dropped = self.admin.would_drop(keep);
-        let mut q = question.unwrap_or_default();
-        if !dropped.is_empty() {
-            if !q.is_empty() {
-                q.push(' ');
+    fn addr_or<'a>(&'a self, or: &'a str) -> &'a str {
+        if self.addr.is_empty() { or } else { &self.addr }
+    }
+
+    // ---- rows and the selection ----
+
+    fn rows(&self, tab: Tab) -> Vec<Row> {
+        let v = &self.view;
+        match tab {
+            Tab::Machines => (0..v.pending.len()).map(Row::Request).chain((0..v.members.len()).map(Row::Member)).collect(),
+            Tab::Updates => {
+                let stopped = self.answered.is_some() && publish::stopped(&v.rollout);
+                stopped.then_some(Row::Stopped).into_iter().chain((0..v.members.len()).map(Row::Member)).collect()
             }
-            q += &format!("This also drops {} from the swarm (on the coordinator, not signed by you).", dropped.join(", "));
-        }
-        if q.is_empty() {
-            self.run(a);
-        } else {
-            self.confirm = Some((format!("{q} y to confirm"), a));
+            Tab::Network => (0..v.unknown.len())
+                .map(Row::Device)
+                .chain((0..v.reports.len()).map(Row::Cut))
+                .chain((0..v.warnings.len()).map(Row::Warning))
+                .collect(),
         }
     }
 
-    pub fn key(&mut self, k: Key) -> Flow {
-        let flow = self.key_inner(k);
-        if flow == Flow::Quit
-            && let Some(what) = self.waiting.change()
+    fn row_key(&self, r: Row) -> String {
+        let v = &self.view;
+        match r {
+            Row::Request(i) => format!("r:{}", v.pending.get(i).map(|r| r.id.as_str()).unwrap_or("")),
+            Row::Member(i) => format!("m:{}", v.members.get(i).map(|(m, _)| m.name.as_str()).unwrap_or("")),
+            Row::Stopped => "stopped".into(),
+            Row::Device(i) => format!("d:{}", v.unknown.get(i).map(|d| d.ip.as_str()).unwrap_or("")),
+            Row::Cut(i) => format!("c:{}", v.reports.get(i).map(String::as_str).unwrap_or("")),
+            Row::Warning(i) => format!("w:{i}"),
+        }
+    }
+
+    fn find(&self, key: &str) -> Option<Row> {
+        TABS.iter().flat_map(|t| self.rows(*t)).find(|r| self.row_key(*r) == key)
+    }
+
+    fn selected(&self) -> Option<Row> {
+        self.rows(self.tab).get(self.sel[self.tab.at()]).copied()
+    }
+
+    /// The selection of every tab found again after a look: the same row
+    /// where it is still there, else the one now at its place.
+    fn reselect(&mut self) {
+        for t in TABS {
+            let rows = self.rows(t);
+            let i = t.at();
+            let found = self.pick[i].as_ref().and_then(|k| rows.iter().position(|r| self.row_key(*r) == *k));
+            self.sel[i] = found.unwrap_or(self.sel[i]).min(rows.len().saturating_sub(1));
+            self.pick[i] = rows.get(self.sel[i]).map(|r| self.row_key(*r));
+        }
+        if let Some(o) = &self.opened
+            && self.find(&o.key).is_none()
         {
-            self.after = Some(format!(
-                "The screen closed while {what}. The upload stopped half way, and a cut-off upload is not taken: \
-                 ./dryserver release status shows whether it arrived. Publish again if not (it gets a new serial)."
+            self.opened = None;
+        }
+    }
+
+    fn move_by(&mut self, up: bool) {
+        if let Some(key) = self.opened.as_ref().map(|o| o.key.clone()) {
+            let n = self.find(&key).map(|r| self.items(r).len()).unwrap_or(0);
+            let o = self.opened.as_mut().expect("opened");
+            o.cursor = if up { o.cursor.saturating_sub(1) } else { (o.cursor + 1).min(n.saturating_sub(1)) };
+            return;
+        }
+        let rows = self.rows(self.tab);
+        let i = self.tab.at();
+        self.sel[i] = if up { self.sel[i].saturating_sub(1) } else { (self.sel[i] + 1).min(rows.len().saturating_sub(1)) };
+        self.pick[i] = rows.get(self.sel[i]).map(|r| self.row_key(*r));
+    }
+
+    fn switch(&mut self, by: usize) {
+        self.opened = None;
+        self.tab = TABS[(self.tab.at() + by) % TABS.len()];
+    }
+
+    fn request(&self, r: Option<Row>) -> Option<&Request> {
+        match r {
+            Some(Row::Request(i)) => self.view.pending.get(i),
+            _ => None,
+        }
+    }
+
+    fn member(&self, r: Option<Row>) -> Option<&(Member, bool)> {
+        match r {
+            Some(Row::Member(i)) => self.view.members.get(i),
+            _ => None,
+        }
+    }
+
+    fn coordinator(&self) -> Option<&Member> {
+        self.view.members.iter().map(|(m, _)| m).find(|m| m.host == 1)
+    }
+
+    /// The member the rollout stopped at (the coordinator for its own update).
+    fn stopped_at(&self) -> Option<u32> {
+        let r = &self.view.rollout;
+        if !publish::stopped(r) {
+            return None;
+        }
+        Some(if r.phase == Phase::Failed { 1 } else { r.pause_host })
+    }
+
+    /// Members on the coordinator that the next signature drops because
+    /// nobody signed them, except keep.
+    fn drops(&self, keep: &str) -> Vec<String> {
+        self.view.would_drop(&[keep])
+    }
+
+    fn host_key_changed(&self) -> bool {
+        self.err.as_ref().is_some_and(|e| e.is(Kind::HostKey))
+    }
+
+    /// The signed list needs sending again: the coordinator lost it,
+    /// serves another, or has members nobody signed.
+    fn list_problem(&self) -> Option<String> {
+        if self.answered.is_none() || self.err.is_some() || self.view.version == 0 {
+            return None;
+        }
+        let unsigned = self.view.unsigned();
+        if !unsigned.is_empty() {
+            return Some(format!(
+                "Not signed by you: {}. The coordinator lists {} without your signature; servers ignore {}.",
+                unsigned.join(", "),
+                if unsigned.len() == 1 { "it" } else { "them" },
+                if unsigned.len() == 1 { "it" } else { "them" }
             ));
         }
-        flow
+        self.view
+            .warnings
+            .iter()
+            .find(|w| w.starts_with("The coordinator has no valid signed list") || w.starts_with("The coordinator serves"))
+            .cloned()
     }
 
-    fn key_inner(&mut self, k: Key) -> Flow {
+    // ---- the actions ----
+
+    fn items(&self, r: Row) -> Vec<Do> {
+        match r {
+            Row::Request(_) => vec![Do::Approve, Do::Reject],
+            Row::Member(i) => {
+                let host = self.view.members.get(i).map(|(m, _)| m.host).unwrap_or(0);
+                let mut v = Vec::new();
+                if self.stopped_at() == Some(host) {
+                    v.extend([Do::TryAgain, Do::Skip]);
+                }
+                v.extend([Do::Remove, Do::Sign]);
+                if host == 1 {
+                    v.push(Do::NewCoordinator);
+                }
+                v.push(Do::WriteList);
+                v
+            }
+            Row::Stopped => vec![Do::TryAgain, Do::Skip, Do::Publish],
+            Row::Device(_) | Row::Cut(_) | Row::Warning(_) => Vec::new(),
+        }
+    }
+
+    fn label(&self, d: Do, r: Option<Row>) -> String {
+        let name = |r: Option<Row>| {
+            self.request(r).map(|q| q.name.clone()).or_else(|| self.member(r).map(|(m, _)| m.name.clone())).unwrap_or_default()
+        };
+        let rollout = &self.view.rollout;
+        match d {
+            Do::Approve => format!("approve {}", name(r)),
+            Do::Reject => format!("reject {}", name(r)),
+            Do::Remove => format!("remove {} from the swarm", name(r)),
+            Do::Sign if self.view.version == 0 => "sign the coordinator".into(),
+            Do::Sign => "sign your list again and send it".into(),
+            Do::NewCoordinator => "look at a new coordinator, after a reinstall".into(),
+            Do::WriteList => "write the server list, for ssh and the kill switch".into(),
+            Do::TryAgain => match publish::resume_does(rollout) {
+                Ok(what) => format!("try again: the coordinator {what}"),
+                Err(_) => "try again".into(),
+            },
+            Do::Skip => match publish::skip_does(rollout) {
+                Ok(what) if rollout.pause != Pause::Canary => format!("skip this machine: the coordinator {what}"),
+                _ => "skip this machine".into(),
+            },
+            Do::Publish => "publish a fixed release: it replaces this rollout".into(),
+        }
+    }
+
+    /// Why d cannot be done now, with r selected; None: it can.
+    fn why_not(&self, d: Do, r: Option<Row>) -> Option<String> {
+        if d == Do::Publish {
+            return if self.publisher.is_none() {
+                Some("This screen cannot publish: dryserver release publish in a terminal does.".into())
+            } else if let Some(what) = self.queue.change().filter(|w| w.starts_with("publishing")) {
+                Some(format!("Still {what}: one release at a time."))
+            } else if self.queue.has(CHECKING) {
+                Some("Already checking a release: wait for it.".into())
+            } else {
+                None
+            };
+        }
+        if let Some(what) = self.queue.change() {
+            return Some(format!("Still {what}: one change at a time."));
+        }
+        if d == Do::NewCoordinator {
+            return (!self.host_key_changed())
+                .then(|| "The coordinator answers with the SSH key this computer knows: n is for after a reinstall.".to_string());
+        }
+        if self.host_key_changed() {
+            return Some("The coordinator's address answers with another SSH key: nothing is signed for it. n looks at it.".into());
+        }
+        if self.err.is_some() {
+            return Some("The coordinator does not answer, so nothing can be signed now: r looks again.".into());
+        }
+        if self.answered.is_none() {
+            return Some("The coordinator has not answered yet: wait for it, the header says how long.".into());
+        }
+        let v = &self.view;
+        match d {
+            Do::Approve => match self.request(r) {
+                None => Some("Select a machine that waits to join first (Machines tab).".into()),
+                Some(q) if v.unproved.contains(&q.id) => Some(format!(
+                    "{} has no valid proof from your USB stick: it was not installed from it, or the coordinator changed the \
+                     request. It can only be rejected (x).",
+                    q.name
+                )),
+                Some(_) => None,
+            },
+            Do::Reject => self.request(r).is_none().then(|| "Select a machine that waits to join first (Machines tab).".into()),
+            Do::Remove => match self.member(r) {
+                None => Some("Select a member first (Machines tab).".into()),
+                Some((m, _)) if m.host == 1 => Some("The coordinator cannot be removed.".into()),
+                Some(_) => None,
+            },
+            Do::Sign if v.version == 0 && v.coordinator_code.is_empty() => {
+                Some("The coordinator sent no entry for itself: there is nothing to sign.".into())
+            }
+            Do::Sign => None,
+            Do::WriteList if self.write_list.is_none() => Some("This screen cannot write the server list.".into()),
+            Do::WriteList if v.version == 0 => Some("Nothing is signed yet: sign the coordinator first (s).".into()),
+            Do::WriteList => None,
+            Do::TryAgain => publish::resume_does(&v.rollout).err().map(|e| format!("Nothing to try again: {}.", words(&e.to_string()))),
+            Do::Skip if publish::stopped(&v.rollout) && v.rollout.pause == Pause::Canary => {
+                Some("The canary stopped the rollout, not a failure: try again (t) goes on after it.".into())
+            }
+            Do::Skip => publish::skip_does(&v.rollout).err().map(|e| format!("Nothing to skip: {}.", words(&e.to_string()))),
+            Do::NewCoordinator | Do::Publish => None,
+        }
+    }
+
+    /// d, for row r: asks first, or says why not.
+    fn act(&mut self, d: Do, r: Option<Row>) {
+        if let Some(why) = self.why_not(d, r) {
+            self.notice = Some(Notice::bad(why));
+            return;
+        }
+        let v = &self.view;
+        let also = |drops: Vec<String>| -> Vec<String> {
+            if drops.is_empty() {
+                Vec::new()
+            } else {
+                vec![format!("It also drops {} from the swarm: on the coordinator, not signed by you.", drops.join(", "))]
+            }
+        };
+        // While nothing is signed, any change signs the coordinator too.
+        let first = (v.version == 0 && !matches!(d, Do::Sign | Do::TryAgain | Do::Skip)).then(|| {
+            let name = self.coordinator().map(|c| c.name.clone()).unwrap_or_else(|| "the coordinator".into());
+            format!("It also signs the coordinator {name}: its screen must show the code {}.", v.coordinator_code)
+        });
+        let ask = |question: String, mut consequences: Vec<String>, drops: Vec<String>, act: Act| {
+            consequences.extend(first.clone());
+            consequences.extend(also(drops));
+            Some(Ask { question, consequences, act })
+        };
+        self.ask = match d {
+            Do::Approve => {
+                let q = self.request(r).cloned().expect("why_not checked it");
+                ask(
+                    format!("Approve {}?", q.name),
+                    vec![
+                        format!("Its screen must show the code {}.", q.code),
+                        "It gets the next free mesh address and joins within a minute.".into(),
+                    ],
+                    self.drops(""),
+                    Act::Approve(q),
+                )
+            }
+            Do::Reject => {
+                let q = self.request(r).cloned().expect("why_not checked it");
+                ask(
+                    format!("Reject {}?", q.name),
+                    vec!["It does not join, and its request is closed.".into()],
+                    self.drops(""),
+                    Act::Reject(q),
+                )
+            }
+            Do::Remove => {
+                let (m, _) = self.member(r).cloned().expect("why_not checked it");
+                ask(
+                    format!("Remove {} from the swarm?", m.name),
+                    vec![
+                        "Servers drop it within a minute: it leaves the mesh and the cluster.".into(),
+                        format!("Its mesh address {} is kept back from the next machines.", mesh::ip(&self.subnet, m.host)),
+                    ],
+                    self.drops(&m.name),
+                    Act::Remove(m.name),
+                )
+            }
+            Do::Sign if v.version == 0 => {
+                let name = self.coordinator().map(|c| c.name.clone()).unwrap_or_else(|| "the coordinator".into());
+                ask(
+                    format!("Sign the coordinator {name}?"),
+                    vec![
+                        format!("Its screen must show the code {} (shown after its install).", v.coordinator_code),
+                        "It becomes the first entry of your signed list; then machines can join.".into(),
+                    ],
+                    self.drops(""),
+                    Act::SignCoordinator,
+                )
+            }
+            Do::Sign => ask(
+                "Sign your list again and send it?".into(),
+                vec!["The same members, under a new version: the coordinator hands it to every server.".into()],
+                self.drops(""),
+                Act::Resend,
+            ),
+            Do::TryAgain => ask(
+                format!("Try release {} again?", v.rollout.serial),
+                vec![
+                    format!("The coordinator {}.", publish::resume_does(&v.rollout).unwrap_or_default()),
+                    "It does so at its next sync, within a minute.".into(),
+                ],
+                Vec::new(),
+                Act::Resume,
+            ),
+            Do::Skip => {
+                let who = v.rollout.pause_name.clone();
+                ask(
+                    format!("Skip {} for release {}?", if who.is_empty() { "the server" } else { &who }, v.rollout.serial),
+                    vec![
+                        format!("The coordinator {}.", publish::skip_does(&v.rollout).unwrap_or_default()),
+                        "The machine keeps the release it runs until the next one.".into(),
+                    ],
+                    Vec::new(),
+                    Act::Skip,
+                )
+            }
+            Do::NewCoordinator => {
+                self.send(Job::Probe);
+                None
+            }
+            Do::WriteList => {
+                self.send(Job::Write);
+                None
+            }
+            Do::Publish => {
+                self.open_form();
+                None
+            }
+        };
+    }
+
+    fn open_form(&mut self) {
+        let version = self.publisher.as_ref().map(|p| p.parts.version.clone()).unwrap_or_default();
+        self.opened = None;
+        self.tab = Tab::Updates;
+        self.failed = None;
+        self.form = Some(publish_form(&self.choice, &version));
+    }
+
+    // ---- keys ----
+
+    fn key(&mut self, k: Key) -> Flow {
+        // A paste where a key is expected does nothing.
+        if matches!(k, Key::Paste(_)) && !self.typing() {
+            return Flow::Continue;
+        }
         if k == Key::Ctrl('c') {
+            // The hub quits right after this: say what it cut off.
+            if let Some(what) = self.queue.change() {
+                self.after = Some(Notice::bad(if what.starts_with("publishing") {
+                    format!(
+                        "dryserver closed while {what}. The upload stopped half way, and a cut-off upload is not taken: \
+                         Updates (7) shows whether it arrived. Publish again if not (it gets a new serial)."
+                    )
+                } else {
+                    format!("dryserver closed while {what}: it may not have reached the coordinator. Machines (4) shows how it stands.")
+                }));
+            }
             return Flow::Quit;
         }
+        if let Some(a) = self.ask.take() {
+            if k == Key::Char('y') {
+                if let Act::Publish(_) = &a.act {
+                    self.tab = Tab::Updates;
+                }
+                self.send(Job::Act(a.act));
+            } else {
+                if let Act::Publish(p) = a.act {
+                    self.plan = Some(p);
+                }
+                self.notice = Some(Notice::info("Nothing was signed."));
+            }
+            return Flow::Continue;
+        }
+        self.notice = None;
+        self.fresh_card = false;
+        if let Some(mut f) = self.form.take() {
+            f.update(&k);
+            match f.status {
+                Status::Completed => {
+                    let mut c = f.state.clone();
+                    c.notes = c.notes.trim().to_string();
+                    self.choice = c.clone();
+                    self.send(Job::Check(c));
+                }
+                Status::Aborted => {
+                    self.choice = f.state.clone();
+                    self.notice = Some(Notice::info("Nothing was signed."));
+                }
+                Status::Active => self.form = Some(f),
+            }
+            return Flow::Continue;
+        }
         if let Some(p) = self.plan.take() {
-            if k == Key::Char('y') {
-                self.notice.clear();
-                self.send(Job::Publish(p));
-            } else {
-                self.notice = "Nothing signed.".into();
+            match k {
+                Key::Enter => {
+                    let n = p.machines();
+                    let window = rollout::window_text(rollout::WINDOW);
+                    self.ask = Some(Ask {
+                        question: format!("Sign and send release {} to the coordinator?", p.release.serial),
+                        consequences: vec![
+                            format!(
+                                "It goes to {n} machine{}: the coordinator first, then the servers one at a time.",
+                                if n == 1 { "" } else { "s" }
+                            ),
+                            if p.release.urgent {
+                                "Urgent: the rollout starts at once.".into()
+                            } else {
+                                format!("Machines update {window} on the coordinator's clock.")
+                            },
+                            "It is signed with this computer's key; a fixed release later replaces it.".into(),
+                        ],
+                        act: Act::Publish(p),
+                    });
+                }
+                Key::Esc => {
+                    self.notice = Some(Notice::info("Nothing was signed: change the choices and enter checks them again."));
+                    self.open_form();
+                }
+                _ => self.plan = Some(p),
             }
             return Flow::Continue;
         }
-        if let Some(f) = self.form.take() {
-            self.form_key(f, k);
-            return Flow::Continue;
-        }
-        if let Some((_, a)) = self.confirm.take() {
-            if k == Key::Char('y') {
-                self.run(a);
-            } else {
-                self.notice = "Nothing changed.".into();
-            }
-            return Flow::Continue;
-        }
-        let pending = self.view.pending.clone();
-        let members = self.view.members.clone();
-        let n = pending.len() + members.len();
-        let member = self.cursor.checked_sub(pending.len()).and_then(|i| members.get(i)).cloned();
-        let armed = std::mem::take(&mut self.quit_armed);
+        let armed = std::mem::take(&mut self.leave_armed);
         match k {
-            Key::Esc if self.details => self.details = false,
-            Key::Char('q') | Key::Esc => match self.waiting.change() {
+            Key::Esc if self.opened.is_some() => self.opened = None,
+            Key::Esc => match self.queue.change().map(str::to_string) {
                 Some(what) if !armed => {
-                    self.notice = format!("Still {what}. Press q again to quit anyway: the upload stops half way.");
-                    self.quit_armed = true;
+                    self.leave_armed = true;
+                    self.notice = Some(Notice::bad(format!(
+                        "Still {what}. esc again leaves: it goes on while dryserver runs, and Machines (4) shows how it ended."
+                    )));
                 }
-                _ => return Flow::Quit,
-            },
-            Key::Char('u') => self.open_form(),
-            Key::Char('R') => self.ask_resume(),
-            Key::Char('i') => self.details = !self.details,
-            Key::Up | Key::Char('k') => self.cursor = self.cursor.saturating_sub(1),
-            Key::Down | Key::Char('j') => self.cursor = (self.cursor + 1).min(n.saturating_sub(1)),
-            Key::Char(c @ ('a' | 'r')) => {
-                let Some(r) = pending.get(self.cursor).cloned() else {
-                    self.notice = "Select a waiting request first.".into();
-                    return Flow::Continue;
-                };
-                let a = if c == 'a' { Action::Approve(r) } else { Action::Reject(r) };
-                self.decide(a, None, &[]);
-            }
-            Key::Char('d') => {
-                let Some((m, _)) = member else { return Flow::Continue };
-                if m.host == 1 {
-                    self.notice = "The coordinator cannot be removed.".into();
-                    return Flow::Continue;
-                }
-                let q = format!("Remove {} from the swarm?", m.name);
-                self.decide(Action::Remove(m.name.clone()), Some(q), std::slice::from_ref(&m.name));
-            }
-            Key::Char('S') => {
-                if self.view.version != 0 {
-                    self.notice = if self.view.unsigned().is_empty() {
-                        "The coordinator is signed.".into()
+                Some(what) => {
+                    self.after = Some(Notice::info(if what.starts_with("publishing") {
+                        format!(
+                            "Machines closed while {what}: it goes on while dryserver runs. Updates (7) shows whether it \
+                             arrived; publish again if not (it gets a new serial)."
+                        )
                     } else {
-                        "Only the coordinator is signed without a request. Machines marked NOT SIGNED were put on the coordinator \
-                         without you: press p to drop them."
-                            .into()
-                    };
-                } else if self.view.coordinator_code.is_empty() {
-                    self.notice = "The coordinator sent no entry for itself.".into();
-                } else {
-                    let q = format!(
-                        "Sign the coordinator? Its screen must show the code {} (shown after its install).",
-                        self.view.coordinator_code
-                    );
-                    self.decide(Action::SignCoordinator, Some(q), &[]);
+                        format!("Machines closed while {what}: it goes on while dryserver runs. Machines (4) shows how it ended.")
+                    }));
+                    return Flow::Quit;
                 }
-            }
-            Key::Char('N') => {
-                if !self.err.as_ref().is_some_and(|e| e.is(Kind::HostKey)) {
-                    self.notice = "N is for a reinstalled coordinator. The one this computer knows answers fine.".into();
-                    return Flow::Continue;
-                }
-                match self.admin.probe_new_coordinator() {
-                    Ok(c) => {
-                        let q = format!(
-                            "The machine at the coordinator's address was installed from your USB stick as coordinator {}. \
-                             Its screen must show the code {}. Make it your coordinator?",
-                            c.name, c.code
-                        );
-                        self.confirm = Some((format!("{q} y to confirm"), Action::NewCoordinator(c)));
+                None => return Flow::Quit,
+            },
+            Key::Tab | Key::Right => self.switch(1),
+            Key::BackTab | Key::Left => self.switch(TABS.len() - 1),
+            Key::Up | Key::Char('k') => self.move_by(true),
+            Key::Down | Key::Char('j') => self.move_by(false),
+            Key::Enter => match &self.opened {
+                Some(o) => {
+                    if let Some(r) = self.find(&o.key)
+                        && let Some(d) = self.items(r).get(o.cursor).copied()
+                    {
+                        self.act(d, Some(r));
                     }
-                    Err(e) => self.notice = format!("Not a coordinator of yours: {e}"),
+                }
+                None => {
+                    // A cut and a warning are whole in the list already.
+                    if let Some(r @ (Row::Request(_) | Row::Member(_) | Row::Stopped | Row::Device(_))) = self.selected() {
+                        self.opened = Some(Opened { key: self.row_key(r), cursor: 0 });
+                    }
+                }
+            },
+            Key::Char('r') => {
+                if self.queue.has(LOADING) {
+                    self.notice = Some(Notice::info("Already asking the coordinator: the header says how long it waits."));
+                } else {
+                    self.failed = None;
+                    self.look();
                 }
             }
-            Key::Char('p') => self.run(Action::Resend),
+            Key::Char(c) => {
+                if let Some(d) = Do::of(c) {
+                    let r = self.opened.as_ref().and_then(|o| self.find(&o.key)).or_else(|| self.selected());
+                    self.act(d, r);
+                }
+            }
             _ => {}
         }
         Flow::Continue
     }
+
+    // ---- the page ----
+
+    /// Right of the header: the coordinator and whether it answers.
+    fn status(&self) -> Doc {
+        let p = theme::palette();
+        let mut d = Doc::new();
+        d.add(Seg("coordinator ".into(), p.hint()));
+        d.add(Seg(self.addr_or("?").to_string(), p.text()));
+        d.s("  ");
+        let loading = self.queue.running().filter(|(l, _)| *l == LOADING).map(|(_, t)| t);
+        if self.host_key_changed() {
+            d.add(theme::mark(Mark::Bad)).add(err(" another SSH key"));
+        } else if self.err.is_some() {
+            let down = self.down_since.map(|t| super::dur(t.elapsed())).unwrap_or_default();
+            d.add(theme::mark(Mark::Bad)).add(err(format!(" no answer for {down}")));
+            if let Some(t) = loading {
+                d.add(Seg(format!(" · asking again {}", super::dur(t)), p.hint()));
+            }
+        } else if self.answered.is_none() {
+            let t = loading.map(super::dur).unwrap_or_default();
+            d.add(theme::mark(Mark::Wait)).add(Seg(format!(" asking {t}"), p.hint()));
+        } else if let Some(t) = loading.filter(|t| *t >= SLOW) {
+            d.add(theme::mark(Mark::Wait)).add(Seg(format!(" slow: waiting {}", super::dur(t)), p.hint()));
+        } else {
+            d.add(theme::mark(Mark::Done)).add(Seg(" answers".into(), p.fg(p.gold)));
+        }
+        d
+    }
+
+    /// The cards every tab shows first: the coordinator does not answer,
+    /// or answers with another key, or a key file is missing.
+    fn top_cards(&self, b: &mut Doc, w: usize) {
+        if let Some(path) = &self.missing {
+            space(b);
+            b.append(frame::card(
+                w,
+                &format!("A key is missing: {} is not there. Nothing here can be signed or checked without it.", path.display()),
+                "Put your copy of secrets/ back where it was. Home (esc) shows what else is missing.",
+                None,
+            ));
+            b.nl();
+        }
+        let Some(e) = &self.err else {
+            if self.answered.is_none() {
+                let t = self.queue.running().filter(|(l, _)| *l == LOADING).map(|(_, t)| t).unwrap_or_default();
+                b.add(Seg(spinner().into(), theme::palette().selected()))
+                    .s(format!(" Asking the coordinator at {}{} {}", self.addr_or("its address"), theme::ellipsis(), super::dur(t)))
+                    .nl();
+                if t >= SLOW {
+                    b.add(dim("It takes longer than usual: the coordinator may be busy, or off. The screen keeps working; esc goes back."))
+                        .nl();
+                }
+            }
+            return;
+        };
+        let text = words(&e.to_string());
+        let stale = self.answered.map(|t| format!(" What shows below is from {} ago.", super::dur(t.elapsed()))).unwrap_or_default();
+        if e.is(Kind::HostKey) {
+            space(b);
+            b.append(frame::card(
+                w,
+                &sentence(&text),
+                &format!(
+                    "If you reinstalled the coordinator from your USB stick, look at the new one: it must show the code on its own \
+                     screen. If you did not, something else answers at its address: change nothing.{stale}"
+                ),
+                Some(("n", "look at the new coordinator")),
+            ));
+        } else {
+            let todo = format!("Is it on, and on your network? The screen asks again every {}s.{stale}", RETRY.as_secs());
+            space(b);
+            b.append(frame::card(w, &format!("Cannot talk to the coordinator. {}", sentence(&text)), &todo, Some(("r", "look again now"))));
+        }
+        b.nl();
+    }
+
+    fn machines_body(&self, w: usize) -> (Doc, Option<Focus>) {
+        let p = theme::palette();
+        let mut b = Doc::new();
+        let now = (self.now)();
+        self.top_cards(&mut b, w);
+        if self.answered.is_none() {
+            // Nothing is known yet: no empty lists that say otherwise.
+            return (b, None);
+        }
+        let v = &self.view;
+        if self.answered.is_some() && self.err.is_none() {
+            if v.version == 0 {
+                if v.coordinator_code.is_empty() {
+                    space(&mut b);
+                    b.append(frame::card(
+                        w,
+                        "The coordinator sent no entry for itself. There is nothing to sign.",
+                        "It was not installed as a coordinator from your USB stick, or its registry is damaged: install it again \
+                         from the stick.",
+                        None,
+                    ));
+                } else {
+                    space(&mut b);
+                    b.append(frame::card(
+                        w,
+                        &format!("Sign your coordinator: its screen shows the code {}.", v.coordinator_code),
+                        "Compare it with the code on the coordinator's own screen, shown after its install. Signing makes it the \
+                         first entry of your signed list; then other machines can join.",
+                        Some(("s", "sign the coordinator")),
+                    ));
+                }
+                b.nl();
+            } else if let Some(problem) = self.list_problem() {
+                space(&mut b);
+                b.append(frame::card(
+                    w,
+                    &problem,
+                    "Sign your list again and send it: the coordinator then serves it, and what nobody signed drops out.",
+                    Some(("s", "sign your list again")),
+                ));
+                b.nl();
+            }
+            let others = v.warnings.len();
+            if others > 0 {
+                space(&mut b);
+                put(
+                    &mut b,
+                    hang(
+                        w,
+                        Mark::Bad,
+                        vec![Seg(format!("{others} warning{} on the Network tab (→).", if others == 1 { "" } else { "s" }), p.text())],
+                    ),
+                );
+            }
+        }
+        let cards = b.lines.len() - 1;
+        let sel = self.selected();
+        let mut focus = None;
+        frame::section(&mut b, "Waiting to join", Some(v.pending.len()));
+        if v.pending.is_empty() {
+            b.append(frame::empty("No machine waits to join. Boot the USB stick on another laptop and choose server.")).nl();
+        }
+        for (i, r) in v.pending.iter().enumerate() {
+            if sel == Some(Row::Request(i)) {
+                focus = Some(Focus::row(b.lines.len() - 1));
+            }
+            let unproved = v.unproved.contains(&r.id);
+            let (m, code) = if unproved {
+                (Mark::Bad, Seg("no proof: reject only".into(), p.alarm()))
+            } else {
+                (Mark::Act, Seg(format!("code {}", r.code), p.text().add_modifier(Modifier::BOLD)))
+            };
+            b.append(frame::row(
+                w,
+                m,
+                vec![
+                    col(Seg(r.name.clone(), p.text()), 16),
+                    col(Seg(r.lan_ip.clone(), p.hint()), 15),
+                    col(code, 21),
+                    col(Seg(ago(r.created, now), p.hint()), 0),
+                ],
+            ))
+            .nl();
+        }
+        if !v.unproved.is_empty() {
+            b.add(dim("No proof: not installed from your USB stick, or changed by the coordinator. It can only be rejected (x).")).nl();
+        } else if !v.pending.is_empty() {
+            b.add(dim("Approve only when the code is the one on the new machine's own screen.")).nl();
+        }
+        frame::section(&mut b, "Members", Some(v.members.len()));
+        if v.members.is_empty() {
+            b.append(frame::empty(
+                "The coordinator lists no machine, not even itself: it was not installed as a coordinator from your stick.",
+            ))
+            .nl();
+        }
+        let target = v.rollout.serial;
+        let seen_w = 14;
+        let health_w = w.saturating_sub(3 + 18 + 13 + seen_w + 2).max(12);
+        for (i, (m, signed)) in v.members.iter().enumerate() {
+            if sel == Some(Row::Member(i)) {
+                focus = Some(Focus::row(b.lines.len() - 1));
+            }
+            let (mark, text, alarm) = health_line(m, *signed, v.version == 0, now, target);
+            let style = if alarm { p.alarm() } else { p.hint() };
+            let seen = if m.last_seen.is_zero() { "never seen".to_string() } else { format!("seen {}", ago(m.last_seen, now)) };
+            b.append(frame::row(
+                w,
+                mark,
+                vec![
+                    col(Seg(m.name.clone(), p.text()), 16),
+                    col(Seg(mesh::ip(&self.subnet, m.host), p.hint()), 11),
+                    col(Seg(text, style), health_w),
+                    col(Seg(seen, p.hint()), 0),
+                ],
+            ))
+            .nl();
+        }
+        b.nl();
+        b.add(dim(if v.version == 0 { "Nothing is signed yet.".to_string() } else { format!("Signed list version {}.", v.version) }));
+        if self.fresh_card && cards > 0 {
+            focus = Some(Focus::keep(0..cards));
+        }
+        (b, focus)
+    }
+
+    /// Progress of a job or the rollout: the snake where there is room, a
+    /// line with a bar where there is not.
+    fn progress(&self, b: &mut Doc, w: usize, rows: usize, pct: Option<f64>, step: &str, took: Duration) {
+        let p = theme::palette();
+        if rows >= RING_ROWS {
+            b.append(frame::progress(w, pct, step, took)).nl();
+            return;
+        }
+        match pct {
+            Some(x) => {
+                b.append(theme::bar(x, 24)).add(Seg(format!(" {:>3.0}%  ", x * 100.0), p.hint()));
+            }
+            None => {
+                b.add(Seg(spinner().into(), p.selected())).s(" ");
+            }
+        }
+        if !step.is_empty() {
+            b.add(Seg(super::fit(step, w.saturating_sub(40).max(10)), p.text())).s("  ");
+        }
+        b.add(Seg(super::dur(took), p.hint())).nl();
+    }
+
+    fn updates_body(&self, w: usize, rows: usize) -> (Doc, Option<Focus>) {
+        let p = theme::palette();
+        let mut b = Doc::new();
+        let now = (self.now)();
+        self.top_cards(&mut b, w);
+        if self.answered.is_none() {
+            return (b, None);
+        }
+        if let Some((problem, todo)) = &self.failed {
+            space(&mut b);
+            b.append(frame::card(w, problem, todo, Some(("p", "publish again"))));
+            b.nl();
+        }
+        if let Some((label, took)) = self.queue.running().filter(|(l, _)| *l == CHECKING || l.starts_with("publishing")) {
+            let step = if label == CHECKING { "Checking the release" } else { label };
+            space(&mut b);
+            self.progress(&mut b, w, rows, None, &sentence(step), took);
+            b.nl();
+        }
+        let cards = b.lines.len() - 1;
+        let v = &self.view;
+        frame::section(&mut b, "Release", None);
+        match &v.release {
+            Some(r) => {
+                b.add(Seg(rollout::release_line(r), p.text())).nl();
+                b.add(dim(format!("dryserver {} · k3s {} · Arch {}", r.dryserver.version, r.k3s.version, r.arch_date))).nl();
+            }
+            None => {
+                let text = match &self.publisher {
+                    Some(p) => format!(
+                        "No release published yet. p publishes this dryserver ({}) to every machine: the coordinator first, then \
+                         the servers one at a time.",
+                        p.parts.version
+                    ),
+                    None => "No release published yet.".into(),
+                };
+                b.append(frame::empty(&text)).nl();
+            }
+        }
+        let sel = self.selected();
+        let mut focus = None;
+        let r = &v.rollout;
+        let stopped = self.rows(Tab::Updates).contains(&Row::Stopped);
+        if stopped {
+            space(&mut b);
+            let start = b.lines.len() - 1;
+            let name = if r.pause_name.is_empty() { "the server".to_string() } else { r.pause_name.clone() };
+            let (problem, todo) = if r.phase == Phase::Failed {
+                (
+                    format!("The coordinator's own update of release {} failed. The coordinator says: {}", r.serial, r.paused),
+                    "No server was touched. Look at the coordinator, then try again; or publish a fixed release (p): it gets a \
+                     higher serial and replaces this rollout."
+                        .to_string(),
+                )
+            } else {
+                (
+                    format!("The rollout of release {} stopped at {name}. The coordinator says: {}", r.serial, r.paused),
+                    format!(
+                        "Look at {name} first: enter on it below shows what it reports. Then try again, or skip this machine; or \
+                         publish a fixed release (p): it gets a higher serial and replaces this rollout."
+                    ),
+                )
+            };
+            let key = if r.phase == Phase::Failed || r.pause == Pause::Canary { "try again" } else { "try again or skip this machine" };
+            b.append(frame::card(w, &problem, &todo, Some(("enter", key))));
+            b.nl();
+            if sel == Some(Row::Stopped) {
+                focus = Some(Focus { lines: start..b.lines.len() - 1, paint: true });
+            }
+        }
+        let at = if v.coordinator_now > 0 { v.coordinator_now } else { now.0.timestamp() };
+        let mut lines: Vec<(String, bool)> = publish::rollout_lines(v, at)
+            .into_iter()
+            // The card and the keys say what the commands would.
+            .filter(|(l, _)| !l.contains("./dryserver release"))
+            .filter(|(l, _)| !(stopped && (l.starts_with("PAUSED: ") || l.starts_with("FAILED: "))))
+            .collect();
+        if r.serial != 0 || !lines.is_empty() {
+            frame::section(&mut b, "Rollout", None);
+            let members = v.members.len().max(1);
+            if r.serial != 0 && !stopped && r.phase != Phase::None {
+                let brain_done = r.phase == Phase::Servers
+                    || self.coordinator().and_then(|c| c.report.as_ref()).is_some_and(|rep| rep.release >= r.serial);
+                let servers = v.members.iter().filter(|(m, _)| m.host != 1 && r.done.contains(&m.host)).count();
+                let pct = (usize::from(brain_done) + servers) as f64 / members as f64;
+                let took = if r.started > 0 && at > r.started { Duration::from_secs((at - r.started) as u64) } else { Duration::ZERO };
+                // Beside the snake, the first line is the step, and not said
+                // twice; beside a bar the lines follow whole.
+                let first = lines.iter().position(|(_, a)| !a);
+                let step = first.map(|i| lines[i].0.clone()).unwrap_or_else(|| format!("Release {}", r.serial));
+                if rows >= RING_ROWS {
+                    self.progress(&mut b, w, rows, Some(pct), &step, took);
+                    if let Some(i) = first {
+                        lines.remove(i);
+                    }
+                } else {
+                    self.progress(&mut b, w, rows, Some(pct), "", took);
+                }
+            }
+            for (l, alarm) in &lines {
+                let l = l.strip_prefix("! ").unwrap_or(l);
+                let (m, style) = if *alarm { (Mark::Bad, p.text()) } else { (Mark::Blank, p.hint()) };
+                put(&mut b, hang(w, m, vec![Seg(l.to_string(), style)]));
+            }
+        }
+        frame::section(&mut b, "Machines", Some(v.members.len()));
+        if v.members.is_empty() {
+            b.append(frame::empty("The coordinator lists no machine.")).nl();
+        }
+        for (i, (m, _)) in v.members.iter().enumerate() {
+            if sel == Some(Row::Member(i)) {
+                focus = Some(Focus::row(b.lines.len() - 1));
+            }
+            let (state, alarm) = publish::machine_state(m, r, at);
+            let release = m.report.as_ref().map_or(0, |rep| rep.release);
+            let mark = match (alarm, r.serial) {
+                (true, _) => Mark::Bad,
+                (false, 0) if release == 0 => Mark::Off,
+                (false, 0) => Mark::Done,
+                (false, t) if release >= t => Mark::Done,
+                _ => Mark::Wait,
+            };
+            b.append(frame::row(
+                w,
+                mark,
+                vec![
+                    col(Seg(m.name.clone(), p.text()), 16),
+                    col(Seg((if m.host == 1 { "coordinator" } else { "server" }).into(), p.hint()), 11),
+                    col(Seg(state, if alarm { p.alarm() } else { p.hint() }), 0),
+                ],
+            ))
+            .nl();
+        }
+        if self.fresh_card && cards > 0 {
+            focus = Some(Focus::keep(0..cards));
+        }
+        (b, focus)
+    }
+
+    fn network_body(&self, w: usize) -> (Doc, Option<Focus>) {
+        let p = theme::palette();
+        let mut b = Doc::new();
+        let now = (self.now)();
+        self.top_cards(&mut b, w);
+        if self.answered.is_none() {
+            // Nothing is known yet: no empty lists that say otherwise.
+            return (b, None);
+        }
+        let cards = b.lines.len() - 1;
+        let v = &self.view;
+        let sel = self.selected();
+        let mut focus = None;
+        frame::section(&mut b, "Unknown devices", Some(v.unknown.len()));
+        if v.scanned.is_zero() {
+            b.append(frame::empty("No scan yet: the coordinator looks at your WiFi/router network every few minutes.")).nl();
+        } else if v.unknown.is_empty() {
+            b.append(frame::empty(&format!("Nothing unknown on your WiFi/router network at the last scan, {}.", ago(v.scanned, now)))).nl();
+        } else {
+            b.add(dim(format!(
+                "On your WiFi/router network at the coordinator's scan {}, and not a member. Nothing here gets into the mesh; look \
+                 up one you do not know in your router.",
+                ago(v.scanned, now)
+            )))
+            .nl();
+        }
+        for (i, d) in v.unknown.iter().enumerate() {
+            if sel == Some(Row::Device(i)) {
+                focus = Some(Focus::row(b.lines.len() - 1));
+            }
+            let what = if d.vendor.is_empty() { "vendor unknown".to_string() } else { d.vendor.clone() };
+            b.append(frame::row(
+                w,
+                if d.ssh { Mark::Bad } else { Mark::Wait },
+                vec![
+                    col(Seg(d.ip.clone(), p.text()), 15),
+                    col(Seg(d.mac.clone(), p.hint()), 17),
+                    col(Seg(if d.ssh { "ssh open".into() } else { String::new() }, p.alarm()), 8),
+                    col(Seg(what, p.hint()), 0),
+                ],
+            ))
+            .nl();
+        }
+        frame::section(&mut b, "Cut off", Some(v.reports.len()));
+        if v.reports.is_empty() {
+            b.append(frame::empty("No machine has cut another off.")).nl();
+        }
+        for (i, r) in v.reports.iter().enumerate() {
+            let lines = put(&mut b, hang(w, Mark::Bad, vec![Seg(r.clone(), p.text())]));
+            if sel == Some(Row::Cut(i)) {
+                focus = Some(Focus { lines, paint: true });
+            }
+        }
+        if !v.reports.is_empty() {
+            b.add(dim("A member's word, relayed by the coordinator: look into it. The Kill switch (9) shows and lifts cuts.")).nl();
+        }
+        frame::section(&mut b, "Warnings", Some(v.warnings.len()));
+        if v.warnings.is_empty() {
+            b.append(frame::empty("Nothing needs a look.")).nl();
+        }
+        for (i, wtext) in v.warnings.iter().enumerate() {
+            let lines = put(&mut b, hang(w, Mark::Bad, vec![Seg(words(wtext), p.text())]));
+            if sel == Some(Row::Warning(i)) {
+                focus = Some(Focus { lines, paint: true });
+            }
+        }
+        if self.fresh_card && cards > 0 {
+            focus = Some(Focus::keep(0..cards));
+        }
+        (b, focus)
+    }
+
+    /// A row's sheet: what is known about it, whole, then what can be done
+    /// to it, as a raised panel in the body. Returns it with the line of
+    /// the chosen action.
+    fn sheet(&self, w: usize, r: Row, cursor: usize) -> (Doc, Option<usize>) {
+        let p = theme::palette();
+        let now = (self.now)();
+        let v = &self.view;
+        let pw = w.min(SHEET);
+        let inner = pw.saturating_sub(4).max(10);
+        let mut lines: Vec<Vec<Seg>> = Vec::new();
+        let mut about: Vec<Vec<Seg>> = Vec::new();
+        let title = match r {
+            Row::Request(i) => {
+                let q = &v.pending[i];
+                about.push(vec![txt(format!(
+                    "Asks to join from {}{}, {}.",
+                    q.lan_ip,
+                    if q.switch { ", with a cable to the switch" } else { "" },
+                    ago(q.created, now)
+                ))]);
+                if v.unproved.contains(&q.id) {
+                    about.push(vec![err(
+                        "No proof from your USB stick: it was not installed from it, or the coordinator changed the request. It \
+                         can only be rejected.",
+                    )]);
+                } else {
+                    about.push(vec![
+                        txt("Code "),
+                        Seg(q.code.clone(), p.text().add_modifier(Modifier::BOLD)),
+                        txt(format!(": approve only when {}'s own screen shows this code.", q.name)),
+                    ]);
+                }
+                about.push(vec![dim(format!("WireGuard key {}", q.wg_key))]);
+                about.push(vec![dim(format!("SSH key {}", q.ssh_host_key))]);
+                q.name.clone()
+            }
+            Row::Member(i) => {
+                let (m, signed) = &v.members[i];
+                let link = if m.switch { "a cable to the switch" } else { "WiFi/router" };
+                let seen = if m.last_seen.is_zero() { "never seen".to_string() } else { format!("seen {}", ago(m.last_seen, now)) };
+                about.push(vec![txt(format!(
+                    "{} · mesh {} · LAN {} · over {link} · {seen}",
+                    if m.host == 1 { "coordinator" } else { "server" },
+                    mesh::ip(&self.subnet, m.host),
+                    if m.lan_ip.is_empty() { "?" } else { &m.lan_ip }
+                ))]);
+                about.push(if *signed {
+                    vec![theme::mark(Mark::Done), Seg(" in the list you signed".into(), p.hint())]
+                } else {
+                    vec![theme::mark(Mark::Bad), err(" not signed by you: put on the coordinator without you; servers ignore it")]
+                });
+                if self.stopped_at() == Some(m.host) {
+                    about.push(vec![theme::mark(Mark::Bad), err(format!(" the rollout stopped here: {}", v.rollout.paused))]);
+                }
+                about.push(Vec::new());
+                let names = |host: u32| {
+                    v.members.iter().find(|(o, _)| o.host == host).map(|(o, _)| o.name.clone()).unwrap_or_else(|| host.to_string())
+                };
+                about.extend(report_lines(m, &names, now));
+                m.name.clone()
+            }
+            Row::Stopped => {
+                let r = &v.rollout;
+                about.push(vec![txt("The coordinator says: "), err(r.paused.clone())]);
+                let who = if r.phase == Phase::Failed { "the coordinator".to_string() } else { r.pause_name.clone() };
+                if !who.is_empty() {
+                    about.push(vec![dim(format!("Look at {who} first: its own sheet shows what it reports."))]);
+                }
+                format!("Release {} stopped", r.serial)
+            }
+            Row::Device(i) => {
+                let d = &v.unknown[i];
+                about.push(vec![txt(format!("MAC {}", d.mac))]);
+                about.push(vec![txt(format!("Vendor {}", if d.vendor.is_empty() { "unknown" } else { &d.vendor }))]);
+                if d.ssh {
+                    about.push(vec![err("It answers on the SSH port.")]);
+                }
+                about.push(vec![dim(format!(
+                    "Seen by the coordinator's scan {}. dryserver never lets it into the mesh. If you do not know it, look it up in \
+                     your router's list of devices.",
+                    ago(if d.seen.is_zero() { v.scanned } else { d.seen }, now)
+                ))]);
+                d.ip.clone()
+            }
+            Row::Cut(_) | Row::Warning(_) => String::new(),
+        };
+        lines.extend(frame::wrap_line(&[Seg(title, p.title())], inner));
+        lines.push(Vec::new());
+        for l in about {
+            lines.extend(frame::wrap_line(&l, inner));
+        }
+        lines.push(Vec::new());
+        let items = self.items(r);
+        let mut at = None;
+        if items.is_empty() {
+            lines.push(vec![dim("Nothing to do here; esc goes back.")]);
+        } else {
+            lines.push(vec![Seg("What you can do".into(), p.title())]);
+        }
+        for (i, d) in items.iter().enumerate() {
+            let pointer = if i == cursor { Seg(format!("{} ", theme::BAR), p.selected()) } else { plain("  ") };
+            let k = d.key().to_string();
+            let (head, body) = match self.why_not(*d, Some(r)) {
+                None => (vec![pointer, theme::cap(&k)], vec![Seg(format!(" {}", self.label(*d, Some(r))), p.text())]),
+                Some(why) => (
+                    vec![pointer, Seg(format!(" {k} "), p.faint())],
+                    vec![Seg(format!(" {}: {}", self.label(*d, Some(r)), why.trim_end_matches('.')), p.faint())],
+                ),
+            };
+            let hw: usize = head.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.0.as_str())).sum();
+            if i == cursor {
+                at = Some(lines.len());
+            }
+            for (j, part) in frame::wrap_line(&body, inner.saturating_sub(hw).max(10)).into_iter().enumerate() {
+                let mut l = if j == 0 { head.clone() } else { vec![plain(" ".repeat(hw))] };
+                l.extend(part);
+                lines.push(l);
+            }
+        }
+        let panel = frame::raised(pw, &lines);
+        // Centred in the body, like a panel over it.
+        let pad = (w.saturating_sub(pw)) / 2;
+        let mut d = Doc::new();
+        for (i, l) in panel.lines.into_iter().enumerate() {
+            if i > 0 {
+                d.nl();
+            }
+            if pad > 0 {
+                d.s(" ".repeat(pad));
+            }
+            d.lines.last_mut().expect("a line").extend(l);
+        }
+        // The panel's first content line is its second.
+        (d, at.map(|a| a + 1))
+    }
+
+    fn summary_body(&self, plan: &Plan) -> Doc {
+        let p = theme::palette();
+        let mut b = Doc::new();
+        frame::section(&mut b, &format!("Release {}, checked and ready to sign", plan.release.serial), None);
+        for line in plan.lines() {
+            b.add(Seg(line, p.text())).nl();
+        }
+        b.nl();
+        b.add(dim(
+            "Nothing is signed yet. enter signs it and sends it to the coordinator, after one more question; esc goes back to the choices.",
+        ))
+        .nl();
+        b
+    }
+
+    fn help(&self) -> Help {
+        let k = |a: &str, b: &str| (a.to_string(), b.to_string());
+        Help {
+            about: "Every decision here is signed with this computer's key, and asks first. Approve a machine only when its own \
+                    screen shows the same code."
+                .into(),
+            keys: vec![
+                k("tab ←→", "the other tabs"),
+                k("↑↓ enter", "move; enter shows the row whole, with what can be done"),
+                k("a x", "approve or reject the machine that waits to join"),
+                k("d", "remove the selected member"),
+                k("s", "sign: the coordinator first, later your list again"),
+                k("n", "look at a new coordinator, after a reinstall"),
+                k("p", "publish a release of this dryserver"),
+                k("t o", "a stopped rollout: try again, or skip its machine"),
+                k("esc", "back; from the list, to Home"),
+            ],
+        }
+    }
+
+    fn page_keys(&self, page: &mut Page) {
+        if let Some(o) = &self.opened {
+            if self.find(&o.key).is_some_and(|r| !self.items(r).is_empty()) {
+                page.key("↑↓", "move").key("enter", "choose");
+            }
+            return;
+        }
+        let sel = self.selected();
+        if self.host_key_changed() {
+            page.key("n", "look at the new coordinator");
+        }
+        match self.tab {
+            Tab::Machines => {
+                if self.answered.is_some() && self.err.is_none() && (self.view.version == 0 || self.list_problem().is_some()) {
+                    page.key("s", if self.view.version == 0 { "sign the coordinator" } else { "sign your list again" });
+                }
+                match sel {
+                    Some(Row::Request(_)) => {
+                        if self.why_not(Do::Approve, sel).is_none() {
+                            page.key("a", "approve");
+                        }
+                        if self.why_not(Do::Reject, sel).is_none() {
+                            page.key("x", "reject");
+                        }
+                        page.key("enter", "more");
+                    }
+                    Some(Row::Member(_)) => {
+                        if self.why_not(Do::Remove, sel).is_none() {
+                            page.key("d", "remove");
+                        }
+                        page.key("enter", "more");
+                    }
+                    _ => {}
+                }
+            }
+            Tab::Updates => {
+                match sel {
+                    Some(Row::Stopped) => {
+                        page.key("enter", "try again or skip");
+                    }
+                    Some(Row::Member(_)) => {
+                        page.key("enter", "more");
+                    }
+                    _ => {}
+                }
+                if self.publisher.is_some() {
+                    page.key("p", "publish");
+                }
+            }
+            Tab::Network => {
+                if let Some(Row::Device(_)) = sel {
+                    page.key("enter", "more");
+                }
+            }
+        }
+        page.key("r", "look again").key("tab", "next tab");
+    }
 }
 
-impl Model for Screen {
+/// The choices for a new release, one step at a time, then a review.
+fn publish_form(c: &Choice, version: &str) -> Form<Choice> {
+    let window = rollout::window_text(rollout::WINDOW);
+    let yes = |b: bool| if b { "yes".to_string() } else { "no".to_string() };
+    Form::new(
+        c.clone(),
+        vec![
+            Group::new(vec![
+                Field::note(
+                    "What it is for",
+                    &format!(
+                        "A release of this dryserver ({version}) for every machine, with the k3s it pins and the newest Arch \
+                         snapshot day. Nothing is signed before you have seen what it changes."
+                    ),
+                ),
+                Field::input("Notes", |c: &Choice| c.notes.clone(), |c, v| c.notes = v)
+                    .placeholder("what it is for, like: fixes the join timeout")
+                    .desc("Shown with the release on every machine. Plain text; may be left empty.")
+                    .validate(|v, _| release::check_notes(v.trim())),
+            ])
+            .title("What it is for"),
+            Group::new(vec![
+                Field::select(
+                    "Urgent",
+                    move |_| {
+                        vec![
+                            (format!("No: machines update {window} on the coordinator's clock"), "no".to_string()),
+                            ("Yes: the rollout starts at once (a security fix)".to_string(), "yes".to_string()),
+                        ]
+                    },
+                    move |c: &Choice| yes(c.urgent),
+                    |c, v| c.urgent = v == "yes",
+                ),
+                Field::select(
+                    "Rollback",
+                    |_| {
+                        vec![
+                            ("No".to_string(), "no".to_string()),
+                            ("Yes: allow older versions than the swarm runs (the way back)".to_string(), "yes".to_string()),
+                        ]
+                    },
+                    move |c: &Choice| yes(c.rollback),
+                    |c, v| c.rollback = v == "yes",
+                ),
+            ])
+            .title("How it rolls out"),
+        ],
+        "cancel",
+    )
+    .keeps_answers()
+    .done_label("check the release")
+}
+
+impl PlaceScreen for Screen {
     type Msg = Msg;
 
     fn init(&mut self, emit: &Emit<Msg>) {
-        self.start(emit);
-        self.load();
+        let Some(admin) = self.admin.take() else { return };
+        let tools = Tools { publisher: self.publisher.clone(), write_list: self.write_list.clone() };
+        self.line = Some(Line::start(admin, tools, emit.clone()));
+        self.look();
     }
 
     fn update(&mut self, ev: Event<Msg>, _: &Emit<Msg>) -> Flow {
         match ev {
-            Event::Key(k) => self.key(k),
-            Event::Msg(m) => {
-                self.answer(m);
-                Flow::Continue
-            }
+            Event::Key(k) => return self.key(k),
+            Event::Msg(m) => self.answer(m),
             Event::Tick => {
                 let wait = if self.err.is_some() { RETRY } else { REFRESH };
-                // Not while the admin types or reads: a load holds the
-                // screen for a moment.
-                let busy = self.confirm.is_some() || self.form.is_some() || self.plan.is_some();
-                if !busy && self.last_load.is_none_or(|t| t.elapsed() >= wait) {
-                    self.load();
+                if self.line.is_some() && self.queue.is_empty() && self.looked.is_none_or(|t| t.elapsed() >= wait) {
+                    self.look();
                 }
-                Flow::Continue
             }
-            _ => Flow::Continue,
+            Event::Resize(..) | Event::Back(_) => {}
         }
+        Flow::Continue
     }
 
-    fn view(&self) -> Doc {
-        let mut b = Doc::new();
-        let now = (self.now)();
-        b.append(theme::header("machines")).s("   ").add(dim("what you decide here is signed with this computer's key")).s("\n\n");
-        // Choosing and confirming a release take the whole screen.
+    fn page(&self, size: Size) -> Page {
+        let w = size.width;
+        let mut page = Page::new("Machines");
+        page.status = self.status();
+        page.tabs = TABS.iter().map(|t| t.title().to_string()).collect();
+        page.tab = self.tab.at();
+        page.back = Back::Esc;
+        page.help = Some(self.help());
+        page.notice = self.notice.clone().or_else(|| {
+            let (what, t) = self.queue.running().filter(|(l, _)| *l != LOADING)?;
+            Some(Notice::info(format!("{} {what}{} {}", spinner(), theme::ellipsis(), super::dur(t))))
+        });
         if let Some(f) = &self.form {
-            b.append(self.form_view(f));
-            return b;
+            let (body, focus) = f.body(w);
+            page.body = body;
+            page.focus = focus.map(Focus::keep);
+            page.keys = f.keys();
+            page.key("esc", &f.esc_label());
+            page.back = Back::Nothing;
+            return page;
         }
         if let Some(p) = &self.plan {
-            b.append(self.plan_view(p));
-            return b;
+            page.body = self.summary_body(p);
+            page.focus = Some(Focus::keep(0..1));
+            page.key("enter", "sign and send it").key("esc", "change the choices");
+            page.back = Back::Nothing;
+            return page;
         }
-        if let Some(e) = &self.err {
-            b.add(err(format!("Cannot talk to the coordinator: {e}"))).s("\n\n");
-            if e.is(Kind::HostKey) {
-                b.s("If you reinstalled the coordinator from your USB stick, press N to look at the new one.\n");
-                b.add(dim("If you did not, something else answers at its address: change nothing.")).s("\n\n");
-            }
-        }
-        let line = |b: &mut Doc, i: usize, text: String| {
-            if i == self.cursor {
-                b.add(sel(format!("> {text}"))).nl();
-            } else {
-                b.s(format!("  {text}")).nl();
-            }
-        };
-        let pending = &self.view.pending;
-        b.s("Waiting to join:\n");
-        if pending.is_empty() {
-            b.add(dim("  none. New machines show up here after their setup finishes.")).nl();
-        }
-        for (i, r) in pending.iter().enumerate() {
-            let text = format!("{:<14} {:<15} code {}   {}", r.name, r.lan_ip, r.code, ago(r.created, now));
-            if !self.view.unproved.contains(&r.id) {
-                line(&mut b, i, text);
-                continue;
-            }
-            if i == self.cursor {
-                b.add(sel(format!("> {text}")));
-            } else {
-                b.s(format!("  {text}"));
-            }
-            b.s("  ").add(err("NO PROOF")).nl();
-        }
-        if !self.view.unproved.is_empty() {
-            b.add(err("  NO PROOF: not installed from your USB stick, or changed by the coordinator. Cannot be approved; reject it (r)."))
-                .nl();
-        }
-        if !pending.is_empty() {
-            b.add(dim("  Approve only if the code matches the one on the new machine's screen.")).nl();
-        }
-
-        b.s("\nMembers, each with what it reports about itself:\n");
-        if !self.view.members.is_empty() {
-            b.add(dim(format!("  {:<14} {:<11} {:<15} {:<6} seen", "name", "mesh", "LAN", "link"))).nl();
-        }
-        for (i, (m, signed)) in self.view.members.iter().enumerate() {
-            let link = if m.switch { "switch" } else { "router" };
-            let text =
-                format!("{:<14} {:<11} {:<15} {:<6} {:<10}", m.name, mesh::ip(&self.subnet, m.host), m.lan_ip, link, ago(m.last_seen, now));
-            if i + pending.len() == self.cursor {
-                b.add(sel(format!("> {text}")));
-            } else {
-                b.s(format!("  {text}"));
-            }
-            if *signed {
-                b.s(" ").add(ok("signed")).nl();
-            } else {
-                b.s(" ").add(err("NOT SIGNED")).nl();
-            }
-            b.append(health(m, now, self.view.rollout.serial)).nl();
-        }
-        if self.view.version == 0 && !self.view.members.is_empty() {
-            b.add(dim("  Nothing signed yet. Press S to sign the coordinator; then machines can join.")).nl();
-        } else if !self.view.unsigned().is_empty() {
-            b.add(err("  NOT SIGNED: put on the coordinator without you. Servers ignore it. Press p to drop it.")).nl();
-        }
-        if self.details {
-            let selected = self.cursor.checked_sub(pending.len()).and_then(|i| self.view.members.get(i));
-            b.nl();
-            match selected {
-                Some((m, _)) => {
-                    let names = |host: u32| {
-                        self.view
-                            .members
-                            .iter()
-                            .find(|(o, _)| o.host == host)
-                            .map(|(o, _)| o.name.clone())
-                            .unwrap_or_else(|| host.to_string())
-                    };
-                    b.append(details(m, &names, now));
-                }
-                None => {
-                    b.add(dim("Select a member to see what it reports.")).nl();
-                }
-            }
-        }
-
-        // The newest release and its rollout, on the coordinator's clock.
-        b.s("\nUpdates:\n");
-        if let Some(r) = &self.view.release {
-            for l in wrap(&rollout::release_line(r), 80, "  ") {
-                b.s(l).nl();
-            }
-        }
-        let at = if self.view.coordinator_now > 0 { self.view.coordinator_now } else { now.0.timestamp() };
-        for (text, alarm) in publish::rollout_lines(&self.view, at) {
-            for l in wrap(&text, 80, "  ") {
-                if alarm {
-                    b.add(err(l));
-                } else {
-                    b.add(dim(l));
-                }
-                b.nl();
-            }
-        }
-        if let Some(hint) = publish::stopped_keys(&self.view.rollout) {
-            for l in wrap(&hint, 80, "  ") {
-                b.add(err(l)).nl();
-            }
-        }
-
-        if !self.view.unknown.is_empty() {
-            b.s(format!("\nUnknown devices on the network (scan {}):\n", ago(self.view.scanned, now)));
-            for d in &self.view.unknown {
-                let ssh = if d.ssh { "  SSH open" } else { "" };
-                b.add(dim(format!("  {:<15} {}  {}{ssh}", d.ip, d.mac, d.vendor))).nl();
-            }
-        }
-
-        if !self.view.reports.is_empty() {
-            b.s("\nCut off:\n");
-            for r in &self.view.reports {
-                b.add(err(format!("  {r}"))).nl();
-            }
-        }
-        if !self.view.warnings.is_empty() {
-            b.nl();
-            for w in &self.view.warnings {
-                b.add(err(super::wrap(&format!("! {w}"), 78))).nl();
-            }
-        }
-        b.nl();
-        if self.view.version == 0 {
-            b.add(dim("Nothing is signed yet.")).nl();
+        let opened = self.opened.as_ref().and_then(|o| self.find(&o.key).map(|r| (r, o.cursor)));
+        if let Some(Act::Publish(p)) = self.ask.as_ref().map(|a| &a.act) {
+            page.body = self.summary_body(p);
+        } else if let Some((r, cursor)) = opened {
+            let (body, at) = self.sheet(w, r, cursor);
+            page.body = body;
+            page.focus = Some(Focus::keep(at.map(|a| a..a + 1).unwrap_or(0..1)));
         } else {
-            b.add(dim(format!("Signed list version {}.", self.view.version))).nl();
+            let (body, focus) = match self.tab {
+                Tab::Machines => self.machines_body(w),
+                Tab::Updates => self.updates_body(w, size.rows),
+                Tab::Network => self.network_body(w),
+            };
+            page.body = body;
+            // Nothing to select: the top, so a new tab starts there.
+            page.focus = Some(focus.unwrap_or(Focus::keep(0..1)));
         }
-        if let Some(w) = self.waiting.view(Duration::from_secs(30), "still going") {
-            b.nl().append(w).nl();
+        self.page_keys(&mut page);
+        if let Some(a) = &self.ask {
+            page.overlay = Some(Overlay::Confirm { question: a.question.clone(), consequences: a.consequences.clone() });
+            // Any key answers the question, ? too.
+            page.help = None;
         }
-        if let Some((q, _)) = &self.confirm {
-            b.nl().add(err(super::wrap(q, 78))).nl();
-        } else if !self.notice.is_empty() {
-            b.nl().s(super::wrap(&self.notice, 78)).nl();
-        }
-        // Three lines, so each fits 80 columns.
-        let mut keys = vec![("↑↓", "select"), ("a", "approve"), ("r", "reject"), ("d", "remove")];
-        if self.view.version == 0 {
-            keys.push(("S", "sign coordinator"));
-        }
-        let more = [("i", if self.details { "hide details" } else { "details" }), ("p", "send list again"), ("q", "quit")];
-        let updates = [("u", "publish an update"), ("R", "resume a stopped rollout")];
-        b.nl().append(theme::keys(&keys)).nl().append(theme::keys(&more)).nl().append(theme::keys(&updates)).nl();
-        b
+        page
+    }
+
+    fn busy(&self) -> Option<String> {
+        self.queue.change().map(str::to_string)
+    }
+
+    fn after(&self) -> Option<Notice> {
+        self.after.clone()
+    }
+
+    fn typing(&self) -> bool {
+        self.ask.is_none() && self.form.as_ref().is_some_and(|f| f.typing())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::admin::tests::{COORD_KEY, SECRET, key32, move_to, reinstalled, request, setup};
-    use crate::registry::{Heartbeat, Member};
-    use crate::report::Report;
-    use crate::testutil::TempDir;
-
-    #[test]
-    fn ago_like_go() {
-        let t = Time::ymd_hms(2026, 1, 1, 12, 0, 0);
-        assert_eq!(ago(Time::zero(), t), "never");
-        assert_eq!(ago(t, t.add(chrono::TimeDelta::seconds(42))), "42s ago");
-        assert_eq!(ago(t, t.add(chrono::TimeDelta::seconds(150))), "3m0s ago");
-    }
-
-    #[test]
-    fn approve_reject_remove() {
-        let dir = TempDir::new();
-        let (admin, store) = setup(&dir);
-        store
-            .update(|s| {
-                for (name, seed) in [("node-a", 2), ("node-b", 3)] {
-                    s.add_request(request(name, seed), COORD_KEY, Time::now())?;
-                }
-                Ok(())
-            })
-            .unwrap();
-        let mut s = Screen::new(admin);
-        s.load();
-        let v = s.view().plain();
-        assert!(v.contains("node-a") && v.contains("code ") && v.contains("NOT SIGNED") && v.contains("Nothing is signed yet"), "{v}");
-
-        s.key(Key::Char('a'));
-        assert!(s.notice.contains("node-a approved and signed as 10.66.0.2"), "{:?}", s.notice);
-        s.key(Key::Char('r'));
-        assert!(s.notice.contains("node-b rejected"), "{:?}", s.notice);
-        let st = store.read().unwrap();
-        assert_eq!(st.members.len(), 2);
-        assert!(st.pending().is_empty() && st.signed_version > 0);
-        let v = s.view().plain();
-        assert!(!v.contains("NOT SIGNED") && v.contains("Signed list version"), "{v}");
-
-        // The coordinator stays; removing a member asks first.
-        s.key(Key::Char('d'));
-        assert!(s.notice.contains("cannot be removed"), "{:?}", s.notice);
-        s.key(Key::Down);
-        s.key(Key::Char('d'));
-        assert!(s.view().plain().contains("Remove node-a from the swarm? y to confirm"));
-        s.key(Key::Char('n'));
-        assert_eq!(store.read().unwrap().members.len(), 2, "anything but y must change nothing");
-        s.key(Key::Char('d'));
-        s.key(Key::Char('y'));
-        assert_eq!(store.read().unwrap().members.len(), 1);
-        s.key(Key::Char('a'));
-        assert!(s.notice.contains("Select a waiting request"));
-    }
-
-    #[test]
-    fn unsigned_members_are_never_signed_here() {
-        let dir = TempDir::new();
-        let (admin, store) = setup(&dir);
-        store
-            .update(|s| {
-                s.members.push(Member { host: 3, name: "rogue".into(), wg_key: key32(3), ..Member::default() });
-                s.add_request(request("node-n", 9), COORD_KEY, Time::now())?;
-                Ok(())
-            })
-            .unwrap();
-        let mut s = Screen::new(admin);
-        s.load();
-        assert!(s.view().plain().contains("Press S to sign the coordinator"), "{}", s.view().plain());
-
-        // The first signature asks for the coordinator's code and says
-        // that the machine nobody approved is dropped.
-        s.key(Key::Char('S'));
-        let v = s.view().plain();
-        let code = crate::registry::coordinator_code(&key32(1), COORD_KEY);
-        assert!(v.contains(&format!("Its screen must show the code {code}")) && v.contains("This also drops rogue from the swarm"), "{v}");
-        s.key(Key::Esc);
-        assert_eq!(store.read().unwrap().signed_version, 0, "anything but y must sign nothing");
-        s.key(Key::Char('S'));
-        s.key(Key::Char('y'));
-        assert!(s.notice.contains("Coordinator signed"), "{:?}", s.notice);
-        let names: Vec<String> = store.read().unwrap().members.iter().map(|m| m.name.clone()).collect();
-        assert_eq!(names, vec!["coord"]);
-
-        // Later a machine appears on the coordinator without a request:
-        // there is no key that signs it.
-        store
-            .update(|st| {
-                st.members.push(Member { host: 7, name: "late".into(), wg_key: key32(7), ..Member::default() });
-                Ok(())
-            })
-            .unwrap();
-        s.load();
-        let v = s.view().plain();
-        assert!(v.contains("NOT SIGNED: put on the coordinator without you"), "{v}");
-        s.key(Key::Down);
-        s.key(Key::Down);
-        s.key(Key::Char('s'));
-        s.key(Key::Char('y'));
-        assert_eq!(store.read().unwrap().members.len(), 2, "s must do nothing");
-        s.key(Key::Char('S'));
-        assert!(s.notice.contains("press p to drop them"), "{:?}", s.notice);
-        assert!(!s.view().plain().contains("y to confirm"));
-        // Approving the real request drops it, after asking.
-        s.key(Key::Home);
-        s.key(Key::Char('k'));
-        s.key(Key::Char('k'));
-        s.key(Key::Char('a'));
-        assert!(s.view().plain().contains("This also drops late from the swarm"), "{}", s.view().plain());
-        s.key(Key::Char('y'));
-        let names: Vec<String> = store.read().unwrap().members.iter().map(|m| m.name.clone()).collect();
-        assert_eq!(names, vec!["coord", "node-n"]);
-    }
-
-    #[test]
-    fn unproved_requests_are_marked_and_refused() {
-        let dir = TempDir::new();
-        let (admin, store) = setup(&dir);
-        store
-            .update(|s| {
-                let mut r = request("node-x", 5);
-                r.wg_key = key32(55);
-                s.add_request(r, COORD_KEY, Time::now())?;
-                Ok(())
-            })
-            .unwrap();
-        let mut s = Screen::new(admin);
-        s.load();
-        let v = s.view().plain();
-        assert!(v.contains("node-x") && v.contains("NO PROOF: not installed from your USB stick"), "{v}");
-        s.key(Key::Char('a'));
-        assert!(s.notice.contains("Failed") && s.notice.contains("no valid proof"), "{:?}", s.notice);
-        assert_eq!(store.read().unwrap().members.len(), 1);
-        s.key(Key::Char('r'));
-        assert!(s.notice.contains("node-x rejected"), "{:?}", s.notice);
-    }
-
-    #[test]
-    fn a_reinstalled_coordinator_is_offered_and_taken() {
-        let dir = TempDir::new();
-        let (mut admin, store) = setup(&dir);
-        store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
-        admin.load().unwrap();
-        admin.approve(&store.read().unwrap().requests[0]).unwrap();
-
-        // Something without the stick's proof answers at the address.
-        let (fake, key) = reinstalled(&dir, "coord", "another-secret-another-secret-another-secret");
-        move_to(&mut admin, &fake, &key);
-        let mut s = Screen::new(admin);
-        s.load();
-        let v = s.view().plain();
-        assert!(v.contains("does not have the SSH key this computer saw before") && v.contains("press N to look at the new one"), "{v}");
-        s.key(Key::Char('N'));
-        assert!(s.notice.contains("Not a coordinator of yours") && s.notice.contains("no valid proof"), "{:?}", s.notice);
-        assert!(!s.view().plain().contains("y to confirm"));
-
-        // The real reinstall.
-        let dir2 = TempDir::new();
-        let (mut admin, store) = setup(&dir2);
-        store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
-        admin.load().unwrap();
-        admin.approve(&store.read().unwrap().requests[0]).unwrap();
-        let (new_store, key) = reinstalled(&dir2, "coord", SECRET);
-        let pinned = move_to(&mut admin, &new_store, &key);
-        let mut s = Screen::new(admin);
-        s.load();
-        s.key(Key::Char('N'));
-        let v = s.view().plain();
-        let code = crate::registry::coordinator_code(&key32(41), &key);
-        assert!(v.contains(&format!("Its screen must show the code {code}")) && v.contains("y to confirm"), "{v}");
-        s.key(Key::Char('n'));
-        assert_eq!(*pinned.lock().unwrap(), COORD_KEY, "saying no must change nothing");
-        s.key(Key::Char('N'));
-        s.key(Key::Char('y'));
-        assert!(s.notice.contains("coord is your coordinator now") && s.notice.contains("quarantine-all -lift"), "{:?}", s.notice);
-        assert_eq!(new_store.read().unwrap().members.len(), 2);
-        let v = s.view().plain();
-        assert!(!v.contains("Cannot talk") && v.contains("node-a") && !v.contains("NOT SIGNED"), "{v}");
-        // With a coordinator that answers, N does nothing.
-        s.key(Key::Char('N'));
-        assert!(s.notice.contains("answers fine"), "{:?}", s.notice);
-    }
-
-    /// A healthy machine's report, as gather makes it.
-    fn healthy(now: i64) -> Report {
-        Report {
-            format: report::FORMAT,
-            time: now,
-            dryserver: "0.1.0".into(),
-            k3s: "v1.31.4+k3s1".into(),
-            kernel: "6.12.1-arch1-1".into(),
-            kernel_installed: "6.12.1-arch1-1".into(),
-            upgraded: now - 2 * 86_400,
-            uptime: 3 * 86_400,
-            load: [0.5, 0.4, 0.3],
-            cpus: 4,
-            mem_used: 1 << 30,
-            mem_total: 4 << 30,
-            disk_used: 20 << 30,
-            disk_total: 50 << 30,
-            temp: Some(48),
-            k3s_active: Some(true),
-            firewall: Some(true),
-            peers: vec![report::Peer { host: 2, age: Some(12) }],
-            ..Report::default()
-        }
-    }
-
-    /// The styled pieces of a doc whose text is exactly text.
-    fn styled(d: &Doc, text: &str) -> Vec<ratatui::style::Style> {
-        d.lines.iter().flatten().filter(|s| s.0 == text).map(|s| s.1).collect()
-    }
-
-    #[test]
-    fn members_show_what_they_report() {
-        let dir = TempDir::new();
-        let (admin, store) = setup(&dir);
-        store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
-        let mut s = Screen::new(admin);
-        s.load();
-        s.key(Key::Char('a'));
-        // Nobody has sent a report yet (an older dryserver sends none).
-        assert!(s.view().plain().contains("no report: its dryserver"), "{}", s.view().plain());
-
-        let now = Time::now().0.timestamp();
-        let sick = Report {
-            time: now - 600,
-            reboot: true,
-            kernel_installed: "6.12.4-arch1-1".into(),
-            disk_used: 95,
-            disk_total: 100,
-            k3s_active: Some(false),
-            firewall: Some(false),
-            peers: vec![report::Peer { host: 1, age: None }],
-            boot: "fallback".into(),
-            ..healthy(now)
-        };
-        store
-            .update(|st| {
-                let hb = |lan: &str, r: Report| Heartbeat { lan_ip: lan.into(), report: Some(r), ..Heartbeat::default() };
-                st.heartbeat(1, hb("192.168.1.50", healthy(now)), Time::now())?;
-                st.heartbeat(2, hb("192.168.1.23", sick), Time::now())
-            })
-            .unwrap();
-        s.load();
-        let doc = s.view();
-        let v = doc.plain();
-        assert!(v.contains("Members, each with what it reports about itself"), "{v}");
-        assert!(v.contains("    0.1.0  disk 40%  mem 25%  48°C  k3s on  firewall on\n"), "{v}");
-        for want in ["disk 95%", "k3s off", "firewall OFF", "reboot needed", "clock 10m behind", "1 silent peer", "running fallback kernel"]
-        {
-            assert!(v.contains(want), "{want}: {v}");
-            assert_eq!(styled(&doc, want), vec![crate::tui::err_style()], "{want} must be an alarm");
-        }
-        assert_eq!(styled(&doc, "k3s on"), vec![ratatui::style::Style::new()], "a healthy value is plain");
-        for line in v.lines() {
-            assert!(line.chars().count() <= 80, "wider than 80 columns: {line:?}");
-        }
-
-        // The details of the coordinator, then of node-a.
-        s.key(Key::Char('i'));
-        let v = s.view().plain();
-        for want in [
-            "coord, as it reports itself (relayed by the coordinator",
-            "dryserver 0.1.0   k3s v1.31.4+k3s1, running   firewall loaded",
-            "kernel 6.12.1-arch1-1\n",
-            "up 3d   upgraded 2d ago   load 0.50 0.40 0.30 on 4 CPUs",
-            "memory 1.0 GiB of 4.0 GiB (25%)   disk 20.0 GiB of 50.0 GiB (40%)   48°C",
-            "WireGuard, last handshake: node-a 12s",
-            "i hide details",
-        ] {
-            assert!(v.contains(want), "{want}: {v}");
-        }
-        s.key(Key::Down);
-        let v = s.view().plain();
-        for want in [
-            "node-a, as it reports itself",
-            "k3s v1.31.4+k3s1, STOPPED   FIREWALL NOT LOADED",
-            "kernel 6.12.1-arch1-1 running, 6.12.4-arch1-1 installed: reboot needed",
-            "clock 10m behind the coordinator's",
-            "WireGuard, last handshake: coord never",
-        ] {
-            assert!(v.contains(want), "{want}: {v}");
-        }
-        for line in v.lines() {
-            assert!(line.chars().count() <= 80, "wider than 80 columns: {line:?}");
-        }
-        // Esc closes the details first; it quits only after that.
-        assert_eq!(s.key(Key::Esc), Flow::Continue);
-        assert!(!s.view().plain().contains("as it reports itself"));
-        assert_eq!(s.key(Key::Esc), Flow::Quit);
-    }
-
-    #[test]
-    fn a_report_is_the_machines_word_and_only_about_itself() {
-        let dir = TempDir::new();
-        let (admin, store) = setup(&dir);
-        store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
-        let mut s = Screen::new(admin);
-        s.load();
-        s.key(Key::Char('a'));
-        // A hacked coordinator writes what it likes into a report, past
-        // the checks on its own heartbeat path.
-        let now = Time::now().0.timestamp();
-        store
-            .update(|st| {
-                let m = st.members.iter_mut().find(|m| m.host == 2).unwrap();
-                m.last_seen = Time::now();
-                m.report = Some(Report {
-                    dryserver: "0.1.0\u{1b}]52;c;ZXZpbA==\u{7}".into(),
-                    kernel: "x".repeat(300),
-                    temp: Some(9999),
-                    peers: (0..2000).map(|h| report::Peer { host: h, age: Some(5) }).collect(),
-                    ..healthy(now)
-                });
-                Ok(())
-            })
-            .unwrap();
-        s.load();
-        s.key(Key::Down);
-        s.key(Key::Char('i'));
-        let v = s.view().plain();
-        assert!(!v.contains('\u{1b}') && !v.contains("xxxx") && !v.contains("9999"), "{v}");
-        assert!(v.contains("WireGuard, last handshake: coord 5s\n"), "only members are peers, never itself: {v}");
-        // The coordinator's own row is untouched by it.
-        s.key(Key::Up);
-        assert!(s.view().plain().contains("coord sends no report"), "{}", s.view().plain());
-        // A machine that went quiet: its report is old news.
-        store
-            .update(|st| {
-                st.members.iter_mut().find(|m| m.host == 2).unwrap().last_seen = Time::now().add(chrono::TimeDelta::minutes(-10));
-                Ok(())
-            })
-            .unwrap();
-        s.load();
-        let doc = s.view();
-        assert_eq!(styled(&doc, "silent for 10m:"), vec![crate::tui::err_style()], "{}", doc.plain());
-    }
-
-    #[test]
-    fn the_release_and_its_rollout_are_shown() {
-        use crate::rollout::{Pause, Phase, Rollout};
-        let dir = TempDir::new();
-        let (admin, store) = setup(&dir);
-        store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
-        let mut s = Screen::new(admin);
-        s.load();
-        s.key(Key::Char('a'));
-        assert!(s.view().plain().contains("No release published yet: ./dryserver release publish"), "{}", s.view().plain());
-
-        // A release on the coordinator, its rollout stopped at node-a.
-        let now = Time::now().0.timestamp();
-        let r = crate::release::Release {
-            serial: 1_795_000_000,
-            created: now - 3600,
-            expires: now + crate::release::LIFETIME,
-            dryserver: crate::release::Binary { version: "0.2.0".into(), sha256: "a".repeat(64), size: 10 },
-            k3s: crate::release::K3s { version: crate::iso::K3S_VERSION.into(), sha256: crate::iso::K3S_SHA256.into() },
-            arch_date: "2026/11/19".into(),
-            rollback: false,
-            urgent: true,
-            notes: "fixes the relay timeout that drops long uploads on slow links".into(),
-        };
-        let served = crate::fsx::dir(&store.path).join(crate::rollout::SERVED_DIR);
-        let at = served.join(r.serial.to_string());
-        std::fs::create_dir_all(&at).unwrap();
-        let env = crate::release::seal(&crate::signed::fake::Key("admin"), &r).unwrap();
-        std::fs::write(at.join(crate::rollout::RELEASE_FILE), serde_json::to_string(&env).unwrap()).unwrap();
-        std::fs::write(served.join("current"), format!("{}\n", r.serial)).unwrap();
-        let failed = Report {
-            update: "failed".into(),
-            update_serial: r.serial,
-            update_note: "dryserver failed: exit status 1: no space left on device".into(),
-            ..healthy(now)
-        };
-        store
-            .update(|st| {
-                st.heartbeat(2, Heartbeat { lan_ip: "192.168.1.23".into(), report: Some(failed), ..Heartbeat::default() }, Time::now())?;
-                st.rollout = Rollout {
-                    serial: r.serial,
-                    urgent: true,
-                    phase: Phase::Servers,
-                    paused: "node-a (the canary): update failed: dryserver failed: exit status 1: no space left on device".into(),
-                    pause: Pause::Failed,
-                    pause_host: 2,
-                    pause_name: "node-a".into(),
-                    cordoned: vec!["node-a".into()],
-                    ..Rollout::default()
-                };
-                Ok(())
-            })
-            .unwrap();
-        s.load();
-        let doc = s.view();
-        let v = doc.plain();
-        for want in [
-            "Updates:",
-            "Release 1795000000 (urgent), made",
-            ": fixes the relay\n    timeout that drops",
-            "PAUSED: node-a (the canary): update failed",
-            "./dryserver release resume (node-a tries again)",
-            "0 of 1 servers on this release.",
-        ] {
-            assert!(v.contains(want), "{want}: {v}");
-        }
-        assert_eq!(styled(&doc, "update failed"), vec![crate::tui::err_style()], "{v}");
-        for line in v.lines() {
-            assert!(line.chars().count() <= 80, "wider than 80 columns: {line:?}");
-        }
-        // The details of node-a say why.
-        s.key(Key::Down);
-        s.key(Key::Char('i'));
-        let v = s.view().plain();
-        assert!(v.contains("no release installed yet; update failed (release 1795000000): dryserver failed"), "{v}");
-        for line in v.lines() {
-            assert!(line.chars().count() <= 80, "wider than 80 columns: {line:?}");
-        }
-    }
-
-    #[test]
-    fn wrap_keeps_lines_short() {
-        assert_eq!(wrap("a b c", 80, "  "), vec!["  a b c"]);
-        let long = "word ".repeat(40);
-        let lines = wrap(long.trim(), 30, "  ");
-        assert!(lines.len() > 1 && lines.iter().all(|l| l.chars().count() <= 30), "{lines:?}");
-        assert!(lines[1].starts_with("    word"), "{lines:?}");
-        assert!(wrap("", 80, "  ").is_empty());
-    }
-
-    #[test]
-    fn resend_drops_what_nobody_signed() {
-        let dir = TempDir::new();
-        let (admin, store) = setup(&dir);
-        let mut s = Screen::new(admin);
-        s.load();
-        s.key(Key::Char('S'));
-        s.key(Key::Char('y'));
-        assert!(!s.view().plain().contains("NOT SIGNED"));
-
-        // The coordinator's list was tampered with: shown in red.
-        store
-            .update(|st| {
-                st.members.push(Member { host: 7, name: "late".into(), wg_key: key32(7), ..Member::default() });
-                st.signed_version = 0;
-                st.signed = Default::default();
-                Ok(())
-            })
-            .unwrap();
-        s.load();
-        let v = s.view().plain();
-        assert!(v.contains("! The coordinator has no valid signed list") && v.contains("NOT SIGNED"), "{v}");
-        // "p" sends the signed list again; the machine nobody signed goes.
-        s.key(Key::Char('p'));
-        assert!(s.notice.contains("sent again"), "{:?}", s.notice);
-        assert_eq!(store.read().unwrap().members.len(), 1);
-    }
-
-    // ---- updates ----
-
-    use crate::publish::tests::{FakeDays, Sent, days_ago, desk, today, twin};
-    use crate::tui::apps::tests::{Busy, Open};
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    impl Busy for Screen {
-        fn busy(&self) -> bool {
-            !self.waiting.is_empty()
-        }
-    }
-
-    /// The screen of a desktop made by desk, with a publisher whose jobs
-    /// wait while hold is set.
-    fn publishing(dir: &TempDir, days: &Arc<FakeDays>) -> (Open<Screen>, crate::registry::Store, Sent, Arc<AtomicBool>) {
-        let (admin, store, sent, fail, parts) = desk(dir);
-        let hold = Arc::new(AtomicBool::new(false));
-        let (path, s, f, h) = (dir.path().to_path_buf(), sent.clone(), fail.clone(), hold.clone());
-        let p = Publisher {
-            admin: Arc::new(move || {
-                while h.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Ok(twin(&path, &s, &f))
-            }),
-            days: days.clone(),
-            parts,
-            today,
-        };
-        (Open::new(Screen::new(admin).with_publisher(p)), store, sent, hold)
-    }
-
-    #[test]
-    fn an_update_is_checked_shown_and_published() {
-        let dir = TempDir::new();
-        let days = Arc::new(FakeDays::with(&[days_ago(1)]));
-        let (mut o, _store, sent, hold) = publishing(&dir, &days);
-        let v = o.view();
-        assert!(v.contains("u publish an update   R resume a stopped rollout"), "{v}");
-        o.fits(60);
-
-        // The choices: notes, then urgent.
-        o.key(Key::Char('u'));
-        for want in ["Publish an update", "A release of this dryserver (0.2.0)", "> notes", "[ ] roll out at once", "esc cancel"] {
-            assert!(o.view().contains(want), "{want}: {}", o.view());
-        }
-        o.fits(24);
-        for k in crate::tui::type_text("fixes the join timeout") {
-            o.key(k);
-        }
-        o.key(Key::Tab);
-        o.key(Key::Char(' '));
-        assert!(o.view().contains("> urgent    [x]"), "{}", o.view());
-        o.key(Key::Enter);
-        assert!(o.view().contains("checking the release"), "the screen says what runs: {}", o.view());
-        o.settle();
-
-        // What changes, before anything is signed.
-        let v = o.view();
-        for want in [
-            "Sign and send this release to the coordinator?",
-            "for 3 machines, urgent:",
-            "dryserver  0.1.0 -> 0.2.0",
-            "urgent     yes: the rollout starts at once",
-            "notes      fixes the join timeout",
-            "y sign and send it",
-        ] {
-            assert!(v.contains(want), "{want}: {v}");
-        }
-        o.fits(24);
-        assert!(sent.lock().unwrap().is_empty());
-        o.key(Key::Char('n'));
-        assert!(o.s.notice.contains("Nothing signed") && sent.lock().unwrap().is_empty(), "{}", o.s.notice);
-
-        // Again: the choices are kept. y sends it on the worker.
-        o.key(Key::Char('u'));
-        assert!(o.view().contains("fixes the join timeout") && o.view().contains("[x]"), "{}", o.view());
-        o.key(Key::Enter);
-        o.settle();
-        hold.store(true, Ordering::SeqCst);
-        o.key(Key::Char('y'));
-        let v = o.view();
-        assert!(v.contains("publishing release") && v.contains("Members"), "the screen goes on while it sends: {v}");
-        // One release at a time.
-        o.key(Key::Char('u'));
-        assert!(o.s.notice.contains("Still publishing release") && o.s.form.is_none(), "{}", o.s.notice);
-        hold.store(false, Ordering::SeqCst);
-        o.settle();
-        assert!(o.s.notice.contains("is on the coordinator. It updates itself first"), "{}", o.s.notice);
-        assert_eq!(sent.lock().unwrap().len(), 1);
-        let v = o.flat();
-        assert!(v.contains("(urgent), made") && v.contains("fixes the join timeout"), "the release shows under Updates: {v}");
-        assert!(v.contains("Not started yet: the coordinator takes the release up") && !v.contains("No release published yet"), "{v}");
-        // The next release starts from fresh choices.
-        o.key(Key::Char('u'));
-        let f = o.s.form.as_ref().unwrap();
-        assert!(f.notes.value.is_empty() && !f.urgent, "{}", o.view());
-        o.key(Key::Esc);
-        assert!(o.s.form.is_none() && o.s.notice.contains("Nothing signed"));
-    }
-
-    #[test]
-    fn a_refused_update_says_why_and_what_to_do() {
-        let dir = TempDir::new();
-        let days = Arc::new(FakeDays::with(&[]));
-        *days.fail.lock().unwrap() = Some("cannot find archive.archlinux.org (is this computer online?)".into());
-        let (mut o, _, sent, _) = publishing(&dir, &days);
-        o.key(Key::Char('u'));
-        o.key(Key::Enter);
-        o.settle();
-        let n = &o.s.notice;
-        assert!(n.starts_with("Not published, nothing was signed: cannot find the newest Arch snapshot"), "{n}");
-        assert!(n.contains("is this computer online?"), "{n}");
-        assert!(o.s.plan.is_none() && sent.lock().unwrap().is_empty());
-        o.fits(80);
-        // Notes that are not plain text.
-        o.key(Key::Char('u'));
-        o.key(Key::Paste("caf\u{e9}".into()));
-        o.key(Key::Enter);
-        o.settle();
-        assert!(o.s.notice.contains("not printable ASCII"), "{}", o.s.notice);
-    }
-
-    #[test]
-    fn closing_the_screen_while_it_publishes_asks_first_and_says_what_happened() {
-        let dir = TempDir::new();
-        let days = Arc::new(FakeDays::with(&[days_ago(0)]));
-        let (mut o, _, _, hold) = publishing(&dir, &days);
-        o.key(Key::Char('u'));
-        o.key(Key::Enter);
-        o.settle();
-        hold.store(true, Ordering::SeqCst);
-        o.key(Key::Char('y'));
-        assert_eq!(o.key(Key::Char('q')), Flow::Continue);
-        assert!(o.s.notice.contains("Press q again to quit anyway: the upload stops half way"), "{}", o.s.notice);
-        assert!(o.s.after().is_none());
-        assert_eq!(o.key(Key::Char('q')), Flow::Quit);
-        let after = o.s.after().unwrap().to_string();
-        assert!(after.contains("The screen closed while publishing release") && after.contains("./dryserver release status"), "{after}");
-        hold.store(false, Ordering::SeqCst);
-        // Ctrl+C quits at once, and says the same.
-        let dir = TempDir::new();
-        let (mut o, _, _, hold) = publishing(&dir, &days);
-        o.key(Key::Char('u'));
-        o.key(Key::Enter);
-        o.settle();
-        hold.store(true, Ordering::SeqCst);
-        o.key(Key::Char('y'));
-        assert_eq!(o.key(Key::Ctrl('c')), Flow::Quit);
-        assert!(o.s.after().is_some());
-        hold.store(false, Ordering::SeqCst);
-        // Nothing running: q quits at once, with nothing to say.
-        let dir = TempDir::new();
-        let (mut o, _, _, _) = publishing(&dir, &days);
-        assert_eq!(o.key(Key::Char('q')), Flow::Quit);
-        assert!(o.s.after().is_none());
-    }
-
-    #[test]
-    fn resume_asks_first_and_only_when_stopped() {
-        use crate::rollout::{Pause, Phase, Rollout};
-        let dir = TempDir::new();
-        let days = Arc::new(FakeDays::with(&[days_ago(0)]));
-        let (mut o, store, _, _) = publishing(&dir, &days);
-        o.key(Key::Char('R'));
-        assert!(o.s.notice.contains("Nothing to resume: there is no rollout to resume"), "{}", o.s.notice);
-        store
-            .update(|s| {
-                s.rollout = Rollout { serial: 5, phase: Phase::Servers, ..Rollout::default() };
-                Ok(())
-            })
-            .unwrap();
-        o.s.load();
-        o.key(Key::Char('R'));
-        assert!(o.s.notice.contains("is not stopped") && o.s.confirm.is_none(), "{}", o.s.notice);
-        store
-            .update(|s| {
-                s.rollout.paused = "node-a: update failed: no space left on device".into();
-                s.rollout.pause = Pause::Failed;
-                s.rollout.pause_host = 2;
-                s.rollout.pause_name = "node-a".into();
-                Ok(())
-            })
-            .unwrap();
-        o.s.load();
-        let v = o.flat();
-        assert!(v.contains("Press R to resume (the coordinator gives node-a its turn again"), "{v}");
-        o.fits(60);
-        o.key(Key::Char('R'));
-        let v = o.flat();
-        assert!(v.contains("Resume the rollout of release 5? The coordinator then gives node-a its turn again"), "{v}");
-        o.key(Key::Char('n'));
-        assert_eq!(store.read().unwrap().rollout.resume_asked, 0, "anything but y asks nothing");
-        o.key(Key::Char('R'));
-        o.key(Key::Char('y'));
-        assert!(o.s.notice.contains("Resumed: the coordinator gives node-a its turn again"), "{}", o.s.notice);
-        assert_eq!(store.read().unwrap().rollout.resume_asked, 1);
-    }
-
-    #[test]
-    fn a_screen_without_a_publisher_says_where_to_publish() {
-        let dir = TempDir::new();
-        let (admin, _) = setup(&dir);
-        let mut s = Screen::new(admin);
-        s.load();
-        s.key(Key::Char('u'));
-        assert!(s.notice.contains("./dryserver release publish") && s.form.is_none(), "{}", s.notice);
-    }
-}
+mod tests;

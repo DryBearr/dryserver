@@ -1,5 +1,5 @@
 #!/bin/bash
-# Live check of signed approval: the real `dryserver approve` screen on a
+# Live check of signed approval: the real Machines screen (`dryserver approve`) on a
 # "desktop" (driven through a pty), a real sshd with the registry forced
 # command as the "coordinator", real OpenSSH keys and signatures.
 #
@@ -148,16 +148,17 @@ CODE=$(jqr "d['requests'][0]['code']")
 echo "== anyone with the USB stick's key, without the signing key"
 out=$(echo '{}' | reg admin 2>&1)
 check "registry stays closed without a signature" grep -qi "bad admin request\|not signed\|bad signature" <<<"$out"
-out=$(screen "$S/thief" "talk to the coordinator|Waiting to join" "" 2>&1)
+out=$(screen "$S/thief" "talk to the coordinator|✓ answers" "" 2>&1)
 check "approve screen with a wrong signing key is refused" grep -q "refused" <<<"$out"
 check_not "it saw no machine names" grep -q "node-a" <<<"$out"
 
 echo "== the admin signs the coordinator, then approves on the desktop"
-out=$(screen "$S/desk" "Press S to sign the coordinator" "S" "Its screen must show the code [0-9]{3} [0-9]{3}" "y" "Coordinator signed|Failed" "")
+out=$(screen "$S/desk" "Sign your coordinator" "s" "Its screen must show the code [0-9]{3} [0-9]{3}" "y" "Coordinator signed|Not signed" "")
 check "first signature asks for the coordinator's code" grep -Eq "Its screen must show the code [0-9]{3} [0-9]{3}" <<<"$out"
 check "coordinator signed" grep -q "Coordinator signed" <<<"$out"
 check "nobody else became a member" test "$(jqr "len(d['members'])")" = 1
-out=$(screen "$S/desk" "node-a" "a" "approved and signed|Failed" "")
+out=$(screen "$S/desk" "node-a" "a" "Approve node-a" "y" "approved and signed|Not approved" "")
+check "approving asks first, with the code" grep -Eq "Approve node-a\? .*Its screen must show the code [0-9]{3} [0-9]{3}" <<<"$out"
 check "screen showed the waiting machine" grep -q "node-a" <<<"$out"
 check "screen showed the same code the coordinator computed ($CODE)" grep -qF "$CODE" <<<"$out"
 check "screen says approved and signed" grep -q "approved and signed as 10.66.0.2" <<<"$out"
@@ -174,11 +175,11 @@ echo "== a request without the stick's proof (a swapped key, or a machine not in
 EVIL_WG=$(wg genkey | wg pubkey)
 out=$(printf '{"name":"node-b","wg_key":"%s","ssh_host_key":"%s root@node-b","lan_ip":"192.168.1.24","proof":"%s"}' "$EVIL_WG" "$NODE_HK" "$PROOF" | reg request)
 check "the coordinator takes it (it cannot tell)" grep -q '"id"' <<<"$out"
-out=$(screen "$S/desk" "NO PROOF" "a" "no valid proof|approved and signed" "")
-check "screen marks it NO PROOF" grep -q "NO PROOF: not installed from your USB stick" <<<"$out"
+out=$(screen "$S/desk" "no proof: reject only" "a" "no valid proof|approved and signed" "")
+check "screen marks it: no proof" grep -q "No proof: not installed from your USB stick" <<<"$out"
 check "approving it is refused" grep -q "no valid proof from your USB stick" <<<"$out"
 check "still 2 members" test "$(jqr "len(d['members'])")" = 2
-out=$(screen "$S/desk" "NO PROOF" "r" "node-b rejected|Failed" "")
+out=$(screen "$S/desk" "no proof: reject only" "x" "Reject node-b" "y" "node-b rejected|Not rejected" "")
 check "it can be rejected" grep -q "node-b rejected" <<<"$out"
 
 # The stored signature verifies with plain OpenSSH, outside dryserver.
@@ -203,7 +204,7 @@ check "a list signed with another key is refused" grep -q "bad signature" <<<"$o
 check "coordinator still has 2 members" test "$(jqr "len(d['members'])")" = 2
 
 echo "== remove, then replay the old list"
-out=$(screen "$S/desk" "node-a" "jd" "y to confirm" "y" "removed|Failed" "")
+out=$(screen "$S/desk" "node-a" "jd" "Remove node-a from the swarm" "y" "removed|Not removed" "")
 check "screen confirmed the removal" grep -q "node-a removed" <<<"$out"
 check "coordinator has 1 member" test "$(jqr "len(d['members'])")" = 1
 V2=$(jqr "d['signed_version']")
@@ -215,9 +216,9 @@ check "coordinator still has 1 member" test "$(jqr "len(d['members'])")" = 1
 echo "== something else answers at the coordinator's address"
 keygen "$S/hostkey2" other
 start_sshd "$S/hostkey2"
-out=$(screen "$S/desk" "press N to look at the new one" "N" "Not a coordinator of yours|y to confirm" "" 2>&1)
+out=$(screen "$S/desk" "look at the new coordinator" "n" "Not a coordinator of yours|your coordinator\\?" "" 2>&1)
 check "approve refuses a machine with another SSH key" grep -q "does not have the SSH key this computer saw before" <<<"$out"
-check "N finds no coordinator of yours (it serves the old registry)" grep -q "Not a coordinator of yours" <<<"$out"
+check "n finds no coordinator of yours (it serves the old registry)" grep -q "Not a coordinator of yours" <<<"$out"
 check "the pin is still the old key" grep -qF "$HOSTKEY" "$S/desk/secrets/coordinator_known_hosts"
 
 echo "== the coordinator is reinstalled from the stick"
@@ -225,7 +226,7 @@ echo "== the coordinator is reinstalled from the stick"
 start_sshd "$S/hostkey"
 NODE2_WG=$(wg genkey | wg pubkey)
 printf '{"name":"node-c","wg_key":"%s","ssh_host_key":"%s root@node-c","lan_ip":"192.168.1.25","proof":"%s"}' "$NODE2_WG" "$NODE_HK" "$(proof node-c "$NODE2_WG" "$NODE_HK")" | reg request >/dev/null
-out=$(screen "$S/desk" "node-c" "a" "approved and signed|Failed" "")
+out=$(screen "$S/desk" "node-c" "a" "Approve node-c" "y" "approved and signed|Not approved" "")
 check "node-c approved on the old coordinator" grep -q "node-c approved and signed" <<<"$out"
 VOLD=$(jqr "d['signed_version']")
 # Fresh install: new SSH key, new WireGuard key, empty registry, own proof.
@@ -236,8 +237,8 @@ cp "$S/hostkey2.pub" "$S/root2/etc/ssh/ssh_host_ed25519_key.pub"
 echo "restrict,command=\"$BIN registry --subnet 10.66.0.0/24 --root $S/root2\" $(cat "$S/desk/secrets/registry_ed25519.pub")" > "$S/authorized_keys"
 start_sshd "$S/hostkey2"
 jq2() { python3 -I -c "import json,sys; d=json.load(open('$S/root2/var/lib/dryserver/registry.json')); print($1)"; }
-out=$(screen "$S/desk" "press N to look at the new one" "N" "Its screen must show the code [0-9]{3} [0-9]{3}" "y" "is your coordinator now|Failed" "")
-check "N shows the new coordinator's code" grep -Eq "Its screen must show the code [0-9]{3} [0-9]{3}" <<<"$out"
+out=$(screen "$S/desk" "look at the new coordinator" "n" "Its screen must show the code [0-9]{3} [0-9]{3}" "y" "is your coordinator now|Nothing changed" "")
+check "n shows the new coordinator's code" grep -Eq "Its screen must show the code [0-9]{3} [0-9]{3}" <<<"$out"
 check "the new coordinator is taken over" grep -q "coord is your coordinator now" <<<"$out"
 check "the new key is pinned" grep -qF "$HOSTKEY2" "$S/desk/secrets/coordinator_known_hosts"
 check "the new coordinator has node-c back" test "$(jq2 "sorted(m['name'] for m in d['members'])")" = "['coord', 'node-c']"
@@ -246,7 +247,7 @@ check "version went up ($VOLD -> $(jq2 "d['signed_version']"))" test "$(jq2 "d['
 out=$(echo | reg signed)
 check "servers can read the signed list from it" grep -q "BEGIN SSH SIGNATURE" <<<"$out"
 out=$(screen "$S/desk" "node-c" "" 2>&1)
-check_not "the screen is clean afterwards" grep -q "NOT SIGNED\|Cannot talk" <<<"$out"
+check_not "the screen is clean afterwards" grep -q "not signed\|Not signed\|Cannot talk\|another SSH key" <<<"$out"
 
 echo "== releases"
 desk() { (cd "$S/desk" && "$BIN" "$@" --config config.env --host 127.0.0.1 --port $PORT 2>&1); }
@@ -308,12 +309,14 @@ check "release status shows the release and its notes" grep -q "Release $SER (ur
 check "release status has a line per machine" grep -Eq "^[ !] coord +coordinator +" <<<"$out"
 out=$(desk release resume)
 check "resume without a rollout is refused" grep -q "no rollout to resume" <<<"$out"
-# The screen checks a release on its worker; this one is refused before
-# anything is signed (a build for this desktop, or older than 0.2.0).
+# The screen checks a release on its own thread; this one is refused
+# before anything is signed (a build for this desktop, or older than
+# 0.2.0). Updates is the second tab; the form goes a step at a time.
 # The screen redraws only what changed: wait for text drawn fresh.
-out=$(screen "$S/desk" "u publish an update" "u" "esc cancel" $'\r' "nothing was signed|y sign and send" "R" "rollout to resume|y to confirm" "")
-check "u on the screen checks the release and says why not" grep -q "nothing was signed" <<<"$out"
-check "R on the screen with nothing stopped resumes nothing" grep -q "no rollout to resume" <<<"$out"
+out=$(screen "$S/desk" "node-c" $'\t' "Release $SER \\(urgent\\)" "p" "Step 1 of 3" $'\r' "How it rolls out" $'\r\r' "Every answer, before" $'\r' "nothing was signed|ready to sign" "t" "rollout to resume|Try release" "")
+check "the Updates tab shows the release" grep -q "Release $SER (urgent), made" <<<"$out"
+check "p on the screen checks the release and says why not" grep -q "nothing was signed" <<<"$out"
+check "t on the screen with nothing stopped tries nothing again" grep -q "no rollout to resume" <<<"$out"
 check_not "nothing was signed from the screen" test -e "$S/desk/secrets/release.signed.json"
 out=$(desk release resume -skip)
 check "resume -skip without a rollout is refused" grep -q "no rollout to resume" <<<"$out"

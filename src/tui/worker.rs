@@ -16,7 +16,6 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use super::{Doc, dim, err, sel, spinner, theme};
 use crate::ctx::Ctx;
 use crate::err::{Error, Kind};
 
@@ -100,23 +99,6 @@ impl Waiting {
     /// How long the running job has been running.
     pub fn running_for(&self) -> Duration {
         self.since.map(|t| t.elapsed()).unwrap_or_default()
-    }
-
-    /// The busy line: what runs, what waits behind it, and an alarm once
-    /// the other side has been silent longer than slow.
-    pub fn view(&self, slow: Duration, silent: &str) -> Option<Doc> {
-        let first = self.jobs.front()?;
-        let mut d = Doc::new();
-        d.s("  ").add(sel(spinner())).s(format!(" {}{}", first.label, theme::ellipsis()));
-        if self.jobs.len() > 1 {
-            let rest: Vec<&str> = self.jobs.iter().skip(1).map(|j| j.label.as_str()).collect();
-            d.add(dim(format!("  then {}", rest.join(", "))));
-        }
-        let t = self.running_for();
-        if t >= slow {
-            d.s("  ").add(err(format!("{silent} ({}s)", t.as_secs())));
-        }
-        Some(d)
     }
 }
 

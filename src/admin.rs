@@ -50,7 +50,7 @@ pub const RECEIPT_OLD: i64 = 900;
 pub const RETIRED: &str = "retired-hosts.json";
 
 /// A way to run one registry command on the coordinator.
-pub trait Link {
+pub trait Link: Send {
     /// Runs one registry command. Fails with Kind::HostKey when the machine
     /// at the coordinator's address has another SSH key than the pinned one.
     fn call(&self, command: &str, stdin: &str) -> Result<String>;
@@ -440,6 +440,12 @@ pub struct NewCoordinator {
 impl View {
     pub fn unsigned(&self) -> Vec<String> {
         self.members.iter().filter(|(_, s)| !s).map(|(m, _)| m.name.clone()).collect()
+    }
+
+    /// Members on the coordinator that the next signature would drop
+    /// because they are not in the signed list, except those in keep.
+    pub fn would_drop(&self, keep: &[&str]) -> Vec<String> {
+        self.members.iter().filter(|(m, s)| m.host != 1 && !s && !keep.contains(&m.name.as_str())).map(|(m, _)| m.name.clone()).collect()
     }
 }
 
@@ -1141,12 +1147,6 @@ impl Admin {
                 host_key: e.ssh_host_key.clone(),
             })
             .collect()
-    }
-
-    /// Members on the coordinator that the next signature would drop
-    /// because they are not in the signed list, except those in keep.
-    pub fn would_drop(&self, keep: &[String]) -> Vec<String> {
-        self.members.iter().filter(|m| m.host != 1 && !self.base.has(m) && !keep.contains(&m.name)).map(|m| m.name.clone()).collect()
     }
 
     /// The newest release this desktop knows was signed: its own copy or
@@ -1851,13 +1851,13 @@ pub mod tests {
         let v = a.load().unwrap();
         assert_eq!(v.unsigned().len(), 3);
         assert_eq!(v.coordinator_code, registry::coordinator_code(&key32(1), COORD_KEY));
-        assert_eq!(a.would_drop(&[]), vec!["node-a".to_string(), "rogue".into()]);
+        assert_eq!(v.would_drop(&[]), vec!["node-a".to_string(), "rogue".into()]);
 
         a.sign_coordinator().unwrap();
         let names: Vec<String> = store.read().unwrap().members.iter().map(|m| m.name.clone()).collect();
         assert_eq!(names, vec!["coord"], "the first signature covers the coordinator and nothing else");
         let v = a.load().unwrap();
-        assert!(v.unsigned().is_empty() && a.would_drop(&[]).is_empty());
+        assert!(v.unsigned().is_empty() && v.would_drop(&[]).is_empty());
         assert!(a.sign_coordinator().unwrap_err().to_string().contains("signed already"));
     }
 

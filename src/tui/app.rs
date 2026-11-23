@@ -456,7 +456,8 @@ impl App {
             Place::Machines | Place::Updates => {
                 self.needs_config(place)?;
                 self.needs_keys(place)?;
-                (self.make.machines)().map(|s| host(s, generation)).map_err(|e| App::failed(place, e))
+                let tab = if place == Place::Updates { super::admin::Tab::Updates } else { super::admin::Tab::Machines };
+                (self.make.machines)().map(|s| host(s.on_tab(tab), generation)).map_err(|e| App::failed(place, e))
             }
             Place::Apps | Place::Outside => {
                 self.needs_config(place)?;
@@ -676,43 +677,6 @@ impl Model for App {
 
     fn job(&mut self) -> Option<Job> {
         self.open.as_mut().and_then(|(_, p)| p.job())
-    }
-}
-
-// ---- the screens not drawn in the frame yet: their own text is the body ----
-
-fn legacy_page(place: &str, body: Doc) -> Page {
-    let mut p = Page::new(place);
-    p.body = body;
-    p.key("pgup pgdn", "scroll");
-    p.back = Back::Esc;
-    p
-}
-
-/// The old screens fit their lines to the width they are told: the body's.
-fn legacy<M>(ev: Event<M>) -> Event<M> {
-    match ev {
-        Event::Resize(w, h) => Event::Resize(frame::body_width(w) as u16 + 2, h.saturating_sub(4)),
-        ev => ev,
-    }
-}
-
-impl PlaceScreen for super::admin::Screen {
-    type Msg = super::admin::Msg;
-    fn init(&mut self, emit: &Emit<Self::Msg>) {
-        Model::init(self, emit);
-    }
-    fn update(&mut self, ev: Event<Self::Msg>, emit: &Emit<Self::Msg>) -> Flow {
-        Model::update(self, legacy(ev), emit)
-    }
-    fn page(&self, _: Size) -> Page {
-        legacy_page("Machines", Model::view(self))
-    }
-    fn after(&self) -> Option<Notice> {
-        super::admin::Screen::after(self).map(Notice::bad)
-    }
-    fn typing(&self) -> bool {
-        true
     }
 }
 

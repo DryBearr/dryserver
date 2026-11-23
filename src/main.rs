@@ -959,10 +959,10 @@ fn run_approve(args: &[String]) -> Result<()> {
     run_hub(&f, Some(tui::app::Place::Machines))
 }
 
-/// The approve screen, which also publishes releases and resumes a
-/// stopped rollout.
+/// The Machines screen, which also publishes releases, lets a stopped
+/// rollout go on and writes the server list.
 fn machines_model(f: &Flags) -> Result<tui::admin::Screen> {
-    let (a, _) = desktop_admin(f, "approve")?;
+    let (a, host) = desktop_admin(f, "approve")?;
     let key = paths().secrets.join(iso::SIGNING_KEY_NAME);
     if publish::has_passphrase(&key) {
         // ssh-keygen would ask for it on the terminal the screen draws on.
@@ -980,7 +980,9 @@ fn machines_model(f: &Flags) -> Result<tui::admin::Screen> {
         parts: publish::Parts::this_program(&paths().out_dir, None)?,
         today: || chrono::Utc::now().date_naive(),
     };
-    Ok(tui::admin::Screen::new(a).with_publisher(publisher))
+    let list = f.clone();
+    let write_list: tui::kill::WriteList = Arc::new(move || Ok(ssh_config(&list)?.summary));
+    Ok(tui::admin::Screen::new(a).at(&host).with_publisher(publisher).with_write_list(write_list))
 }
 
 const RELEASE_USAGE: &str = r#"usage: dryserver release publish|status|resume [flags]

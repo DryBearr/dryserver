@@ -33,8 +33,8 @@ node-b (node-a is the canary, watched for 5m).
 Sign it and send it to the coordinator at 192.168.1.50? [y/N]
 ```
 
-Or press `u` in `./dryserver approve`: the same checks and the same
-summary, `y` sends it.
+Or press `p` in `./dryserver approve` (Machines, any tab): the notes,
+then the same checks and the same summary, `y` sends it.
 
 The summary compares with the newest release on the coordinator. When
 that one failed on the coordinator and went back, it compares with the

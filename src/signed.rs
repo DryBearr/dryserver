@@ -253,7 +253,7 @@ pub fn host_verify(ctx: &Ctx, run: &dyn Runner, tmp_dir: &Path, key: &str, names
         .map_err(|e| e.wrap("bad signature"))
 }
 
-pub trait Signer {
+pub trait Signer: Send {
     fn sign(&self, namespace: &str, doc: &str) -> Result<String>;
 }
 

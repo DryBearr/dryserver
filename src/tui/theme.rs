@@ -535,28 +535,7 @@ pub fn snake_height() -> usize {
     }
 }
 
-// ---- older parts, for the screens not redrawn in the frame yet ----
-
-/// The top of a working screen: the product, then where you are.
-pub fn header(place: &str) -> Doc {
-    let p = palette();
-    let mut d = Doc::new();
-    d.add(Seg("dryserver".into(), p.title())).s("  ").s(place);
-    d
-}
-
-/// The keys of a screen: each key in gold, what it does in violet.
-pub fn keys(pairs: &[(&str, &str)]) -> Doc {
-    let p = palette();
-    let mut d = Doc::new();
-    for (i, (key, does)) in pairs.iter().enumerate() {
-        if i > 0 {
-            d.s("   ");
-        }
-        d.add(Seg(key.to_string(), p.fg(p.gold))).s(" ").add(Seg(does.to_string(), p.hint()));
-    }
-    d
-}
+// ---- the progress bar ----
 
 /// A bar of width cells for pct in 0..=1, coloured like the snake: thin
 /// half blocks where there are colours to tell done from not done, full
@@ -823,9 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn header_keys_and_bar() {
-        assert_eq!(header("machines").plain(), "dryserver  machines");
-        assert_eq!(keys(&[("↑↓", "select"), ("q", "quit")]).plain(), "↑↓ select   q quit");
+    fn bar_by_tier() {
         {
             let _g = force(Tier::Console, true);
             assert_eq!(bar(0.5, 8).plain(), "████░░░░");

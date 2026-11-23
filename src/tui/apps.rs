@@ -1121,67 +1121,6 @@ pub mod tests {
         }
     }
 
-    // ---- for the screens not drawn in the frame yet (Machines) ----
-
-    /// A Model screen with its worker's channel.
-    #[allow(dead_code)]
-    pub struct Open<S: crate::tui::Model> {
-        pub s: S,
-        pub rx: Receiver<S::Msg>,
-        pub emit: Emit<S::Msg>,
-    }
-
-    #[allow(dead_code)]
-    pub trait Busy {
-        fn busy(&self) -> bool;
-    }
-
-    #[allow(dead_code)]
-    impl<S: crate::tui::Model + Busy> Open<S> {
-        pub fn new(mut s: S) -> Open<S> {
-            let (emit, rx) = collector();
-            s.init(&emit);
-            Open { s, rx, emit }
-        }
-
-        /// Feeds the worker's answers to the screen until nothing waits.
-        pub fn settle(&mut self) {
-            while self.s.busy() {
-                let m = self.rx.recv_timeout(Duration::from_secs(10)).expect("the worker did not answer");
-                self.s.update(Event::Msg(m), &self.emit);
-            }
-        }
-
-        pub fn key(&mut self, k: Key) -> Flow {
-            self.s.update(Event::Key(k), &self.emit)
-        }
-
-        pub fn type_in(&mut self, text: &str) {
-            for k in type_text(text) {
-                self.key(k);
-            }
-            self.key(Key::Enter);
-        }
-
-        pub fn view(&self) -> String {
-            self.s.view().plain()
-        }
-
-        /// The view as one line: wrapped text reads as it was written.
-        pub fn flat(&self) -> String {
-            self.view().replace('\n', " ")
-        }
-
-        /// The screen fits 80 columns and the given number of rows.
-        pub fn fits(&self, rows: usize) {
-            let v = self.view();
-            for l in v.lines() {
-                assert!(l.width() <= 80, "wider than 80 columns ({}): {l:?}\n{v}", l.width());
-            }
-            assert!(v.lines().count() <= rows, "more than {rows} rows:\n{v}");
-        }
-    }
-
     pub fn doors(dir: &crate::testutil::TempDir) -> Entrances {
         Arc::new(vec![Box::new(Cloudflare::new(dir.path())), Box::new(Vps)])
     }

@@ -913,7 +913,7 @@ fn machine_line(m: &Member, r: &Rollout, now: i64) -> (String, bool) {
     (format!("{:<14} {role:<11}  {state}{}", m.name, version.unwrap_or_default()), alarm)
 }
 
-fn machine_state(m: &Member, r: &Rollout, now: i64) -> (String, bool) {
+pub fn machine_state(m: &Member, r: &Rollout, now: i64) -> (String, bool) {
     let Some(rep) = &m.report else {
         return ("no report: its dryserver is too old to update itself".into(), true);
     };
@@ -1015,21 +1015,6 @@ pub fn status_lines(v: &View, now: i64) -> Vec<String> {
     // Every line carries the coordinator's words: none reaches the
     // terminal with a character it would obey.
     out.into_iter().map(|l| l.replace(|c: char| c.is_control(), "?")).collect()
-}
-
-/// The same advice for the approve screen, with its keys.
-pub fn stopped_keys(r: &Rollout) -> Option<String> {
-    if !stopped(r) {
-        return None;
-    }
-    let what = resume_does(r).ok()?;
-    let mut s = format!(
-        "Press R to resume (the coordinator {what}), or u to publish a fixed release: it gets a higher serial and replaces this rollout."
-    );
-    if skip_does(r).is_ok() && r.pause != Pause::Canary {
-        s += &format!(" To pass {} over instead: ./dryserver release resume -skip", paused_name(r));
-    }
-    Some(s)
 }
 
 #[cfg(test)]

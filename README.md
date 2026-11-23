@@ -139,8 +139,9 @@ machine: a stick carries the dryserver it was built with.
 3. When it has restarted, **reserve its address in your router** for the
    device named `coord` (DHCP reservation), then restart the coordinator
    once.
-4. On your desktop, run `./dryserver approve` and press `S` to sign the
-   coordinator, if it shows the same code as the coordinator's screen.
+4. On your desktop, run `./dryserver approve` (Machines) and press `s` to
+   sign the coordinator, if it shows the same code as the coordinator's
+   screen.
    From now on, servers accept only the machines you approve here.
 
 **Encryption**, chosen per laptop:
@@ -280,7 +281,7 @@ git pull && make
 ./dryserver release publish -notes "fixes the join timeout"
 ```
 
-Or press `u` in `./dryserver approve`. Either way you see what changes
+Or press `p` in `./dryserver approve` (Machines). Either way you see what changes
 before anything is signed:
 
 ```
@@ -394,7 +395,7 @@ are down until you lift the cut. Then:
 2. power the coordinator off and keep its disk to look at,
 3. install it again from the stick, as coordinator, at the same address,
 4. in `./dryserver approve`, which says the machine there has another SSH
-   key, press `N`, compare the code with the new coordinator's screen and
+   key, press `n`, compare the code with the new coordinator's screen and
    confirm,
 5. run `./dryserver quarantine-all -lift`: the servers follow the new
    coordinator, and the old one stays out,
@@ -487,7 +488,7 @@ On your desktop:
 | `./dryserver build` | build the ISO, with its log in the terminal |
 | `./dryserver disks` | list disks and which ones may be flashed |
 | `sudo ./dryserver flash --iso FILE` | flash any image to a USB drive |
-| `./dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed. `u` publishes an update, `R` resumes a stopped rollout |
+| `./dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed. `p` publishes an update; `enter` on a stopped rollout tries it again or skips the machine |
 | `./dryserver apps` | start an app from a container image, remove one, see what runs where |
 | `./dryserver outside` | the ways in from the internet: open, sync or close the Cloudflare Tunnel |
 | `./dryserver release publish` | check a release, show what changes, sign it and roll it out (`-urgent`, `-notes`, `-rollback`, `-arch-date`, `-k3s`) |

@@ -113,7 +113,10 @@ Every desktop screen is one frame, the full terminal:
 - **Actions sheet**: `enter` on a row opens a raised panel with the row's
   details (a label in violet, the value whole in bone, wrapped under
   itself) and what can be done to it, each with its key. Something that
-  cannot be done now is listed in ash with the reason.
+  cannot be done now is listed in ash with the reason. When the details
+  are taller than a panel can be (a machine's whole report at 80×24),
+  the sheet is drawn in the body instead, centred with the same look,
+  so it scrolls and the chosen action stays in view.
 - **Panels** (confirm, help, actions sheet) go over the body, with a cell
   of plain screen round them; what is under them recedes toward the coal,
   so only the panel reads.
@@ -150,7 +153,10 @@ only, so no two actions differ by shift.
 | `1`-`9` | on Home, open that place |
 
 Actions, where they exist: `a` approve, `x` reject, `d` remove, `n` new,
-`p` publish, `y` yes in a confirm. Anything else is in the actions sheet.
+`p` publish, `y` yes in a confirm. Anything else is in the actions sheet,
+with its key shown there: in Machines `s` sign, `t` try a stopped
+rollout again, `o` skip a machine in it, `w` write the server list for
+ssh.
 
 ## Words
 

@@ -936,6 +936,14 @@ fn small(w: u16, h: u16) -> Doc {
     g.into_doc()
 }
 
+/// Lines on the raised surface, width cells wide, as part of the body: a
+/// panel that scrolls with it (the Machines sheets, whose details are
+/// taller than a panel over the body can be in a small window). Lines
+/// wider than width - 4 wrap; the first line of content is line 1.
+pub fn raised(width: usize, lines: &[Vec<Seg>]) -> Doc {
+    Doc { lines: panel(lines, width) }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;

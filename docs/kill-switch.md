@@ -29,7 +29,7 @@ until you lift the cut. Then:
 2. power off the coordinator and keep its disk for investigation,
 3. reinstall it from the USB stick, as coordinator, at the same address,
 4. `./dryserver approve`: it says the machine there has another SSH key.
-   Press `N`, compare the code with the new coordinator's screen, confirm.
+   Press `n`, compare the code with the new coordinator's screen, confirm.
    Your desktop signs a new list with the new coordinator in the old one's
    place; every machine you signed before stays in it,
 5. `./dryserver quarantine-all -lift`: each server reads the signed list

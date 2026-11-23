@@ -773,13 +773,6 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
     ] {
         assert!(text.contains(want), "{want}:\n{text}");
     }
-    let keys = stopped_keys(&v.rollout).unwrap();
-    assert!(
-        keys.contains("Press R to resume (the coordinator gives node-b its turn again")
-            && keys.contains("u to publish a fixed release")
-            && keys.contains("To pass node-b over instead: ./dryserver release resume -skip"),
-        "{keys}"
-    );
 
     // Running: no advice. A server whose turn it is says so.
     let mut running = v.clone();
@@ -788,7 +781,7 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
     running.rollout.turn = Some(Turn { host: 4, name: "node-c".into(), since: now - 60, ready: true, ..Turn::default() });
     running.members[3].0.last_seen = Time(chrono::DateTime::from_timestamp(now - 10, 0).unwrap());
     let text = status_lines(&running, 0).join("\n");
-    assert!(!text.contains("The rollout is stopped") && stopped_keys(&running.rollout).is_none(), "{text}");
+    assert!(!text.contains("The rollout is stopped"), "{text}");
     assert!(text.contains("  node-c         server       its turn: updating"), "{text}");
 
     // Nothing published yet.
@@ -835,7 +828,6 @@ fn review_release_status_prints_no_control_characters() {
     let text = status_lines(&v, now).join("\n");
     assert!(text.contains("the coordinator gives the server its turn again") && !text.contains("pwned"), "{text}");
     assert!(!resume_does(&v.rollout).unwrap().contains('\x1b') && !skip_does(&v.rollout).unwrap().contains('\x1b'));
-    assert!(!stopped_keys(&v.rollout).unwrap().chars().any(|c| c.is_control()));
 }
 
 /// Every text of the rollout as the desktop takes it is printable ASCII

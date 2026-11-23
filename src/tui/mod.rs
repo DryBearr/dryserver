@@ -138,9 +138,6 @@ pub fn sel_style() -> Style {
 pub fn err_style() -> Style {
     theme::palette().alarm()
 }
-pub fn ok_style() -> Style {
-    theme::palette().ok()
-}
 
 /// A piece of text with a style.
 #[derive(Debug, Clone)]
@@ -160,9 +157,6 @@ pub fn sel(s: impl Into<String>) -> Seg {
 }
 pub fn err(s: impl Into<String>) -> Seg {
     Seg(s.into(), err_style())
-}
-pub fn ok(s: impl Into<String>) -> Seg {
-    Seg(s.into(), ok_style())
 }
 
 /// Styled lines, built like a string: text with "\n" starts new lines.
@@ -272,42 +266,6 @@ pub fn fit(s: &str, n: usize) -> String {
         out.push(c);
     }
     out + dots
-}
-
-/// s broken into lines of at most width cells, at spaces where it can;
-/// its own line breaks stay. The screens do not wrap by themselves, and
-/// a long message would be cut at the edge.
-pub fn wrap(s: &str, width: usize) -> String {
-    let mut out = Vec::new();
-    for para in s.split('\n') {
-        // A line's indent starts each of its parts.
-        let body = para.trim_start_matches(' ');
-        let indent = &para[..para.len() - body.len()];
-        let width = width.saturating_sub(indent.len()).max(10);
-        let start = out.len();
-        let mut line = String::new();
-        for word in body.split(' ') {
-            let (lw, ww) = (line.width(), word.width());
-            if lw > 0 && lw + 1 + ww > width {
-                out.push(std::mem::take(&mut line));
-            }
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
-            // A word longer than a line is cut where the line ends.
-            while line.width() > width {
-                let cut: String = line.chars().take(width).collect();
-                line = line.chars().skip(cut.chars().count()).collect();
-                out.push(cut);
-            }
-        }
-        out.push(line);
-        for l in &mut out[start..] {
-            l.insert_str(0, indent);
-        }
-    }
-    out.join("\n")
 }
 
 /// The current frame of the busy spinner: an ember that glows and fades.
@@ -645,14 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn long_lines_wrap() {
-        assert_eq!(wrap("one two three four", 10), "one two\nthree four");
-        assert_eq!(wrap("keep\nbreaks", 80), "keep\nbreaks");
-        assert_eq!(wrap("abcdefghijklmnopqrstuvwxyz", 10), "abcdefghij\nklmnopqrst\nuvwxyz");
-        let long =
-            "Close Cloudflare Tunnel? blog, shop still come in through it: nothing from outside reaches them after that. y to confirm";
-        assert!(wrap(long, 76).lines().all(|l| l.width() <= 76), "{}", wrap(long, 76));
-        assert_eq!(wrap("    one two three four", 14), "    one two\n    three four", "the indent stays");
+    fn long_lines_fit() {
         assert_eq!(fit("short", 10), "short");
         assert!(fit("node-a,node-b,node-c", 12).width() <= 12 && fit("node-a,node-b,node-c", 12).starts_with("node-a,no"));
     }

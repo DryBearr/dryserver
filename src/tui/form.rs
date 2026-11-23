@@ -664,9 +664,8 @@ impl<S: 'static> Form<S> {
         }
         let keys = self.keys();
         let esc = self.esc_label();
-        let mut pairs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        pairs.push(("esc", esc.as_str()));
-        d.append(theme::keys(&pairs)).nl();
+        let pairs: Vec<String> = keys.iter().map(|(k, v)| format!("{k} {v}")).chain([format!("esc {esc}")]).collect();
+        d.s(pairs.join("   ")).nl();
         d
     }
 }
