@@ -12,13 +12,17 @@
 //! with the reason: package signatures weakened in pacman.conf, /boot not
 //! mounted, too little disk space, another pacman at work. pacman's own
 //! checks stay on: no skipped signatures, ever, and no blanket --overwrite.
-//! Files in pacman's way are taken over only in two cases dryserver can
+//! Files in pacman's way are taken over only in three cases dryserver can
 //! account for file by file, each path named exactly (install_run): a
 //! rollback across a package split (the files' owner is not in the older
-//! snapshot), and an install that was cut off in the middle of a package
-//! (files of that package's own list, owned by none; a package that lost
-//! its database entry that way is installed again by name, from the list
-//! of what that run was to install: lost_packages). A run that pacman
+//! snapshot; once the older package owns them, the newer one leaves the
+//! database and what else it had is deleted: drop_split_owners), an install
+//! that was cut off in the middle of a package (files of that package's own
+//! list, owned by none; a package that lost its database entry that way is
+//! installed again by name, from the list of what that run was to install:
+//! lost_packages), and files owned by none that are byte for byte what the
+//! incoming package writes there (left by an earlier install of it: read
+//! from its package file in the cache, identical). A run that pacman
 //! refused changed nothing (its log says so) and keeps reboots safe; one
 //! that fails part way leaves pacman's own state and the next run picks it
 //! up; until one succeeds the machine must not reboot, since its boot
@@ -39,7 +43,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -73,6 +77,9 @@ pub const INSTALLING: &str = "/var/lib/dryserver-update/arch-installing";
 /// A rollback across a package split (SplitRecord), until the newer
 /// packages that owned the files lost their database entry.
 pub const SPLIT: &str = "/var/lib/dryserver-update/arch-split.json";
+/// Where the files of a package that are compared with files in pacman's
+/// way are unpacked to (Host::identical), and removed again.
+const COMPARE: &str = "/var/lib/dryserver-update/arch-compare";
 /// Where pacman keeps the packages it loaded (CacheDir, as Arch ships it).
 const PKG_CACHE: &str = "/var/cache/pacman/pkg";
 const PACMAN_LOG: &str = "/var/log/pacman.log";
@@ -1009,8 +1016,8 @@ impl Host<'_> {
     }
 
     /// Which of the files in pacman's way (out.said) it may install over,
-    /// all of them or none; Err says why not. Only two cases, checked file
-    /// by file:
+    /// all of them or none; Err says why not. Only three cases, checked
+    /// file by file:
     /// - a rollback across a package split: every file is owned by a
     ///   package the older snapshot does not have (foreign once the lists of
     ///   its day are loaded). Arch split openssl-3 off openssl after the day
@@ -1020,6 +1027,10 @@ impl Host<'_> {
     /// - an install that was cut off in the middle of a package (INSTALLING
     ///   was left): every file is owned by no package and is in the incoming
     ///   package's own file list, from its package file in the cache.
+    /// - files left by an earlier install of the incoming package (a split
+    ///   rollback by a dryserver that left them, or by hand): every file is
+    ///   owned by no package and is byte for byte what the incoming package
+    ///   writes there (identical). Overwritten, nothing of anyone's is lost.
     fn overwrite_plan(&self, ctx: &Ctx, out: &mut ArchOutcome) -> std::result::Result<Vec<String>, String> {
         let said = out.said.clone();
         if said.more_conflicts || !said.both.is_empty() || !said.corrupt.is_empty() {
@@ -1029,7 +1040,7 @@ impl Host<'_> {
             return Err(format!("{} cannot be named to pacman exactly, so nothing was overwritten", c.path));
         }
         let paths: Vec<String> = said.conflicts.iter().map(|c| c.path.clone()).collect();
-        let shown = || paths.join(" ");
+        let shown = || listed(&paths, 8);
         let owned = said.conflicts.iter().filter(|c| c.owner.is_some()).count();
         if owned == said.conflicts.len() {
             if !out.downgrade {
@@ -1072,9 +1083,20 @@ impl Host<'_> {
             shown()
         );
         if !out.cut_off {
-            return Err(format!(
-                "They belong to no package and no install of dryserver's was cut off, so nothing was overwritten. {manual}"
-            ));
+            let targets: BTreeSet<&str> = said.conflicts.iter().map(|c| c.target.as_str()).collect();
+            let targets = targets.into_iter().collect::<Vec<_>>().join(", ");
+            if let Err(why) = self.identical(ctx, &said.conflicts) {
+                return Err(format!(
+                    "They belong to no package, no install of dryserver's was cut off, and {why}: nothing was overwritten. {manual}"
+                ));
+            }
+            let msg = format!(
+                "files no package owns were in the way, each byte for byte what {targets} bring(s) (left by an earlier install): taken over ({})",
+                shown()
+            );
+            self.say(&format!("Arch: {msg}"));
+            out.repairs.push(msg);
+            return Ok(paths);
         }
         let mut files: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
         for c in &said.conflicts {
@@ -1186,14 +1208,75 @@ impl Host<'_> {
     /// in pacman's cache: absolute paths.
     fn package_files(&self, ctx: &Ctx, package: &str) -> Result<BTreeSet<String>> {
         let tctx = ctx.with_timeout(self.limits.sync);
+        let file = self.package_file(ctx, package)?;
+        let list = self.run.output(&tctx, &pacman(&["-Qlpq", &file.display().to_string()]).quiet())?;
+        Ok(list.lines().map(str::trim).filter(|l| l.starts_with('/') && !l.ends_with('/')).map(str::to_string).collect())
+    }
+
+    /// Where package's file (as the snapshot has it) is in pacman's cache,
+    /// as pacman names it.
+    fn package_file(&self, ctx: &Ctx, package: &str) -> Result<PathBuf> {
+        let tctx = ctx.with_timeout(self.limits.sync);
         let name = self.run.output(&tctx, &pacman(&["-Sddp", "--print-format", "%f", package]).quiet())?;
         let name = name.lines().next().unwrap_or("").trim().to_string();
         if name.is_empty() || name.contains('/') || name.starts_with('.') {
             bail!("pacman names no package file for {package}");
         }
-        let file = self.path(&format!("{PKG_CACHE}/{name}"));
-        let list = self.run.output(&tctx, &pacman(&["-Qlpq", &file.display().to_string()]).quiet())?;
-        Ok(list.lines().map(str::trim).filter(|l| l.starts_with('/') && !l.ends_with('/')).map(str::to_string).collect())
+        Ok(self.path(&format!("{PKG_CACHE}/{name}")))
+    }
+
+    /// Whether every file in pacman's way that no package owns (conflicts)
+    /// is byte for byte what its incoming package writes there: a regular
+    /// file of the same content (sha256), or a symbolic link to the same
+    /// place. The package's own are read from its file in pacman's cache,
+    /// which pacman checked before it looked for files in the way: bsdtar
+    /// unpacks only those into COMPARE, a directory of dryserver's. On disk
+    /// each is found without following a link on the way. Err says why
+    /// not, naming the files.
+    fn identical(&self, ctx: &Ctx, conflicts: &[Conflict]) -> std::result::Result<(), String> {
+        let mut by: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for c in conflicts {
+            by.entry(c.target.as_str()).or_default().push(c.path.as_str());
+        }
+        let mut differ = Vec::new();
+        for (target, paths) in by {
+            let file = self.package_file(ctx, target).map_err(|e| format!("{e} to compare them with"))?;
+            if !fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
+                let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                return Err(format!("{target}'s package file {} is not in {PKG_CACHE} to compare them with", show(&name)));
+            }
+            let dir = self.path(COMPARE);
+            let res = self.unpack(ctx, &file, &dir, &paths).map_err(|e| format!("{target}'s package file cannot give them ({e})"));
+            if res.is_ok() {
+                for p in &paths {
+                    if let Err(why) = same_file(&dir, &self.root, p) {
+                        differ.push(format!("{} ({why})", printable(p)));
+                    }
+                }
+            }
+            let _ = fs::remove_dir_all(&dir);
+            res?;
+        }
+        if differ.is_empty() {
+            return Ok(());
+        }
+        Err(format!("they are not all byte for byte what their package brings: {}", listed(&differ, 8)))
+    }
+
+    /// The files paths of the package file, into the new directory dir, and
+    /// nothing else (bsdtar, each name matching itself only).
+    fn unpack(&self, ctx: &Ctx, file: &Path, dir: &Path, paths: &[&str]) -> Result<()> {
+        // What a power cut left there.
+        let _ = fs::remove_dir_all(dir);
+        fsx::mkdir_all(fsx::dir(dir), 0o700)?;
+        fs::DirBuilder::new().mode(0o700).create(dir).map_err(|e| Error::from(e).wrap(format!("mkdir {}", dir.display())))?;
+        let (file, to) = (file.display().to_string(), dir.display().to_string());
+        let mut args = vec!["-x".to_string(), "-f".into(), file, "-C".into(), to];
+        // Into a directory of root's: no owner, flags or attributes from it.
+        args.extend(["--no-same-owner", "--no-acls", "--no-fflags", "--no-xattrs"].map(String::from));
+        args.extend(paths.iter().map(|p| tar_pattern(p.trim_start_matches('/'))));
+        let (o, res) = self.run.run(&ctx.with_timeout(self.limits.sync), &Cmd::new("bsdtar", &args).quiet());
+        res.map_err(|e| errf!("{}", one_line(&if o.trim().is_empty() { e.to_string() } else { o }, 300)))
     }
 
     /// After a rollback across a package split went in (SPLIT): the newer
@@ -2146,7 +2229,9 @@ enum Split {
 }
 
 const MAX_SAID: usize = 8;
-const MAX_CONFLICTS: usize = 64;
+/// A package of a few thousand files may be in the way whole (left by an
+/// earlier install of it); each is named to pacman again, a few MB at most.
+const MAX_CONFLICTS: usize = 4096;
 /// The most rounds of removing what a rollback left (remove_foreign_orphans):
 /// a package that goes can leave its own dependencies as orphans.
 const MAX_ORPHAN_ROUNDS: usize = 4;
@@ -2317,6 +2402,61 @@ fn pacman_problem(out: &str, said: &PacmanSaid) -> String {
         "packages conflict".into()
     } else {
         "see the log".into()
+    }
+}
+
+/// A name in an archive as a pattern for bsdtar that matches that name
+/// only: libarchive's patterns take *, ? and [ as wildcards and a
+/// backslash for the next character as it is.
+fn tar_pattern(name: &str) -> String {
+    let mut s = String::with_capacity(name.len() + 8);
+    for c in name.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            s.push('\\');
+        }
+        s.push(c);
+    }
+    s
+}
+
+/// Whether path under ours is what it is under theirs: a regular file of
+/// the same content, or a symbolic link to the same place; each found
+/// without following a link on the way. Err says how not.
+fn same_file(theirs: &Path, ours: &Path, path: &str) -> std::result::Result<(), String> {
+    let t = match look(theirs, path) {
+        Ok(Some(f)) => f,
+        Ok(None) => return Err("not in the package".into()),
+        Err(e) => return Err(format!("in the package: {e}")),
+    };
+    let o = match look(ours, path) {
+        Ok(Some(f)) => f,
+        Ok(None) => return Err("not on disk any more".into()),
+        Err(e) => return Err(e),
+    };
+    let what = |k: Kind| match k {
+        Kind::File => "a file",
+        Kind::Link => "a symbolic link",
+        Kind::Dir => "a directory",
+        Kind::Other => "a special file",
+    };
+    match (o.kind, t.kind) {
+        (Kind::File, Kind::File) => {
+            let (a, b) = (o.sha256().map_err(|e| e.to_string())?, t.sha256().map_err(|e| e.to_string())?);
+            if a == b { Ok(()) } else { Err("its content differs".into()) }
+        }
+        (Kind::Link, Kind::Link) => {
+            let (a, b) = (o.link().map_err(|e| e.to_string())?, t.link().map_err(|e| e.to_string())?);
+            if a == b {
+                Ok(())
+            } else {
+                Err(format!(
+                    "a link to {}, the package's to {}",
+                    printable(&String::from_utf8_lossy(&a)),
+                    printable(&String::from_utf8_lossy(&b))
+                ))
+            }
+        }
+        (a, b) => Err(format!("{} on disk, {} in the package", what(a), what(b))),
     }
 }
 
@@ -3008,6 +3148,18 @@ impl Found {
         Ok(fsx::hex(&h.finalize()))
     }
 
+    /// Where a symbolic link points, as it is written.
+    fn link(&self) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+        // SAFETY: a valid directory descriptor, C string and buffer.
+        let n = unsafe { libc::readlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            return Err(os_err());
+        }
+        buf.truncate(n as usize);
+        Ok(buf)
+    }
+
     /// Removes the name itself: a link, never what it points to; a
     /// directory only when it is empty.
     fn unlink(&self, dir: bool) -> io::Result<()> {
@@ -3216,7 +3368,7 @@ mod tests {
                     self.inhibited_installs.lock().unwrap().push(held);
                     (self.pacman)(ctx, &self.root, c)
                 }
-                ("pacman", _) => (self.pacman)(ctx, &self.root, c),
+                ("pacman", _) | ("bsdtar", _) => (self.pacman)(ctx, &self.root, c),
                 ("sshd", ["-t", ..]) if self.sshd_fails => {
                     (String::new(), Err("sshd failed: exit status 255: Bad configuration option".into()))
                 }
@@ -4549,6 +4701,21 @@ mod tests {
         format!("{name} {version} {path}\n")
     }
 
+    /// One entry of a package, under root as pacman or bsdtar unpacks it.
+    fn lab_place(root: &Path, name: &str, version: &str, e: &str) {
+        if let Some(d) = e.strip_suffix('/') {
+            fs::create_dir_all(fsx::under(root, d)).unwrap();
+            return;
+        }
+        let p = fsx::under(root, lab_path(e));
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let _ = fs::remove_file(&p);
+        match e.split_once(" -> ") {
+            Some((_, t)) => std::os::unix::fs::symlink(t, &p).unwrap(),
+            None => fs::write(&p, lab_content(name, version, e)).unwrap(),
+        }
+    }
+
     /// A path as pacman reads an --overwrite pattern of exact_pattern's.
     fn unescape(p: &str) -> String {
         let mut s = String::new();
@@ -4585,18 +4752,36 @@ mod tests {
         /// The package's files on disk, as pacman unpacks it.
         fn place(&self, root: &Path, name: &str, version: &str) {
             for e in lab_entries(name, version) {
-                if let Some(d) = e.strip_suffix('/') {
-                    fs::create_dir_all(fsx::under(root, d)).unwrap();
-                    continue;
-                }
-                let p = fsx::under(root, lab_path(&e));
-                fs::create_dir_all(p.parent().unwrap()).unwrap();
-                let _ = fs::remove_file(&p);
-                match e.split_once(" -> ") {
-                    Some((_, t)) => std::os::unix::fs::symlink(t, &p).unwrap(),
-                    None => fs::write(&p, lab_content(name, version, &e)).unwrap(),
+                lab_place(root, name, version, &e);
+            }
+        }
+
+        /// bsdtar -x -f FILE -C DIR [--flags] NAME...: the named files of a
+        /// package file in the cache, each name matching itself only.
+        fn bsdtar(&self, c: &Cmd) -> (String, Result<()>) {
+            let a = &c.args;
+            let value = |flag: &str| a.iter().position(|x| x == flag).map(|i| PathBuf::from(&a[i + 1])).unwrap();
+            let (file, dir) = (value("-f"), value("-C"));
+            if !file.is_file() {
+                return (
+                    format!("bsdtar: Error opening archive: Failed to open '{}'\n", file.display()),
+                    Err("bsdtar failed: exit status 1".into()),
+                );
+            }
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            let (n, v) = [LAB_OLD, LAB_NEW].iter().flat_map(|d| lab_day(d)).find(|(n, v)| lab_file(n, v) == name).unwrap();
+            let mut missing = String::new();
+            for m in a.iter().skip_while(|x| *x != "-C").skip(2).filter(|x| !x.starts_with('-')) {
+                let p = format!("/{}", unescape(m));
+                match lab_entries(n, v).into_iter().find(|e| lab_path(e) == p && !e.ends_with('/')) {
+                    Some(e) => lab_place(&dir, n, v, &e),
+                    None => missing += &format!("bsdtar: {}: Not found in archive\n", &p[1..]),
                 }
             }
+            if missing.is_empty() {
+                return (String::new(), Ok(()));
+            }
+            (missing + "bsdtar: Error exit delayed from previous errors\n", Err("bsdtar failed: exit status 1".into()))
         }
 
         /// The owner pacman -Qo names: the first by name.
@@ -4612,6 +4797,9 @@ mod tests {
         fn run(&self, root: &Path, c: &Cmd) -> (String, Result<()>) {
             let ok = |s: String| (s, Ok(()));
             let fail = |s: String| (s, Err("pacman failed: exit status 1".into()));
+            if c.name == "bsdtar" {
+                return self.bsdtar(c);
+            }
             let day = pinned_date(&get(root, MIRRORLIST)).unwrap_or_default();
             let mut db = self.installed.lock().unwrap();
             let args: Vec<&str> = c.args.iter().map(String::as_str).collect();
@@ -4956,6 +5144,154 @@ mod tests {
         assert!(out.ok() && lines.iter().any(|l| l == "pacman -Rdd --dbonly --noconfirm openssl-3"), "{lines:?}");
         assert!(lab_has(dir.path(), "/usr/include/openssl-3/openssl/aes.h"));
         assert!(out.warnings.iter().any(|w| w.contains("file list of openssl-3 cannot be read whole")), "{:?}", out.warnings);
+    }
+
+    /// A machine on 11/08 as a rollback by a dryserver from before left it,
+    /// as the lab machines are: the files of openssl-3 that neither openssl
+    /// has are on disk, owned by no package, and its entry is gone.
+    fn lab_leftovers() -> (TempDir, Arc<SplitLab>) {
+        let dir = two_kernels();
+        let r = dir.path();
+        put(r, MIRRORLIST, mirrorlist(LAB_OLD).unwrap());
+        let lab = SplitLab::new(r, LAB_OLD);
+        for e in lab_entries("openssl-3", "3.5.9-2") {
+            if OPENSSL_3_ALONE.contains(&lab_path(&e)) {
+                lab_place(r, "openssl-3", "3.5.9-2", &e);
+            }
+        }
+        (dir, lab)
+    }
+
+    #[test]
+    fn files_an_earlier_install_left_are_taken_over_when_they_are_byte_for_byte_the_packages() {
+        // The lab machines: going forward, pacman refuses to install
+        // openssl-3 over what the same openssl-3 left when a rollback went
+        // back past it. Those are what it brings, byte for byte.
+        let (dir, lab) = lab_leftovers();
+        let r = dir.path();
+        let fake = lab.fake(r);
+        let (h, _) = host(r, &fake);
+        let out = h.arch_update(&Ctx::new(), LAB_NEW, false);
+        assert!(out.ok(), "{}", out.summary());
+        let installs: Vec<String> = fake.pacman_lines().into_iter().filter(|l| l.starts_with("pacman -Su ")).collect();
+        let exact: String = OPENSSL_3_ALONE.iter().map(|p| format!(" --overwrite {p}")).collect();
+        let first = "pacman -Su --noconfirm --ignore linux-lts";
+        assert_eq!(installs, [first.to_string(), format!("{first}{exact}")]);
+        // Read from the package file the download loaded, those files only,
+        // into a directory of dryserver's that goes afterwards.
+        let tar = fake.lines().into_iter().find(|l| l.starts_with("bsdtar")).unwrap();
+        let file = h.path(&format!("{PKG_CACHE}/openssl-3-3.5.9-2-x86_64.pkg.tar.zst"));
+        assert!(tar.starts_with(&format!("bsdtar -x -f {} -C {}", file.display(), h.path(COMPARE).display())), "{tar}");
+        let names: String = OPENSSL_3_ALONE.iter().map(|p| format!(" {}", &p[1..])).collect();
+        assert!(tar.ends_with(&names), "{tar}");
+        assert!(!h.path(COMPARE).exists());
+        let installed: Vec<(String, String)> = lab_day(LAB_NEW).into_iter().map(|(n, v)| (n.into(), v.into())).collect();
+        assert_eq!(lab.installed(), installed);
+        let s = out.summary();
+        assert!(
+            s.contains(
+                "files no package owns were in the way, each byte for byte what openssl-3 bring(s) (left by an earlier install): \
+                 taken over (/usr/include/openssl-3/openssl/aes.h"
+            ),
+            "{s}"
+        );
+        // A whole package's files in the way are read, not cut at 64.
+        let many: String = (0..3000).map(|i| format!("foo: /usr/share/foo/{i} exists in filesystem\n")).collect();
+        let said = parse_pacman(&many);
+        assert!(said.conflicts.len() == 3000 && !said.more_conflicts);
+        // Names with wildcards match themselves only, in bsdtar too.
+        assert_eq!(tar_pattern("usr/a*b?[c]\\d"), "usr/a\\*b\\?\\[c\\]\\\\d");
+    }
+
+    #[test]
+    fn files_in_the_way_that_are_not_byte_for_byte_the_packages_are_never_overwritten() {
+        let aes = "/usr/include/openssl-3/openssl/aes.h";
+        let evp = "/usr/include/openssl-3/openssl/evp.h";
+        let link = "/usr/lib/openssl-3/libcrypto.so";
+        let license = "/usr/share/licenses/openssl-3/LICENSE";
+        let cases: [(&str, &[&str]); 5] = [
+            // One byte differs; the rest is the package's.
+            ("one byte", &["/usr/include/openssl-3/openssl/aes.h (its content differs)"]),
+            // Some are the package's, two are not: none is overwritten.
+            (
+                "mixed",
+                &[
+                    "/usr/include/openssl-3/openssl/evp.h (its content differs)",
+                    "/usr/lib/openssl-3/libcrypto.so (a link to ../libcrypto.so.4, the package's to ../libcrypto.so.3)",
+                    "/usr/share/licenses/openssl-3/LICENSE (a directory on disk, a file in the package)",
+                ],
+            ),
+            // The package file is not in the cache.
+            ("no package", &["openssl-3's package file \"openssl-3-3.5.9-2-x86_64.pkg.tar.zst\" is not in /var/cache/pacman/pkg"]),
+            // The same files, but through a link to elsewhere.
+            ("linked directory", &["/usr/include/openssl-3 on its way is a symbolic link or no directory, not followed"]),
+            // The package does not have it (pacman would never say so; a
+            // package file that does not match its name in the cache).
+            ("not in the package", &["openssl-3's package file cannot give them", "Not found in archive"]),
+        ];
+        for (case, said) in cases {
+            let (dir, lab) = lab_leftovers();
+            let r = dir.path();
+            let fake = if case == "not in the package" {
+                // pacman names another package's file for openssl-3.
+                let lab = lab.clone();
+                let mut fake = Fake::with_pacman(r, move |_, root, c| {
+                    if c.args[0] == "-Sddp" && c.args.last().is_some_and(|a| a == "openssl-3") {
+                        return (format!("{}\n", lab_file("filesystem", "2025.10-1")), Ok(()));
+                    }
+                    lab.run(root, c)
+                });
+                fake.keyring_newer = false;
+                fake
+            } else {
+                lab.fake(r)
+            };
+            let (mut h, _) = host(r, &fake);
+            match case {
+                "one byte" => put(r, aes, lab_content("openssl-3", "3.5.9-2", aes).replace('\n', "!")),
+                "mixed" => {
+                    put(r, evp, "an older evp.h\n");
+                    fs::remove_file(fsx::under(r, link)).unwrap();
+                    std::os::unix::fs::symlink("../libcrypto.so.4", fsx::under(r, link)).unwrap();
+                    fs::remove_file(fsx::under(r, license)).unwrap();
+                    put(r, &format!("{license}/mine"), "the admin's");
+                }
+                "no package" => {
+                    let cache = h.path(&format!("{PKG_CACHE}/{}", lab_file("openssl-3", "3.5.9-2")));
+                    h.hook = Arc::new(move |p| {
+                        if p == "arch loaded" {
+                            fs::remove_file(&cache).unwrap();
+                        }
+                        Ok(())
+                    });
+                }
+                "linked directory" => {
+                    fs::create_dir_all(fsx::under(r, "/keep")).unwrap();
+                    fs::rename(fsx::under(r, "/usr/include/openssl-3"), fsx::under(r, "/keep/inc")).unwrap();
+                    std::os::unix::fs::symlink(fsx::under(r, "/keep/inc"), fsx::under(r, "/usr/include/openssl-3")).unwrap();
+                }
+                _ => {}
+            }
+            let before: BTreeMap<String, String> =
+                [aes, evp, license].iter().map(|p| (p.to_string(), fs::read_to_string(fsx::under(r, p)).unwrap_or_default())).collect();
+            let out = h.arch_update(&Ctx::new(), LAB_NEW, false);
+            let why = out.failure.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
+            assert!(why.contains("pacman changed nothing") && why.contains("nothing was overwritten") && out.untouched, "{case}: {why}");
+            for s in said {
+                assert!(why.contains(s), "{case}: {s}: {why}");
+            }
+            if case == "one byte" {
+                let differ = why.split("what their package brings: ").nth(1).and_then(|w| w.split(": nothing was").next());
+                assert_eq!(differ, Some(said[0]), "{case}: only what differs is named: {why}");
+            }
+            assert!(!fake.lines().iter().any(|l| l.contains("--overwrite")), "{case}: {:?}", fake.pacman_lines());
+            for (p, text) in &before {
+                assert_eq!(&fs::read_to_string(fsx::under(r, p)).unwrap_or_default(), text, "{case}: {p}");
+            }
+            assert!(!h.path(COMPARE).exists(), "{case}");
+            let installed: Vec<(String, String)> = lab_day(LAB_OLD).into_iter().map(|(n, v)| (n.into(), v.into())).collect();
+            assert_eq!(lab.installed(), installed, "{case}");
+        }
     }
 
     #[test]

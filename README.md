@@ -866,7 +866,7 @@ release that brings it. Step by step:
    cut in pacman's hooks) are made again with `mkinitcpio -P`. When pacman
    refuses (files in the way, a damaged package), the update says pacman's
    own error lines; it changed nothing then, and rebooting stays safe.
-   Files in the way are taken over in two cases only, each file named: a
+   Files in the way are taken over in three cases only, each file named: a
    rollback across a package split (Arch moved files into a new package
    the older day does not have, like openssl-3; the older package takes
    them back, the new one leaves pacman's database once the older package's
@@ -879,12 +879,17 @@ release that brings it. Step by step:
    is removed, never a package that shares a file with another one and
    never before the split is done; an edited config file it had stays as
    `.pacsave`; a split left half done is finished before the next update
-   goes forward, or that update refuses with the reason), and an install
+   goes forward, or that update refuses with the reason), an install
    cut off by a power
    cut in the middle of a package (its own files, owned by no package; a
    package that left pacman's database that way, the main kernel among
    them, is installed again by name: each install run notes what it
-   installs).
+   installs), and files owned by no package that are byte for byte what
+   the incoming package writes there (left by an earlier install of it,
+   such as a split rollback by an older dryserver: each is compared with
+   the package file pacman loaded, a link by where it points, and one file
+   that differs, lies under a link or is missing from the package refuses
+   them all).
    Anything else is refused with the files, for you to look at. A machine
    installed after the release, whose packages are of a newer day, keeps
    them; the next release moves them. A rollback brings the packages to
