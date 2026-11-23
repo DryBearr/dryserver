@@ -475,6 +475,10 @@ pub struct Admin {
     /// LAN addresses from the members' signed reports (SIGNERS), as last
     /// loaded.
     lans: std::collections::BTreeMap<String, String>,
+    /// Digests of the signatures that checked out (key, namespace, text,
+    /// signature): the screen loads every few seconds, and the same report
+    /// is checked once.
+    good: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 impl Admin {
@@ -496,7 +500,23 @@ impl Admin {
             stop: None,
             run: std::sync::Arc::new(crate::runner::ExecRunner::silent()),
             lans: Default::default(),
+            good: Default::default(),
         }
+    }
+
+    /// signed::host_verify, remembering what checked out.
+    fn host_verify(&self, key: &str, namespace: &str, text: &str, sig: &str) -> Result<()> {
+        let id = fsx::hex(&<sha2::Sha256 as sha2::Digest>::digest(format!("{key}\n{namespace}\n{text}\n{sig}").as_bytes()));
+        if self.good.borrow().contains(&id) {
+            return Ok(());
+        }
+        signed::host_verify(&crate::ctx::Ctx::new(), self.run.as_ref(), &std::env::temp_dir(), key, namespace, text, sig)?;
+        let mut good = self.good.borrow_mut();
+        if good.len() > 1024 {
+            good.clear();
+        }
+        good.insert(id);
+        Ok(())
     }
 
     /// The members' signed LAN addresses (SIGNERS).
@@ -513,8 +533,6 @@ impl Admin {
         let was = self.signers();
         let mut lans = was.clone();
         let (mut unsigned, mut forged) = (Vec::new(), Vec::new());
-        let ctx = crate::ctx::Ctx::new();
-        let tmp = std::env::temp_dir();
         for m in members.iter_mut() {
             let Some(e) = self.base.members.iter().find(|e| e.matches(m)) else { continue };
             let Some(r) = &m.report else { continue };
@@ -527,7 +545,7 @@ impl Admin {
                 }
                 continue;
             }
-            match r.verify(&ctx, self.run.as_ref(), &tmp, e.host, &e.wg_key, &e.ssh_host_key) {
+            match self.host_verify(&e.ssh_host_key, signed::NS_REPORT, &r.signed_text(e.host, &e.wg_key), &r.sig) {
                 Ok(()) => {
                     lans.insert(m.wg_key.clone(), r.lan.clone());
                 }
@@ -591,10 +609,7 @@ impl Admin {
             });
         }
         let text = registry::Receipt::text(r.version, &r.sha256, r.time);
-        let ctx = crate::ctx::Ctx::new();
-        if signed::host_verify(&ctx, self.run.as_ref(), &std::env::temp_dir(), &coord.ssh_host_key, signed::NS_RECEIPT, &text, &r.sig)
-            .is_err()
-        {
+        if self.host_verify(&coord.ssh_host_key, signed::NS_RECEIPT, &text, &r.sig).is_err() {
             return Some(format!(
                 "The coordinator's receipt for the list it follows is not signed by the coordinator you signed: its \
                  registry account may be broken into. {removed}"
