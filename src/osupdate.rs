@@ -5146,6 +5146,37 @@ mod tests {
         assert!(out.warnings.iter().any(|w| w.contains("file list of openssl-3 cannot be read whole")), "{:?}", out.warnings);
     }
 
+    #[test]
+    fn going_forward_across_a_package_split_pacman_moves_the_files_itself() {
+        // A machine on 11/08: openssl 3.6.5 owns libcrypto.so.3. On 11/22
+        // openssl 4.1 lacks it and the new openssl-3 has it: pacman moves
+        // it from one package to the other within the one run, and nothing
+        // of dryserver's split handling comes into it.
+        let dir = two_kernels();
+        let r = dir.path();
+        put(r, MIRRORLIST, mirrorlist(LAB_OLD).unwrap());
+        let lab = SplitLab::new(r, LAB_OLD);
+        let fake = lab.fake(r);
+        let (h, _) = host(r, &fake);
+        let out = h.arch_update(&Ctx::new(), LAB_NEW, false);
+        assert!(out.ok() && out.repairs.is_empty() && out.warnings.is_empty(), "{} {:?}", out.summary(), out.warnings);
+        let lines = fake.pacman_lines();
+        let installs: Vec<&String> = lines.iter().filter(|l| l.starts_with("pacman -Su ") || l.starts_with("pacman -R")).collect();
+        assert_eq!(installs, ["pacman -Su --noconfirm --ignore linux-lts"], "{lines:?}");
+        for never in ["--overwrite", "pacman -Qmq", "pacman -Qoq", "pacman -Qlq", "pacman -Qii", "pacman -Sddp"] {
+            assert!(!lines.iter().any(|l| l.contains(never)), "{never}: {lines:?}");
+        }
+        assert!(!fake.lines().iter().any(|l| l.starts_with("bsdtar")));
+        assert!(!h.path(SPLIT).exists() && !h.path(INSTALLING).exists() && !h.path(COMPARE).exists());
+        let installed: Vec<(String, String)> = lab_day(LAB_NEW).into_iter().map(|(n, v)| (n.into(), v.into())).collect();
+        assert_eq!(lab.installed(), installed);
+        assert_eq!(get(r, "/usr/lib/libcrypto.so.3"), lab_content("openssl-3", "3.5.9-2", "/usr/lib/libcrypto.so.3"));
+        assert!(lab_has(r, "/usr/lib/libcrypto.so.4") && OPENSSL_3_ALONE.iter().all(|p| lab_has(r, p)));
+        let names: Vec<(&str, &str)> = out.changes.iter().map(|c| (c.action.as_str(), c.name.as_str())).collect();
+        assert_eq!(names, [("upgraded", "openssl"), ("installed", "openssl-3")]);
+        assert!(out.restart == ["openssl"] && out.summary().contains("2 package(s) changed"), "{}", out.summary());
+    }
+
     /// A machine on 11/08 as a rollback by a dryserver from before left it,
     /// as the lab machines are: the files of openssl-3 that neither openssl
     /// has are on disk, owned by no package, and its entry is gone.
