@@ -434,10 +434,9 @@ fn pixel(letter: char, tier: Tier) -> Option<Color> {
 /// One frame of the pixel snake: each cell is two pixels, the upper one
 /// the half block's colour and the lower one its background. A missing
 /// pixel shows the screen behind it.
-fn pixels(frame: usize, tier: Tier) -> Doc {
-    let rows = &sprite::FRAMES[frame.min(sprite::FRAMES.len() - 1)];
+fn pixels(rows: &[&str], tier: Tier) -> Doc {
     let mut d = Doc::new();
-    for y in 0..sprite::SIZE / 2 {
+    for y in 0..rows.len() / 2 {
         if y > 0 {
             d.nl();
         }
@@ -469,9 +468,69 @@ pub fn frame_of(progress: Option<f64>) -> usize {
 pub fn snake(progress: Option<f64>) -> Doc {
     let p = palette();
     match p.tier {
-        Tier::True | Tier::C256 => pixels(frame_of(progress), p.tier),
+        Tier::True | Tier::C256 => pixels(&sprite::FRAMES[frame_of(progress)], p.tier),
         Tier::Console | Tier::Plain => ring(progress),
     }
+}
+
+/// The whole snake for a short window: 12 × 6 cells in pixels, else the
+/// block ring.
+pub fn small_snake() -> Doc {
+    let p = palette();
+    match p.tier {
+        Tier::True | Tier::C256 => pixels(&sprite::SMALL, p.tier),
+        Tier::Console | Tier::Plain => ring(None),
+    }
+}
+
+/// How many rows and columns small_snake() takes.
+pub fn small_snake_size() -> (usize, usize) {
+    match palette().tier {
+        Tier::True | Tier::C256 => (sprite::SMALL_SIZE / 2, sprite::SMALL_SIZE),
+        Tier::Console | Tier::Plain => (RING.len(), RING[0].chars().count()),
+    }
+}
+
+/// A style pushed back behind a panel: its colours faded toward the
+/// screen (to ash where they cannot be mixed), no bold, and no selection
+/// background, so only the panel reads. A picture (a cell of the pixel
+/// snake) keeps its shape as one flat dark colour where colours cannot be
+/// mixed.
+pub fn dimmed(s: Style, picture: bool) -> Style {
+    let p = palette();
+    let mut out = s.remove_modifier(Modifier::BOLD);
+    if s.bg.is_some() && s.bg == p.shade {
+        out.bg = None;
+    }
+    match p.tier {
+        Tier::Plain => {}
+        Tier::True => {
+            let coal = match p.coal {
+                Some(Color::Rgb(r, g, b)) => (r, g, b),
+                _ => (20, 12, 10),
+            };
+            let fade = |c: Color| match c {
+                Color::Rgb(r, g, b) => {
+                    let m = |a: u8, b: u8| ((a as f64) * 0.32 + (b as f64) * 0.68).round() as u8;
+                    Color::Rgb(m(r, coal.0), m(g, coal.1), m(b, coal.2))
+                }
+                _ => p.ash,
+            };
+            out.fg = out.fg.map(fade);
+            out.bg = out.bg.map(fade);
+        }
+        // Indexed colours do not mix: text goes ash, a picture one dark
+        // grey, so it keeps its shape.
+        Tier::C256 => {
+            out.fg = out.fg.map(|_| if picture { Color::Indexed(236) } else { p.ash });
+            out.bg = out.bg.map(|_| Color::Indexed(236));
+        }
+        Tier::Console => {
+            out.fg = out.fg.map(|_| p.ash);
+            out.bg = None;
+        }
+    }
+    out
 }
 
 /// How many rows snake() takes.
@@ -653,7 +712,7 @@ mod tests {
             let _g = force(tier, false);
             assert_eq!(snake_height(), 10);
             for f in 0..sprite::FRAMES.len() {
-                let d = pixels(f, tier);
+                let d = pixels(&sprite::FRAMES[f], tier);
                 let text = d.plain();
                 let lines: Vec<&str> = text.lines().collect();
                 assert_eq!(lines.len(), 10, "frame {f}");
@@ -679,7 +738,7 @@ mod tests {
         // The pixels are the sprite's: the cell for rows 2 and 3, column 9
         // of the whole snake.
         let last = &sprite::FRAMES[20];
-        let d = pixels(20, Tier::True);
+        let d = pixels(&sprite::FRAMES[20], Tier::True);
         let cell = d.lines[1].iter().flat_map(|s| s.0.chars().map(move |c| (c, s.1))).nth(9).unwrap();
         let (t, b) = (last[2].as_bytes()[9] as char, last[3].as_bytes()[9] as char);
         assert_eq!(cell.1.fg, pixel(t, Tier::True).or(pixel(b, Tier::True)));
@@ -693,6 +752,44 @@ mod tests {
         assert_eq!(frame_of(Some(0.53)), 11);
         assert_eq!(frame_of(Some(7.0)), 20);
         assert_eq!(frame_of(Some(-1.0)), 0);
+    }
+
+    #[test]
+    fn small_snake_for_short_windows() {
+        for tier in [Tier::True, Tier::C256] {
+            let _g = force(tier, false);
+            let (rows, cols) = small_snake_size();
+            assert_eq!((rows, cols), (6, 12));
+            let text = small_snake().plain();
+            assert_eq!(text.lines().count(), rows);
+            assert!(text.lines().all(|l| l.chars().count() == cols));
+        }
+        // The small snake is a whole ring: every row and column has pixels.
+        for (y, r) in sprite::SMALL.iter().enumerate() {
+            assert!(r.chars().any(|c| c != '.'), "row {y} is empty");
+        }
+        let _g = force(Tier::Console, true);
+        assert_eq!(small_snake().plain(), RING.join("\n"));
+        assert_eq!(small_snake_size(), (5, 11));
+    }
+
+    #[test]
+    fn dimmed_behind_a_panel() {
+        let _g = force(Tier::True, false);
+        let p = palette();
+        let s = dimmed(p.selected().bg(p.shade.unwrap()).add_modifier(Modifier::BOLD), false);
+        assert!(s.bg.is_none(), "the selection's shade goes");
+        assert!(!s.add_modifier.contains(Modifier::BOLD));
+        match (s.fg, p.ember) {
+            (Some(Color::Rgb(r, ..)), Color::Rgb(er, ..)) => assert!(r < er / 2, "faded toward the coal"),
+            other => panic!("{other:?}"),
+        }
+        let _g = force(Tier::C256, false);
+        let s = dimmed(Style::new().fg(Color::Indexed(203)).bg(Color::Indexed(208)), true);
+        assert_eq!((s.fg, s.bg), (Some(Color::Indexed(236)), Some(Color::Indexed(236))), "a picture keeps its shape");
+        let _g = force(Tier::Console, true);
+        let s = dimmed(Style::new().fg(Color::LightRed).bg(Color::Red), false);
+        assert_eq!((s.fg, s.bg), (Some(palette().ash), None));
     }
 
     #[test]

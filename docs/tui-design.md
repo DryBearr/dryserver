@@ -81,8 +81,9 @@ Every desktop screen is one frame, the full terminal:
   whether it answers). Below it, the tabs when the place has more than
   one: the open tab in bone bold on shade, the others in violet. `tab`
   and `shift+tab` (or `←` `→`) switch.
-- **Body**: everything else, two columns in from the left, at most 100
-  columns wide. It scrolls when it does not fit, and the selected row
+- **Body**: everything else, three columns in from the left (the
+  selection's `▌` sits in the second), at most 100 columns wide, under a
+  blank line when the window has more than 24 rows. It scrolls when it does not fit, and the selected row
   always stays in view; a thin thumb on the right edge shows where you
   are. Long lines wrap at word boundaries and keep their indent; table
   cells are cut with `…` and shown whole in the details.
@@ -105,12 +106,16 @@ Every desktop screen is one frame, the full terminal:
 - **Empty state**: what is missing, why, and the key that fixes it, never
   a bare "none". "No machine waits to join. Boot the USB stick on another
   laptop and choose server."
-- **Problem card**: a raised panel with an alarm line (what happened),
-  then what to do, then the key that does it. Used for an unreachable
+- **Problem card**: a raised panel with an alarm line (what happened: its
+  first sentence in alarm bold, the rest in bone), then what to do, then
+  the key that does it. Used for an unreachable
   coordinator, a changed host key, a missing key file, a stopped rollout.
 - **Actions sheet**: `enter` on a row opens a raised panel listing what can
   be done to it, each with its key. Something that cannot be done now is
   listed in ash with the reason.
+- **Panels** (confirm, help, actions sheet) go over the body, with a cell
+  of plain screen round them; what is under them recedes toward the coal,
+  so only the panel reads.
 - **Confirm**: a raised panel over the body: the question, then one line
   per consequence, then `y` for yes and any other key for no. Signing,
   removing, closing a way in, publishing and flashing always confirm;
@@ -178,7 +183,9 @@ No capitals for emphasis: the colour and the mark carry it.
    Next  Build the installer again (2): the stick has an older dryserver.
 ```
 
-Everything on Home comes from files on this computer, so it shows at
+A window too short for the 20-column snake gets the same snake at 12
+pixels (12 × 6 cells), with the Next line beside it, so all nine places
+show at 80 × 24. Everything on Home comes from files on this computer, so it shows at
 once and never waits for the network. The next step is the first of:
 no config, a config with errors, no installer or one older than the
 config or than this dryserver, no keys, no signed coordinator, no server,

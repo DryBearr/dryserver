@@ -321,10 +321,13 @@ def write_rust(path, steps=20):
     """The 20-cell snake for the terminal: one frame per step of growth,
     each pixel a letter of the palette ('.' is empty)."""
     frames = [Sprite(20, 6.4, 3.4, grown=k / steps, detail=False).render() for k in range(steps + 1)]
+    # The whole snake at 12 pixels, for windows too short for the big one.
+    # Smaller than that, the cleanup eats the thin tail and the ring breaks.
+    small = Sprite(12, 3.8, 2.4, detail=False).render()
     palette = []
     rows_out = []
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    for grid in frames:
+    for grid in frames + [small]:
         rows = []
         for row in grid:
             line = ""
@@ -361,11 +364,22 @@ def write_rust(path, steps=20):
         "/// the whole snake, biting its tail.",
         f"pub const FRAMES: [[&str; SIZE]; {steps + 1}] = [",
     ]
-    for rows in rows_out:
+    for rows in rows_out[:-1]:
         out.append("    [")
         for r in rows:
             out.append(f'        "{r}",')
         out.append("    ],")
+    out.append("];")
+    out += [
+        "",
+        "/// Pixels per side of the small snake.",
+        f"pub const SMALL_SIZE: usize = {len(small)};",
+        "",
+        "/// The whole snake, small, for short windows.",
+        "pub const SMALL: [&str; SMALL_SIZE] = [",
+    ]
+    for r in rows_out[-1]:
+        out.append(f'    "{r}",')
     out.append("];")
     open(path, "w").write("\n".join(out) + "\n")
 

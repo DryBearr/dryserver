@@ -7,7 +7,7 @@ pub const SIZE: usize = 20;
 
 /// The colours, as (r, g, b); a pixel's letter is its index here
 /// (A-Z, then a-z, then 0-9), and '.' is no pixel.
-pub const PALETTE: [(u8, u8, u8); 25] = [
+pub const PALETTE: [(u8, u8, u8); 26] = [
     (7, 3, 4),
     (132, 49, 45),
     (232, 179, 65),
@@ -33,6 +33,7 @@ pub const PALETTE: [(u8, u8, u8); 25] = [
     (238, 132, 52),
     (89, 73, 135),
     (224, 69, 42),
+    (71, 47, 94),
 ];
 
 /// Frame k shows the snake grown k/20 of the way round; the last is
@@ -500,4 +501,23 @@ pub const FRAMES: [[&str; SIZE]; 21] = [
         "........AAAAA.......",
         "....................",
     ],
+];
+
+/// Pixels per side of the small snake.
+pub const SMALL_SIZE: usize = 12;
+
+/// The whole snake, small, for short windows.
+pub const SMALL: [&str; SMALL_SIZE] = [
+    ".....AAAA...",
+    "...AABCDDA..",
+    "..AROZBDDBA.",
+    ".ARSAABDDDA.",
+    ".ANA..AADDBA",
+    "ANNA....AHKA",
+    "ANNA....AHKA",
+    ".AIQA..AWHKA",
+    ".AIIMAAWLPA.",
+    "..AIMMMLPA..",
+    "...AGGGPA...",
+    "....AAAA....",
 ];

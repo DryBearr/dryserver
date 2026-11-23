@@ -344,9 +344,14 @@ pub fn body(f: &Facts, cursor: usize, width: usize, rows: usize) -> (Doc, usize)
     // The items end in an empty line.
     let item_rows = items.lines.len() - 1;
     let full = theme::snake_height() + 1 + item_rows + 1 + frame::wrap_line(&next_segs[2..], width.saturating_sub(hang)).len() <= rows;
-    // A short window gets the small ring, with the next step beside it,
+    // A short window gets the small snake, with the next step beside it,
     // where it is seen without scrolling.
-    let (snake, snake_rows, snake_w) = if full { (theme::snake(None), theme::snake_height(), 20) } else { (theme::ring(None), 5, 11) };
+    let (snake, snake_rows, snake_w) = if full {
+        (theme::snake(None), theme::snake_height(), 20)
+    } else {
+        let (rows, cols) = theme::small_snake_size();
+        (theme::small_snake(), rows, cols)
+    };
     let mut title = Doc::new();
     let title_rows = if full { 2 } else { 3 + frame::wrap_line(&next_segs[2..], width.saturating_sub(snake_w + 3 + hang)).len() };
     for _ in 0..snake_rows.saturating_sub(title_rows) / 2 {

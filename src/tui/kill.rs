@@ -119,10 +119,12 @@ fn read_list(path: &Option<PathBuf>) -> List {
 impl Kill {
     pub fn new(path: Option<PathBuf>, quarantine: Quarantine, write_list: WriteList) -> Kill {
         let list = read_list(&path);
+        // Without the list only writing it works: start there.
+        let cursor = if matches!(list, List::Read { .. }) { 0 } else { ACTIONS.len() - 1 };
         Kill {
             path,
             list,
-            cursor: 0,
+            cursor,
             confirm: None,
             job: None,
             running: None,
@@ -421,11 +423,13 @@ mod tests {
         let mut k = kill(&dir, None, runs.clone(), false);
         let t = text(&k);
         assert!(t.contains("There is no server list on this computer yet") && t.contains("needs the server list"), "{t}");
-        assert!(keys(&mut k, &[Key::Enter]).is_none());
+        // The cursor starts on the only line that works; the others say
+        // what they need.
+        assert!(keys(&mut k, &[Key::Up, Key::Enter]).is_none());
         assert!(k.notice.as_ref().unwrap().text.contains("Write it first") && runs.lock().unwrap().is_empty());
         // The last line writes it in the background.
         let (emit, rx) = collector();
-        for key in [Key::Down, Key::Down, Key::Down, Key::Down, Key::Down, Key::Enter] {
+        for key in [Key::Down, Key::Down, Key::Enter] {
             k.update(Event::Key(key), &emit);
         }
         assert!(k.busy().is_some());

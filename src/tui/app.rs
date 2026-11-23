@@ -308,7 +308,7 @@ impl App {
     }
 
     fn size(&self) -> Size {
-        Size { width: frame::body_width(self.w), rows: (self.h as usize).saturating_sub(4) }
+        Size { width: frame::body_width(self.w), rows: frame::body_rows(self.h) }
     }
 
     /// The place on screen now.

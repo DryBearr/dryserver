@@ -239,6 +239,18 @@ pub fn too_small(w: u16, h: u16) -> bool {
 }
 
 /// How wide the body is in a window w columns wide.
+/// The blank line under the bars: there in windows taller than the
+/// smallest, where a row can be spared.
+fn gap(h: usize) -> usize {
+    usize::from(h > MIN_H as usize)
+}
+
+/// The rows the body gets in a window h rows high, with no tabs and a
+/// notice of one line.
+pub fn body_rows(h: u16) -> usize {
+    (h as usize).saturating_sub(3 + gap(h as usize))
+}
+
 pub fn body_width(w: u16) -> usize {
     (w as usize).saturating_sub(LEFT + 2).clamp(10, MAX_BODY)
 }
@@ -304,6 +316,16 @@ impl Grid {
                         cell.style.bg = Some(bg);
                     }
                 }
+            }
+        }
+    }
+
+    /// Pushes a row back behind a panel.
+    fn dim(&mut self, row: usize) {
+        if let Some(line) = self.rows.get_mut(row) {
+            for cell in line.iter_mut() {
+                let picture = matches!(cell.sym.as_str(), "▀" | "▄" | "█");
+                cell.style = theme::dimmed(cell.style, picture);
             }
         }
     }
@@ -607,10 +629,18 @@ pub fn card(width: usize, problem: &str, todo: &str, key: Option<(&str, &str)>) 
     let p = theme::palette();
     // The problem hangs after its mark: "! " starts only the first line,
     // and its own line breaks stay.
+    // Its first sentence is the alarm; what follows explains it, and reads
+    // better in plain text.
     let mut lines: Vec<Vec<Seg>> = Vec::new();
     let inner = width.max(8) - 4;
-    for para in problem.split('\n') {
-        for part in wrap_line(&[Seg(para.into(), p.fg(alarm_fg()))], inner.saturating_sub(2)) {
+    let alarm = p.fg(alarm_fg()).add_modifier(Modifier::BOLD);
+    for (i, para) in problem.split('\n').enumerate() {
+        let segs = match (i, para.find(". ")) {
+            (0, Some(end)) => vec![Seg(para[..=end].into(), alarm), Seg(para[end + 1..].into(), p.text())],
+            (0, None) => vec![Seg(para.into(), alarm)],
+            _ => vec![Seg(para.into(), p.text())],
+        };
+        for part in wrap_line(&segs, inner.saturating_sub(2)) {
             let first = lines.is_empty();
             let mut l = vec![if first { theme::mark(Mark::Bad) } else { Seg(" ".into(), Style::new()) }, Seg(" ".into(), Style::new())];
             l.extend(part);
@@ -721,8 +751,8 @@ pub fn draw(page: &Page, scroll: &Scroll, w: u16, h: u16) -> Doc {
         }
         row += 1;
     }
-    // A blank line under the bars.
-    row += 1;
+    // A blank line under the bars, when the window has a row to spare.
+    row += gap(h);
     let body_top = row;
 
     // The notice and footer at the bottom.
@@ -778,13 +808,20 @@ pub fn draw(page: &Page, scroll: &Scroll, w: u16, h: u16) -> Doc {
         }
     }
 
-    // An overlay over the body.
+    // An overlay over the body: what is under it recedes, and a cell of
+    // plain screen round the panel keeps the two apart.
     if let Some(o) = &page.overlay {
+        for r in body_top..notice_top {
+            g.dim(r);
+        }
         let pw = bw.saturating_sub(2).min(MAX_PANEL);
         let lines = panel(&overlay_lines(o, page.help.as_ref()), pw);
         let col = LEFT + (bw - pw) / 2;
         let shown = lines.len().min(rows);
         let first = body_top + (rows - shown) / 2;
+        for r in first.saturating_sub(1).max(body_top)..(first + shown + 1).min(notice_top) {
+            g.fill(r, col.saturating_sub(2), col + pw + 2, Style::new());
+        }
         for (i, l) in lines.iter().take(shown).enumerate() {
             g.fill(first + i, col, col + pw, Style::new());
             g.put(first + i, col, l, col + pw);

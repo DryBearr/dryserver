@@ -455,7 +455,7 @@ impl Model for Flash {
 
     fn view(&self) -> Doc {
         let (w, h) = self.size;
-        let page = Flash::page(self, Size { width: frame::body_width(w), rows: (h as usize).saturating_sub(4) });
+        let page = Flash::page(self, Size { width: frame::body_width(w), rows: frame::body_rows(h) });
         frame::draw(&page, &self.scroll, w, h)
     }
 }
