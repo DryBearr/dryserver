@@ -1034,6 +1034,15 @@ ended.
   hacked coordinator can hold back a newer list from servers that have not
   seen it yet, so a removal may not arrive; cut the machine off with
   `./dryserver quarantine-all -name NAME` then.
+- **The registry account cannot steer an update.** A release installs
+  only with your signature, checked by each machine itself. The order of
+  the rollout is not the registry's either: root on the coordinator signs
+  each server's turn (that server, that release, a few minutes) with its
+  SSH host key, and a server updates only on a turn signed for it. A
+  resume or a skip counts only with your signature, checked by root, once,
+  for the stop it is at. Each machine signs its own report (release,
+  update state, LAN address), so the registry cannot mark a server updated
+  or hide one that went back.
 - **Each server joins the cluster with a token of its own, and the
   registry never holds one.** Servers get the member list from an account
   on the coordinator that every server reaches over SSH, so whatever that
