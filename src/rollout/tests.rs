@@ -101,6 +101,9 @@ struct Sim {
     lan_down: bool,
     /// The brain: nft -c refuses its firewall.
     nft_fails: bool,
+    /// A server: it has no way of its own to the coordinator's LAN
+    /// address (its WiFi is down, WireGuard runs over the switch).
+    no_route: bool,
 }
 
 /// What `sshd -T -C user=...` says on a machine set up as dryserver does.
@@ -270,6 +273,12 @@ impl Runner for Fake {
             }
             // A server tries the coordinator's way in from the home network,
             // with the host key it pinned.
+            ("ip", ["-4", "-o", "route", "get", "192.168.1.50"]) => {
+                if s.no_route {
+                    return (String::new(), Err("ip failed: exit status 2: RTNETLINK answers: Network is unreachable".into()));
+                }
+                ("192.168.1.50 dev eth0 src 192.168.1.21 uid 0 \\    cache \n".into(), Ok(()))
+            }
             ("ssh", [.., "dryreg@192.168.1.50", "signed"]) => {
                 s.sshd.push("ssh dryreg@192.168.1.50 signed".into());
                 assert!(c.args.iter().any(|a| a.starts_with("UserKnownHostsFile=") && a.ends_with("known_hosts")), "{c}");
@@ -3334,6 +3343,22 @@ fn review_the_brain_keeps_a_release_only_once_its_ssh_answers_from_the_lan() {
     assert!(n > 0);
     sw.ticks(5);
     assert_eq!(tries(&sw), n, "the servers go on trying after the brain is done");
+
+    // A server with no way of its own to that address (its WiFi down,
+    // WireGuard over the switch) says nothing of the coordinator: it does
+    // not hold the update; one that gets through still decides.
+    let mut sw = Swarm::new(2);
+    sw.server(2).fake.sim().no_route = true;
+    sw.publish(10, true);
+    sw.until(5, |s| s.installed(1) == 10);
+    assert!(sw.rollout().warnings.iter().all(|w| !w.contains("without a server proving")), "{:#?}", sw.rollout());
+    let mut sw = Swarm::new(1);
+    sw.server(2).fake.sim().no_route = true;
+    sw.publish(10, true);
+    sw.until(5, |s| s.installed(1) == 10);
+    let r = sw.rollout();
+    assert!(r.warnings.iter().any(|w| w.contains("no server has a way of its own to that address")), "{r:#?}");
+    assert!(sw.server(2).fake.sim().sshd.is_empty(), "it does not try without a route");
 
     // A server that was not asked (the registry account kept the ask from
     // it): the brain waits a while, then goes by its firewall's rules, and

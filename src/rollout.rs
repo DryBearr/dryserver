@@ -1156,12 +1156,7 @@ impl<'a> Machine<'a> {
         r.update_serial = serial;
         r.update_note = report::note(&note);
         if !self.brain {
-            r.coord_ssh = match l.probe_lan {
-                false => "idle",
-                true if self.reaches_coordinator_lan() => "ok",
-                true => "failed",
-            }
-            .into();
+            r.coord_ssh = if l.probe_lan { self.reaches_coordinator_lan() } else { "idle" }.into();
         }
     }
 
@@ -1169,15 +1164,22 @@ impl<'a> Machine<'a> {
     /// way the admin's desktop comes in (`release publish`): through its
     /// firewall's rule for the home network, its sshd and the registry's
     /// forced command, with the host key this server pinned. The brain
-    /// cannot try that way on itself.
-    fn reaches_coordinator_lan(&self) -> bool {
+    /// cannot try that way on itself. "ok", "failed", or "no-route": this
+    /// server has no way of its own to that address (its WiFi or cable is
+    /// down while WireGuard runs over the switch, or the address is only
+    /// reached through the mesh), which says nothing of the coordinator.
+    fn reaches_coordinator_lan(&self) -> &'static str {
         let lan = self.n.cfg.coord_lan_ip.trim();
-        if lan.is_empty() {
-            return false;
+        if crate::cidr::parse_ip4(lan).is_none() {
+            return "no-route";
         }
         let ctx = Ctx::new().with_timeout(Duration::from_secs(20));
+        let route = self.n.run.output(&ctx, &Cmd::new("ip", &["-4", "-o", "route", "get", lan]).quiet().stdout_only());
+        if route.as_deref().map_or(true, |r| r.split_whitespace().skip_while(|w| *w != "dev").nth(1).is_none_or(|d| d == "wg0")) {
+            return "no-route";
+        }
         let cmd = Cmd::new("ssh", &self.n.ssh_args(lan, "signed")).quiet().stdout_only();
-        self.n.run.output(&ctx, &cmd).is_ok_and(|o| o.trim_start().starts_with('{'))
+        if self.n.run.output(&ctx, &cmd).is_ok_and(|o| o.trim_start().starts_with('{')) { "ok" } else { "failed" }
     }
 
     /// One step towards the offered release, at a sync that reached the
@@ -1861,12 +1863,20 @@ fn lan_way_in(ctx: &Ctx, n: &Node, members: &[Member], since: i64, now: i64) -> 
             failed.join(", ")
         ));
     }
-    let can = servers().any(|m| m.last_seen.0.timestamp() >= since.saturating_sub(OFFLINE) && !said(m).is_empty());
-    if can && now < since.saturating_add(LAN_PROBE_WAIT) {
+    // Servers about that were not asked yet (idle): a while for them.
+    let about = |m: &&Member| m.last_seen.0.timestamp() >= since.saturating_sub(OFFLINE);
+    let asked = servers().filter(about).any(|m| said(m) == "idle");
+    if asked && now < since.saturating_add(LAN_PROBE_WAIT) {
         return Err(format!("no server has tried its SSH at {lan} from the home network since the update yet"));
     }
     lan_ssh_in_firewall(ctx, n)?;
-    let why = if can { "the servers were not asked to try it" } else { "no server can try it" };
+    let why = if asked {
+        "the servers were not asked to try it"
+    } else if servers().filter(about).any(|m| said(m) == "no-route") {
+        "no server has a way of its own to that address"
+    } else {
+        "no server can try it"
+    };
     Ok(Some(format!(
         "kept without a server proving the coordinator's SSH at {lan} from the home network ({why}); its firewall's rules take SSH from there"
     )))
@@ -3167,11 +3177,12 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
             out.push((format!("The coordinator updates itself first, once {} finished the update it is in.", name(r.wait_for)), false))
         }
         Phase::Brain if r.brain_since != 0 => {
-            let age = (now - r.brain_since).max(0);
-            let says = members
-                .iter()
-                .find(|m| m.host == 1)
-                .and_then(|m| m.report.as_ref())
+            let brain = members.iter().find(|m| m.host == 1).and_then(|m| m.report.as_ref());
+            // On the coordinator's clock, as brain_since: its last report's
+            // time (the desktop's clock may be off).
+            let at = brain.map(|rep| rep.time).filter(|t| *t > 0).unwrap_or(now);
+            let age = (at - r.brain_since).max(0);
+            let says = brain
                 .map(|rep| if rep.update_note.is_empty() { rep.update.clone() } else { format!("{}: {}", rep.update, rep.update_note) })
                 .filter(|s| !s.is_empty())
                 .map(|s| format!(", its update says {}", shown(&s, 200)))

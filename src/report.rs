@@ -168,8 +168,9 @@ pub struct Report {
 }
 
 /// What a server says of the coordinator's SSH at its LAN address: ok, it
-/// answered; failed, it did not; idle, the server was not asked to try.
-pub const COORD_SSH_STATES: [&str; 3] = ["ok", "failed", "idle"];
+/// answered; failed, it did not; idle, the server was not asked to try;
+/// no-route, the server has no way of its own to that address.
+pub const COORD_SSH_STATES: [&str; 4] = ["ok", "failed", "idle", "no-route"];
 
 /// How a machine boots (see install/boot.rs):
 /// - ready: the main kernel runs, the fallback kernel (linux-lts) waits;
