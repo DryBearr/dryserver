@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/img/banner.svg" width="736" alt="dryserver: a snake made of console blocks biting its own tail, ember red at the head, gold along the body, violet at the tail">
+  <img src="docs/img/banner.svg" width="736" alt="dryserver: an ouroboros, a snake biting its own tail, ember red at the head, gold along the body, violet at the tail">
 </p>
 
 <p align="center">
@@ -633,8 +633,8 @@ the generated system files are in `testdata/sysconf`;
 The reference docs are in [`docs/`](docs): [machines](docs/machines.md),
 [updates](docs/updates.md), [apps](docs/apps.md),
 [security](docs/security.md), [kill switch](docs/kill-switch.md),
-[backups](docs/backups.md). The README art in `docs/img` is drawn from the
-same block ring as the installer screen, by `docs/img/draw.py`.
+[backups](docs/backups.md). The README art in `docs/img` is the installer's
+ouroboros drawn smooth, by `docs/img/draw.py`.
 
 ## License
 
