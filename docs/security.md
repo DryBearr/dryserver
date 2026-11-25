@@ -32,7 +32,7 @@ Part of the [dryserver README](../README.md).
   minute and the firewall blocks that member at once; within a minute the
   server makes it a quarantine that lasts until you lift it, writes it to
   `/var/log/dryserver-cuts.log` and its console, and tells the coordinator,
-  so `./dryserver approve` shows who cut whom. Each server decides this for
+  so `dryserver approve` shows who cut whom. Each server decides this for
   itself only and tells no other server to cut, so a hacked server can cut
   off only itself. Only tries to open something count (a TCP SYN, UDP,
   other protocols), not late packets of a connection a restarted machine
@@ -69,7 +69,7 @@ Part of the [dryserver README](../README.md).
   or the coordinator was installed again) forgets that key, asks again
   and shows a new code on its screen, saying why. After approval, the
   member list is only served over the mesh. Removing a machine (`d` in
-  `./dryserver approve`) drops it from all servers within a minute.
+  `dryserver approve`) drops it from all servers within a minute.
   The approval screen signs exactly the request you chose (its keys, not
   only its id), and shows none of the requests the coordinator lists more
   than once under one id, name or key. A request the coordinator turns
@@ -79,7 +79,7 @@ Part of the [dryserver README](../README.md).
   or reject the other request). One address may have three requests
   waiting at most: every server holds the key that asks.
 - **Unknown devices**: the coordinator scans its networks every 15 minutes and
-  lists unknown devices in `./dryserver approve` (report only). A server's
+  lists unknown devices in `dryserver approve` (report only). A server's
   own word about its address does not hide a device there: it counts only
   where WireGuard on the coordinator sees that server's packets come from
   (when it talks over the WiFi/router network), and an address two servers
@@ -94,7 +94,7 @@ Part of the [dryserver README](../README.md).
   appear twice.
 - **Signed member list**: building the USB stick creates
   `secrets/signing_ed25519` on your computer; its public half is installed
-  on every server. `./dryserver approve` on your computer signs every
+  on every server. `dryserver approve` on your computer signs every
   decision (approve, reject, remove) with it. The coordinator stores and
   hands out the signed list but cannot make or change one. Servers use only
   the machines in the signed list: one the coordinator adds by itself is
@@ -103,7 +103,7 @@ Part of the [dryserver README](../README.md).
   signed list stops k3s and its containers and no longer counts itself a
   member. Nobody can approve on a server, the coordinator
   included, and a machine that shows up on the coordinator without a join
-  request cannot be signed at all. `./dryserver ssh-config` takes server
+  request cannot be signed at all. `dryserver ssh-config` takes server
   names and SSH host keys from the signed list too. The registry account
   can stall the registry (hold its lock, fill it, drop or roll back the
   list): the coordinator's own sync then keeps to the newest list it has
@@ -112,14 +112,14 @@ Part of the [dryserver README](../README.md).
   again (servers get no newer list meanwhile, and updates wait). The
   registry account could also take your newest list, answer your desktop
   with it and never keep it: root on the coordinator leaves a receipt for
-  the list it follows, signed with its SSH host key, and `./dryserver
+  the list it follows, signed with its SSH host key, and `dryserver
   approve` and `release status` check it against the coordinator's key in
   the list you signed. Three minutes after you signed a list the
   coordinator does not follow, they say so plainly (also with no receipt,
   a forged one, or none newer than 15 minutes). Limit: a
   hacked coordinator can hold back a newer list from servers that have not
   seen it yet, so a removal may not arrive; cut the machine off with
-  `./dryserver quarantine-all -name NAME` then.
+  `dryserver quarantine-all -name NAME` then.
 - **The registry account cannot steer an update.** A release installs
   only with your signature, checked by each machine itself. The order of
   the rollout is not the registry's either: root on the coordinator signs
@@ -191,7 +191,7 @@ to them. A hacked server, the coordinator included, cannot use your key to log
 into the others. Connect to each server from the desktop:
 
 ```sh
-./dryserver ssh-config     # writes ~/.ssh/config.d/dryserver
+dryserver ssh-config     # writes ~/.ssh/config.d/dryserver
 ssh node-a                 # jumps through the coordinator
 scp -3 node-a:file node-b: # copy between servers through the desktop
 ```
@@ -211,4 +211,4 @@ Host keys are checked against `~/.ssh/known_hosts.d/dryserver` alone, which
 holds the keys from the list you signed, and a server with any other key
 is refused. A key you once accepted in `~/.ssh/known_hosts` (say of an old
 coordinator at the same address) never counts. After a machine is
-reinstalled and approved, run `./dryserver ssh-config` again.
+reinstalled and approved, run `dryserver ssh-config` again.

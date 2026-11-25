@@ -57,6 +57,8 @@ pub struct Build {
     out_dir: PathBuf,
     secrets: PathBuf,
     missing_keys: Vec<String>,
+    /// The swarm runs: a missing key is not made again (iso::ensure_keys).
+    swarm_started: bool,
     image_before: Option<(u64, std::time::SystemTime)>,
     builder: Builder,
     lines: Vec<String>,
@@ -90,6 +92,7 @@ impl Build {
             out_dir: paths.out_dir.clone(),
             secrets: paths.secrets.clone(),
             missing_keys: facts.missing_keys.clone(),
+            swarm_started: facts.started,
             image_before: facts.iso,
             builder: Arc::new(|ctx, o, log| iso::run(ctx, o, log)),
             lines: Vec::new(),
@@ -167,9 +170,11 @@ impl Build {
         tools.extend(cfg.extra_list());
         let tools = if tools.is_empty() { "the basics only".to_string() } else { format!("the basics, {}", tools.join(" ")) };
         let keys = if self.missing_keys.is_empty() {
-            (Mark::Done, "kept: the same keys as before, in secrets/".to_string())
+            (Mark::Done, "kept: the same keys as before".to_string())
+        } else if self.swarm_started {
+            (Mark::Bad, format!("missing: restore {} from your backup (never made again)", self.missing_keys.join(", ")))
         } else {
-            (Mark::Act, format!("made now in secrets/: {}", self.missing_keys.join(", ")))
+            (Mark::Act, format!("made now: {}", self.missing_keys.join(", ")))
         };
         let image = match self.image_before {
             Some((size, made)) => {
@@ -375,6 +380,7 @@ mod tests {
             iso: None,
             exe_time: None,
             missing_keys: vec![iso::SIGNING_KEY_NAME.into()],
+            started: false,
             signed: None,
             signed_time: None,
             release: None,
@@ -405,8 +411,7 @@ mod tests {
             if *f2.lock().unwrap() { Err("container build failed (exit status 1), see out/build.log".into()) } else { Ok(()) }
         }));
         let t = text(&b);
-        for want in ["What will be built", "coordinator 10.1.0.60, WiFi SNET2", "k3s", "made now in secrets/: signing_ed25519", "made new"]
-        {
+        for want in ["What will be built", "coordinator 10.1.0.60, WiFi SNET2", "k3s", "made now: signing_ed25519", "made new"] {
             assert!(t.contains(want), "{want:?}:\n{t}");
         }
         let (emit, rx) = collector();

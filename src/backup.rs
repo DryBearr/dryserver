@@ -7,7 +7,7 @@
 //! key whose private half only the admin's desktop holds
 //! (secrets/backup_ed25519): the coordinator can make a backup but never
 //! read one, so neither a stolen backup nor a hacked coordinator gives
-//! away an older state. `./dryserver backup-pull` on the desktop copies
+//! away an older state. `dryserver backup-pull` on the desktop copies
 //! the backups there.
 //!
 //! The archive, format 1 (restoring is a later step; this is all it needs):

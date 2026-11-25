@@ -26,3 +26,11 @@ endif
 .PHONY: test
 test:
 	cargo test
+
+# Puts dryserver where your shell finds it, so it runs from any folder:
+# ~/.local/bin by default. For every user: make && sudo make install PREFIX=/usr/local
+PREFIX ?= $(HOME)/.local
+.PHONY: install
+install: dryserver
+	install -Dm755 dryserver $(DESTDIR)$(PREFIX)/bin/dryserver
+	@echo "Installed $(DESTDIR)$(PREFIX)/bin/dryserver. Your swarm: dryserver where"

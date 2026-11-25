@@ -29,7 +29,7 @@ desktop with one command.
 
 ```
   your desktop                          home router (WiFi)
-  ./dryserver  ── build + flash ──►  USB stick       │  internet, setup, joining
+  dryserver  ── build + flash ──►  USB stick       │  internet, setup, joining
                                        │ boot         │
                      ┌─────────────────┼──────────────┤
                      ▼                 ▼              ▼
@@ -62,7 +62,7 @@ up a swarm goes around the same way.
 | <img src="docs/img/ring-4.svg" width="40" alt="Stage 4 of 5"> | [4. Add servers](#4-add-servers) | every other laptop |
 | <img src="docs/img/ring-5.svg" width="40" alt="Stage 5 of 5"> | [5. Run apps and keep them updated](#5-run-apps-and-keep-them-updated) | your desktop, from then on |
 
-Want to see the laptop's setup screen first? `./dryserver install --demo`
+Want to see the laptop's setup screen first? `dryserver install --demo`
 shows it and changes nothing.
 
 ## 1. Get ready
@@ -92,10 +92,23 @@ shows it and changes nothing.
 
 ```sh
 git clone https://github.com/DryBearr/dryserver && cd dryserver
-make                 # builds ./dryserver
-./dryserver          # menu: 1 Config, 2 Build installer ISO   (no sudo)
-sudo ./dryserver     # menu: 3 Flash USB                      (writing a USB drive needs root)
+make install         # builds dryserver and puts it in ~/.local/bin
+dryserver            # menu: 1 Config, 2 Build installer ISO, 3 USB stick (asks for sudo)
 ```
+
+dryserver works from any folder. It keeps your swarm in one place:
+
+| Folder | What | |
+|---|---|---|
+| `~/.config/dryserver/config.env` | your settings, with the WiFi password | |
+| `~/.config/dryserver/secrets/` | your keys | **back it up** |
+| `~/.cache/dryserver/` | the installer image and the package cache | made again by a build |
+
+`dryserver where` shows them. An older dryserver kept `config.env` and
+`secrets/` in the folder you ran it from: copy them over once with
+`dryserver init --from ~/path/to/that/folder` (it changes nothing there).
+Until you do, dryserver refuses to start a second swarm next to them.
+`DRYSERVER_HOME=DIR` keeps all of it in `DIR` instead, for a second swarm.
 
 1. **Config.** WiFi, the coordinator's address, the mesh, your tools, the
    admin user name and your SSH public key. Copy the key with
@@ -105,16 +118,20 @@ sudo ./dryserver     # menu: 3 Flash USB                      (writing a USB dri
 2. **Build installer ISO.** About 6 minutes; the first build downloads
    about 1 GB.
 3. **Save your keys.** The first build makes the keys of your swarm in
-   `secrets/`. Copy that folder somewhere safe now (see the box below).
+   `~/.config/dryserver/secrets/`. Copy that folder somewhere safe now
+   (see the box below).
 4. **Flash USB.** Only USB drives are listed. Type the device name to
    confirm; the image is read back and checked.
 
 > [!IMPORTANT]
-> **Back up `secrets/`**, to a second USB stick or a password manager.
+> **Back up `~/.config/dryserver/secrets/`**, to a second USB stick or a
+> password manager.
 > `signing_ed25519` is the key of your swarm: without it you cannot
 > approve a machine or publish an update, and every machine has to be
 > installed again. `backup_ed25519` is the only key that opens the
-> coordinator's backups. Neither is ever on the stick or a server.
+> coordinator's backups. Neither is ever on the stick or a server. Once
+> your coordinator is signed, a lost key is never made again (a new one
+> would lock you out of your machines): dryserver asks you to restore it.
 
 After a `git pull`, build the stick again before you install a new
 machine: a stick carries the dryserver it was built with.
@@ -139,7 +156,7 @@ machine: a stick carries the dryserver it was built with.
 3. When it has restarted, **reserve its address in your router** for the
    device named `coord` (DHCP reservation), then restart the coordinator
    once.
-4. On your desktop, run `./dryserver approve` (Machines) and press `s` to
+4. On your desktop, run `dryserver approve` (Machines) and press `s` to
    sign the coordinator, if it shows the same code as the coordinator's
    screen.
    From now on, servers accept only the machines you approve here.
@@ -167,7 +184,7 @@ More about the setup screen and what each machine gets:
 1. Boot the same stick on the next laptop and choose **server**. Leave the
    hostname empty for `node-xxxx`, or name it.
 2. When it is installed, the laptop shows a 6-digit code.
-3. On your desktop, run `./dryserver approve`, find the machine and press
+3. On your desktop, run `dryserver approve`, find the machine and press
    `a` if the code matches. Within a minute it is in the mesh, and soon
    after in the cluster.
 4. Give it a fixed address in your router too: the
@@ -175,13 +192,13 @@ More about the setup screen and what each machine gets:
 5. Connect to it:
 
    ```sh
-   ./dryserver ssh-config     # writes ~/.ssh/config.d/dryserver
+   dryserver ssh-config     # writes ~/.ssh/config.d/dryserver
    ssh node-a                 # through the coordinator
    ssh coord
    ```
 
    Add `Include config.d/*` at the top of `~/.ssh/config` if it is not
-   there. Run `./dryserver ssh-config` again after each new machine.
+   there. Run `dryserver ssh-config` again after each new machine.
 
 No private keys are stored on servers, and your key is never forwarded to
 them: a hacked server cannot use it to log into the others. To copy a file
@@ -197,7 +214,7 @@ machine whose new skin does not fit goes back to the old one by itself.
 ### Run an app
 
 ```sh
-./dryserver apps           # or "Apps" in the menu
+dryserver apps           # or "Apps" in the menu
 ```
 
 Press `n` and give the app a name, its container image, the port it
@@ -223,7 +240,7 @@ which sends what arrives for your host names through them. A relay on a
 VPS you rent is planned and not built yet.
 
 ```sh
-./dryserver outside        # or "Outside" in the menu, or o on the apps screen
+dryserver outside        # or "Outside" in the menu, or o on the apps screen
 ```
 
 **With an API token** (recommended), dryserver sets up the tunnel and the
@@ -242,10 +259,11 @@ DNS records for you:
    zone (domain) your apps' host names are in. Newer dashboards call Edit
    "Write". An expiry date and an IP filter (your home address) are a good
    idea.
-2. Save the token on your computer as `secrets/cloudflare_api_token`, and
-   make it yours alone: `chmod 600 secrets/cloudflare_api_token`.
+2. Save the token on your computer as
+   `~/.config/dryserver/secrets/cloudflare_api_token`, and make it yours
+   alone: `chmod 600 ~/.config/dryserver/secrets/cloudflare_api_token`.
    dryserver refuses it while other users can read it.
-3. In `./dryserver outside`, press `s` on the Cloudflare Tunnel. It lists
+3. In `dryserver outside`, press `s` on the Cloudflare Tunnel. It lists
    every change it would make, in order (`pgdn` scrolls a long list). `y`
    makes exactly those; when something changed since it looked, it makes
    none and says so.
@@ -258,9 +276,10 @@ the name over with `t`.
 **By hand**, without an API token:
 
 1. In the Cloudflare dashboard (Zero Trust, Networks, Tunnels), create a
-   tunnel and copy its token. Save it as `secrets/cloudflare_tunnel_token`
+   tunnel and copy its token. Save it as
+   `~/.config/dryserver/secrets/cloudflare_tunnel_token`
    (the whole `cloudflared service install ...` line works too).
-2. In `./dryserver outside`, press `o`. The tunnel's line shows how many
+2. In `dryserver outside`, press `o`. The tunnel's line shows how many
    copies hold a connection to Cloudflare.
 3. In the dashboard, add a public host name per app and point each at
    `http://traefik.kube-system.svc.cluster.local:80`.
@@ -278,10 +297,10 @@ reinstalled.
 
 ```sh
 git pull && make
-./dryserver release publish -notes "fixes the join timeout"
+dryserver release publish -notes "fixes the join timeout"
 ```
 
-Or press `p` in `./dryserver approve` (Machines). Either way you see what changes
+Or press `p` in `dryserver approve` (Machines). Either way you see what changes
 before anything is signed:
 
 ```
@@ -313,8 +332,8 @@ Releases install between 03:00 and 05:00 on the coordinator's clock. Add
 `-urgent` to start at once (for security fixes); an urgent release keeps
 the Arch packages where they are unless you name a day with `-arch-date`.
 
-Watch it with `./dryserver release status`, or under Updates in
-`./dryserver approve`.
+Watch it with `dryserver release status`, or under Updates in
+`dryserver approve`.
 
 **A machine that fails goes back by itself.** Every update waits for a
 confirm; without one, the machine puts back its old dryserver, k3s and
@@ -323,8 +342,8 @@ at that machine and tells you why. Then:
 
 | You want to | Run |
 |---|---|
-| let that machine try again | `./dryserver release resume` |
-| pass over that machine for this release | `./dryserver release resume -skip` |
+| let that machine try again | `dryserver release resume` |
+| pass over that machine for this release | `dryserver release resume -skip` |
 | ship a fix | publish a new release: it replaces the rollout |
 | go back to an older release | build the older dryserver and publish it with `-rollback` (add `-arch-date` with the older day to take the packages back too) |
 
@@ -333,7 +352,7 @@ Each step, every check and every edge case:
 
 ### See how machines are doing
 
-`./dryserver approve` shows every machine with its health, sent once a
+`dryserver approve` shows every machine with its health, sent once a
 minute: versions, kernel, memory, disk, temperature, k3s, firewall, the
 release it runs and how its update went. Problems show in red (a full
 disk, k3s down, a reboot due, the fallback kernel running, and so on).
@@ -348,16 +367,16 @@ key only your desktop has. Copy them home now and then; if the
 coordinator's disk dies, the backups on it die with it:
 
 ```sh
-./dryserver backup-pull    # copies the newest backups into secrets/backups/
+dryserver backup-pull      # copies the newest backups into ~/.config/dryserver/secrets/backups/
 ```
 
 Restoring is not built yet. To look inside one:
-`age -d -i secrets/backup_ed25519 FILE | tar -tv`. More:
+`age -d -i ~/.config/dryserver/secrets/backup_ed25519 FILE | tar -tv`. More:
 [docs/backups.md](docs/backups.md).
 
 ### Remove a machine
 
-Press `d` on it in `./dryserver approve`. Within a minute every server
+Press `d` on it in `dryserver approve`. Within a minute every server
 drops it, the cluster moves its apps to the servers that are left, and the
 removed machine stops k3s and its containers. To bring it back, run
 `sudo dryserver join` on it and approve it like a new machine. More:
@@ -372,16 +391,16 @@ removed machine stops k3s and its containers. To bring it back, run
 | The setup fails | press `q` for a shell; the full log is in `/tmp/dryserver-install.log`. Old LVM, RAID, swap or encrypted volumes on the disk are released by themselves |
 | A new server cannot reach the coordinator | is the coordinator on? Is its address reserved in the router and the same as in the config? Same WiFi? The server keeps trying and shows its code on the login screen |
 | A TPM laptop asks for the passphrase at boot | the firmware or the boot settings changed: type the passphrase, then run `sudo dryserver tpm-enroll` |
-| `./dryserver approve` says "running fallback kernel" | the main kernel did not boot (`sudo dryserver boot status`, `journalctl -b -1 -u dryserver-boot-check`). The next release with a fixed kernel, or a rollback, makes it boot the main kernel again. See [When a kernel update does not boot](docs/machines.md#when-a-kernel-update-does-not-boot) |
-| An update stopped | `./dryserver release status` says where and why; see [Update the swarm](#update-the-swarm) |
-| `ssh node-a` asks for a password or fails | run `./dryserver ssh-config` again; check for `Include config.d/*` in `~/.ssh/config` |
+| `dryserver approve` says "running fallback kernel" | the main kernel did not boot (`sudo dryserver boot status`, `journalctl -b -1 -u dryserver-boot-check`). The next release with a fixed kernel, or a rollback, makes it boot the main kernel again. See [When a kernel update does not boot](docs/machines.md#when-a-kernel-update-does-not-boot) |
+| An update stopped | `dryserver release status` says where and why; see [Update the swarm](#update-the-swarm) |
+| `ssh node-a` asks for a password or fails | run `dryserver ssh-config` again; check for `Include config.d/*` in `~/.ssh/config` |
 
 ### The coordinator may be hacked
 
 Cut it off from every server, from your desktop:
 
 ```sh
-./dryserver quarantine-all
+dryserver quarantine-all
 ```
 
 It goes to each server straight over your home network, never through the
@@ -394,16 +413,16 @@ are down until you lift the cut. Then:
 1. delete the tunnel in the Cloudflare dashboard, if you use one,
 2. power the coordinator off and keep its disk to look at,
 3. install it again from the stick, as coordinator, at the same address,
-4. in `./dryserver approve`, which says the machine there has another SSH
+4. in `dryserver approve`, which says the machine there has another SSH
    key, press `n`, compare the code with the new coordinator's screen and
    confirm,
-5. run `./dryserver quarantine-all -lift`: the servers follow the new
+5. run `dryserver quarantine-all -lift`: the servers follow the new
    coordinator, and the old one stays out,
-6. run `./dryserver ssh-config` once the servers have synced with it.
+6. run `dryserver ssh-config` once the servers have synced with it.
 
 After a false alarm (nothing was installed again), lift with
-`./dryserver quarantine-all -lift -same`, and only when you are sure. To
-cut off a server instead: `./dryserver quarantine-all -name node-a`.
+`dryserver quarantine-all -lift -same`, and only when you are sure. To
+cut off a server instead: `dryserver quarantine-all -name node-a`.
 
 What a hacked coordinator could do before the cut, and every detail:
 [docs/kill-switch.md](docs/kill-switch.md).
@@ -423,7 +442,7 @@ itself): with one, a hacked server could leave the cluster and take the
 name of a server that has not joined yet. The coordinator's console says
 so. Its node comes back when k3s starts again on it (`sudo systemctl
 restart k3s` there), with its certificate. A server whose certificate is
-gone or ran out: remove it in `./dryserver approve`, run `sudo dryserver
+gone or ran out: remove it in `dryserver approve`, run `sudo dryserver
 join` on it and approve it again.
 
 A name that a machine registered in the cluster without that name's
@@ -484,20 +503,22 @@ On your desktop:
 
 | Command | What it does |
 |---|---|
-| `./dryserver` | the menu: config, build, flash, machines, apps, outside |
-| `./dryserver build` | build the ISO, with its log in the terminal |
-| `./dryserver disks` | list disks and which ones may be flashed |
-| `sudo ./dryserver flash --iso FILE` | flash any image to a USB drive |
-| `./dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed. `p` publishes an update; `enter` on a stopped rollout tries it again or skips the machine |
-| `./dryserver apps` | start an app from a container image, remove one, see what runs where |
-| `./dryserver outside` | the ways in from the internet: open, sync or close the Cloudflare Tunnel |
-| `./dryserver release publish` | check a release, show what changes, sign it and roll it out (`-urgent`, `-notes`, `-rollback`, `-arch-date`, `-k3s`) |
-| `./dryserver release status` | the release on every machine, and what to do when it stopped |
-| `./dryserver release resume` | let a stopped rollout go on: the machine tries again (`-skip` passes it over) |
-| `./dryserver ssh-config` | SSH config for all your machines |
-| `./dryserver quarantine-all` | kill switch: cut the coordinator off on every server (`-name`, `-status`, `-lift`) |
-| `./dryserver backup-pull` | copy the coordinator's newest encrypted backups into `secrets/backups/` |
-| `./dryserver install --demo` | try the laptop's setup screen; changes nothing |
+| `dryserver` | the menu: config, build, flash, machines, apps, outside |
+| `dryserver where` | the folders that hold your config, keys and images |
+| `dryserver init --from DIR` | copy the swarm an older dryserver kept in `DIR` to where it belongs now |
+| `dryserver build` | build the ISO, with its log in the terminal |
+| `dryserver disks` | list disks and which ones may be flashed |
+| `sudo "$(command -v dryserver)" flash --iso FILE` | flash any image to a USB drive (sudo does not look in `~/.local/bin`) |
+| `dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed. `p` publishes an update; `enter` on a stopped rollout tries it again or skips the machine |
+| `dryserver apps` | start an app from a container image, remove one, see what runs where |
+| `dryserver outside` | the ways in from the internet: open, sync or close the Cloudflare Tunnel |
+| `dryserver release publish` | check a release, show what changes, sign it and roll it out (`-urgent`, `-notes`, `-rollback`, `-arch-date`, `-k3s`) |
+| `dryserver release status` | the release on every machine, and what to do when it stopped |
+| `dryserver release resume` | let a stopped rollout go on: the machine tries again (`-skip` passes it over) |
+| `dryserver ssh-config` | SSH config for all your machines |
+| `dryserver quarantine-all` | kill switch: cut the coordinator off on every server (`-name`, `-status`, `-lift`) |
+| `dryserver backup-pull` | copy the coordinator's newest encrypted backups into `secrets/backups/` |
+| `dryserver install --demo` | try the laptop's setup screen; changes nothing |
 
 On a machine:
 
@@ -583,7 +604,8 @@ installing.
 
 ## Your files
 
-Everything here stays on your desktop and is never committed.
+Everything here stays on your desktop, in `~/.config/dryserver/` (the
+image in `~/.cache/dryserver/`; `dryserver where` shows both).
 
 | Path | What | Back it up? |
 |---|---|---|
@@ -594,8 +616,8 @@ Everything here stays on your desktop and is never committed.
 | `secrets/registry_ed25519` | the key machines use to ask to join | |
 | `secrets/members.signed.json` | the last list of machines you signed: who is in your swarm | yes |
 | `secrets/release.signed.json`, `secrets/releases/` | the last release you signed, and a copy of each; serials go on from it | |
-| `secrets/backups/` | the coordinator's backups, copied by `./dryserver backup-pull` (encrypted) | |
-| `out/dryserver.iso`, `out/build.log` | the installer image and its build log | |
+| `secrets/backups/` | the coordinator's backups, copied by `dryserver backup-pull` (encrypted) | |
+| `~/.cache/dryserver/dryserver.iso`, `build.log`, `pkgcache/` | the installer image, its build log and the package cache | |
 
 ## Development
 
@@ -606,7 +628,7 @@ test/validate-boot.sh               # both kernels' images with the real mkinitc
 test/live-firewall.sh               # the generated firewall with real connections: mesh, home network, containers
 test/live-quarantine.sh             # kill switch with real WireGuard and nftables, in private namespaces
 test/live-approve.sh                # signed approval: the real screen against a real sshd and registry
-test/qemu.sh coord                  # boot out/dryserver.iso in a UEFI VM with a blank disk
+test/qemu.sh coord                  # boot the built installer image in a UEFI VM with a blank disk
 test/qemu-lan.sh coord c1           # VMs wired like a swarm (own router each, shared switch); see its header
 BIOS=1 test/qemu.sh node            # legacy BIOS
 TPM=1 OVMF_CODE=... test/qemu.sh    # TPM tests need firmware that measures boot (Arch's edk2-ovmf)

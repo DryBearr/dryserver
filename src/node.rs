@@ -87,20 +87,20 @@ fn refusal(name: &str, e: &Error) -> Option<String> {
     Some(if msg.contains("is already a member; remove it first") {
         format!(
             "the name {name} is a member already. If this machine takes its place, remove {name} on your computer in \
-             ./dryserver approve (d); this machine then asks again by itself"
+             dryserver approve (d); this machine then asks again by itself"
         )
     } else if msg.contains("WireGuard key already belongs to a member") {
         format!(
             "this machine is a member already, by its WireGuard key, but has no record of it ({JOIN_STATE}). Put that back, \
-             or remove it on your computer in ./dryserver approve (d): it then asks again by itself"
+             or remove it on your computer in dryserver approve (d): it then asks again by itself"
         )
     } else if msg.contains("another machine is already asking to join as") {
         format!(
             "another machine is asking to join as {name} already. If that one is not this machine (its code is not the one \
-             below), reject it on your computer in ./dryserver approve (r): this machine then asks again by itself"
+             below), reject it on your computer in dryserver approve (r): this machine then asks again by itself"
         )
     } else if msg.contains("too many pending requests") || msg.contains("wait already; approve or reject") {
-        "too many machines are waiting to join. Approve or reject them on your computer in ./dryserver approve; this \
+        "too many machines are waiting to join. Approve or reject them on your computer in dryserver approve; this \
          machine asks again by itself"
             .into()
     } else {
@@ -123,7 +123,7 @@ fn is_zero(n: &u32) -> bool {
 pub fn coordinator_issue(code: &str) -> String {
     format!(
         "\ndryserver: this coordinator is not signed yet, no machine can join.\n\
-         On your own computer run: ./dryserver approve   and press S.\n\
+         On your own computer run: dryserver approve   and press S.\n\
          Sign only if it shows this code:  {code}\n\n"
     )
 }
@@ -757,7 +757,7 @@ impl Node {
             if plain {
                 return Err(
                     "the coordinator sent the cluster token unencrypted, as dryserver did before, which this version never takes: \
-                     update the coordinator (./dryserver release publish)"
+                     update the coordinator (dryserver release publish)"
                         .into(),
                 );
             }
@@ -1128,7 +1128,7 @@ impl Node {
                      server that had not joined yet: find out which; or one of an older dryserver with the shared agent token, \
                      README: A new cluster token), and k3s gave it a certificate for {name}, good for a year. \
                      No server gets a join token for {name}, and a node under it is deleted at every sync. To have a server under \
-                     that name in the cluster, remove it in ./dryserver approve and install it again under another name",
+                     that name in the cluster, remove it in dryserver approve and install it again under another name",
                     day(t.since),
                     t.why
                 )
@@ -1138,7 +1138,7 @@ impl Node {
             format!(
                 "{name} was in the cluster and its node is gone. It gets no new join token: with one, a hacked server could leave \
                  the cluster and take another server's name. It comes back by itself when k3s starts again on it (its \
-                 certificate is good for its own name); if it does not, remove it in ./dryserver approve, run sudo dryserver join \
+                 certificate is good for its own name); if it does not, remove it in dryserver approve, run sudo dryserver join \
                  on it and approve it again"
             )
         }));
@@ -1545,7 +1545,7 @@ impl Node {
             Some(&format!(
                 "ALARM: {why}.\nThe mesh and the cluster follow the newest member list this coordinator has seen (version \
                  {ver}). Servers get no newer list and no new join tokens, and updates wait. The registry account ({}) may be \
-                 broken into; if you removed a server and it still runs: ./dryserver quarantine-all -name NAME",
+                 broken into; if you removed a server and it still runs: dryserver quarantine-all -name NAME",
                 sysconf::REGISTRY_USER
             )),
         );
@@ -1973,7 +1973,7 @@ fn joining(ctx: &Ctx, n: &Node, params: &Params, log: &mut dyn Write, pace: &Pac
             }
         }
         show(&format!(
-            "{forgot}dryserver: waiting for approval. On your own computer run: ./dryserver approve\n\
+            "{forgot}dryserver: waiting for approval. On your own computer run: dryserver approve\n\
              Approve only if it shows this code:  {}",
             st.code
         ));
@@ -4670,7 +4670,7 @@ mod tests {
             let first = log.lines().next().unwrap();
             assert!(first.starts_with("dryserver: the coordinator turned this machine's request down: ") && first.contains(want), "{log}");
             let code = registry::pairing_code(WG_PUBKEY, NODE_KEY, COORD_KEY);
-            assert!(log.contains("./dryserver approve") && log.contains(&format!("This machine's code is {code}")), "{log}");
+            assert!(log.contains("dryserver approve") && log.contains(&format!("This machine's code is {code}")), "{log}");
             assert!(!log.contains("cannot reach"), "{log}");
             // It asks again by itself, and joins once the name is free.
             assert_eq!(n.load_state().host, 4, "{script}");

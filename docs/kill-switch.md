@@ -7,7 +7,7 @@ Part of the [dryserver README](../README.md).
 If you think the coordinator is hacked, cut it off from every server:
 
 ```sh
-./dryserver quarantine-all     # on the desktop
+dryserver quarantine-all     # on the desktop
 ```
 
 It connects to each server over the WiFi/router network (the `.lan` entries),
@@ -28,14 +28,14 @@ until you lift the cut. Then:
 1. delete the tunnel in the Cloudflare dashboard, if you use one,
 2. power off the coordinator and keep its disk for investigation,
 3. reinstall it from the USB stick, as coordinator, at the same address,
-4. `./dryserver approve`: it says the machine there has another SSH key.
+4. `dryserver approve`: it says the machine there has another SSH key.
    Press `n`, compare the code with the new coordinator's screen, confirm.
    Your desktop signs a new list with the new coordinator in the old one's
    place; every machine you signed before stays in it,
-5. `./dryserver quarantine-all -lift`: each server reads the signed list
+5. `dryserver quarantine-all -lift`: each server reads the signed list
    from the coordinator's address, takes the new coordinator's keys from it
    and follows it. The old coordinator stays out.
-6. `./dryserver ssh-config`, once the servers have synced with the new
+6. `dryserver ssh-config`, once the servers have synced with the new
    coordinator: `ssh coord` checks its new key from then on.
 
 A server lifts its quarantine only onto a coordinator that serves a list you
@@ -51,23 +51,23 @@ A server that was switched off during all this runs
 `sudo dryserver quarantine -lift` once to follow the new coordinator.
 
 After a false alarm (the coordinator was not reinstalled):
-`./dryserver quarantine-all -lift -same`. Do that only when you are sure.
+`dryserver quarantine-all -lift -same`. Do that only when you are sure.
 
 `quarantine` also prints the WireGuard peers each server keeps. A hacked
 coordinator may have added its own; cut any you do not know by name:
-`./dryserver quarantine-all -name rogue`. The same works for a hacked server:
+`dryserver quarantine-all -name rogue`. The same works for a hacked server:
 it is cut off on all the others.
 
 | Command | What it does |
 |---|---|
-| `./dryserver quarantine-all` | desktop: cut the coordinator off on every server |
-| `./dryserver quarantine-all -name a,b` | desktop: cut members a and b off on every other server |
-| `./dryserver quarantine-all -status` / `-lift` | desktop: show or undo on every server |
-| `./dryserver quarantine-all -lift -same` | desktop: undo after a false alarm, trusting the same coordinator again |
+| `dryserver quarantine-all` | desktop: cut the coordinator off on every server |
+| `dryserver quarantine-all -name a,b` | desktop: cut members a and b off on every other server |
+| `dryserver quarantine-all -status` / `-lift` | desktop: show or undo on every server |
+| `dryserver quarantine-all -lift -same` | desktop: undo after a false alarm, trusting the same coordinator again |
 | `sudo dryserver quarantine [-name a,b]` | on one server |
 | `sudo dryserver quarantine -status` / `-lift [-same]` | on one server |
 
-Run `./dryserver ssh-config` again after adding servers, while the
+Run `dryserver ssh-config` again after adding servers, while the
 coordinator is still trusted: `quarantine-all` only reaches servers in that
 list. Give servers a fixed address in your router (DHCP reservation), so the
 `.lan` entries stay right.
@@ -81,7 +81,7 @@ Limits for now:
 - A server that ran a copy of the Cloudflare Tunnel knows the tunnel's
   token. After you cut off or removed a server you do not trust, make a new
   token in the Cloudflare dashboard, save it and press `o` in
-  `./dryserver outside`.
+  `dryserver outside`.
 - After a false alarm, `-lift -same` trusts the same machine again, with
   whatever was done to it.
 - Servers on an older dryserver do not know `-same` and `-min-version`

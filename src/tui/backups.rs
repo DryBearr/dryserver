@@ -221,7 +221,8 @@ impl PlaceScreen for Backups {
             ))
             .nl();
         }
-        b.nl().add(dim("Restoring needs secrets/backup_ed25519, the key the build made: keep a copy of it somewhere safe."));
+        let key = crate::fsx::dir(&self.dir).join(crate::iso::BACKUP_KEY_NAME);
+        b.nl().add(dim(format!("Restoring needs {}, the key the build made: keep a copy of it somewhere safe.", key.display())));
         page.focus = focus;
         page.notice = self.notice.clone();
         if !matches!(self.state, State::Pulling { .. }) {

@@ -1,5 +1,5 @@
 //! Publishing a release from the desktop, made hard to get wrong. The same
-//! steps run for `./dryserver release publish` and for the approve
+//! steps run for `dryserver release publish` and for the approve
 //! screen's publish key:
 //!
 //! 1. `plan` checks everything that goes into the release before anything
@@ -261,7 +261,7 @@ pub fn pick_day(ctx: &Ctx, days: &dyn Days, given: &str, current: Option<&str>, 
 
 // ---- the k3s binary ----
 
-/// Where `./dryserver build` keeps the k3s binary it downloads for the USB
+/// Where `dryserver build` keeps the k3s binary it downloads for the USB
 /// stick.
 pub fn default_k3s(out_dir: &Path) -> PathBuf {
     out_dir.join("pkgcache").join(format!("k3s-{}", iso::K3S_VERSION))
@@ -278,7 +278,7 @@ pub fn get_k3s(path: &Path, version: &str) -> String {
     let dir = fsx::dir(path).display().to_string();
     format!(
         "Get it one of two ways, then publish again:\n  \
-         ./dryserver build    (downloads it while it builds the USB stick image, about 6 minutes)\n  \
+         dryserver build    (downloads it while it builds the USB stick image, about 6 minutes)\n  \
          mkdir -p '{dir}' && curl -fL -o '{p}' '{}'\n\
          Its sha256 is checked here before anything is signed.",
         k3s_url(version)
@@ -872,7 +872,7 @@ pub fn skip_does(r: &Rollout) -> Result<String> {
         bail!("there is no rollout to resume (a new release starts its rollout within a minute of its publish)");
     }
     if r.phase == Phase::Failed {
-        bail!("the coordinator's own update is never passed over: ./dryserver release resume tries it again");
+        bail!("the coordinator's own update is never passed over: dryserver release resume tries it again");
     }
     if r.paused.is_empty() || r.pause_host == 0 {
         bail!("the rollout of release {} is not stopped at a server: there is nothing to pass over", r.serial);
@@ -1003,13 +1003,13 @@ pub fn status_lines(v: &View, now: i64) -> Vec<String> {
     {
         out.push(String::new());
         out.push("The rollout is stopped. Look at the machine first, then either".into());
-        out.push(format!("  ./dryserver release resume                       the coordinator {what}, or"));
+        out.push(format!("  dryserver release resume                       the coordinator {what}, or"));
         if let Ok(skip) = skip_does(&v.rollout)
             && v.rollout.pause != Pause::Canary
         {
-            out.push(format!("  ./dryserver release resume -skip                 the coordinator {skip}, or"));
+            out.push(format!("  dryserver release resume -skip                 the coordinator {skip}, or"));
         }
-        out.push("  ./dryserver release publish -notes \"the fix\"    a fixed release: it gets a higher serial".into());
+        out.push("  dryserver release publish -notes \"the fix\"    a fixed release: it gets a higher serial".into());
         out.push("                                                   and replaces this rollout".into());
     }
     // Every line carries the coordinator's words: none reaches the

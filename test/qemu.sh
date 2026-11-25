@@ -19,7 +19,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 name=${1:-node}
-iso=${ISO:-out/dryserver.iso}
+# The image dryserver build made: in DRYSERVER_HOME/out, or the cache
+# folder (dryserver where shows it); out/ in the repo as a last resort.
+if [[ -z ${ISO:-} ]]; then
+    for iso in ${DRYSERVER_HOME:+$DRYSERVER_HOME/out/dryserver.iso} "${XDG_CACHE_HOME:-$HOME/.cache}/dryserver/dryserver.iso" out/dryserver.iso; do
+        [[ -f $iso ]] && break
+    done
+else
+    iso=$ISO
+fi
 disk=out/vm-$name.qcow2
 data=out/vm-$name-data.qcow2
 vars=out/vm-$name.vars.fd

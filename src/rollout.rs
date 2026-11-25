@@ -34,7 +34,7 @@
 //! itself when its update is not confirmed in time (lane 5's revert
 //! guard), and the rollout stops at the first machine that fails, reverts,
 //! refuses or does not finish in time; the admin looks, then publishes a
-//! fixed release, resumes (`./dryserver release resume`: the machine tries
+//! fixed release, resumes (`dryserver release resume`: the machine tries
 //! again) or passes the server over (`release resume -skip`). A new
 //! release replaces a running rollout: machines go straight to the newest.
 //!
@@ -3156,7 +3156,7 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
     }
     if r.serial == 0 {
         if out.is_empty() {
-            out.push(("No release published yet: ./dryserver release publish".into(), false));
+            out.push(("No release published yet: dryserver release publish".into(), false));
         }
         return out;
     }
@@ -3170,8 +3170,8 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
         Phase::Brain if !r.paused.is_empty() => {
             let who = name(r.pause_host);
             out.push((format!("PAUSED: {}.", shown(&r.paused, 300)), true));
-            out.push((format!("Look at it, then: ./dryserver release resume (the coordinator waits once more for {who})"), true));
-            out.push((format!("Or let the coordinator update itself without waiting for {who}: ./dryserver release resume -skip"), true));
+            out.push((format!("Look at it, then: dryserver release resume (the coordinator waits once more for {who})"), true));
+            out.push((format!("Or let the coordinator update itself without waiting for {who}: dryserver release resume -skip"), true));
         }
         Phase::Brain if r.wait_for != 0 => {
             out.push((format!("The coordinator updates itself first, once {} finished the update it is in.", name(r.wait_for)), false))
@@ -3203,7 +3203,7 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
         Phase::Brain => out.push(("The coordinator updates itself first.".into(), false)),
         Phase::Failed => {
             out.push((format!("FAILED: {}.", shown(&r.paused, 300)), true));
-            out.push(("Publish a fixed release, or try again: ./dryserver release resume".into(), true));
+            out.push(("Publish a fixed release, or try again: dryserver release resume".into(), true));
         }
         Phase::Servers => {
             if !r.paused.is_empty() {
@@ -3214,9 +3214,9 @@ pub fn lines(r: &Rollout, members: &[Member], now: i64) -> Vec<(String, bool)> {
                     Pause::Canary => "goes on".into(),
                     _ => format!("{who} tries again"),
                 };
-                out.push((format!("Look at it, then: ./dryserver release resume ({what})"), true));
+                out.push((format!("Look at it, then: dryserver release resume ({what})"), true));
                 if r.pause != Pause::Canary {
-                    out.push((format!("Or pass {who} over for this release: ./dryserver release resume -skip"), true));
+                    out.push((format!("Or pass {who} over for this release: dryserver release resume -skip"), true));
                 }
             } else if let Some(t) = &r.turn {
                 let age = report::short_age((now - t.since).max(0) as u64);

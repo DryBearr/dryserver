@@ -87,6 +87,8 @@ if pid == 0:
     fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     os.chdir(cwd)
     os.environ["TERM"] = "xterm-256color"
+    # The folder is the swarm, as an older dryserver kept it.
+    os.environ["DRYSERVER_HOME"] = os.path.abspath(cwd)
     os.execv(binp, [binp, os.environ.get("SCREEN", "apps"), "--config", "config.env", "--host", "127.0.0.1", "--port", port])
 rows, cols = 24, 80
 cells = [[" "] * cols for _ in range(rows)]

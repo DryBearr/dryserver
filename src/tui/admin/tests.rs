@@ -734,7 +734,7 @@ fn the_release_and_a_stopped_rollout_are_shown() {
     s.press(&[Key::Tab]);
     let t = s.flat();
     assert!(t.contains("No release published yet.") && !t.contains("p publishes"), "no p without a publisher: {t}");
-    assert!(!t.contains("./dryserver"), "the screen names its keys, not commands: {t}");
+    assert!(!t.contains("dryserver release"), "the screen names its keys, not commands: {t}");
 
     let serial = with_release(&store, stopped_at_node_a(), Some(2));
     s.press(&[ch('r')]);
@@ -750,7 +750,7 @@ fn the_release_and_a_stopped_rollout_are_shown() {
     ] {
         assert!(t.contains(want), "{want}: {t}");
     }
-    assert!(!t.contains("./dryserver") && !t.contains("PAUSED"), "{t}");
+    assert!(!t.contains("dryserver release") && !t.contains("PAUSED"), "{t}");
     assert_eq!(s.s.selected(), Some(Row::Stopped), "the card is selected first");
     let foot = rows(&s.draw(100, 32)).last().unwrap().clone();
     assert!(foot.contains("enter  try again or skip") && !foot.contains("publish"), "{foot}");
@@ -918,7 +918,7 @@ fn leaving_while_it_publishes_asks_once_and_says_what_happens() {
     s.key(ch('y'));
     assert_eq!(s.key(Key::Ctrl('c')), Flow::Quit);
     let after = s.s.after().unwrap().text;
-    assert!(after.contains("The upload stopped half way") && !after.contains("./dryserver"), "{after}");
+    assert!(after.contains("The upload stopped half way") && !after.contains("dryserver release"), "{after}");
     hold.store(false, Ordering::SeqCst);
     // Nothing running: esc leaves at once, with nothing to say.
     let dir = TempDir::new();

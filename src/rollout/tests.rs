@@ -1881,8 +1881,8 @@ fn resume_tries_the_failed_server_again() {
     sw.publish(10, true);
     sw.until(20, |s| !s.rollout().paused.is_empty());
     let l = sw.lines();
-    assert!(l.contains("Look at it, then: ./dryserver release resume (node-a tries again)"), "{l}");
-    assert!(l.contains("Or pass node-a over for this release: ./dryserver release resume -skip"), "{l}");
+    assert!(l.contains("Look at it, then: dryserver release resume (node-a tries again)"), "{l}");
+    assert!(l.contains("Or pass node-a over for this release: dryserver release resume -skip"), "{l}");
     // The admin made room on node-a and resumes.
     sw.server(2).fake.sim().apply_fails = None;
     sw.resume();
@@ -2023,7 +2023,7 @@ fn skip_passes_over_a_server_but_never_the_brain() {
     sw.publish(10, false);
     sw.until(30, |s| !s.rollout().paused.is_empty());
     let l = sw.lines();
-    assert!(l.contains("./dryserver release resume (updates node-a without draining)") && l.contains("-skip"), "{l}");
+    assert!(l.contains("dryserver release resume (updates node-a without draining)") && l.contains("-skip"), "{l}");
     sw.skip();
     sw.until(30, |s| s.installed(3) == 10);
     assert!(sw.server(2).fake.sim().applied.is_empty() && sw.rollout().skipped.iter().any(|s| s.host == 2));
@@ -2035,7 +2035,7 @@ fn skip_passes_over_a_server_but_never_the_brain() {
     sw.sick.push(2);
     sw.ticks(2);
     let l = sw.lines();
-    assert!(l.contains("./dryserver release resume (goes on)") && !l.contains("-skip"), "{l}");
+    assert!(l.contains("dryserver release resume (goes on)") && !l.contains("-skip"), "{l}");
     sw.sick.clear();
     sw.skip();
     sw.until_unpaused(30, |s| s.everyone_on(10));
@@ -2047,7 +2047,7 @@ fn skip_passes_over_a_server_but_never_the_brain() {
     sw.ticks(3);
     assert_eq!(sw.rollout().phase, Phase::Failed);
     let e = sw.ask(true).unwrap_err().to_string();
-    assert!(e.contains("never passed over") && e.contains("./dryserver release resume"), "{e}");
+    assert!(e.contains("never passed over") && e.contains("dryserver release resume"), "{e}");
     sw.brain.fake.sim().apply_fails = None;
     // The registry account keeps the admin's skip anyway: a resume.
     let skip = sw.signed_ask("release-skip", sw.now);
@@ -3116,7 +3116,7 @@ fn review_a_slow_server_from_the_old_rollout_is_not_updating_beside_the_next() {
     assert!(r.cordoned == vec!["node-b".to_string()], "uncordoned in the middle of its update: {r:#?}");
     assert_eq!(sw.brain.fake.sim().applied.len(), 1);
     let l = sw.lines();
-    assert!(l.contains("PAUSED: node-b did not finish") && l.contains("./dryserver release resume -skip"), "{l}");
+    assert!(l.contains("PAUSED: node-b did not finish") && l.contains("dryserver release resume -skip"), "{l}");
     // The admin resumes: it waits once more, and stops again.
     sw.resume();
     sw.ticks(5);

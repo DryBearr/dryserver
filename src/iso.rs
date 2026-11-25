@@ -105,10 +105,7 @@ pub fn run(ctx: &Ctx, o: &Options, log: &mut (dyn Write + Send)) -> Result<()> {
     let file = File::create(&log_path).map_err(|e| Error::from(e).wrap(format!("open {}", log_path.display())))?;
     let mut tee = Tee { file, log };
 
-    let key = ensure_registry_key(ctx, &o.secrets_dir, &mut tee)?;
-    let signing_pub = ensure_signing_key(ctx, &o.secrets_dir, &mut tee)?;
-    let backup_pub = ensure_backup_key(ctx, &o.secrets_dir, &mut tee)?;
-    let join_secret = ensure_join_secret(&o.secrets_dir, &mut tee)?;
+    let Keys { registry: key, signing_pub, backup_pub, join_secret } = ensure_keys(ctx, &o.secrets_dir, &mut tee)?;
 
     let stage = out_dir.join("stage");
     let stage_c = stage.clone();
@@ -236,12 +233,56 @@ fn has_interp(b: &[u8]) -> Option<bool> {
     Some(false)
 }
 
+/// Whether this computer runs a swarm already: it signed a list or a
+/// release, or met the coordinator. From then on the machines trust the
+/// keys in secrets/, so one that is missing is restored, never made again:
+/// a new key would lock this computer out of every machine.
+pub fn swarm_started(dir: &Path) -> bool {
+    [crate::admin::SIGNED_COPY, crate::admin::RELEASE_COPY, crate::admin::KNOWN_HOSTS]
+        .iter()
+        .any(|n| std::fs::symlink_metadata(dir.join(n)).is_ok())
+}
+
+/// The error for a key that is missing once the swarm runs.
+fn lost(path: &Path, why: &str) -> Error {
+    errf!(
+        "{} is missing, and this computer already runs a swarm: {why}. A new one is not made, it would lock you out. \
+         Restore it from your backup into {}",
+        path.display(),
+        fsx::dir(path).display()
+    )
+}
+
+/// The keys and the secret a stick needs, in secrets/.
+#[derive(Debug)]
+pub struct Keys {
+    pub registry: PathBuf,
+    pub signing_pub: PathBuf,
+    pub backup_pub: PathBuf,
+    pub join_secret: PathBuf,
+}
+
+/// Makes the keys and the secret that are missing, as long as the swarm
+/// has not started (see swarm_started), and checks the ones that are there.
+pub fn ensure_keys(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<Keys> {
+    let started = swarm_started(dir);
+    Ok(Keys {
+        registry: ensure_registry_key(ctx, dir, started, log)?,
+        signing_pub: ensure_signing_key(ctx, dir, started, log)?,
+        backup_pub: ensure_backup_key(ctx, dir, started, log)?,
+        join_secret: ensure_join_secret(dir, started, log)?,
+    })
+}
+
 /// Creates the SSH keypair nodes use to register with the coordinator. The
 /// same key is baked into every ISO, so it is kept across builds.
-fn ensure_registry_key(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<PathBuf> {
+fn ensure_registry_key(ctx: &Ctx, dir: &Path, started: bool, log: &mut dyn Write) -> Result<PathBuf> {
     let key = dir.join(KEY_NAME);
     if key.exists() {
         return Ok(key);
+    }
+    if started {
+        return Err(lost(&key, "every machine lets in only this key at the coordinator's registry"));
     }
     fsx::mkdir_all(dir, 0o700)?;
     let _ = writeln!(log, "==> Generating registry key {}", key.display());
@@ -275,10 +316,11 @@ fn key_body(line: &str) -> String {
 /// - a public half without its private half is an error, not a reason to
 ///   make a new pair (servers already trust the old one);
 /// - the two halves must belong together.
-fn ensure_signing_key(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<PathBuf> {
+fn ensure_signing_key(ctx: &Ctx, dir: &Path, started: bool, log: &mut dyn Write) -> Result<PathBuf> {
     ensure_keypair(
         ctx,
         dir,
+        started,
         &Pair {
             name: SIGNING_KEY_NAME,
             pub_name: SIGNING_PUB,
@@ -295,10 +337,11 @@ fn ensure_signing_key(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<Path
 /// Makes sure secrets/ holds the keypair backups are encrypted to, and
 /// returns the path of its public half. The same rules as for the signing
 /// key: a coordinator installed with this key makes backups only it opens.
-fn ensure_backup_key(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<PathBuf> {
+fn ensure_backup_key(ctx: &Ctx, dir: &Path, started: bool, log: &mut dyn Write) -> Result<PathBuf> {
     ensure_keypair(
         ctx,
         dir,
+        started,
         &Pair {
             name: BACKUP_KEY_NAME,
             pub_name: BACKUP_PUB,
@@ -324,7 +367,7 @@ struct Pair {
     lost_new: &'static str,
 }
 
-fn ensure_keypair(ctx: &Ctx, dir: &Path, p: &Pair, log: &mut dyn Write) -> Result<PathBuf> {
+fn ensure_keypair(ctx: &Ctx, dir: &Path, started: bool, p: &Pair, log: &mut dyn Write) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let key = dir.join(p.name);
     let pubkey = dir.join(p.pub_name);
@@ -339,6 +382,9 @@ fn ensure_keypair(ctx: &Ctx, dir: &Path, p: &Pair, log: &mut dyn Write) -> Resul
                 p.lost,
                 p.lost_new
             ));
+        }
+        if started {
+            return Err(lost(&key, p.lost));
         }
         fsx::mkdir_all(dir, 0o700)?;
         let _ = writeln!(
@@ -382,10 +428,13 @@ fn ensure_keypair(ctx: &Ctx, dir: &Path, p: &Pair, log: &mut dyn Write) -> Resul
 
 /// Makes sure secrets/ holds the join secret and returns its path. Created
 /// once: machines installed from an older stick carry proofs made with it.
-fn ensure_join_secret(dir: &Path, log: &mut dyn Write) -> Result<PathBuf> {
+fn ensure_join_secret(dir: &Path, started: bool, log: &mut dyn Write) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join(JOIN_SECRET);
     if !path.exists() {
+        if started {
+            return Err(lost(&path, "your desktop checks every join request against it"));
+        }
         fsx::mkdir_all(dir, 0o700)?;
         let _ = writeln!(log, "==> Generating join secret {}", path.display());
         fsx::write_file(&path, format!("{}\n", fsx::hex(&fsx::random_bytes(32))), 0o600)?;
@@ -540,8 +589,8 @@ mod tests {
         let secrets = dir.join("secrets");
         let ctx = Ctx::new();
         let mut log = Vec::new();
-        let signing = ensure_signing_key(&ctx, &secrets, &mut log).unwrap();
-        let p = ensure_backup_key(&ctx, &secrets, &mut log).unwrap();
+        let signing = ensure_signing_key(&ctx, &secrets, false, &mut log).unwrap();
+        let p = ensure_backup_key(&ctx, &secrets, false, &mut log).unwrap();
         let text = String::from_utf8_lossy(&log).into_owned();
         assert!(text.contains("backup key") && text.contains("opens the coordinator's encrypted backups"), "{text}");
         let first = std::fs::read_to_string(&p).unwrap();
@@ -551,13 +600,13 @@ mod tests {
         assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
         // Kept across builds; a lost public half comes back from the
         // private one; a lost private half never makes a new pair.
-        ensure_backup_key(&ctx, &secrets, &mut Vec::new()).unwrap();
+        ensure_backup_key(&ctx, &secrets, false, &mut Vec::new()).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), first);
         std::fs::remove_file(&p).unwrap();
-        ensure_backup_key(&ctx, &secrets, &mut Vec::new()).unwrap();
+        ensure_backup_key(&ctx, &secrets, false, &mut Vec::new()).unwrap();
         assert_eq!(key_body(&std::fs::read_to_string(&p).unwrap()), key_body(&first));
         std::fs::remove_file(&key).unwrap();
-        let e = ensure_backup_key(&ctx, &secrets, &mut Vec::new()).unwrap_err().to_string();
+        let e = ensure_backup_key(&ctx, &secrets, false, &mut Vec::new()).unwrap_err().to_string();
         assert!(e.contains("Restore the private key") && e.contains("backups made before open only with the old key"), "{e}");
         assert!(!key.exists());
     }
@@ -567,19 +616,19 @@ mod tests {
         let dir = TempDir::new();
         let secrets = dir.join("secrets");
         let mut log = Vec::new();
-        let p = ensure_join_secret(&secrets, &mut log).unwrap();
+        let p = ensure_join_secret(&secrets, false, &mut log).unwrap();
         let first = std::fs::read_to_string(&p).unwrap();
         assert_eq!(first.trim().len(), 64, "32 random bytes in hex");
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         // Kept across builds.
-        ensure_join_secret(&secrets, &mut Vec::new()).unwrap();
+        ensure_join_secret(&secrets, false, &mut Vec::new()).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), first);
         // Loose permissions are tightened; junk is refused, not replaced.
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        ensure_join_secret(&secrets, &mut Vec::new()).unwrap();
+        ensure_join_secret(&secrets, false, &mut Vec::new()).unwrap();
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         std::fs::write(&p, "not hex!\n").unwrap();
-        assert!(ensure_join_secret(&secrets, &mut Vec::new()).unwrap_err().to_string().contains("damaged"));
+        assert!(ensure_join_secret(&secrets, false, &mut Vec::new()).unwrap_err().to_string().contains("damaged"));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "not hex!\n");
     }
 
@@ -592,7 +641,7 @@ mod tests {
         let secrets = dir.join("secrets");
         let ctx = Ctx::new();
         let mut log = Vec::new();
-        let p = ensure_signing_key(&ctx, &secrets, &mut log).unwrap();
+        let p = ensure_signing_key(&ctx, &secrets, false, &mut log).unwrap();
         assert!(String::from_utf8_lossy(&log).contains("back up"), "first build must tell the admin to back the key up");
         let first = std::fs::read_to_string(&p).unwrap();
         assert!(first.starts_with("ssh-ed25519 "), "{first}");
@@ -602,35 +651,82 @@ mod tests {
 
         // Kept across builds, silently.
         let mut log = Vec::new();
-        ensure_signing_key(&ctx, &secrets, &mut log).unwrap();
+        ensure_signing_key(&ctx, &secrets, false, &mut log).unwrap();
         assert!(log.is_empty());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), first);
 
         // A lost public half is rewritten from the private half.
         std::fs::remove_file(&p).unwrap();
-        ensure_signing_key(&ctx, &secrets, &mut Vec::new()).unwrap();
+        ensure_signing_key(&ctx, &secrets, false, &mut Vec::new()).unwrap();
         assert_eq!(key_body(&std::fs::read_to_string(&p).unwrap()), key_body(&first));
 
         // Loose permissions on a restored key are tightened.
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
-        ensure_signing_key(&ctx, &secrets, &mut Vec::new()).unwrap();
+        ensure_signing_key(&ctx, &secrets, false, &mut Vec::new()).unwrap();
         assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
 
         // A public half from another pair is refused.
         std::fs::write(&p, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherOtherOtherOtherOtherOtherOtherOtherOtherO x\n").unwrap();
-        let e = ensure_signing_key(&ctx, &secrets, &mut Vec::new()).unwrap_err().to_string();
+        let e = ensure_signing_key(&ctx, &secrets, false, &mut Vec::new()).unwrap_err().to_string();
         assert!(e.contains("does not belong"), "{e}");
         std::fs::write(&p, &first).unwrap();
 
         // A lost private half never leads to a new pair.
         std::fs::remove_file(&key).unwrap();
-        let e = ensure_signing_key(&ctx, &secrets, &mut Vec::new()).unwrap_err().to_string();
+        let e = ensure_signing_key(&ctx, &secrets, false, &mut Vec::new()).unwrap_err().to_string();
         assert!(e.contains("Restore the private key"), "{e}");
         assert!(!key.exists() && std::fs::read_to_string(&p).unwrap() == first);
 
         // A file that is not a key is refused.
         std::fs::write(&key, "garbage").unwrap();
-        assert!(ensure_signing_key(&ctx, &secrets, &mut Vec::new()).is_err());
+        assert!(ensure_signing_key(&ctx, &secrets, false, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn once_the_swarm_runs_a_missing_key_is_never_made_again() {
+        if !in_path("ssh-keygen") {
+            return;
+        }
+        let ctx = Ctx::new();
+        // A new swarm: every key is made.
+        let dir = TempDir::new();
+        let secrets = dir.join("secrets");
+        assert!(!swarm_started(&secrets));
+        let k = ensure_keys(&ctx, &secrets, &mut Vec::new()).unwrap();
+        for p in [&k.registry, &k.signing_pub, &k.backup_pub, &k.join_secret] {
+            assert!(p.exists(), "{}", p.display());
+        }
+        // An older swarm with only the registry key (made by an older
+        // version) gets the others, as long as it never ran.
+        let dir = TempDir::new();
+        let secrets = dir.join("secrets");
+        ensure_registry_key(&ctx, &secrets, false, &mut Vec::new()).unwrap();
+        ensure_keys(&ctx, &secrets, &mut Vec::new()).unwrap();
+
+        // Once it met the coordinator, signed a list or a release, every
+        // missing key is an error that says to restore it.
+        for mark in [crate::admin::SIGNED_COPY, crate::admin::KNOWN_HOSTS, crate::admin::RELEASE_COPY] {
+            for name in [KEY_NAME, SIGNING_KEY_NAME, BACKUP_KEY_NAME, JOIN_SECRET] {
+                let dir = TempDir::new();
+                let secrets = dir.join("secrets");
+                ensure_keys(&ctx, &secrets, &mut Vec::new()).unwrap();
+                std::fs::write(secrets.join(mark), "x").unwrap();
+                assert!(swarm_started(&secrets));
+                // Kept keys still pass.
+                ensure_keys(&ctx, &secrets, &mut Vec::new()).unwrap();
+                let before: Vec<_> = std::fs::read_dir(&secrets).unwrap().map(|e| e.unwrap().file_name()).collect();
+                std::fs::remove_file(secrets.join(name)).unwrap();
+                // The public half alone may stay: the error is the same
+                // either way for the private half.
+                let pubf = secrets.join(format!("{name}.pub"));
+                let _ = std::fs::remove_file(&pubf);
+                let e = ensure_keys(&ctx, &secrets, &mut Vec::new()).unwrap_err().to_string();
+                assert!(e.contains("already runs a swarm") && e.contains("Restore it from your backup"), "{mark} {name}: {e}");
+                assert!(!secrets.join(name).exists(), "{mark} {name}: a new one was made");
+                let after: Vec<_> = std::fs::read_dir(&secrets).unwrap().map(|e| e.unwrap().file_name()).collect();
+                assert!(after.len() < before.len(), "nothing new is written");
+            }
+        }
     }
 
     #[test]

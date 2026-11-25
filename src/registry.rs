@@ -1115,13 +1115,13 @@ fn same_stop(r: &Rollout, ask: &signed::AdminRequest) -> Result<()> {
     if ask.serial == 0 {
         return Err(errf!(
             "the request names no rollout (none was there when you looked, or this dryserver is older than the coordinator's); \
-             the rollout is at release {}: look again with ./dryserver release status",
+             the rollout is at release {}: look again with dryserver release status",
             r.serial
         ));
     }
     if ask.serial != r.serial || ask.host != r.pause_host {
         return Err(errf!(
-            "the rollout changed since you looked (it is at release {}{}): look again with ./dryserver release status",
+            "the rollout changed since you looked (it is at release {}{}): look again with dryserver release status",
             r.serial,
             if r.paused.is_empty() { ", not stopped".to_string() } else { format!(", stopped at host {}", r.pause_host) }
         ));
@@ -1287,7 +1287,7 @@ pub fn serve(
                     return Err("there is no rollout to resume".into());
                 }
                 if r.phase == rollout::Phase::Failed {
-                    return Err("the coordinator's own update is never passed over: ./dryserver release resume tries it again".into());
+                    return Err("the coordinator's own update is never passed over: dryserver release resume tries it again".into());
                 }
                 if r.paused.is_empty() || r.pause_host == 0 {
                     return Err("the rollout is not stopped at a server: there is nothing to pass over".into());

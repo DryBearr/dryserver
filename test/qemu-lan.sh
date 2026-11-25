@@ -27,7 +27,8 @@
 # connections between two VMs itself and resets them.)
 #
 #   DIR=out      where the disks and the ISO (DIR/out/dryserver.iso or
-#                DIR/dryserver.iso) are
+#                DIR/dryserver.iso) are; a test swarm in DIR is built
+#                with DRYSERVER_HOME=DIR dryserver build
 #   MEM=2048     memory in MiB
 set -euo pipefail
 kind=${1:?coord or server}

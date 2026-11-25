@@ -284,6 +284,12 @@ impl App {
         }
     }
 
+    /// Home opens with this notice.
+    pub fn with_notice(mut self, n: Notice) -> App {
+        self.notice = Some(n);
+        self
+    }
+
     /// Opens place first instead of Home.
     pub fn start_at(mut self, place: Place) -> App {
         self.start = Some(place);
@@ -389,10 +395,23 @@ impl App {
     fn needs_keys(&self, place: Place) -> std::result::Result<(), Problem> {
         match self.facts.missing_keys.iter().find(|k| home::ADMIN_KEYS.contains(&k.as_str())) {
             None => Ok(()),
+            Some(k) if self.facts.started => Err(Problem {
+                place,
+                problem: format!("A key is missing: {} is not there.", self.paths.secrets.join(k).display()),
+                todo: format!(
+                    "Restore it from your backup into {}. Your machines trust this key: a new one would lock you out, so \
+                     none is made.",
+                    self.paths.secrets.display()
+                ),
+                fix: None,
+            }),
             Some(k) => Err(Problem {
                 place,
                 problem: format!("A key is missing: {} is not there.", self.paths.secrets.join(k).display()),
-                todo: "Build the installer (2): it makes your keys. Keep secrets/ safe: it is how this computer signs.".into(),
+                todo: format!(
+                    "Build the installer (2): it makes your keys. Back up {}: it is how this computer signs.",
+                    self.paths.secrets.display()
+                ),
                 fix: Some(("enter", "open Installer", Fix::Open(Place::Installer))),
             }),
         }

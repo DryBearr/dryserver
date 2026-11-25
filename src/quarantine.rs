@@ -602,7 +602,7 @@ pub fn auto_cut(ctx: &Ctx, n: &Node, coordinator: bool) -> Result<()> {
                 eprintln!(
                     "dryserver: the coordinator ({ip}) is in the firewall's {} set, counted like a member; not cut for it \
                      (the coordinator is cut only for tries counted for it alone). If you do not trust it: \
-                     ./dryserver quarantine-all",
+                     dryserver quarantine-all",
                     crate::sysconf::OFFENDERS_SET
                 );
             }
@@ -782,7 +782,7 @@ fn adopt(ctx: &Ctx, n: &Node, me: u32, rewrite: bool, how: LiftOptions) -> Resul
     let env =
         n.fetch_signed_unpinned(ctx).map_err(|e| e.wrap(format!("cannot read the signed member list from the coordinator at {ip}")))?;
     if env.is_empty() {
-        bail!("the coordinator at {ip} has no member list signed by you (approve from your desktop first: ./dryserver approve)");
+        bail!("the coordinator at {ip} has no member list signed by you (approve from your desktop first: dryserver approve)");
     }
     let list = env
         .list(n.verifier.as_ref(), |h| !mesh::ip(&n.cfg.wg_subnet, h).is_empty())
@@ -795,7 +795,7 @@ fn adopt(ctx: &Ctx, n: &Node, me: u32, rewrite: bool, how: LiftOptions) -> Resul
     if list.version < how.min_version {
         bail!(
             "the coordinator at {ip} serves signed list version {}, older than version {} your desktop signed last \
-             (publish it with ./dryserver approve, or check what answers at {ip})",
+             (publish it with dryserver approve, or check what answers at {ip})",
             list.version,
             how.min_version
         );
@@ -824,7 +824,7 @@ fn adopt(ctx: &Ctx, n: &Node, me: u32, rewrite: bool, how: LiftOptions) -> Resul
     if same_machine && !how.same {
         bail!(
             "the signed list from {ip} (version {}) still has the coordinator this server cut off, with the same SSH key. \
-             After a false alarm lift with -same. After a reinstall, sign the new coordinator first (./dryserver approve, N)",
+             After a false alarm lift with -same. After a reinstall, sign the new coordinator first (dryserver approve, N)",
             list.version
         );
     }

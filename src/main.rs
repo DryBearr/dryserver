@@ -15,6 +15,7 @@ mod err;
 mod flash;
 mod fsx;
 mod gotime;
+mod homedir;
 mod install;
 mod iso;
 mod k3stoken;
@@ -62,10 +63,18 @@ const USAGE: &str = r#"usage: dryserver [command] [flags]
 Run without a command for the desktop app: config, installer, USB stick,
 machines, apps, the ways in, updates, backups and the kill switch.
 
+It works from any folder. Your config and keys are in ~/.config/dryserver,
+the installer image in ~/.cache/dryserver (DRYSERVER_HOME=DIR keeps all of
+it in DIR instead).
+
 commands:
+  init [--from DIR]   set this computer up: make the keys of a new swarm, or
+                      copy the swarm an older version kept in DIR (its
+                      config.env and secrets/) to where it belongs now
+  where               the folders that hold your config, keys and images
   install [--demo]    laptop setup screen (runs from the installer USB);
                       --demo only shows the screens, nothing is changed
-  build               build out/dryserver.iso from config.env, log to stdout
+  build               build the installer image from your config, log to stdout
   disks               list disks and show which ones may be flashed
   flash --iso FILE    select a USB drive and write FILE to it (needs root)
   sysconf --out DIR   write the system files a server would get (for review)
@@ -78,10 +87,11 @@ commands:
 
   approve             the app at Machines: approve or reject machines,
                       remove members, publish an update (u); every
-                      decision is signed with secrets/signing_ed25519
+                      decision is signed with your signing key
   apps                the app at Apps: what runs on your cluster
-  backup-pull         copy the coordinator's newest backups into
-                      secrets/backups (encrypted; signed by the coordinator)
+  backup-pull         copy the coordinator's newest backups into the
+                      backups folder next to your keys (encrypted; signed
+                      by the coordinator)
   outside             the app at Outside: the ways in from the internet
   release publish     check a release of this dryserver, show what changes,
                       sign it and send it to the coordinator: it updates
@@ -124,8 +134,61 @@ on servers:
 const LIVE_CONFIG: &str = "/etc/dryserver/config.env";
 const INSTALL_LOG: &str = "/tmp/dryserver-install.log";
 
-fn paths() -> tui::app::Paths {
-    tui::app::Paths { config: "config.env".into(), out_dir: "out".into(), secrets: "secrets".into() }
+/// The desktop's folders (see homedir), the same from any working
+/// directory. Refuses while the swarm is still in the folder an older
+/// version kept it in and nothing is here yet: whatever ran now would
+/// start a new swarm beside it. Made once, with the folders.
+fn paths() -> Result<tui::app::Paths> {
+    desktop().map(|(p, _)| p)
+}
+
+/// The paths, and a word about a folder of an older version that is not
+/// used any more (printed once, and shown on Home).
+fn desktop() -> Result<(tui::app::Paths, Option<String>)> {
+    type Made = std::result::Result<(tui::app::Paths, Option<String>), String>;
+    static PATHS: std::sync::OnceLock<Made> = std::sync::OnceLock::new();
+    PATHS
+        .get_or_init(|| {
+            let r = desktop_paths().map_err(|e| e.to_string());
+            if let Ok((_, Some(note))) = &r {
+                eprintln!("note: {note}");
+            }
+            r
+        })
+        .clone()
+        .map_err(err::Error::new)
+}
+
+fn desktop_paths() -> Result<(tui::app::Paths, Option<String>)> {
+    let l = homedir::layout(&homedir::Env::current())?;
+    let note = match homedir::look(&l, &homedir::candidates()) {
+        Some(homedir::Stray::Other(d)) => bail!("{}", homedir::other_swarm(&l, &d)),
+        Some(homedir::Stray::Waiting(d)) => bail!(
+            "dryserver keeps your swarm in {} now, and works from any folder. Your swarm is still in {}: bring it \
+             there once (it is copied, {} stays as it is):\n  dryserver init --from {}",
+            l.home.display(),
+            d.display(),
+            d.display(),
+            d.display()
+        ),
+        Some(homedir::Stray::Old(d)) => Some(format!(
+            "{d}/config.env and {d}/secrets are an old copy, not used; dryserver uses {} (dryserver where). Delete \
+             them once you are sure it works from there.",
+            l.home.display(),
+            d = d.display()
+        )),
+        None => None,
+    };
+    homedir::prepare(&l)?;
+    Ok((tui::app::Paths { config: l.config, out_dir: l.out_dir, secrets: l.secrets }, note))
+}
+
+/// The config file: -config FILE, or the one in the home folder.
+fn config_file(f: &Flags) -> Result<PathBuf> {
+    match f.get("config") {
+        "" => Ok(paths()?.config),
+        c => Ok(PathBuf::from(c)),
+    }
 }
 
 fn main() -> ExitCode {
@@ -141,6 +204,8 @@ fn main() -> ExitCode {
     };
     let rest = &args[1..];
     let res = match cmd.as_str() {
+        "init" => run_init(rest),
+        "where" => run_where(rest),
         "install" => run_install(rest),
         "build" => run_build(rest),
         "disks" => run_disks(rest),
@@ -266,9 +331,12 @@ fn run_app() -> Result<()> {
 
 /// The desktop app, at Home or at place. Every place runs inside it.
 fn run_hub(f: &Flags, place: Option<tui::app::Place>) -> Result<()> {
-    let mut p = paths();
-    p.config = PathBuf::from(f.get("config"));
+    let (mut p, note) = desktop()?;
+    p.config = config_file(f)?;
     let mut app = tui::app::App::new(p, factories(f));
+    if let Some(n) = note {
+        app = app.with_notice(tui::frame::Notice::info(n));
+    }
     if let Some(place) = place {
         app = app.start_at(place);
     }
@@ -288,7 +356,7 @@ fn factories(f: &Flags) -> tui::app::Factories {
         machines: Box::new(move || machines_model(&machines)),
         cluster: Box::new(move || {
             let c: Arc<dyn apps::Cluster> = Arc::new(desktop_cluster(&cluster, "apps")?);
-            Ok((c, desktop_doors()))
+            Ok((c, desktop_doors()?))
         }),
         pull: Arc::new(move |out| backup_pull(&pull, out)),
         write_list: Arc::new(move || {
@@ -310,12 +378,72 @@ fn factories(f: &Flags) -> tui::app::Factories {
     }
 }
 
+/// Sets this computer up: copies a swarm from the folder an older version
+/// kept it in, or makes the keys of a new one. Running it again is safe.
+fn run_init(args: &[String]) -> Result<()> {
+    let f = Flags::parse(
+        "init",
+        args,
+        &[
+            ("from", "", "the folder an older dryserver kept your swarm in (its config.env and secrets/): copied, never changed"),
+            ("new", "false", "make a new swarm even though one was found in this folder or next to this program"),
+        ],
+    );
+    if fsx::is_root() {
+        bail!("run init as your normal user, not with sudo: the files must be yours");
+    }
+    if Path::new(LIVE_CONFIG).exists() {
+        bail!("init runs on your own computer, not on a server");
+    }
+    let l = homedir::layout(&homedir::Env::current())?;
+    let mut out = std::io::stdout();
+    if !f.get("from").is_empty() {
+        let from = Path::new(f.get("from"));
+        let b = homedir::bring(from, &l)?;
+        for p in &b.copied {
+            println!("Copied {}", p.display());
+        }
+        for p in &b.same {
+            println!("Already there: {}", p.display());
+        }
+        println!(
+            "The files in {} are not used any more; delete them once dryserver works from here. The installer image is \
+             not copied: build it again.",
+            std::path::absolute(from)?.display()
+        );
+    } else if !f.on("new")
+        && let Some(homedir::Stray::Waiting(d)) = homedir::look(&l, &homedir::candidates())
+    {
+        bail!(
+            "{} holds a swarm (config.env, secrets/). Bring it here:\n  dryserver init --from {}\nOr make a new swarm \
+             anyway: dryserver init --new",
+            d.display(),
+            d.display()
+        );
+    }
+    homedir::prepare(&l)?;
+    iso::ensure_keys(&Ctx::on_signals(), &l.secrets, &mut out)?;
+    println!("Ready. Your swarm on this computer:");
+    homedir::describe(&l, homedir::look(&l, &homedir::candidates()).as_ref(), &mut out)?;
+    if !l.config.exists() {
+        println!("\nNext: dryserver, then Config.");
+    }
+    Ok(())
+}
+
+fn run_where(args: &[String]) -> Result<()> {
+    Flags::parse("where", args, &[]);
+    let l = homedir::layout(&homedir::Env::current())?;
+    homedir::describe(&l, homedir::look(&l, &homedir::candidates()).as_ref(), &mut std::io::stdout())?;
+    Ok(())
+}
+
 fn run_install(args: &[String]) -> Result<()> {
     let f = Flags::parse("install", args, &[("demo", "false", "show the setup screens without changing anything")]);
     let live = Config::load(LIVE_CONFIG);
     let (be, cfg): (Arc<dyn install::Backend>, Config) = if f.on("demo") {
         let cfg = live
-            .or_else(|_| Config::load(paths().config))
+            .or_else(|e| paths().and_then(|p| Config::load(p.config)).map_err(|_| e))
             .unwrap_or_else(|_| Config { coord_lan_ip: "192.168.1.50".into(), ..Config::default() });
         (Arc::new(install::Demo::new()), cfg)
     } else {
@@ -352,7 +480,7 @@ fn open_log(path: &Path) -> Result<std::fs::File> {
 
 fn run_build(args: &[String]) -> Result<()> {
     Flags::parse("build", args, &[]);
-    let p = paths();
+    let p = paths()?;
     let cfg = Config::load(&p.config).map_err(|e| errf!("load {}: {e} (create it with the menu: dryserver)", p.config.display()))?;
     let ctx = Ctx::on_signals();
     let mut out = std::io::stdout();
@@ -406,7 +534,7 @@ fn run_sysconf(args: &[String]) -> Result<()> {
         args,
         &[
             ("out", "", "directory to write the files into"),
-            ("config", "config.env", "config file"),
+            ("config", "", "config file (default: the one dryserver where shows)"),
             ("role", "node", "node or coordinator"),
             ("hostname", "node-0000", "machine hostname"),
             ("host", "0", "mesh host number (0 = not approved yet)"),
@@ -418,7 +546,7 @@ fn run_sysconf(args: &[String]) -> Result<()> {
     }
     let role = Role::parse(f.get("role")).ok_or_else(|| errf!("sysconf: --role must be node or coordinator"))?;
     let host: u32 = f.get("host").parse().map_err(|_| errf!("sysconf: --host must be a number"))?;
-    let cfg = Config::load(f.get("config"))?;
+    let cfg = Config::load(config_file(&f)?)?;
     let plan = packages::resolve(&cfg.tool_list(), &cfg.extra_list())?;
     let files = sysconf::render(&Params {
         config: cfg,
@@ -470,7 +598,7 @@ fn ssh_config(f: &Flags) -> Result<SshConfigDone> {
     let Some(coord_name) = servers.iter().find(|s| s.mesh_ip == coord_ip).map(|s| s.name.clone()) else {
         bail!("nothing is signed yet: sign the coordinator in Machines first");
     };
-    let cfg = Config::load(f.get("config"))?;
+    let cfg = Config::load(config_file(f)?)?;
     let home = PathBuf::from(std::env::var("HOME").map_err(|_| errf!("$HOME is not defined"))?);
     let conf_path = home.join(".ssh/config.d/dryserver");
     let kh_path = home.join(".ssh/known_hosts.d/dryserver");
@@ -501,7 +629,7 @@ fn ssh_config(f: &Flags) -> Result<SshConfigDone> {
 }
 
 const DESKTOP_FLAGS: &[(&str, &str, &str)] = &[
-    ("config", "config.env", "config file"),
+    ("config", "", "config file (default: the one dryserver where shows)"),
     ("host", "", "coordinator address (default: COORD_LAN_IP)"),
     ("port", "22", "coordinator SSH port"),
 ];
@@ -512,11 +640,14 @@ fn desktop_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
     if fsx::is_root() {
         bail!("run {cmd} as your normal user, not with sudo");
     }
-    let cfg = Config::load(f.get("config"))?;
-    let secrets = paths().secrets;
+    let cfg = Config::load(config_file(f)?)?;
+    let secrets = paths()?.secrets;
     let need = |name: &str, what: &str| -> Result<PathBuf> {
         let p = secrets.join(name);
         if !p.exists() {
+            if iso::swarm_started(&secrets) {
+                bail!("{} is missing ({what}). Restore it from your backup into {}", p.display(), secrets.display());
+            }
             bail!("{} is missing ({what}). Building the installer makes it: dryserver, then Installer", p.display());
         }
         Ok(p)
@@ -710,7 +841,7 @@ fn quarantine_all(names: &[String], lift: bool, same: bool, status: bool) -> Res
     let mut action = Vec::new();
     if lift {
         // No server takes a list older than the newest one signed here.
-        let copy_path = paths().secrets.join(admin::SIGNED_COPY);
+        let copy_path = paths()?.secrets.join(admin::SIGNED_COPY);
         let copy = fsx::read_string(&copy_path).map_err(|e| {
             e.wrap(format!(
                 "no copy of the member list you signed last ({}). Lift on each server by hand: \
@@ -874,13 +1005,13 @@ fn run_backup(args: &[String]) -> Result<()> {
 fn run_backup_pull(args: &[String]) -> Result<()> {
     let f = Flags::parse("backup-pull", args, DESKTOP_FLAGS);
     if Path::new(LIVE_CONFIG).exists() {
-        bail!("backup-pull runs on your own computer:\n  ./dryserver backup-pull");
+        bail!("backup-pull runs on your own computer:\n  dryserver backup-pull");
     }
     let r = backup_pull(&f, &mut std::io::stdout())?;
     for n in &r.removed {
         println!("removed {n} (older than the {} daily and {} weekly kept)", backup::KEEP_DAILY, backup::KEEP_WEEKLY);
     }
-    println!("{} new backup(s) in {}.", r.fetched.len(), paths().secrets.join("backups").display());
+    println!("{} new backup(s) in {}.", r.fetched.len(), paths()?.secrets.join("backups").display());
     if !r.problems.is_empty() {
         bail!("not everything was copied:\n  {}", r.problems.join("\n  "));
     }
@@ -894,8 +1025,8 @@ fn backup_pull(f: &Flags, out: &mut dyn std::io::Write) -> Result<backup::Pulled
     if fsx::is_root() {
         bail!("run backup-pull as your normal user, not with sudo");
     }
-    let cfg = Config::load(f.get("config"))?;
-    let secrets = paths().secrets;
+    let cfg = Config::load(config_file(f)?)?;
+    let secrets = paths()?.secrets;
     let host = if f.get("host").is_empty() { cfg.coord_lan_ip.clone() } else { f.get("host").to_string() };
     let known_hosts = secrets.join(admin::KNOWN_HOSTS);
     // The coordinator's host key as this computer pinned it (approve):
@@ -924,13 +1055,13 @@ fn desktop_cluster(f: &Flags, cmd: &str) -> Result<apps::SshCluster> {
     if fsx::is_root() {
         bail!("run {cmd} as your normal user, not with sudo");
     }
-    let cfg = Config::load(f.get("config"))?;
+    let cfg = Config::load(config_file(f)?)?;
     let host = if f.get("host").is_empty() { cfg.coord_lan_ip.clone() } else { f.get("host").to_string() };
     Ok(apps::SshCluster {
         host,
         port: f.get("port").to_string(),
         user: cfg.username,
-        known_hosts: paths().secrets.join(admin::KNOWN_HOSTS),
+        known_hosts: paths()?.secrets.join(admin::KNOWN_HOSTS),
     })
 }
 
@@ -938,15 +1069,15 @@ fn run_apps(args: &[String], place: tui::Place) -> Result<()> {
     let cmd = if place == tui::Place::Apps { "apps" } else { "outside" };
     let f = Flags::parse(cmd, args, DESKTOP_FLAGS);
     if Path::new(LIVE_CONFIG).exists() {
-        bail!("{cmd} runs on your own computer:\n  ./dryserver {cmd}\nOn the coordinator itself, use: k3s kubectl");
+        bail!("{cmd} runs on your own computer:\n  dryserver {cmd}\nOn the coordinator itself, use: k3s kubectl");
     }
     run_hub(&f, Some(if place == tui::Place::Apps { tui::app::Place::Apps } else { tui::app::Place::Outside }))
 }
 
 /// The ways in from outside this desktop knows, with its secrets.
-fn desktop_doors() -> entrance::Entrances {
-    let secrets = paths().secrets;
-    Arc::new(vec![Box::new(entrance::cloudflare::Cloudflare::new(&secrets)), Box::new(entrance::Vps)])
+fn desktop_doors() -> Result<entrance::Entrances> {
+    let secrets = paths()?.secrets;
+    Ok(Arc::new(vec![Box::new(entrance::cloudflare::Cloudflare::new(&secrets)), Box::new(entrance::Vps)]))
 }
 
 fn run_approve(args: &[String]) -> Result<()> {
@@ -954,7 +1085,7 @@ fn run_approve(args: &[String]) -> Result<()> {
     if Path::new(LIVE_CONFIG).exists() {
         // A server cannot let anyone in, the coordinator included: only
         // the computer that holds the signing key can.
-        bail!("approve runs on your own computer, where the signing key is:\n  ./dryserver approve");
+        bail!("approve runs on your own computer, where the signing key is:\n  dryserver approve");
     }
     run_hub(&f, Some(tui::app::Place::Machines))
 }
@@ -963,7 +1094,7 @@ fn run_approve(args: &[String]) -> Result<()> {
 /// rollout go on and writes the server list.
 fn machines_model(f: &Flags) -> Result<tui::admin::Screen> {
     let (a, host) = desktop_admin(f, "approve")?;
-    let key = paths().secrets.join(iso::SIGNING_KEY_NAME);
+    let key = paths()?.secrets.join(iso::SIGNING_KEY_NAME);
     if publish::has_passphrase(&key) {
         // ssh-keygen would ask for it on the terminal the screen draws on.
         bail!(
@@ -977,7 +1108,7 @@ fn machines_model(f: &Flags) -> Result<tui::admin::Screen> {
     let publisher = tui::admin::Publisher {
         admin: Arc::new(move || desktop_admin(&again, "approve").map(|(a, _)| a)),
         days: Arc::new(publish::Archive::new()),
-        parts: publish::Parts::this_program(&paths().out_dir, None)?,
+        parts: publish::Parts::this_program(&paths()?.out_dir, None)?,
         today: || chrono::Utc::now().date_naive(),
     };
     let list = f.clone();
@@ -997,8 +1128,8 @@ const RELEASE_USAGE: &str = r#"usage: dryserver release publish|status|resume [f
               -rollback       allow older versions: the way back
               -arch-date D    the Arch snapshot day YYYY/MM/DD (default: the
                               newest day on archive.archlinux.org)
-              -k3s FILE       the pinned k3s (default: out/pkgcache/k3s-VERSION,
-                              from ./dryserver build)
+              -k3s FILE       the pinned k3s (default: pkgcache/k3s-VERSION in
+                              the images folder, from dryserver build)
               -yes            do not ask
   status    the release, where its rollout stands, one line per machine,
             and what to do when it stopped
@@ -1024,7 +1155,7 @@ fn run_release(args: &[String]) -> Result<()> {
     }
     if Path::new(LIVE_CONFIG).exists() {
         // Only the computer with the signing key makes releases.
-        bail!("release runs on your own computer, where the signing key is:\n  ./dryserver release {sub}");
+        bail!("release runs on your own computer, where the signing key is:\n  dryserver release {sub}");
     }
     match sub.as_str() {
         "publish" => release_publish(rest),
@@ -1054,7 +1185,7 @@ fn run_release(args: &[String]) -> Result<()> {
 /// ssh-keygen is going to ask for the signing key's passphrase.
 fn release_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
     let a = desktop_admin(f, cmd)?;
-    let key = paths().secrets.join(iso::SIGNING_KEY_NAME);
+    let key = paths()?.secrets.join(iso::SIGNING_KEY_NAME);
     if publish::has_passphrase(&key) {
         eprintln!(
             "{} has a passphrase: ssh-keygen asks for it at each signature (to read the coordinator's state, and to sign).",
@@ -1083,7 +1214,7 @@ fn release_publish(args: &[String]) -> Result<()> {
         ("urgent", "false", "roll out at once, not in the nightly update window (a security fix)"),
         ("rollback", "false", "allow older versions than the machines run: the way back from a bad release"),
         ("arch-date", "", "the Arch snapshot day YYYY/MM/DD (default: the newest day on archive.archlinux.org)"),
-        ("k3s", "", "the pinned k3s binary (default: out/pkgcache/k3s-VERSION, from ./dryserver build)"),
+        ("k3s", "", "the pinned k3s binary (default: pkgcache/k3s-VERSION in the images folder, from dryserver build)"),
         ("yes", "false", "sign and send without asking"),
     ]);
     let f = Flags::parse("release publish", args, &spec);
@@ -1097,7 +1228,7 @@ fn release_publish(args: &[String]) -> Result<()> {
         "" => None,
         p => Some(PathBuf::from(p)),
     };
-    let parts = publish::Parts::this_program(&paths().out_dir, k3s)?;
+    let parts = publish::Parts::this_program(&paths()?.out_dir, k3s)?;
     let choice = publish::Choice {
         arch_date: f.get("arch-date").into(),
         notes: f.get("notes").into(),
@@ -1124,7 +1255,7 @@ fn release_publish(args: &[String]) -> Result<()> {
     }
     let r = publish::publish(&mut a, &plan).map_err(|e| e.wrap("not published"))?;
     println!("Release {} is on the coordinator. It updates itself first, then one server at a time.", r.serial);
-    println!("Watch it: ./dryserver release status, or ./dryserver approve");
+    println!("Watch it: dryserver release status, or dryserver approve");
     println!("Stop or go back: publish a fixed release, or the old dryserver with -rollback.");
     Ok(())
 }

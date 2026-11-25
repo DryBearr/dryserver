@@ -231,8 +231,8 @@ fn report_lines(m: &Member, names: &dyn Fn(u32) -> String, now: Time) -> Vec<Vec
 /// the screen names its own key or place.
 fn words(s: &str) -> String {
     let s = s
-        .replace("./dryserver release status shows what the coordinator has", "the Updates tab shows what the coordinator has")
-        .replace("./dryserver release resume tries it again", "try again (t) does that");
+        .replace("dryserver release status shows what the coordinator has", "the Updates tab shows what the coordinator has")
+        .replace("dryserver release resume tries it again", "try again (t) does that");
     report::printable(&s)
 }
 
@@ -1668,7 +1668,7 @@ impl Screen {
         let mut lines: Vec<(String, bool)> = publish::rollout_lines(v, at)
             .into_iter()
             // The card and the keys say what the commands would.
-            .filter(|(l, _)| !l.contains("./dryserver release"))
+            .filter(|(l, _)| !l.contains("dryserver release"))
             .filter(|(l, _)| !(stopped && (l.starts_with("PAUSED: ") || l.starts_with("FAILED: "))))
             .collect();
         if r.serial != 0 || !lines.is_empty() {

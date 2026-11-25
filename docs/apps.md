@@ -17,7 +17,7 @@ answering; for the first 45 seconds about every second request still goes to
 the dead copy and fails.
 
 ```sh
-./dryserver apps           # or "Apps" in the menu
+dryserver apps           # or "Apps" in the menu
 ```
 
 `n` starts an app from a container image, one step at a time: a name (it
@@ -89,7 +89,7 @@ what can be done to it: open it with the token you saved (`o`), sync it
 (`s`), take a name over (`t`), close it (`x`); `a` goes back to the apps:
 
 ```sh
-./dryserver outside        # or "Outside" in the menu, or o on the apps screen
+dryserver outside        # or "Outside" in the menu, or o on the apps screen
 ```
 
 - **Cloudflare Tunnel**: two pods in the cluster dial out to Cloudflare,
@@ -108,7 +108,7 @@ with kubectl) is served by neither, and the Outside screen says so.
 The Cloudflare Tunnel can be set up two ways: from your computer with one
 API token, or by hand in the dashboard.
 
-### What `s` does in `./dryserver outside`
+### What `s` does in `dryserver outside`
 
 It first lists every change it would make, in order, and makes exactly
 those on `y` (any other key changes nothing; a plan that changed since is
@@ -163,7 +163,7 @@ Cloudflare, DNS and the ingress.
 
 ## When a machine leaves
 
-Remove a server in `./dryserver approve` and the cluster follows: the
+Remove a server in `dryserver approve` and the cluster follows: the
 coordinator deletes it from the cluster, and its apps start on the servers
 that are left. The removed server stops k3s and every container as soon as
 it sees the signed list without itself (it asks the coordinator on the home

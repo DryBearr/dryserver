@@ -69,6 +69,9 @@ pub struct Facts {
     pub exe_time: Option<SystemTime>,
     /// Keys from KEYS that are not in secrets/.
     pub missing_keys: Vec<String>,
+    /// The swarm runs (iso::swarm_started): a missing key is restored from
+    /// a backup, a build never makes it again.
+    pub started: bool,
     pub signed: Option<Signed>,
     pub signed_time: Option<SystemTime>,
     /// The serial of the last release signed here.
@@ -129,6 +132,7 @@ impl Facts {
             iso,
             exe_time,
             missing_keys: KEYS.iter().filter(|k| !s.join(k).exists()).map(|k| k.to_string()).collect(),
+            started: iso::swarm_started(s),
             signed: read_signed(&signed_path),
             signed_time: mtime(&signed_path),
             release: read_release(&s.join(admin::RELEASE_COPY)),
@@ -211,6 +215,7 @@ pub fn line(f: &Facts, place: Place) -> (Mark, String) {
             (None, _) if !cfg_ok => (Mark::Off, "needs the config first (1)".into()),
             (None, _) => (Mark::Act, "not built yet".into()),
             (Some(_), Some(p)) => (Mark::Bad, p.into()),
+            (Some(_), None) if !keys && f.started => (Mark::Bad, "a key is missing: restore it from your backup".into()),
             (Some(_), None) if !keys => (Mark::Bad, "the keys are missing: build it again".into()),
             (Some((size, made)), None) => {
                 let when = chrono::DateTime::<chrono::Local>::from(made).format("%Y-%m-%d %H:%M");
@@ -222,6 +227,7 @@ pub fn line(f: &Facts, place: Place) -> (Mark, String) {
             (Some(_), true) => (Mark::Act, "write the installer to a stick".into()),
             (Some(_), false) => (Mark::Off, "write the installer to a stick (asks for sudo)".into()),
         },
+        Place::Machines if !admin_keys && f.started => (Mark::Bad, "a key is missing: restore it from your backup".into()),
         Place::Machines if !admin_keys => (Mark::Off, "no keys yet: build the installer (2)".into()),
         Place::Machines => match f.signed.as_ref().filter(|s| s.coordinator.is_some()) {
             None => (Mark::Act, "sign your coordinator once it is installed".into()),
@@ -264,6 +270,16 @@ pub struct Next {
 /// older one, no keys, no signed coordinator, no server, old backups.
 pub fn next(f: &Facts) -> Next {
     let n = |p: Place, t: &str| Next { place: Some(p), text: t.to_string() };
+    if f.started && !f.missing_keys.is_empty() {
+        return Next {
+            place: None,
+            text: format!(
+                "Restore {} from your backup into the keys folder (dryserver where shows it). Your machines trust \
+                 these keys: new ones would lock you out.",
+                f.missing_keys.join(", ")
+            ),
+        };
+    }
     let mut next = match &f.cfg {
         Cfg::Missing => n(Place::Config, "Make the config (1): the WiFi, the coordinator's address and your SSH key."),
         Cfg::Broken(e) => n(Place::Config, &format!("Fix the config (1): {e}")),
@@ -393,6 +409,7 @@ mod tests {
             iso: Some((1_200_000_000, t + Duration::from_secs(60))),
             exe_time: Some(t),
             missing_keys: vec![],
+            started: true,
             signed: Some(Signed { coordinator: Some("coord".into()), servers: 2 }),
             signed_time: Some(t),
             release: Some(1_795_400_000),
@@ -420,7 +437,14 @@ mod tests {
         case(&|f| f.iso = None, Place::Installer, "Build the installer (2)");
         case(&|f| f.cfg_time = Some(f.now), Place::Installer, "the config changed since");
         case(&|f| f.exe_time = Some(f.now), Place::Installer, "an older dryserver");
-        case(&|f| f.missing_keys = vec![iso::SIGNING_KEY_NAME.into()], Place::Installer, "makes your keys");
+        case(
+            &|f| {
+                f.missing_keys = vec![iso::SIGNING_KEY_NAME.into()];
+                f.started = false;
+            },
+            Place::Installer,
+            "makes your keys",
+        );
         case(&|f| f.signed = None, Place::Machines, "sign it in Machines (4)");
         case(&|f| f.signed = Some(Signed { coordinator: None, servers: 1 }), Place::Machines, "sign it");
         case(&|f| f.signed.as_mut().unwrap().servers = 0, Place::Machines, "Install a server");
@@ -448,10 +472,22 @@ mod tests {
             &|f| {
                 f.iso = None;
                 f.missing_keys = vec!["x".into()];
+                f.started = false;
             },
             Place::Installer,
             "Build the installer (2)",
         );
+        // Once the swarm runs, a missing key comes back from the backup,
+        // before anything else: a build would not make it.
+        for (cfg, iso) in [(Cfg::Missing, None), (facts().cfg, facts().iso)] {
+            let mut f = facts();
+            f.cfg = cfg;
+            f.iso = iso;
+            f.missing_keys = vec![iso::SIGNING_KEY_NAME.into(), iso::JOIN_SECRET.into()];
+            let n = next(&f);
+            assert_eq!(n.place, None, "{n:?}");
+            assert!(n.text.contains("Restore signing_ed25519, join_secret from your backup") && n.text.contains("lock you out"), "{n:?}");
+        }
         // Under sudo the step says where it can be done.
         let mut f = facts();
         f.signed = None;
@@ -486,7 +522,11 @@ mod tests {
         g.missing_keys = vec![iso::BACKUP_KEY_NAME.into()];
         assert_eq!(l(&g, Place::Machines).0, Mark::Done, "Machines does not need the backup key");
         g.missing_keys = vec![iso::SIGNING_KEY_NAME.into()];
+        assert_eq!(l(&g, Place::Machines), (Mark::Bad, "a key is missing: restore it from your backup".into()));
+        assert_eq!(l(&g, Place::Installer), (Mark::Bad, "a key is missing: restore it from your backup".into()));
+        g.started = false;
         assert_eq!(l(&g, Place::Machines).0, Mark::Off);
+        assert_eq!(l(&g, Place::Installer), (Mark::Bad, "the keys are missing: build it again".into()));
         let mut g = facts();
         g.met = false;
         assert_eq!(l(&g, Place::Apps).0, Mark::Off);

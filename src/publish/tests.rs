@@ -377,7 +377,7 @@ fn the_k3s_file_is_checked_before_signing() {
     for want in [
         &format!("k3s {v} is not on this computer ({} is missing)", p.display()),
         "the coordinator runs k3s v1.36.1+k3s1, so it needs this one",
-        "./dryserver build",
+        "dryserver build",
         &format!("mkdir -p '{}' && curl -fL -o '{}'", dir.path().display(), p.display()),
         &format!("https://github.com/k3s-io/k3s/releases/download/{}/k3s", v.replace('+', "%2B")),
         "checked here before anything is signed",
@@ -549,7 +549,7 @@ fn a_cut_off_upload_is_said_and_the_next_one_goes_up() {
         e.contains(&format!("release {} is signed and kept on this computer, but the coordinator did not take it", p.release.serial)),
         "{e}"
     );
-    assert!(e.contains("Connection timed out") && e.contains("./dryserver release status shows what the coordinator has"), "{e}");
+    assert!(e.contains("Connection timed out") && e.contains("dryserver release status shows what the coordinator has"), "{e}");
     assert!(e.contains("Publishing again is safe"), "{e}");
     assert_eq!(sent.lock().unwrap().len(), 1);
     // The next plan says so and goes up from it.
@@ -767,9 +767,9 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
         // What its update does now, from the note.
         &format!("  node-h         server       updating (release {s}): installing the packages of Arch 2026/11/20"),
         "The rollout is stopped. Look at the machine first, then either",
-        "./dryserver release resume                       the coordinator gives node-b its turn again",
-        "./dryserver release resume -skip                 the coordinator passes node-b over for release",
-        "./dryserver release publish -notes \"the fix\"    a fixed release: it gets a higher serial",
+        "dryserver release resume                       the coordinator gives node-b its turn again",
+        "dryserver release resume -skip                 the coordinator passes node-b over for release",
+        "dryserver release publish -notes \"the fix\"    a fixed release: it gets a higher serial",
     ] {
         assert!(text.contains(want), "{want}:\n{text}");
     }
@@ -787,7 +787,7 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
     // Nothing published yet.
     let none = View { members: vec![member(1, "coord", Some(rep(0, "", 0, "")), now - 5)], coordinator_now: now, ..View::default() };
     let text = status_lines(&none, 0).join("\n");
-    assert!(text.starts_with("Rollout:\n  No release published yet: ./dryserver release publish"), "{text}");
+    assert!(text.starts_with("Rollout:\n  No release published yet: dryserver release publish"), "{text}");
     assert!(text.contains("  coord          coordinator  no release installed  dryserver 0.2.0"), "{text}");
 
     // Published a moment ago: the coordinator did not take it up yet.

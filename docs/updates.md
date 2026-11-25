@@ -13,7 +13,7 @@ One command, in the dryserver folder on your desktop:
 
 ```sh
 make                                                  # the static binary to ship
-./dryserver release publish -notes "fixes the join timeout"
+dryserver release publish -notes "fixes the join timeout"
 ```
 
 It checks the release, shows what changes and asks before anything is
@@ -33,7 +33,7 @@ node-b (node-a is the canary, watched for 5m).
 Sign it and send it to the coordinator at 192.168.1.50? [y/N]
 ```
 
-Or press `p` in `./dryserver approve` (Machines, any tab): the notes,
+Or press `p` in `dryserver approve` (Machines, any tab): the notes,
 then the same checks and the same summary, `y` sends it.
 
 The summary compares with the newest release on the coordinator. When
@@ -47,7 +47,7 @@ is shown as maybe another build, never as the same.
 - **Checked before signing**: the binary is the static one `make`
   builds; nothing is older than what the swarm runs (unless you go back,
   below); the k3s binary has the checksum this dryserver pins
-  (`out/pkgcache/k3s-VERSION`, downloaded by `./dryserver build`; when it
+  (`pkgcache/k3s-VERSION` in `~/.cache/dryserver`, downloaded by `dryserver build`; when it
   is missing and the coordinator needs it you are told how to get it);
   the Arch snapshot day is on archive.archlinux.org. The day is the
   newest one there (today's, or a few days back while today's is not
@@ -56,8 +56,8 @@ is shown as maybe another build, never as the same.
 - **What happens**: the coordinator updates itself first, then one server
   at a time, each one drained first and kept on the new release only once
   it is healthy (below).
-- **Watch it**: `./dryserver release status` (one line per machine), or
-  Updates in `./dryserver approve`.
+- **Watch it**: `dryserver release status` (one line per machine), or
+  Updates in `dryserver approve`.
 - **Urgent** (`-urgent`): the rollout starts at once instead of in the
   update window 03:00-05:00 on the coordinator's clock. It is still the
   coordinator first and one server at a time; the canary is watched for a
@@ -68,8 +68,8 @@ is shown as maybe another build, never as the same.
   the summary names them. For security fixes.
 - **When it stops**: a rollout stops by itself at a server whose update
   fails. `release status` says where and what to do: look at the machine,
-  then `./dryserver release resume` (it says what that does first: the
-  server tries again), `./dryserver release resume -skip` (the server is
+  then `dryserver release resume` (it says what that does first: the
+  server tries again), `dryserver release resume -skip` (the server is
   passed over for this release), or publish a fixed release (it gets a
   higher serial and replaces the rollout).
 - **Stop it or go back**: build the dryserver the swarm ran before and
@@ -117,19 +117,19 @@ The rollout **stops** at a server whose update fails, goes back, is
 refused by its own checks, or does not finish in an hour (one never heard
 from since its turn came is passed over after 20 minutes instead), and at a
 canary that is not well. A server that finishes after all lets the rollout
-go on by itself. `./dryserver approve` shows why, and the release
+go on by itself. `dryserver approve` shows why, and the release
 on every machine. A stopped server stays cordoned while it is up and not
 well, and is uncordoned once it runs its old release well again. Look at
 it, then publish a fixed release, or:
 
-- `./dryserver release resume`: the server tries the release once more
+- `dryserver release resume`: the server tries the release once more
   (drained again, at once for an urgent release or in the window for a
   normal one; when it is switched off, the others go on and it tries once
   it is back). What it loaded so far stays. A server that could not be
   drained updates without draining; after a canary that was not well the
   rollout goes on; when the coordinator's own update failed, it tries
   again.
-- `./dryserver release resume -skip`: the server is passed over. It keeps
+- `dryserver release resume -skip`: the server is passed over. It keeps
   its release until the next one, and the others go on. The coordinator
   is never passed over: no server updates before it does.
 

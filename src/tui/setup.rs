@@ -1148,7 +1148,7 @@ impl Setup {
         frame::section(b, "Approve it on your computer", None);
         b.add(Seg(
             format!(
-                "Open ./dryserver there and go to Machines (4): this machine waits to join. Approve it (a) only if your \
+                "Open dryserver there and go to Machines (4): this machine waits to join. Approve it (a) only if your \
                  computer shows the same code, {}:",
                 self.code
             ),
@@ -1179,14 +1179,14 @@ impl Setup {
                 text(
                     b,
                     "After it restarts, its screen shows the code to sign it with. Sign it on your computer: open \
-                         ./dryserver, go to Machines (4) and press s."
+                         dryserver, go to Machines (4) and press s."
                         .into(),
                 );
             } else {
                 text(
                     b,
                     format!(
-                        "After it restarts, sign it on your computer (./dryserver, Machines, s), only if it shows the same \
+                        "After it restarts, sign it on your computer (dryserver, Machines, s), only if it shows the same \
                          code, {}:",
                         self.code
                     ),
@@ -1209,7 +1209,7 @@ impl Setup {
                 b,
                 format!(
                     "{why} After it restarts it asks again by itself and shows its code on its screen; approve it on your \
-                     computer then (./dryserver, Machines)."
+                     computer then (dryserver, Machines)."
                 ),
             );
         }
@@ -1381,7 +1381,7 @@ impl Setup {
                 vec![k("l", "the whole log"), k("ctrl+c", "stop the install (asks first)")],
             ),
             State::Join => (
-                "The server asks the coordinator to let it in. On your computer, open ./dryserver, go to Machines (4), and \
+                "The server asks the coordinator to let it in. On your computer, open dryserver, go to Machines (4), and \
                  approve it if it shows the same code. Skipped, it asks again at every start until you approve it."
                     .to_string(),
                 vec![k("s", "skip"), k("r", "ask now, after the coordinator did not answer")],
@@ -2284,12 +2284,7 @@ mod tests {
         assert!(t.s.state == State::Done && t.s.code == "305 771", "the coordinator's own code must be shown: {:?}", t.s.code);
         let v = t.words();
         assert!(!v.contains("passphrase once"), "passphrase mode has no first-boot TPM step");
-        t.has(&[
-            "The coordinator is installed",
-            "sign it on your computer (./dryserver, Machines, s)",
-            "the same code, 305 771",
-            "Sign it",
-        ]);
+        t.has(&["The coordinator is installed", "sign it on your computer (dryserver, Machines, s)", "the same code, 305 771", "Sign it"]);
         assert!(!v.contains("sudo dryserver approve"));
         let screen = t.screen(Tier::True, false, 120, 50).join("\n");
         assert!(screen.contains("██"), "the code in large digits:\n{screen}");

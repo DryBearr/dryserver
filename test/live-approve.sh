@@ -101,6 +101,8 @@ if pid == 0:
     fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 160, 0, 0))
     os.chdir(cwd)
     os.environ["TERM"] = "xterm-256color"
+    # The folder is the swarm, as an older dryserver kept it.
+    os.environ["DRYSERVER_HOME"] = os.path.abspath(cwd)
     os.execv(binp, [binp, "approve", "--config", "config.env", "--host", "127.0.0.1", "--port", port])
 seen = ""
 def read_until(pat, timeout=20):
@@ -250,7 +252,7 @@ out=$(screen "$S/desk" "node-c" "" 2>&1)
 check_not "the screen is clean afterwards" grep -q "not signed\|Not signed\|Cannot talk\|another SSH key" <<<"$out"
 
 echo "== releases"
-desk() { (cd "$S/desk" && "$BIN" "$@" --config config.env --host 127.0.0.1 --port $PORT 2>&1); }
+desk() { (cd "$S/desk" && DRYSERVER_HOME="$S/desk" "$BIN" "$@" --config config.env --host 127.0.0.1 --port $PORT 2>&1); }
 REL=$S/root2/var/lib/dryserver/release
 out=$(desk release status)
 check "release status: nothing published yet" grep -q "No release published yet" <<<"$out"

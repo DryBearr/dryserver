@@ -13,7 +13,7 @@ but cannot read one. For the copy of the cluster's datastore k3s pauses
 for a moment; the apps keep running.
 
 ```sh
-./dryserver backup-pull    # copy the newest backups into secrets/backups/
+dryserver backup-pull    # copy the newest backups into secrets/backups/
 ```
 
 It copies them over your own SSH login, checks each one's size and the

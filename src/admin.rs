@@ -1,4 +1,4 @@
-//! The admin's side of approval, on the desktop. `./dryserver approve`
+//! The admin's side of approval, on the desktop. `dryserver approve`
 //! shows the machines waiting to join and the members, and every decision
 //! is signed here with secrets/signing_ed25519 before it goes to the
 //! coordinator. The coordinator stores and hands out the signed list; it
@@ -8,7 +8,7 @@
 //! pairing codes are computed here, and members that are on the
 //! coordinator but not in the list this desktop signed are shown as such.
 //!
-//! Releases go the same way (`./dryserver release publish`): signed here,
+//! Releases go the same way (`dryserver release publish`): signed here,
 //! uploaded with their binaries, and rolled out by the coordinator.
 
 use std::path::{Path, PathBuf};
@@ -604,7 +604,7 @@ impl Admin {
         let late = now - signed_at > RECEIPT_LAG;
         let v = self.base.version;
         let removed = "A server you removed may still be in its mesh and its cluster: cut it off with \
-                       ./dryserver quarantine-all -name NAME.";
+                       dryserver quarantine-all -name NAME.";
         if r.is_empty() {
             return late.then(|| {
                 format!(
@@ -1242,7 +1242,7 @@ impl Admin {
         let kept = |e: Error| {
             errf!(
                 "release {} is signed and kept on this computer, but the coordinator did not take it: {e}. \
-                 ./dryserver release status shows what the coordinator has. Publishing again is safe: \
+                 dryserver release status shows what the coordinator has. Publishing again is safe: \
                  the next release gets a higher serial",
                 r.serial
             )

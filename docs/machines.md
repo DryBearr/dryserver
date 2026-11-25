@@ -85,7 +85,7 @@ so one bad initramfs cannot reach both kernels. While the fallback kernel
 runs, or the main image failed, every update looks at each kernel's image:
 one that was never made (a power cut before pacman's hook) is made again,
 and the machine reboots into the main kernel. `sudo dryserver boot status`
-shows the images, which one started and whether the fallback waits; `./dryserver approve` shows
+shows the images, which one started and whether the fallback waits; `dryserver approve` shows
 "running fallback kernel" or "no fallback kernel" for a machine.
 
 Limits: two kernels that are both broken (both updated in one go, or new
@@ -128,7 +128,7 @@ one waits for a reboot, when it was last fully upgraded (`pacman -Syu`),
 uptime, load, memory, root disk, its hottest temperature sensor, whether
 k3s runs and the firewall is loaded, when it last shook hands with
 each WireGuard peer, which release it runs and how its update stands, and
-whether it booted the fallback kernel (`boot`). `./dryserver approve` shows it under each member:
+whether it booted the fallback kernel (`boot`). `dryserver approve` shows it under each member:
 problems in red (a disk or memory 90% full, 85 °C, k3s or the firewall
 down, a reboot due, a clock more than two minutes off, no upgrade for 30
 days, a peer silent for five minutes, the fallback kernel running, missing
