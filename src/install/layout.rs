@@ -96,6 +96,13 @@ pub fn kernel_cmdline(encrypted: bool, root_uuid: &str) -> String {
     format!("root={root} rw quiet panic={}", super::boot::PANIC_SECS)
 }
 
+/// Appended to /etc/default/grub (BIOS): the main kernel first and the
+/// default. grub-mkconfig sorts the kernels with `sort -V`, which puts
+/// vmlinuz-linux-lts before vmlinuz-linux, so without this every BIOS
+/// machine starts the fallback kernel; linux-lts stays under "Advanced
+/// options".
+pub const GRUB_TOP_LEVEL: &str = "\n# dryserver: the main kernel (linux) on top and started; linux-lts under Advanced options.\nGRUB_TOP_LEVEL=\"/boot/vmlinuz-linux\"\nGRUB_DEFAULT=0\n";
+
 /// Appended to /etc/default/grub (BIOS), which grub-mkconfig reads as a
 /// shell script: the same panic restart for every GRUB entry.
 pub fn grub_panic() -> String {

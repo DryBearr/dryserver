@@ -442,12 +442,17 @@ impl Real {
         self.write("/etc/mkinitcpio.conf", 0o644, lines.join("\n"))?;
 
         if !lay.uefi {
-            // GRUB lists both kernels, the newest (linux) first and as the
-            // default; linux-lts is under "Advanced options", picked by
-            // hand only (no boot counting with GRUB here).
+            // GRUB lists both kernels, linux on top and as the default
+            // (GRUB_TOP_LEVEL: its own order would put linux-lts there);
+            // linux-lts is under "Advanced options", picked by hand only (no
+            // boot counting with GRUB here). Set last: the last value of a
+            // variable counts.
             let mut grub = fsx::read_or_empty(self.target("/etc/default/grub")).replace("GRUB_TIMEOUT=5", "GRUB_TIMEOUT=1");
             if !grub.contains("panic=") {
                 grub += &grub_panic();
+            }
+            if !grub.contains("GRUB_TOP_LEVEL=\"/boot/vmlinuz-linux\"") {
+                grub += crate::install::layout::GRUB_TOP_LEVEL;
             }
             self.write("/etc/default/grub", 0o644, grub)?;
             self.chroot(ctx, &["mkinitcpio", "-P"])?;
@@ -929,7 +934,9 @@ mod tests {
         // initramfs files.
         assert!(fr.find("pacstrap").args.iter().any(|a| a == "linux-lts"));
         let grub = get(&r.target, "/etc/default/grub");
-        assert!(grub.starts_with("GRUB_TIMEOUT=1\n") && grub.ends_with(&grub_panic()), "{grub}");
+        assert!(grub.starts_with("GRUB_TIMEOUT=1\n") && grub.contains(&grub_panic()), "{grub}");
+        // linux on top and started, whatever GRUB's own order says.
+        assert!(grub.ends_with("GRUB_TOP_LEVEL=\"/boot/vmlinuz-linux\"\nGRUB_DEFAULT=0\n"), "{grub}");
         assert!(fr.index(&format!("arch-chroot {t} mkinitcpio -P")) < fr.index(&format!("arch-chroot {t} grub-mkconfig")));
         assert!(!r.target("/etc/mkinitcpio.d/linux.preset").exists() && !r.target("/etc/kernel/cmdline").exists());
         // The registry account gets no home of its own: root's, made here.
