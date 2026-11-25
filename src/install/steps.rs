@@ -111,6 +111,12 @@ impl Real {
 
     fn filesystems(&self, ctx: &Ctx, ch: &Choices, lay: &Layout) -> Result<Vec<DataDisk>> {
         let enc = ch.enc() != Encryption::None;
+        // Whatever an earlier install left in the new partitions (an old
+        // LUKS header, an old boot partition) goes, so nothing but the new
+        // filesystem is found there.
+        for p in [&lay.root, &lay.boot] {
+            self.cmd(ctx, "wipefs", &["--all", "--force", p])?;
+        }
         let mut root_dev = lay.root.clone();
         if enc {
             self.luks_format(ctx, &lay.root, &ch.disk_passphrase)?;
@@ -129,15 +135,18 @@ impl Real {
             self.cmd(ctx, "mkfs.ext4", &["-F", "-q", "-L", "boot", &lay.boot])?;
         }
         let data = self.prepare_data(ctx, ch, enc)?;
-
-        self.cmd(ctx, "mount", &[&root_dev, &self.target.display().to_string()])?;
+        // udev reads the new filesystems first; then mount is told each
+        // one's type, never left to guess it (a guess that went wrong on a
+        // disk with an earlier install tried squashfs for the ESP).
+        self.cmd(ctx, "udevadm", &["settle"])?;
+        self.cmd(ctx, "mount", &["-t", "ext4", &root_dev, &self.target.display().to_string()])?;
         let _ = fsx::mkdir_all(self.target("/boot"), 0o755);
         // The ESP holds the random seed; keep it private.
-        let boot_opts = if lay.uefi { "umask=0077" } else { "defaults" };
-        self.cmd(ctx, "mount", &["-o", boot_opts, &lay.boot, &self.target("/boot").display().to_string()])?;
+        let (boot_type, boot_opts) = if lay.uefi { ("vfat", "umask=0077") } else { ("ext4", "defaults") };
+        self.cmd(ctx, "mount", &["-t", boot_type, "-o", boot_opts, &lay.boot, &self.target("/boot").display().to_string()])?;
         for d in &data {
             let _ = fsx::mkdir_all(self.target(&d.mount), 0o755);
-            self.cmd(ctx, "mount", &[&d.dev, &self.target(&d.mount).display().to_string()])?;
+            self.cmd(ctx, "mount", &["-t", "ext4", &d.dev, &self.target(&d.mount).display().to_string()])?;
         }
         Ok(data)
     }
@@ -772,13 +781,16 @@ mod tests {
         let order = [
             "wipefs --all --force /dev/nvme0n1".to_string(),
             "sfdisk --wipe always --wipe-partitions always /dev/nvme0n1".into(),
+            "wipefs --all --force /dev/nvme0n1p2".into(),
+            "wipefs --all --force /dev/nvme0n1p1".into(),
             "cryptsetup luksFormat --type luks2 --pbkdf argon2id --batch-mode --key-file=- /dev/nvme0n1p2".into(),
             "cryptsetup open --key-file=- /dev/nvme0n1p2 root".into(),
             "cryptsetup luksAddKey --key-file=- /dev/nvme0n1p2".into(),
             "mkfs.ext4 -F -q -L root /dev/mapper/root".into(),
             "mkfs.fat -F 32 -n EFI /dev/nvme0n1p1".into(),
             "cryptsetup luksAddKey --key-file=- /dev/sda1".into(),
-            "mount /dev/mapper/root".into(),
+            "mount -t ext4 /dev/mapper/root".into(),
+            "mount -t vfat -o umask=0077 /dev/nvme0n1p1".into(),
             "pacstrap -K".into(),
             format!("arch-chroot {t} useradd -m -G wheel,docker"),
             format!("arch-chroot {t} chpasswd"),
