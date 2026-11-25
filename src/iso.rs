@@ -310,8 +310,8 @@ fn ensure_signer(ctx: &Ctx, dir: &Path, started: bool, admin: Option<&str>, log:
     };
     match (have, admin) {
         (Some(h), Some(a)) if h != a && started => Err(errf!(
-            "your machines trust the signing key {} ({}), and the SSH key in your config is another one ({}). Put the \
-             key they trust back in Config, with its private half in ~/.ssh or ssh-agent",
+            "your machines trust the signing key {} ({}), and the SSH key in your config is another one ({}). Hand \
+             the trust to the new key first: dryserver replace-key. Or put the key they trust back in Config",
             crate::signed::short_key(&h),
             pubf.display(),
             crate::signed::short_key(&a)

@@ -681,6 +681,20 @@ impl Served {
         res.map(|_| r.serial)
     }
 
+    /// Puts a new signature on a release stored here: the same text, signed
+    /// by the key the swarm trusts now, after the key that signed it was
+    /// handed on (replace-key). Nothing else of the release changes.
+    pub fn resign(&self, v: &dyn Verifier, env: &Envelope, now: i64) -> Result<u64> {
+        let r = release::open(v, env, now)?;
+        let _lock = fsx::lock(self.dir.join(".lock"))?;
+        let have = self.envelope(r.serial).map_err(|e| e.wrap("there is no such release on the coordinator"))?;
+        if have.doc != env.doc {
+            bail!("release {} on the coordinator says something else: only its signature may change", r.serial);
+        }
+        write_atomic(&self.path(r.serial, RELEASE_FILE), &(serde_json::to_string(env)? + "\n"))?;
+        Ok(r.serial)
+    }
+
     /// Makes a checked upload the newest, under a lock: two uploads at the
     /// same time end with the newer one, never with a mix.
     fn commit(&self, r: &Release, stage: &Path, now: i64, back: Option<u64>) -> Result<()> {

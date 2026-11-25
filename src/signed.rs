@@ -26,6 +26,10 @@ use crate::{bail, errf, fsx};
 /// for another.
 pub const NS_MEMBERS: &str = "dryserver-members";
 pub const NS_ADMIN: &str = "dryserver-admin";
+/// A change of the key the swarm trusts, signed by the key it replaces.
+pub const NS_KEY: &str = "dryserver-key";
+/// More key changes than this in one list are not a swarm's.
+pub const MAX_KEY_CHANGES: usize = 64;
 /// The signer name in the allowed-signers file.
 const SIGNER: &str = "dryserver";
 /// How far the admin's clock and the coordinator's may differ.
@@ -78,6 +82,69 @@ pub struct List {
     pub members: Vec<Entry>,
     /// WireGuard keys of waiting requests the admin turned down.
     pub rejected: Vec<String>,
+    /// Every change of the key the swarm trusts, oldest first, each signed
+    /// by the key it replaced (KeyChange). A machine follows them from the
+    /// key it trusts to the one that signed this list; every list after a
+    /// change carries them, so a machine that was off catches up.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<Envelope>,
+}
+
+/// The swarm trusts another key from now on: to, in place of from. Signed
+/// (NS_KEY) by from, so only the holder of the key trusted now can hand
+/// the trust on.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyChange {
+    /// When it was made (seconds since 1970); grows along the chain.
+    pub serial: u64,
+    /// "ssh-ed25519 base64".
+    pub from: String,
+    pub to: String,
+    /// The key also logs in as the admin: the machines put to in place of
+    /// from in the admin's authorized_keys and config.
+    pub login: bool,
+}
+
+/// Signs a key change with the key it replaces.
+pub fn seal_key_change(s: &dyn Signer, c: &KeyChange) -> Result<Envelope> {
+    let doc = serde_json::to_string(c)?;
+    let sig = s.sign(NS_KEY, &doc)?;
+    Ok(Envelope { doc, sig })
+}
+
+/// Follows chain from the key trusted now, start: each change whose from
+/// is the key trusted at that point is checked with that key (check:
+/// key, namespace, doc, sig) and hands the trust to its to. Changes of
+/// other keys (ones already followed, or of a fork nobody trusted) are
+/// passed over. Returns the key trusted at the end and the changes taken.
+/// A change of the key trusted that does not check out is an error: the
+/// list that carries it is refused as a whole.
+pub fn follow(start: &str, chain: &[Envelope], check: &dyn Fn(&str, &str, &str, &str) -> Result<()>) -> Result<(String, Vec<KeyChange>)> {
+    if chain.len() > MAX_KEY_CHANGES {
+        bail!("the list carries {} key changes, more than {MAX_KEY_CHANGES}", chain.len());
+    }
+    let mut cur = key_body(start);
+    let mut taken = Vec::new();
+    let mut last = 0u64;
+    for env in chain {
+        let c: KeyChange = serde_json::from_str(&env.doc).map_err(|_| errf!("a key change in the list is damaged"))?;
+        if key_body(&c.from) != cur {
+            continue;
+        }
+        check(&cur, NS_KEY, &env.doc, &env.sig).map_err(|e| e.wrap("a key change not signed by the key it replaces"))?;
+        let to = key_body(&c.to);
+        if !to.starts_with("ssh-ed25519 ") || to.split_whitespace().count() != 2 || to == cur {
+            bail!("a key change hands the trust to something that is not a new ed25519 key");
+        }
+        if c.serial <= last {
+            bail!("the key changes in the list are out of order");
+        }
+        last = c.serial;
+        cur = to;
+        taken.push(c);
+    }
+    Ok((cur, taken))
 }
 
 impl List {
@@ -119,10 +186,32 @@ impl Envelope {
 
     /// The member list inside, after its signature and content are checked.
     pub fn list(&self, v: &dyn Verifier, fits: impl Fn(u32) -> bool) -> Result<List> {
-        v.verify(NS_MEMBERS, &self.doc, &self.sig)?;
+        self.list_signed_by(v, fits).map(|(l, _)| l)
+    }
+
+    /// The member list and the key that signed it: the one v trusts, or
+    /// the one the list's key changes hand the trust to from there.
+    pub fn list_signed_by(&self, v: &dyn Verifier, fits: impl Fn(u32) -> bool) -> Result<(List, Option<String>)> {
+        // Read before it is checked only to find the key changes, which
+        // prove themselves one by one from the key v trusts.
         let list: List = serde_json::from_str(&self.doc).map_err(|e| Error::from(e).wrap("signed list"))?;
+        let signer = match v.key() {
+            Some(start) => {
+                let (cur, _) = follow(&start, &list.keys, &|k, ns, d, s| v.verify_with(k, ns, d, s))?;
+                if cur == key_body(&start) {
+                    v.verify(NS_MEMBERS, &self.doc, &self.sig)?;
+                } else {
+                    v.verify_with(&cur, NS_MEMBERS, &self.doc, &self.sig)?;
+                }
+                Some(cur)
+            }
+            None => {
+                v.verify(NS_MEMBERS, &self.doc, &self.sig)?;
+                None
+            }
+        };
         list.check(fits)?;
-        Ok(list)
+        Ok((list, signer))
     }
 }
 
@@ -259,7 +348,17 @@ pub trait Signer: Send {
 }
 
 pub trait Verifier: Send + Sync {
+    /// Checks a signature of the key trusted now.
     fn verify(&self, namespace: &str, doc: &str, sig: &str) -> Result<()>;
+    /// The key trusted now ("ssh-ed25519 base64"), for following the key
+    /// changes in a member list; None: this one follows none.
+    fn key(&self) -> Option<String> {
+        None
+    }
+    /// Checks a signature of key: one a key change hands the trust to.
+    fn verify_with(&self, _key: &str, _namespace: &str, _doc: &str, _sig: &str) -> Result<()> {
+        Err("this check follows no key change".into())
+    }
 }
 
 fn ssh_keygen(args: &[&str], stdin: &str) -> Result<std::process::Output> {
@@ -441,45 +540,121 @@ pub struct SshVerifier {
     pub tmp_dir: PathBuf,
 }
 
-impl SshVerifier {
-    /// For a server: the key the installer put there.
-    pub fn installed(root: &Path, tmp_dir: PathBuf) -> SshVerifier {
-        SshVerifier { pubkey: fsx::under(root, crate::node::SIGNING_PUB), tmp_dir }
+/// The key in a public key file, when it is an ed25519 one.
+fn key_in(path: &Path) -> Result<String> {
+    let line = fsx::read_string(path).map_err(|e| e.wrap("no signing key on this machine"))?;
+    let key = key_body(&line);
+    if !key.starts_with("ssh-ed25519 ") {
+        bail!("{} is not an ed25519 public key", path.display());
     }
+    Ok(key)
+}
+
+/// Checks sig of key with ssh-keygen, through two small files in tmp_dir.
+fn verify_key(tmp_dir: &Path, key: &str, namespace: &str, doc: &str, sig: &str) -> Result<()> {
+    if !key.starts_with("ssh-ed25519 ") {
+        bail!("not an ed25519 key");
+    }
+    if !sig.contains("BEGIN SSH SIGNATURE") {
+        bail!("not signed");
+    }
+    let id = fsx::hex(&fsx::random_bytes(8));
+    let allowed = tmp_dir.join(format!("dryserver-signers-{id}"));
+    let sig_file = tmp_dir.join(format!("dryserver-sig-{id}"));
+    struct Remove<'a>(&'a Path, &'a Path);
+    impl Drop for Remove<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+            let _ = std::fs::remove_file(self.1);
+        }
+    }
+    let _rm = Remove(&allowed, &sig_file);
+    // New files under names of their own: in a shared temporary
+    // directory a name taken already is someone else's, never ours to
+    // write through.
+    fsx::create_file(&allowed, format!("{SIGNER} namespaces=\"{namespace}\" {key}\n"), 0o600)?;
+    fsx::create_file(&sig_file, sig, 0o600)?;
+    let (a, s) = (allowed.display().to_string(), sig_file.display().to_string());
+    let out = ssh_keygen(&["-Y", "verify", "-f", &a, "-I", SIGNER, "-n", namespace, "-s", &s], doc)?;
+    if !out.status.success() {
+        return Err(errf!("bad signature ({})", String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("").trim()));
+    }
+    Ok(())
 }
 
 impl Verifier for SshVerifier {
     fn verify(&self, namespace: &str, doc: &str, sig: &str) -> Result<()> {
-        let line = fsx::read_string(&self.pubkey).map_err(|e| e.wrap("no signing key on this machine"))?;
-        let key = key_body(&line);
-        if !key.starts_with("ssh-ed25519 ") {
-            bail!("{} is not an ed25519 public key", self.pubkey.display());
-        }
-        if !sig.contains("BEGIN SSH SIGNATURE") {
-            bail!("not signed");
-        }
-        let id = fsx::hex(&fsx::random_bytes(8));
-        let allowed = self.tmp_dir.join(format!("dryserver-signers-{id}"));
-        let sig_file = self.tmp_dir.join(format!("dryserver-sig-{id}"));
-        struct Remove<'a>(&'a Path, &'a Path);
-        impl Drop for Remove<'_> {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(self.0);
-                let _ = std::fs::remove_file(self.1);
-            }
-        }
-        let _rm = Remove(&allowed, &sig_file);
-        // New files under names of their own: in a shared temporary
-        // directory a name taken already is someone else's, never ours to
-        // write through.
-        fsx::create_file(&allowed, format!("{SIGNER} namespaces=\"{namespace}\" {key}\n"), 0o600)?;
-        fsx::create_file(&sig_file, sig, 0o600)?;
-        let (a, s) = (allowed.display().to_string(), sig_file.display().to_string());
-        let out = ssh_keygen(&["-Y", "verify", "-f", &a, "-I", SIGNER, "-n", namespace, "-s", &s], doc)?;
-        if !out.status.success() {
-            return Err(errf!("bad signature ({})", String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("").trim()));
-        }
-        Ok(())
+        verify_key(&self.tmp_dir, &key_in(&self.pubkey)?, namespace, doc, sig)
+    }
+
+    fn key(&self) -> Option<String> {
+        key_in(&self.pubkey).ok()
+    }
+
+    fn verify_with(&self, key: &str, namespace: &str, doc: &str, sig: &str) -> Result<()> {
+        verify_key(&self.tmp_dir, &key_body(key), namespace, doc, sig)
+    }
+}
+
+/// The key changes of the list in path: an Envelope, or a registry state
+/// with it under "signed". None when it cannot be read.
+pub fn chain_in(path: &Path) -> Vec<Envelope> {
+    let Ok(b) = std::fs::read(path) else { return Vec::new() };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) else { return Vec::new() };
+    let env = v.get("signed").cloned().unwrap_or(v);
+    let Ok(env) = serde_json::from_value::<Envelope>(env) else { return Vec::new() };
+    serde_json::from_str::<List>(&env.doc).map(|l| l.keys).unwrap_or_default()
+}
+
+/// What a machine trusts: the key the installer put there, followed
+/// through the key changes of the newest member list it took. That list
+/// only ever grows in version and was checked when it was taken, so a
+/// key once handed on is never trusted again, here or after a reboot.
+pub struct Trust {
+    /// The installer's key (node::SIGNING_PUB).
+    pub base: PathBuf,
+    /// The newest list taken: an Envelope (node::SIGNED_FILE), or the
+    /// registry's state with it under "signed". Missing or unreadable:
+    /// the base key alone.
+    pub newest: PathBuf,
+    pub tmp_dir: PathBuf,
+}
+
+impl Trust {
+    /// For a server (root): its installer's key and its newest list.
+    pub fn installed(root: &Path, tmp_dir: PathBuf) -> Trust {
+        Trust { base: fsx::under(root, crate::node::SIGNING_PUB), newest: fsx::under(root, crate::node::SIGNED_FILE), tmp_dir }
+    }
+
+    /// For the registry account on the coordinator, which cannot read
+    /// root's list: the list in the registry's own state.
+    pub fn for_registry(root: &Path, store: &Path, tmp_dir: PathBuf) -> Trust {
+        Trust { base: fsx::under(root, crate::node::SIGNING_PUB), newest: store.to_path_buf(), tmp_dir }
+    }
+
+    fn chain(&self) -> Vec<Envelope> {
+        chain_in(&self.newest)
+    }
+
+    /// The key trusted now, and every change that led there from the
+    /// installer's key.
+    pub fn followed(&self) -> Result<(String, Vec<KeyChange>)> {
+        let base = key_in(&self.base)?;
+        follow(&base, &self.chain(), &|k, ns, d, s| verify_key(&self.tmp_dir, k, ns, d, s))
+    }
+}
+
+impl Verifier for Trust {
+    fn verify(&self, namespace: &str, doc: &str, sig: &str) -> Result<()> {
+        verify_key(&self.tmp_dir, &self.followed()?.0, namespace, doc, sig)
+    }
+
+    fn key(&self) -> Option<String> {
+        self.followed().ok().map(|(k, _)| k)
+    }
+
+    fn verify_with(&self, key: &str, namespace: &str, doc: &str, sig: &str) -> Result<()> {
+        verify_key(&self.tmp_dir, &key_body(key), namespace, doc, sig)
     }
 }
 
@@ -501,9 +676,66 @@ pub mod fake {
         }
     }
 
+    impl Key {
+        /// Its "public key", for key changes.
+        pub fn public(&self) -> String {
+            format!("ssh-ed25519 FAKE{}", self.0)
+        }
+    }
+
     impl Verifier for Key {
         fn verify(&self, namespace: &str, doc: &str, sig: &str) -> Result<()> {
             if sig == mac(self.0, namespace, doc) { Ok(()) } else { Err("bad signature".into()) }
+        }
+
+        fn key(&self) -> Option<String> {
+            Some(self.public())
+        }
+
+        fn verify_with(&self, key: &str, namespace: &str, doc: &str, sig: &str) -> Result<()> {
+            let name = key_body(key).strip_prefix("ssh-ed25519 FAKE").map(str::to_string).unwrap_or_default();
+            if !name.is_empty() && sig == mac(&name, namespace, doc) { Ok(()) } else { Err("bad signature".into()) }
+        }
+    }
+
+    /// Trusts what Trust would with fake keys: base, followed through the
+    /// key changes of the list in newest.
+    pub struct Chained {
+        pub base: &'static str,
+        pub newest: PathBuf,
+    }
+
+    impl Verifier for Chained {
+        fn verify(&self, namespace: &str, doc: &str, sig: &str) -> Result<()> {
+            let k = self.key().ok_or_else(|| Error::new("no key"))?;
+            self.verify_with(&k, namespace, doc, sig)
+        }
+
+        fn key(&self) -> Option<String> {
+            follow(&Key(self.base).public(), &chain_in(&self.newest), &|k, ns, d, s| Key("any").verify_with(k, ns, d, s)).ok().map(|f| f.0)
+        }
+
+        fn verify_with(&self, key: &str, namespace: &str, doc: &str, sig: &str) -> Result<()> {
+            Key("any").verify_with(key, namespace, doc, sig)
+        }
+    }
+
+    /// Trusts the fake key named in a file ("ssh-ed25519 FAKEname"), like
+    /// SshVerifier trusts the key in its file: what a desktop holds.
+    pub struct FileKey(pub PathBuf);
+
+    impl Verifier for FileKey {
+        fn verify(&self, namespace: &str, doc: &str, sig: &str) -> Result<()> {
+            let k = self.key().ok_or_else(|| Error::new("no key"))?;
+            self.verify_with(&k, namespace, doc, sig)
+        }
+
+        fn key(&self) -> Option<String> {
+            std::fs::read_to_string(&self.0).ok().map(|t| key_body(&t))
+        }
+
+        fn verify_with(&self, key: &str, namespace: &str, doc: &str, sig: &str) -> Result<()> {
+            Key("any").verify_with(key, namespace, doc, sig)
         }
     }
 
@@ -564,7 +796,7 @@ mod tests {
     }
 
     fn list() -> List {
-        List { version: 3, members: vec![entry(1, "coord"), entry(2, "nodeb")], rejected: vec![] }
+        List { version: 3, members: vec![entry(1, "coord"), entry(2, "nodeb")], rejected: vec![], keys: vec![] }
     }
 
     #[test]
@@ -699,7 +931,7 @@ mod tests {
         let v = SshVerifier { pubkey: dir.join("signing.pub"), tmp_dir: dir.path().to_path_buf() };
 
         // A full-size list: 254 members.
-        let big = List { version: 7, members: (1..=254).map(|h| entry(h, &format!("node{h}"))).collect(), rejected: vec![] };
+        let big = List { version: 7, members: (1..=254).map(|h| entry(h, &format!("node{h}"))).collect(), rejected: vec![], keys: vec![] };
         let env = seal(&signer, &big).unwrap();
         assert_eq!(env.list(&v, fits).unwrap(), big);
 
@@ -730,6 +962,107 @@ mod tests {
         // A signing key that cannot be read gives a clear error.
         let e = SshSigner { key: dir.join("nokey") }.sign(NS_MEMBERS, "x").unwrap_err().to_string();
         assert!(e.contains("cannot sign"), "{e}");
+    }
+
+    fn change(signer: &fake::Key, from: &fake::Key, to: &fake::Key, serial: u64, login: bool) -> Envelope {
+        seal_key_change(signer, &KeyChange { serial, from: from.public(), to: to.public(), login }).unwrap()
+    }
+
+    #[test]
+    fn key_changes_hand_the_trust_on_one_by_one() {
+        use fake::Key;
+        let (k1, k2, k3, thief) = (Key("k1"), Key("k2"), Key("k3"), Key("thief"));
+        let check = |k: &str, ns: &str, d: &str, s: &str| k1.verify_with(k, ns, d, s);
+        let c12 = change(&k1, &k1, &k2, 10, true);
+        let c23 = change(&k2, &k2, &k3, 20, true);
+        // From k1 through both; from k2 only the second; from k3 none.
+        let (cur, taken) = follow(&k1.public(), &[c12.clone(), c23.clone()], &check).unwrap();
+        assert_eq!((cur, taken.len()), (k3.public(), 2));
+        assert_eq!(follow(&k2.public(), &[c12.clone(), c23.clone()], &check).unwrap().0, k3.public());
+        assert_eq!(follow(&k3.public(), &[c12.clone(), c23.clone()], &check).unwrap(), (k3.public(), vec![]));
+        // A change of the trusted key signed by another key: refused.
+        let forged = change(&thief, &k1, &thief, 10, true);
+        let e = follow(&k1.public(), &[forged], &check).unwrap_err().to_string();
+        assert!(e.contains("not signed by the key it replaces"), "{e}");
+        // A fork of a key not trusted (any more) is passed over.
+        let fork = change(&k1, &k1, &thief, 15, true);
+        assert_eq!(follow(&k2.public(), &[c12.clone(), fork.clone(), c23.clone()], &check).unwrap().0, k3.public());
+        // Order: a change older than the one before it is refused.
+        let back = change(&k2, &k2, &k3, 5, true);
+        assert!(follow(&k1.public(), &[c12.clone(), back], &check).unwrap_err().to_string().contains("out of order"));
+        // Only to a new ed25519 key.
+        for bad in ["ssh-rsa AAAA", "", "ssh-ed25519", "ssh-ed25519 FAKEk1"] {
+            let c = seal_key_change(&k1, &KeyChange { serial: 1, from: k1.public(), to: bad.into(), login: false }).unwrap();
+            assert!(follow(&k1.public(), &[c], &check).is_err(), "{bad:?}");
+        }
+        // Damaged, or too many.
+        assert!(follow(&k1.public(), &[Envelope { doc: "{".into(), sig: "x".into() }], &check).is_err());
+        assert!(follow(&k1.public(), &vec![c12.clone(); MAX_KEY_CHANGES + 1], &check).unwrap_err().to_string().contains("more than"));
+    }
+
+    #[test]
+    fn a_list_after_a_key_change_proves_its_signer() {
+        use fake::Key;
+        let (k1, k2) = (Key("k1"), Key("k2"));
+        let base = List { version: 5, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![] };
+        let old = seal(&k1, &base).unwrap();
+        let with = List { version: 6, keys: vec![change(&k1, &k1, &k2, 10, true)], ..base.clone() };
+        let new = seal(&k2, &with).unwrap();
+        // A machine that trusts k1 follows the change to k2 and takes it.
+        assert_eq!(new.list_signed_by(&k1, fits).unwrap(), (with.clone(), Some(k2.public())));
+        // One that trusts k2 already takes it as it is.
+        assert_eq!(new.list_signed_by(&k2, fits).unwrap().0, with);
+        // Once on k2, a list of the old key is refused, change or not.
+        assert!(old.list(&k2, fits).is_err());
+        let old_with = seal(&k1, &with).unwrap();
+        assert!(old_with.list(&k1, fits).is_err(), "signed by k1, but its own change says k2 signs");
+        assert!(old_with.list(&k2, fits).is_err());
+        // A list signed by k2 without the change is no list for k1.
+        assert!(seal(&k2, &base).unwrap().list(&k1, fits).is_err());
+        // Old lists without key changes read as before.
+        let doc: serde_json::Value = serde_json::from_str(&old.doc).unwrap();
+        assert!(doc.get("keys").is_none(), "no field when there is no change");
+    }
+
+    #[test]
+    fn a_machine_trusts_the_newest_key_of_the_list_it_took() {
+        if !crate::iso::in_path("ssh-keygen") {
+            return;
+        }
+        let dir = TempDir::new();
+        let make = |name: &str| {
+            let key = dir.join(name);
+            assert!(Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).status().unwrap().success());
+            (SshSigner { key: key.clone() }, key_body(&std::fs::read_to_string(format!("{}.pub", key.display())).unwrap()))
+        };
+        let ((s1, p1), (s2, p2)) = (make("k1"), make("k2"));
+        let root = dir.join("root");
+        crate::testutil::put(&root, crate::node::SIGNING_PUB, format!("{p1} dryserver-signing\n"));
+        let t = Trust::installed(&root, dir.path().to_path_buf());
+        // Fresh: the installer's key.
+        assert_eq!(t.key(), Some(p1.clone()));
+        let doc = "hello";
+        let by1 = s1.sign(NS_ADMIN, doc).unwrap();
+        let by2 = s2.sign(NS_ADMIN, doc).unwrap();
+        t.verify(NS_ADMIN, doc, &by1).unwrap();
+        assert!(t.verify(NS_ADMIN, doc, &by2).is_err());
+        // A list with the change, signed by k2, proves itself from k1...
+        let c = seal_key_change(&s1, &KeyChange { serial: 7, from: p1.clone(), to: p2.clone(), login: true }).unwrap();
+        let list = List { version: 2, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![c] };
+        let env = seal(&s2, &list).unwrap();
+        assert_eq!(env.list_signed_by(&t, fits).unwrap(), (list.clone(), Some(p2.clone())));
+        // ...and once it is the list taken, k2 is trusted and k1 no more.
+        crate::testutil::put(&root, crate::node::SIGNED_FILE, serde_json::to_string(&env).unwrap());
+        assert_eq!(t.key(), Some(p2.clone()));
+        t.verify(NS_ADMIN, doc, &by2).unwrap();
+        assert!(t.verify(NS_ADMIN, doc, &by1).is_err());
+        let (_, taken) = t.followed().unwrap();
+        assert_eq!(taken.len(), 1);
+        // The registry reads the same from its own state.
+        let state = serde_json::json!({ "members": [], "signed": env });
+        crate::testutil::put(&root, "/var/lib/dryreg/registry.json", state.to_string());
+        let r = Trust::for_registry(&root, &fsx::under(&root, "/var/lib/dryreg/registry.json"), dir.path().to_path_buf());
+        assert_eq!(r.key(), Some(p2));
     }
 
     /// An ssh-agent of a test's own, stopped when dropped.
@@ -777,7 +1110,7 @@ mod tests {
         let trusted = dir.join("signing_ed25519.pub");
         std::fs::copy(ssh.join("id_ed25519.pub"), &trusted).unwrap();
         let v = SshVerifier { pubkey: trusted.clone(), tmp_dir: dir.path().to_path_buf() };
-        let list = List { version: 3, members: vec![entry(1, "coord")], rejected: vec![] };
+        let list = List { version: 3, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![] };
 
         // No agent: the file in ~/.ssh signs.
         let file = OwnKeySigner { pubkey: trusted.clone(), ssh_dir: Some(ssh.clone()), agent: None };

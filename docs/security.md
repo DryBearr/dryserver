@@ -100,7 +100,20 @@ Part of the [dryserver README](../README.md).
   that is safe because every signature is made for one named use
   (`dryserver-members`, `dryserver-release`...) and an SSH login signs
   data of another form, so no signature passes for another. Servers do not
-  allow agent forwarding, so a server cannot borrow your agent to sign. The coordinator stores and
+  allow agent forwarding, so a server cannot borrow your agent to sign.
+- **Replacing the key** (`dryserver replace-key`): the old key signs a key
+  change ("trust this key from now on"), carried in every member list
+  after it, which the new key signs. Each machine follows the changes from
+  the key it trusts, checking each with the key it replaces, and trusts
+  the key at the end: the newest list it took (root's, only ever newer)
+  says which, so a key once handed on is never trusted again, after a
+  reboot too. The coordinator refuses a list that leaves a change out, so
+  a machine that was off, or installed from an older stick, still follows.
+  A change that also logs in puts the new key in place of the old one in
+  the admin's `authorized_keys`. Limit: only the holder of the key trusted
+  now can hand the trust on. A lost key with no backup cannot be replaced,
+  and a thief with your key can replace it too; whoever does so first
+  holds the swarm. The coordinator stores and
   hands out the signed list but cannot make or change one. Servers use only
   the machines in the signed list: one the coordinator adds by itself is
   ignored and logged, and an older list is refused, so a removed machine

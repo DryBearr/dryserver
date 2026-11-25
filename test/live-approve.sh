@@ -90,9 +90,9 @@ chmod +x "$S/bin/ssh"
 export PATH="$S/bin:$PATH"
 export DESK_HOME="$S/deskhome"
 # Whether a signed file (doc, sig) verifies with the admin's own SSH key.
-own_signed() { # file, namespace
-    python3 -I -c "import json,sys; d=json.load(open(sys.argv[1])); open(sys.argv[2],'w').write(d['doc']); open(sys.argv[3],'w').write(d['sig'])" "$1" "$S/own.doc" "$S/own.sig" &&
-        echo "a namespaces=\"$2\" $(cut -d' ' -f1,2 "$S/deskhome/.ssh/id_ed25519.pub")" > "$S/own.allowed" &&
+own_signed() { # file, namespace[, public key file]
+    python3 -I -c "import json,sys; d=json.load(open(sys.argv[1])); d=d.get('signed', d); open(sys.argv[2],'w').write(d['doc']); open(sys.argv[3],'w').write(d['sig'])" "$1" "$S/own.doc" "$S/own.sig" &&
+        echo "a namespaces=\"$2\" $(cut -d' ' -f1,2 "${3:-$S/deskhome/.ssh/id_ed25519.pub}")" > "$S/own.allowed" &&
         ssh-keygen -Y verify -f "$S/own.allowed" -I a -n "$2" -s "$S/own.sig" < "$S/own.doc"
 }
 
@@ -343,6 +343,38 @@ out=$(echo x | reg release-skip 2>&1)
 check "release-skip needs the admin's signature" grep -q "bad admin request" <<<"$out"
 out=$(reg "release-get $SER release" 2>&1)
 check "release-get is not answered outside the mesh" grep -q "only answered over the mesh" <<<"$out"
+
+echo "== replace the key"
+# A second computer with a copy of the swarm from before, and only the
+# old key: it must follow the change and say why it cannot sign.
+cp -r "$S/desk" "$S/laptop"
+mkdir -p "$S/laptophome/.ssh"
+cp "$S/deskhome/.ssh/id_ed25519"* "$S/laptophome/.ssh/"
+keygen "$S/deskhome/.ssh/id_new" admin@new
+RELNOW=$(cat "$REL/current" 2>/dev/null)
+out=$(desk replace-key --to "$S/deskhome/.ssh/id_new.pub" --yes)
+check "replace-key hands the trust on ($(grep -m1 Replaced <<<"$out"))" grep -q "Replaced: signed list version" <<<"$out"
+check "the desktop trusts the new key" test "$(cut -d' ' -f1,2 "$S/deskhome/.ssh/id_new.pub")" = "$(cut -d' ' -f1,2 "$S/desk/secrets/signing_ed25519.pub")"
+check "the config logs in with the new key" grep -qF "$(cut -d' ' -f1,2 "$S/deskhome/.ssh/id_new.pub")" "$S/desk/config.env"
+check "the coordinator's list is signed by the new key" own_signed "$S/root2/var/lib/dryserver/registry.json" dryserver-members "$S/deskhome/.ssh/id_new.pub"
+check_not "and not by the old one" own_signed "$S/root2/var/lib/dryserver/registry.json" dryserver-members
+python3 -I -c "import json,sys; d=json.load(open(sys.argv[1]))['signed']; l=json.loads(d['doc']); k=l['keys'][-1]; open(sys.argv[2],'w').write(json.dumps(k))" "$S/root2/var/lib/dryserver/registry.json" "$S/change.json"
+check "the change is signed by the old key" own_signed "$S/change.json" dryserver-key
+if [ -n "$RELNOW" ]; then
+    check "the newest release is signed by the new key" own_signed "$REL/$RELNOW/release.json" dryserver-release "$S/deskhome/.ssh/id_new.pub"
+fi
+out=$(desk release status)
+check "the desktop goes on with the new key" grep -qv "bad signature\|refused" <<<"$out"
+check_not "the desktop that made the change is not told it came from elsewhere" grep -q "replaced on another computer" <<<"$out"
+laptop() { (cd "$S/laptop" && env -u SSH_AUTH_SOCK HOME="$S/laptophome" DRYSERVER_HOME="$S/laptop" "$BIN" "$@" --config config.env --host 127.0.0.1 --port $PORT 2>&1); }
+out=$(laptop release status)
+check "a computer on the old key follows the change and says so" grep -q "replaced on another computer" <<<"$out"
+check "it trusts the new key now" test "$(cut -d' ' -f1,2 "$S/deskhome/.ssh/id_new.pub")" = "$(cut -d' ' -f1,2 "$S/laptop/secrets/signing_ed25519.pub")"
+cp "$S/deskhome/.ssh/id_new"* "$S/laptophome/.ssh/"
+out=$(laptop release status)
+check "with the new key there it goes on" grep -qv "replaced on another computer\|bad signature" <<<"$out"
+out=$(desk replace-key --to "$S/deskhome/.ssh/id_new.pub" --yes)
+check "the key trusted now is not replaced by itself" grep -q "trusts now" <<<"$out"
 
 echo "== connections"
 # The screen asks the coordinator every few seconds over one shared

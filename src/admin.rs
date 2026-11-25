@@ -468,6 +468,9 @@ pub struct Admin {
     coordinator_proved: bool,
     /// The newest release on the coordinator, verified, as last loaded.
     release: Option<Release>,
+    /// That release as the coordinator holds it, signed: replace-key signs
+    /// its text again with the new key.
+    release_env: Option<Envelope>,
     /// When that one failed on the coordinator and went back, the release
     /// the machines run instead (rollout::went_back), as last loaded.
     went_back: Option<u64>,
@@ -487,6 +490,29 @@ pub struct Admin {
     good: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
+/// What replace_key did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Replaced {
+    /// The list that carries the change.
+    pub version: u64,
+    /// The release signed again with the new key.
+    pub release: Option<u64>,
+    /// What did not work but changes nothing about the key.
+    pub warning: Option<String>,
+}
+
+/// Whether a release is still rolling out: the coordinator updates
+/// itself, waits for the window, failed, or a server has it to come.
+fn rollout_busy(r: &Rollout, members: &[(Member, bool)]) -> bool {
+    match r.phase {
+        rollout::Phase::None => false,
+        rollout::Phase::Waiting | rollout::Phase::Brain | rollout::Phase::Failed => true,
+        rollout::Phase::Servers => {
+            members.iter().any(|(m, _)| m.host != 1 && !r.done.contains(&m.host) && !r.skipped.iter().any(|s| s.host == m.host))
+        }
+    }
+}
+
 impl Admin {
     pub fn new(link: Box<dyn Link>, signer: Box<dyn Signer>, verifier: Box<dyn Verifier>, secrets: &Path, subnet: &str) -> Admin {
         Admin {
@@ -502,6 +528,7 @@ impl Admin {
             unproved: Vec::new(),
             coordinator_proved: false,
             release: None,
+            release_env: None,
             went_back: None,
             stop: None,
             run: std::sync::Arc::new(crate::runner::ExecRunner::silent()),
@@ -674,8 +701,11 @@ impl Admin {
     /// Fetches the coordinator's state and compares it with what this
     /// desktop signed.
     pub fn load(&mut self) -> Result<View> {
-        let ask = signed::seal_admin(self.signer.as_ref(), "state", (self.now)().0.timestamp())?;
-        let out = self.link.call("admin", &serde_json::to_string(&ask)?)?;
+        let ask = serde_json::to_string(&signed::seal_admin(self.signer.as_ref(), "state", (self.now)().0.timestamp())?)?;
+        let out = match self.link.call("admin", &ask) {
+            Ok(out) => out,
+            Err(e) => self.after_refused_ask(e, &ask)?,
+        };
         let st: AdminState = serde_json::from_str(&out).map_err(|e| Error::from(e).wrap("the coordinator's answer"))?;
         let mut v = View { unknown: st.unknown.into_iter().filter_map(clean_device).collect(), scanned: st.scanned, ..View::default() };
         let coord_key = self.link.host_key()?;
@@ -683,9 +713,20 @@ impl Admin {
 
         // The release: only what the admin's signature covers is shown.
         self.release = None;
+        self.release_env = None;
+        // A key change on another computer: taken on before anything else
+        // is checked, which then goes by the new key.
+        if !st.signed.is_empty()
+            && let Some(w) = self.follow_key_change(&st.signed)?
+        {
+            v.warnings.push(w);
+        }
         if !st.release.is_empty() {
             match release::open(self.verifier.as_ref(), &st.release, now) {
-                Ok(r) => self.release = Some(r),
+                Ok(r) => {
+                    self.release = Some(r);
+                    self.release_env = Some(st.release.clone());
+                }
                 Err(e) => v.warnings.push(format!("The coordinator's newest release was refused: {e}")),
             }
         }
@@ -888,6 +929,16 @@ impl Admin {
     /// Builds the next list from the last signed one, signs it, keeps a
     /// copy and sends it to the coordinator.
     fn publish(&mut self, change: impl FnOnce(&mut List, &Admin) -> Result<()>) -> Result<u64> {
+        self.publish_with(change, |_| Ok(()))
+    }
+
+    /// publish, with saved run once the new list is this computer's copy
+    /// and before it is sent.
+    fn publish_with(
+        &mut self,
+        change: impl FnOnce(&mut List, &Admin) -> Result<()>,
+        saved: impl FnOnce(&Admin) -> Result<()>,
+    ) -> Result<u64> {
         let mut list = self.base.clone();
         list.rejected.clear();
         if !list.members.iter().any(|e| e.host == 1) {
@@ -921,8 +972,156 @@ impl Admin {
         // Saved before sending: a version is never used for two lists.
         self.save_copy(&env)?;
         self.base = list;
+        saved(self)?;
         self.link.call("publish", &serde_json::to_string(&env)?)?;
         Ok(self.base.version)
+    }
+
+    /// When the coordinator refuses this computer's ask, a key change may
+    /// stand between them. This computer made one the coordinator did not
+    /// take yet (its copy of the list carries it): sent again, and the ask
+    /// once more. Or another computer made one: this computer follows it
+    /// (from the list anyone may read) and says why it cannot sign.
+    fn after_refused_ask(&mut self, e: Error, ask: &str) -> Result<String> {
+        if e.is(crate::err::Kind::HostKey) {
+            return Err(e);
+        }
+        let fits = |h: u32| !crate::mesh::ip(&self.subnet, h).is_empty();
+        let copy = std::fs::read(self.copy_path()).ok().and_then(|b| serde_json::from_slice::<Envelope>(&b).ok());
+        if let Some(env) = copy
+            && let Ok((l, Some(_))) = env.list_signed_by(self.verifier.as_ref(), fits)
+            && !l.keys.is_empty()
+            && self.link.call("publish", &serde_json::to_string(&env)?).is_ok()
+        {
+            return self.link.call("admin", ask);
+        }
+        if let Ok(out) = self.link.call("signed", "")
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&out)
+            && let Ok(env) = serde_json::from_value::<Envelope>(v["signed"].clone())
+            && !env.is_empty()
+            && let Some(w) = self.follow_key_change(&env)?
+        {
+            return Err(errf!("{w}"));
+        }
+        Err(e)
+    }
+
+    /// The coordinator's list, signed through key changes from the key
+    /// this computer trusts to another one: the key was replaced on another
+    /// computer. This one trusts the new key from now on (its old key is
+    /// handed on, nothing it signs counts any more). Returns what to tell.
+    fn follow_key_change(&mut self, env: &Envelope) -> Result<Option<String>> {
+        let fits = |h: u32| !crate::mesh::ip(&self.subnet, h).is_empty();
+        let Some(now) = self.verifier.key() else { return Ok(None) };
+        let Ok((_, Some(signer))) = env.list_signed_by(self.verifier.as_ref(), fits) else { return Ok(None) };
+        if signer == key_body(&now) {
+            return Ok(None);
+        }
+        self.trust_key(&signer)?;
+        Ok(Some(format!(
+            "Your swarm's key was replaced on another computer: it is {} now, and this computer trusts it. To sign here, \
+             this computer needs that key, in ssh-agent or ~/.ssh (dryserver import, or copy it).",
+            signed::short_key(&signer)
+        )))
+    }
+
+    /// From now on this computer trusts key, and signs with it: its public
+    /// half becomes SIGNING_PUB. An older swarm's own signing key, handed
+    /// on, moves to secrets/replaced/ so that nothing signs with it again.
+    fn trust_key(&self, key: &str) -> Result<()> {
+        let path = self.secrets.join(crate::iso::SIGNING_PUB);
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        fsx::write_new(&tmp, format!("{} dryserver-signing\n", key_body(key)), 0o644)?;
+        fsx::rename(&tmp, &path)?;
+        let legacy = self.secrets.join(crate::iso::SIGNING_KEY_NAME);
+        if legacy.exists() {
+            let dir = self.secrets.join("replaced");
+            fsx::mkdir_all(&dir, 0o700)?;
+            fsx::rename(&legacy, dir.join(format!("{}-{}", crate::iso::SIGNING_KEY_NAME, (self.now)().0.timestamp())))?;
+        }
+        Ok(())
+    }
+
+    /// Hands the swarm's trust from the key that signs now to the key to,
+    /// whose private half new signs with: one key change, signed by the
+    /// key it replaces, in a new list signed by to. Every machine follows
+    /// it from the key it trusts at its next sync, and from then on takes
+    /// nothing the old key signs. login: to also becomes the admin's login
+    /// key on the machines. The newest release is signed again with to,
+    /// so the coordinator's copy of it stays good.
+    pub fn replace_key(&mut self, new: Box<dyn Signer>, to: &str, login: bool) -> Result<Replaced> {
+        let v = self.load()?;
+        if self.base.version == 0 {
+            bail!("nothing is signed yet: the USB stick takes your key from the config, build it again instead");
+        }
+        if rollout_busy(&v.rollout, &v.members) {
+            bail!("release {} is rolling out: replace the key once it is done (dryserver release status)", v.rollout.serial);
+        }
+        let from = self.verifier.key().ok_or_else(|| Error::new("this computer trusts no key it can name"))?;
+        let to = key_body(to);
+        if !to.starts_with("ssh-ed25519 ") || to.split_whitespace().count() != 2 {
+            bail!("the new key must be an ed25519 public key (ssh-ed25519 ...)");
+        }
+        if to == key_body(&from) {
+            bail!("that is the key your swarm trusts now");
+        }
+        let last = self.base.keys.iter().filter_map(|e| serde_json::from_str::<signed::KeyChange>(&e.doc).ok()).map(|c| c.serial).max();
+        let serial = ((self.now)().0.timestamp().max(0) as u64).max(last.map_or(0, |s| s + 1));
+        let change = signed::KeyChange { serial, from: key_body(&from), to: to.clone(), login };
+        let change = signed::seal_key_change(self.signer.as_ref(), &change)?;
+        let release = self.release_env.clone();
+        let old = std::mem::replace(&mut self.signer, new);
+        let version = match self.publish_with(
+            |list, _| {
+                list.keys.push(change);
+                Ok(())
+            },
+            |a| a.trust_key(&to),
+        ) {
+            Ok(v) => v,
+            Err(e) if self.verifier.key().is_some_and(|k| k == to) => {
+                // Saved and trusted here, not sent: the next change sends
+                // it (or resend).
+                return Err(e.wrap(
+                    "the key is replaced on this computer, but the coordinator did not take it yet: open Machines to send it again",
+                ));
+            }
+            Err(e) => {
+                self.signer = old;
+                return Err(e.wrap("nothing changed"));
+            }
+        };
+        let mut done = Replaced { version, release: None, warning: None };
+        if let Some(env) = release {
+            let resigned = (|| -> Result<u64> {
+                let sig = self.signer.sign(release::NS_RELEASE, &env.doc)?;
+                let env = Envelope { doc: env.doc.clone(), sig };
+                let out = self.link.call("release-resign", &serde_json::to_string(&env)?)?;
+                let serial = serde_json::from_str::<serde_json::Value>(&out)
+                    .ok()
+                    .and_then(|v| v["serial"].as_u64())
+                    .ok_or_else(|| Error::new("the coordinator's answer"))?;
+                // This computer's copy goes by the new key too.
+                if self.last_release().is_none_or(|r| r.serial <= serial) {
+                    let path = self.secrets.join(RELEASE_COPY);
+                    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+                    fsx::write_new(&tmp, serde_json::to_string(&env)? + "\n", 0o600)?;
+                    fsx::rename(&tmp, &path)?;
+                }
+                Ok(serial)
+            })();
+            match resigned {
+                Ok(s) => done.release = Some(s),
+                Err(e) => {
+                    done.warning = Some(format!(
+                        "release {} on the coordinator still carries the old key's signature ({e}): publish the next \
+                         release with the new key",
+                        self.release.as_ref().map_or(0, |r| r.serial)
+                    ))
+                }
+            }
+        }
+        Ok(done)
     }
 
     /// The numbers of removed members (RETIRED), oldest first.
@@ -2144,6 +2343,7 @@ pub mod tests {
                 version: u64::MAX,
                 members: vec![Entry { host: 1, name: "coord".into(), wg_key: key32(1), ssh_host_key: COORD_KEY.into() }],
                 rejected: vec![],
+                keys: vec![],
             },
         )
         .unwrap();
@@ -2267,9 +2467,11 @@ pub mod tests {
         // Someone with the registry key but another signing key gets nothing.
         a.signer = Box::new(SshSigner { key: thief });
         assert!(a.load().unwrap_err().to_string().contains("bad signature"), "the registry opened for a wrong key");
-        let forged =
-            signed::seal(a.signer.as_ref(), &List { version: u64::MAX, members: vec![Entry::of(&s.members[0])], rejected: vec![] })
-                .unwrap();
+        let forged = signed::seal(
+            a.signer.as_ref(),
+            &List { version: u64::MAX, members: vec![Entry::of(&s.members[0])], rejected: vec![], keys: vec![] },
+        )
+        .unwrap();
         assert!(a.link.call("publish", &serde_json::to_string(&forged).unwrap()).unwrap_err().to_string().contains("bad signature"));
         assert_eq!(store.read().unwrap().members.len(), 2);
         assert!(node.signed_members(2, &s.members, &forged).unwrap_err().to_string().contains("bad signature"));
@@ -2335,6 +2537,142 @@ pub mod tests {
             uploads: uploads.clone(),
         });
         uploads
+    }
+
+    /// A desktop whose trusted key is in its file (like SshVerifier), with
+    /// a coordinator that follows the key changes of its stored list (like
+    /// Trust::for_registry). Uploads are recorded, not stored.
+    fn chained(dir: &TempDir) -> (Admin, Store, Arc<Mutex<bool>>) {
+        let (mut a, store, _) = setup_failing(dir);
+        let pubf = dir.join("secrets").join(crate::iso::SIGNING_PUB);
+        std::fs::write(&pubf, format!("{} dryserver-signing\n", Key("admin").public())).unwrap();
+        a.verifier = Box::new(signed::fake::FileKey(pubf));
+        let fails: Arc<Mutex<bool>> = Arc::default();
+        a.link = Box::new(Recorder {
+            inner: Direct {
+                store: Store::new(&store.path),
+                host_key: COORD_KEY.into(),
+                publish_fails: fails.clone(),
+                verifier: Some(Box::new(signed::fake::Chained { base: "admin", newest: store.path.clone() })),
+                pinned: Arc::new(Mutex::new(COORD_KEY.into())),
+            },
+            uploads: Arc::default(),
+        });
+        (a, store, fails)
+    }
+
+    #[test]
+    fn replace_key_hands_the_trust_to_the_new_key_everywhere() {
+        let dir = TempDir::new();
+        let (mut a, store, _) = chained(&dir);
+        a.load().unwrap();
+        a.sign_coordinator().unwrap();
+        // A release on the coordinator, signed with the old key.
+        let bin = static_binary(&dir, "dryserver", "0.2.0");
+        let d = release::Draft { binary: &bin, version: "0.2.0", arch_date: "2026/11/19", ..release::Draft::default() };
+        let r = a.publish_release(&d, &dir.join("no-k3s")).unwrap();
+        let served = fsx::dir(&store.path).join(rollout::SERVED_DIR).join(r.serial.to_string());
+        std::fs::create_dir_all(&served).unwrap();
+        std::fs::copy(dir.join("secrets").join(RELEASE_COPY), served.join(rollout::RELEASE_FILE)).unwrap();
+        std::fs::write(fsx::dir(&store.path).join(rollout::SERVED_DIR).join("current"), format!("{}\n", r.serial)).unwrap();
+        a.load().unwrap();
+
+        let (old, new) = (Key("admin"), Key("admin2"));
+        // Not to the key trusted now, nor to something not ed25519.
+        assert!(a.replace_key(Box::new(Key("admin")), &old.public(), true).unwrap_err().to_string().contains("trusts now"));
+        assert!(a.replace_key(Box::new(Key("x")), "ssh-rsa AAAA", true).unwrap_err().to_string().contains("ed25519"));
+        let done = a.replace_key(Box::new(Key("admin2")), &new.public(), true).unwrap();
+        assert_eq!((done.release, done.warning.clone()), (Some(r.serial), None), "{done:?}");
+        // This computer trusts the new key...
+        let pubf = dir.join("secrets").join(crate::iso::SIGNING_PUB);
+        assert_eq!(key_body(&std::fs::read_to_string(&pubf).unwrap()), new.public());
+        // ...the coordinator's list carries the change, signed by the old
+        // key, and the list by the new one: a machine on the old key
+        // follows it.
+        let s = store.read().unwrap();
+        let (list, by) = s.signed.list_signed_by(&old, |h| h < 255).unwrap();
+        assert_eq!(by, Some(new.public()));
+        let change: signed::KeyChange = serde_json::from_str(&list.keys[0].doc).unwrap();
+        assert_eq!((change.from, change.to, change.login), (old.public(), new.public(), true));
+        assert_eq!(list.version, done.version);
+        // The release on the coordinator and this computer's copy are
+        // signed by the new key, the text as it was.
+        let now = Time::now().0.timestamp();
+        let env: Envelope = serde_json::from_str(&std::fs::read_to_string(served.join(rollout::RELEASE_FILE)).unwrap()).unwrap();
+        assert_eq!(release::open(&new, &env, now).unwrap(), r);
+        assert!(release::open(&old, &env, now).is_err());
+        let copy: Envelope = serde_json::from_slice(&std::fs::read(dir.join("secrets").join(RELEASE_COPY)).unwrap()).unwrap();
+        assert_eq!(copy, env);
+        // Everything goes on with the new key: loading, signing.
+        let v = a.load().unwrap();
+        assert!(v.warnings.is_empty(), "{:?}", v.warnings);
+        assert!(a.resend().unwrap() > done.version);
+        // The old key is refused by the coordinator.
+        let ask = signed::seal_admin(&old, "state", now).unwrap();
+        assert!(a.link.call("admin", &serde_json::to_string(&ask).unwrap()).is_err());
+
+        // A second computer still on the old key follows the change on its
+        // next load, and says so.
+        let dir2 = TempDir::new();
+        let (mut b, _, _) = chained(&dir2);
+        b.link = Box::new(Direct {
+            store: Store::new(&store.path),
+            host_key: COORD_KEY.into(),
+            publish_fails: Arc::default(),
+            verifier: Some(Box::new(signed::fake::Chained { base: "admin", newest: store.path.clone() })),
+            pinned: Arc::new(Mutex::new(COORD_KEY.into())),
+        });
+        std::fs::write(dir2.join("secrets").join(crate::iso::SIGNING_KEY_NAME), "an older swarm's own key").unwrap();
+        // Its asks are refused now; it reads the list anyone may, follows
+        // the change and says why it cannot go on.
+        let w = b.load().unwrap_err().to_string();
+        assert!(w.contains("replaced on another computer") && w.contains("needs that key"), "{w}");
+        assert_eq!(key_body(&std::fs::read_to_string(dir2.join("secrets").join(crate::iso::SIGNING_PUB)).unwrap()), new.public());
+        assert!(!dir2.join("secrets").join(crate::iso::SIGNING_KEY_NAME).exists(), "the handed-on key no longer signs");
+        assert_eq!(std::fs::read_dir(dir2.join("secrets").join("replaced")).unwrap().count(), 1);
+        // With the new key there (import), it goes on.
+        b.signer = Box::new(Key("admin2"));
+        let w = b.load().unwrap().warnings.join("\n");
+        assert!(!w.contains("replaced on another computer"), "said once: {w}");
+        assert!(b.resend().is_ok());
+    }
+
+    #[test]
+    fn replace_key_waits_for_a_rollout_and_says_what_a_failed_send_left() {
+        let dir = TempDir::new();
+        let (mut a, store, fails) = chained(&dir);
+        a.load().unwrap();
+        // Nothing signed yet: the stick takes the key from the config.
+        assert!(
+            a.replace_key(Box::new(Key("admin2")), &Key("admin2").public(), true).unwrap_err().to_string().contains("nothing is signed")
+        );
+        a.sign_coordinator().unwrap();
+        store
+            .update(|s| {
+                s.rollout.serial = 7;
+                s.rollout.phase = rollout::Phase::Brain;
+                Ok(())
+            })
+            .unwrap();
+        let e = a.replace_key(Box::new(Key("admin2")), &Key("admin2").public(), true).unwrap_err().to_string();
+        assert!(e.contains("rolling out"), "{e}");
+        store
+            .update(|s| {
+                s.rollout = Rollout::default();
+                Ok(())
+            })
+            .unwrap();
+        // The coordinator does not answer the publish: this computer is on
+        // the new key already, and says how the coordinator gets it.
+        *fails.lock().unwrap() = true;
+        let e = a.replace_key(Box::new(Key("admin2")), &Key("admin2").public(), true).unwrap_err().to_string();
+        assert!(e.contains("did not take it yet"), "{e}");
+        assert_eq!(a.verifier.key(), Some(Key("admin2").public()));
+        *fails.lock().unwrap() = false;
+        a.load().unwrap();
+        a.resend().unwrap();
+        let (_, by) = store.read().unwrap().signed.list_signed_by(&Key("admin"), |h| h < 255).unwrap();
+        assert_eq!(by, Some(Key("admin2").public()));
     }
 
     /// Release N failed on the coordinator and went back: the machines run

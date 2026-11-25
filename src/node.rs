@@ -21,9 +21,9 @@ use crate::mesh::{self, SelfInfo};
 use crate::registry::{self, Heartbeat, Member, Status, StatusReply, Store};
 use crate::report::{self, Report};
 use crate::runner::{Cmd, Runner};
-use crate::signed::{self, Envelope, Verifier};
+use crate::signed::{self, Envelope, Verifier, key_body};
 use crate::sysconf::{self, Params};
-use crate::{errf, fsx, quarantine, rollout};
+use crate::{bail, errf, fsx, quarantine, rollout};
 
 // Files inside the server's root.
 pub const REGISTRY_KEY: &str = "/etc/dryserver/registry_ed25519";
@@ -337,7 +337,7 @@ impl Node {
             root: root.to_path_buf(),
             run,
             tmp_dir: None,
-            verifier: Arc::new(signed::SshVerifier::installed(root, tmp)),
+            verifier: Arc::new(signed::Trust::installed(root, tmp)),
         }
     }
 
@@ -1473,6 +1473,11 @@ impl Node {
         if !seen.as_ref().is_some_and(|(ver, _)| *ver == list.version) {
             self.write(SIGNED_FILE, 0o600, &(serde_json::to_string(env)? + "\n"))?;
         }
+        // Signed by the admin: a key change that also logs in reaches the
+        // admin's login here. Each time, so one stopped half way is done.
+        if let Err(e) = self.follow_login(&list) {
+            eprintln!("dryserver: the admin's new login key is not in place yet: {e}");
+        }
         let members: Vec<Member> = list
             .members
             .iter()
@@ -1501,6 +1506,59 @@ impl Node {
             )
         };
         Ok((members, status))
+    }
+
+    /// Puts the newest login key of the list's key changes in place of the
+    /// ones it replaced: in the admin's authorized_keys (keeping each
+    /// line's label, owner and mode) and as ADMIN_SSH_PUBKEY in the config.
+    /// A key handed on logs in no more. Nothing changes when there is
+    /// nothing to change.
+    pub fn follow_login(&self, list: &signed::List) -> Result<()> {
+        let changes: Vec<signed::KeyChange> =
+            list.keys.iter().filter_map(|e| serde_json::from_str::<signed::KeyChange>(&e.doc).ok()).filter(|c| c.login).collect();
+        let Some(newest) = changes.last().map(|c| key_body(&c.to)) else { return Ok(()) };
+        let old: Vec<String> = changes.iter().map(|c| key_body(&c.from)).filter(|k| *k != newest).collect();
+        if !registry::valid_ssh_key(&newest) {
+            bail!("the newest login key is not a usable SSH key");
+        }
+        let keys = self.path(&format!("/home/{}/.ssh/authorized_keys", self.cfg.username));
+        if let Ok(text) = std::fs::read_to_string(&keys) {
+            let mut have = text.lines().any(|l| key_body(l) == newest);
+            let mut out = Vec::new();
+            for l in text.lines() {
+                if old.contains(&key_body(l)) {
+                    if !have {
+                        let label: Vec<&str> = l.split_whitespace().skip(2).collect();
+                        out.push(format!("{newest} {}", label.join(" ")).trim().to_string());
+                        have = true;
+                    }
+                    continue;
+                }
+                out.push(l.to_string());
+            }
+            let new_text = out.join("\n") + "\n";
+            if new_text != text {
+                write_as_before(&keys, &new_text)?;
+            }
+        }
+        let cfg = self.path(crate::update::CONFIG);
+        if let Ok(text) = std::fs::read_to_string(&cfg) {
+            let mut changed = false;
+            let lines: Vec<String> = text
+                .lines()
+                .map(|l| match l.strip_prefix("ADMIN_SSH_PUBKEY=") {
+                    Some(v) if old.contains(&key_body(v.trim_matches(|c| c == '\'' || c == '"'))) => {
+                        changed = true;
+                        format!("ADMIN_SSH_PUBKEY='{newest}'")
+                    }
+                    _ => l.to_string(),
+                })
+                .collect();
+            if changed {
+                write_as_before(&cfg, &(lines.join("\n") + "\n"))?;
+            }
+        }
+        Ok(())
     }
 
     /// On the coordinator, when the registry cannot be used (why): the
@@ -2310,6 +2368,22 @@ pub fn local_ip(ctx: &Ctx, run: &dyn Runner, dst: &str) -> Result<String> {
     }
 }
 
+/// Writes path anew with the owner and mode it has: a new file beside it,
+/// renamed over it, never through a link.
+fn write_as_before(path: &Path, text: &str) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let m = std::fs::symlink_metadata(path).map_err(|e| Error::from(e).wrap(format!("open {}", path.display())))?;
+    if !m.is_file() {
+        bail!("{} is not a plain file", path.display());
+    }
+    let tmp = PathBuf::from(format!("{}.dryserver-new", path.display()));
+    fsx::write_new(&tmp, text, m.permissions().mode() & 0o7777)?;
+    if fsx::is_root() {
+        std::os::unix::fs::lchown(&tmp, Some(m.uid()), Some(m.gid()))
+            .map_err(|e| Error::from(e).wrap(format!("chown {}", tmp.display())))?;
+    }
+    fsx::rename(&tmp, path)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2340,8 +2414,45 @@ mod tests {
         Entry { host: 3, name: "node-c".into(), wg_key: OTHER_WG.into(), ssh_host_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInodec".into() }
     }
 
+    #[test]
+    fn after_a_key_change_the_node_takes_the_new_key_only_and_moves_the_login() {
+        let (_dir, mut n, _) = setup(vec![]);
+        n.verifier = Arc::new(signed::fake::Chained { base: "admin", newest: n.path(SIGNED_FILE) });
+        let (k1, k2) = (Key("admin"), Key("admin2"));
+        let keys = format!("/home/{}/.ssh/authorized_keys", n.cfg.username);
+        put(&n.root, &keys, format!("{} desktop\nssh-ed25519 AAAAfriend friend\n", k1.public()));
+        put(&n.root, crate::update::CONFIG, format!("COORD_LAN_IP='192.168.1.50'\nADMIN_SSH_PUBKEY='{}'\nUSERNAME='admin'\n", k1.public()));
+        let members = vec![coord_entry(), node_entry(2)];
+        n.signed_members(2, &[], &sign(&k1, 5, members.clone())).unwrap();
+        // The change, in a list the new key signed.
+        let change =
+            signed::seal_key_change(&k1, &signed::KeyChange { serial: 9, from: k1.public(), to: k2.public(), login: true }).unwrap();
+        let v6 = seal(&k2, &List { version: 6, members: members.clone(), rejected: vec![], keys: vec![change.clone()] }).unwrap();
+        n.signed_members(2, &[], &v6).unwrap();
+        assert_eq!(n.verifier.key(), Some(k2.public()), "the list taken says who signs now");
+        // The admin logs in with the new key, under the old label; others stay.
+        assert_eq!(get(&n.root, &keys), format!("{} desktop\nssh-ed25519 AAAAfriend friend\n", k2.public()));
+        assert!(get(&n.root, crate::update::CONFIG).contains(&format!("ADMIN_SSH_PUBKEY='{}'", k2.public())));
+        assert!(get(&n.root, crate::update::CONFIG).contains("COORD_LAN_IP='192.168.1.50'"));
+        // Again: nothing changes.
+        n.follow_login(&serde_json::from_str(&v6.doc).unwrap()).unwrap();
+        assert_eq!(get(&n.root, &keys), format!("{} desktop\nssh-ed25519 AAAAfriend friend\n", k2.public()));
+        // The old key signs a newer list: refused, the old way back is shut.
+        let e = n.signed_members(2, &[], &sign(&k1, 7, members.clone())).unwrap_err().to_string();
+        assert!(e.contains("bad signature"), "{e}");
+        // Newer lists of the new key carry the change and are taken.
+        let v8 = seal(&k2, &List { version: 8, members: members.clone(), rejected: vec![], keys: vec![change] }).unwrap();
+        n.signed_members(2, &[], &v8).unwrap();
+        // A key change that does not log in leaves the login alone.
+        let (_dir2, n2, _) = setup(vec![]);
+        put(&n2.root, &keys, format!("{} desktop\n", k1.public()));
+        let c = signed::seal_key_change(&k1, &signed::KeyChange { serial: 3, from: k1.public(), to: k2.public(), login: false }).unwrap();
+        n2.follow_login(&List { version: 1, members: vec![], rejected: vec![], keys: vec![c] }).unwrap();
+        assert_eq!(get(&n2.root, &keys), format!("{} desktop\n", k1.public()));
+    }
+
     fn sign(key: &Key, version: u64, members: Vec<Entry>) -> Envelope {
-        seal(key, &List { version, members, rejected: vec![] }).unwrap()
+        seal(key, &List { version, members, rejected: vec![], keys: vec![] }).unwrap()
     }
 
     fn coord_member() -> Member {
@@ -3033,7 +3144,7 @@ mod tests {
 
         // A server without the signing key trusts nothing.
         let mut blind = n.clone();
-        blind.verifier = Arc::new(signed::SshVerifier::installed(&n.root, n.root.clone()));
+        blind.verifier = Arc::new(signed::Trust::installed(&n.root, n.root.clone()));
         set(peers(&[coord_member(), node_member(2)], &sign(&ADMIN, 8, vec![coord_entry(), node_entry(2)])));
         assert!(sync(&ctx, &blind, false, &store).unwrap_err().to_string().contains("no signing key"));
     }

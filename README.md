@@ -389,6 +389,30 @@ Restoring is not built yet. To look inside one:
 `age -d -i ~/.config/dryserver/secrets/backup_ed25519 FILE | tar -tv`. More:
 [docs/backups.md](docs/backups.md).
 
+### Replace your key
+
+A new laptop, a key you want to retire, or one you think someone copied:
+
+```sh
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_new      # with a passphrase
+dryserver replace-key --to ~/.ssh/id_ed25519_new.pub
+```
+
+The old key signs one last thing: "trust the new key from now on". The
+new key signs the list of machines that carries it. Within a minute every
+machine follows it from the key it trusts, takes nothing the old key
+signs from then on, and logs you in with the new key instead of the old
+one. A machine that was off follows it when it comes back; one installed
+from an older stick too. Your config, and the newest release on the
+coordinator, are switched to the new key. Your other computer, still on
+the old key, says so at its next look and trusts the new key; give it the
+new key (`dryserver export`/`import`) to sign there. It waits while a
+release is rolling out. Build the stick again afterwards.
+
+This needs the old key. If it is lost with no copy, nothing can hand the
+trust on: back it up (`dryserver export`). If someone copied it, replace
+it at once: whoever replaces it first, you or they, holds the swarm.
+
 ### Remove a machine
 
 Press `d` on it in `dryserver approve`. Within a minute every server
@@ -523,6 +547,7 @@ On your desktop:
 | `dryserver init --from DIR` | copy the swarm an older dryserver kept in `DIR` to where it belongs now |
 | `dryserver export [FILE]` | your swarm in one file locked with a passphrase (`--no-ssh-key` leaves your SSH key out) |
 | `dryserver import FILE` | put a swarm from `export` on this computer |
+| `dryserver replace-key --to FILE.pub` | hand your swarm's trust (and your login) to a new SSH key, signed by the old one |
 | `dryserver build` | build the ISO, with its log in the terminal |
 | `dryserver disks` | list disks and which ones may be flashed |
 | `sudo "$(command -v dryserver)" flash --iso FILE` | flash any image to a USB drive (sudo does not look in `~/.local/bin`) |

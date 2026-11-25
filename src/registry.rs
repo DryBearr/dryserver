@@ -309,7 +309,7 @@ pub fn valid_name(s: &str) -> bool {
 
 /// "ssh-ed25519 BASE64[ comment]" with one of the accepted key types and a
 /// comment without whitespace.
-fn valid_ssh_key(s: &str) -> bool {
+pub fn valid_ssh_key(s: &str) -> bool {
     let Some((typ, rest)) = s.split_once(' ') else {
         return false;
     };
@@ -513,6 +513,12 @@ impl State {
     pub fn publish(&mut self, list: &List, env: &Envelope, now: Time) -> Result<()> {
         if list.version <= self.signed_version {
             return Err(errf!("this list (version {}) is not newer than the current one (version {})", list.version, self.signed_version));
+        }
+        // Every key change the coordinator has stays in the list, in its
+        // order: a machine that was off follows them from its old key.
+        let had = serde_json::from_str::<List>(&self.signed.doc).map(|l| l.keys).unwrap_or_default();
+        if !list.keys.starts_with(&had) {
+            return Err("this list leaves out key changes the coordinator has: sign it with them".into());
         }
         let Some(me) = self.members.iter().find(|m| m.host == 1) else {
             return Err("the coordinator has no entry for itself".into());
@@ -1151,6 +1157,7 @@ fn parse_serial(s: &str) -> Result<u64> {
 ///   release-get SERIAL FILE OFFSET          -> up to CHUNK bytes   (the server whose turn it is)
 ///   release-resume stdin: signed admin request -> {"resume": N}    (holder of the signing key)
 ///   release-skip stdin: signed admin request -> {"skip": N}        (holder of the signing key)
+///   release-resign stdin: a release signed again -> {"serial": N}  (holder of the signing key)
 ///
 /// The key that reaches this command is on every server and on the USB
 /// stick, so it proves nothing. admin, publish, release-put,
@@ -1260,6 +1267,11 @@ pub fn serve(
                 })
             });
             let serial = served.receive(verifier, input, now.0.timestamp(), back)?;
+            send(out, &serde_json::json!({ "serial": serial }))
+        }
+        ("release-resign", 1) => {
+            let env: Envelope = decode_limited(input, MAX_SIGNED_INPUT).ok_or_else(|| Error::new("bad release"))?;
+            let serial = served.resign(verifier, &env, now.0.timestamp())?;
             send(out, &serde_json::json!({ "serial": serial }))
         }
         ("release-resume", 1) => {
@@ -2025,6 +2037,51 @@ mod tests {
         signed::Entry { host, name: name.into(), wg_key: key32(seed), ssh_host_key: host_key.into() }
     }
 
+    /// call, with the coordinator's checker following the key changes of
+    /// its stored list, as Trust::for_registry does.
+    fn call_chained(st: &Store, cmd: &str, stdin: &str) -> Result<String> {
+        let mesh = FakeMesh(HashMap::from([("10.66.0.2".to_string(), 2)]));
+        let served = Served::beside(st, fsx::dir(&st.path).join("k3s"));
+        let v = signed::fake::Chained { base: "admin", newest: st.path.clone() };
+        let mut out = Vec::new();
+        serve(st, &served, &mesh, &v, COORD_KEY, cmd, "192.168.1.9 5000 22", &mut stdin.as_bytes(), &mut out, t0())?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn after_a_key_change_the_coordinator_takes_the_new_key_and_keeps_the_changes() {
+        let dir = TempDir::new();
+        let st = coordinator(&dir);
+        let (k1, k2, k3) = (signed::fake::Key("admin"), signed::fake::Key("admin2"), signed::fake::Key("admin3"));
+        let members = vec![entry(1, "coord", 1, COORD_KEY)];
+        let send = |key: &signed::fake::Key, version: u64, keys: Vec<Envelope>| {
+            let l = List { version, members: members.clone(), rejected: vec![], keys };
+            call_chained(&st, "publish", &serde_json::to_string(&signed::seal(key, &l).unwrap()).unwrap())
+        };
+        send(&k1, 5, vec![]).unwrap();
+        let c12 = signed::seal_key_change(&k1, &signed::KeyChange { serial: 10, from: k1.public(), to: k2.public(), login: true }).unwrap();
+        // The new key without the change: refused; with it: taken.
+        assert!(send(&k2, 6, vec![]).is_err());
+        send(&k2, 6, vec![c12.clone()]).unwrap();
+        // From now on asks of the new key count, of the old one not.
+        let ask = |k: &signed::fake::Key| serde_json::to_string(&signed::seal_admin(k, "state", t0().0.timestamp()).unwrap()).unwrap();
+        call_chained(&st, "admin", &ask(&k2)).unwrap();
+        assert!(call_chained(&st, "admin", &ask(&k1)).is_err());
+        // The old key cannot sign a newer list, with or without the change.
+        assert!(send(&k1, 7, vec![]).is_err());
+        assert!(send(&k1, 7, vec![c12.clone()]).is_err());
+        // A list that leaves the change out is refused even when signed
+        // right, so a machine that was off can still follow.
+        let e = send(&k2, 7, vec![]).unwrap_err().to_string();
+        assert!(e.contains("bad signature") || e.contains("leaves out key changes"), "{e}");
+        // A second change goes on from the first.
+        let c23 = signed::seal_key_change(&k2, &signed::KeyChange { serial: 20, from: k2.public(), to: k3.public(), login: true }).unwrap();
+        let e = send(&k3, 8, vec![c23.clone()]).unwrap_err().to_string();
+        assert!(e.contains("leaves out key changes"), "{e}");
+        send(&k3, 8, vec![c12, c23]).unwrap();
+        assert!(call_chained(&st, "admin", &ask(&k3)).is_ok());
+    }
+
     fn publish(st: &Store, key: &signed::fake::Key, list: &List) -> Result<String> {
         call(st, "publish", "192.168.1.9 5000 22", &serde_json::to_string(&signed::seal(key, list).unwrap()).unwrap())
     }
@@ -2035,7 +2092,7 @@ mod tests {
         let st = coordinator(&dir);
         let coord = entry(1, "coord", 1, COORD_KEY);
         let node_a = entry(2, "node-a", 2, "ssh-ed25519 AAAAnodea");
-        let v5 = List { version: 5, members: vec![coord.clone(), node_a.clone()], rejected: vec![] };
+        let v5 = List { version: 5, members: vec![coord.clone(), node_a.clone()], rejected: vec![], keys: vec![] };
 
         // Not signed with the admin's key: refused, nothing changes.
         assert!(publish(&st, &signed::fake::Key("thief"), &v5).is_err());
@@ -2053,22 +2110,26 @@ mod tests {
 
         // The same or an older list is refused: no way back to an old list.
         for old in [5, 4] {
-            let e = publish(&st, &ADMIN, &List { version: old, members: vec![coord.clone()], rejected: vec![] }).unwrap_err().to_string();
+            let e = publish(&st, &ADMIN, &List { version: old, members: vec![coord.clone()], rejected: vec![], keys: vec![] })
+                .unwrap_err()
+                .to_string();
             assert!(e.contains("not newer"), "{e}");
         }
         assert_eq!(st.read().unwrap().members.len(), 2);
 
         // A newer list without node-a removes it.
-        publish(&st, &ADMIN, &List { version: 6, members: vec![coord.clone()], rejected: vec![] }).unwrap();
+        publish(&st, &ADMIN, &List { version: 6, members: vec![coord.clone()], rejected: vec![], keys: vec![] }).unwrap();
         assert_eq!(st.read().unwrap().members.len(), 1);
 
         // A list for another coordinator (other keys or name) is refused.
         for other in [entry(1, "coord", 9, COORD_KEY), entry(1, "coord", 1, "ssh-ed25519 AAAAother"), entry(1, "brain", 1, COORD_KEY)] {
-            let e = publish(&st, &ADMIN, &List { version: 7, members: vec![other], rejected: vec![] }).unwrap_err().to_string();
+            let e =
+                publish(&st, &ADMIN, &List { version: 7, members: vec![other], rejected: vec![], keys: vec![] }).unwrap_err().to_string();
             assert!(e.contains("own name and keys"), "{e}");
         }
         // Bad entries are refused even with a good signature.
-        let bad = List { version: 7, members: vec![coord.clone(), entry(300, "far", 3, "ssh-ed25519 AAAAx")], rejected: vec![] };
+        let bad =
+            List { version: 7, members: vec![coord.clone(), entry(300, "far", 3, "ssh-ed25519 AAAAx")], rejected: vec![], keys: vec![] };
         assert!(publish(&st, &ADMIN, &bad).unwrap_err().to_string().contains("outside the mesh"));
         assert_eq!(st.read().unwrap().signed_version, 6);
     }
@@ -2099,6 +2160,7 @@ mod tests {
             version: 1,
             members: vec![entry(1, "coord", 1, COORD_KEY), entry(2, "node-a", 2, "ssh-ed25519 AAAAnodea")],
             rejected: vec![],
+            keys: vec![],
         };
         publish(&st, &ADMIN, &list).unwrap();
         let s = st.read().unwrap();
@@ -2161,13 +2223,13 @@ mod tests {
         ask("n-other", 71, "192.168.1.67").unwrap();
         // The admin turns n0 down: a place is free again.
         let me = st.read().unwrap().members[0].clone();
-        let list = List { version: 1, members: vec![signed::Entry::of(&me)], rejected: vec![key32(60)] };
+        let list = List { version: 1, members: vec![signed::Entry::of(&me)], rejected: vec![key32(60)], keys: vec![] };
         publish(&st, &ADMIN, &list).unwrap();
         ask("n-again", 72, "192.168.1.66").unwrap();
         // A refusal goes once its machine is signed.
         let c = Request { wg_key: key32(10), ..req("coord") };
         let z = signed::Entry { host: 9, name: "node-z".into(), wg_key: c.wg_key, ssh_host_key: signed::key_body(&c.ssh_host_key) };
-        publish(&st, &ADMIN, &List { version: 2, members: vec![signed::Entry::of(&me), z], rejected: vec![] }).unwrap();
+        publish(&st, &ADMIN, &List { version: 2, members: vec![signed::Entry::of(&me), z], rejected: vec![], keys: vec![] }).unwrap();
         assert!(!state().refused.iter().any(|f| f.request.wg_key == key32(10)), "{:?}", state().refused);
     }
 
@@ -2188,7 +2250,7 @@ mod tests {
         assert!(ask(&ADMIN, "other", now).is_err());
         assert!(call(&st, "admin", "192.168.1.9 5000 22", "{}").is_err());
         // A signed list is not an admin request and the other way round.
-        let list = List { version: 1, members: vec![entry(1, "coord", 1, COORD_KEY)], rejected: vec![] };
+        let list = List { version: 1, members: vec![entry(1, "coord", 1, COORD_KEY)], rejected: vec![], keys: vec![] };
         let env = serde_json::to_string(&signed::seal(&ADMIN, &list).unwrap()).unwrap();
         assert!(call(&st, "admin", "192.168.1.9 5000 22", &env).is_err());
         let adm = serde_json::to_string(&signed::seal_admin(&ADMIN, "state", now).unwrap()).unwrap();
@@ -2203,6 +2265,7 @@ mod tests {
             version: 3,
             members: vec![entry(1, "coord", 1, COORD_KEY), entry(2, "node-a", 2, "ssh-ed25519 AAAAnodea")],
             rejected: vec![],
+            keys: vec![],
         };
         // Before anything is signed the field is there but empty.
         st.update(|s| {
@@ -2275,6 +2338,7 @@ mod tests {
                 signed::Entry { host: 2, name: "node-a".into(), wg_key: r.wg_key.clone(), ssh_host_key: signed::key_body(&r.ssh_host_key) },
             ],
             rejected: vec![],
+            keys: vec![],
         };
         publish(&st, &ADMIN, &list).unwrap();
         let out = call(&st, &format!("status {id}"), "192.168.1.23 5000 22", "").unwrap();

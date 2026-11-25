@@ -568,6 +568,7 @@ mod tests {
                 signed::Entry { host: 2, name: "node-a".into(), ..Default::default() },
             ],
             rejected: vec![],
+            keys: vec![],
         };
         let env = signed::Envelope { doc: serde_json::to_string(&list).unwrap(), sig: "sig".into() };
         std::fs::write(p.secrets.join(admin::SIGNED_COPY), serde_json::to_string(&env).unwrap()).unwrap();

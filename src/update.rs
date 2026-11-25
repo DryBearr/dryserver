@@ -152,7 +152,7 @@ use crate::node::{self, Node};
 use crate::osupdate::{self, ArchOutcome, K3sOutcome};
 use crate::release::{self, Place, Release};
 use crate::runner::{Cmd, LogFn, Runner};
-use crate::signed::{Envelope, SshVerifier, Verifier};
+use crate::signed::{Envelope, Verifier};
 use crate::sysconf::{self, Params, Role};
 use crate::{bail, errf, fsx, gotime, packages, quarantine};
 
@@ -342,7 +342,7 @@ impl Machine {
         Machine {
             root: PathBuf::from("/"),
             run,
-            verifier: Arc::new(SshVerifier::installed(Path::new("/"), PathBuf::from("/run"))),
+            verifier: Arc::new(crate::signed::Trust::installed(Path::new("/"), PathBuf::from("/run"))),
             owner: 0,
             hook: Arc::new(|_| Ok(())),
             migrations: MIGRATIONS,

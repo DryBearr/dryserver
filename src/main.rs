@@ -77,6 +77,11 @@ commands:
                       config, keys and your SSH key, for a second computer
                       or a stick in a drawer (--no-ssh-key leaves it out)
   import FILE         put a swarm from export on this computer
+  replace-key [--to FILE.pub]
+                      hand your swarm's trust to a new SSH key (default: the
+                      one in your config): signed by the old key, followed
+                      by every machine, which then takes nothing the old key
+                      signs and logs you in with the new one
   install [--demo]    laptop setup screen (runs from the installer USB);
                       --demo only shows the screens, nothing is changed
   build               build the installer image from your config, log to stdout
@@ -213,6 +218,7 @@ fn main() -> ExitCode {
         "where" => run_where(rest),
         "export" => run_export(rest),
         "import" => run_import(rest),
+        "replace-key" => run_replace_key(rest),
         "install" => run_install(rest),
         "build" => run_build(rest),
         "disks" => run_disks(rest),
@@ -527,6 +533,91 @@ fn run_import(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_replace_key(args: &[String]) -> Result<()> {
+    let mut spec = DESKTOP_FLAGS.to_vec();
+    spec.extend([("to", "", "the new key's public half (default: ADMIN_SSH_PUBKEY in your config)"), ("yes", "false", "do not ask")]);
+    let f = Flags::parse("replace-key", args, &spec);
+    if Path::new(LIVE_CONFIG).exists() {
+        bail!("replace-key runs on your own computer, where your key is");
+    }
+    let (mut a, _) = desktop_admin(&f, "replace-key")?;
+    let secrets = paths()?.secrets;
+    let cfg_path = config_file(&f)?;
+    let mut cfg = Config::load(&cfg_path)?;
+    let trusted = signed::key_body(&fsx::read_string(secrets.join(iso::SIGNING_PUB))?);
+    let to = match f.get("to") {
+        "" => signed::key_body(&cfg.admin_ssh_pubkey),
+        p => signed::key_body(&fsx::read_string(p)?),
+    };
+    if to == trusted {
+        bail!(
+            "the key in your config is the one your swarm trusts now. Make a new one and name it:\n  ssh-keygen -t ed25519 -f \
+             ~/.ssh/id_ed25519_new\n  dryserver replace-key --to ~/.ssh/id_ed25519_new.pub"
+        );
+    }
+    config::valid_pubkey(&to).map_err(|e| errf!("the new key: {e}"))?;
+    let legacy = secrets.join(iso::SIGNING_KEY_NAME).exists();
+    if legacy && to != signed::key_body(&cfg.admin_ssh_pubkey) {
+        // One key for both from here on: the one that logs in already.
+        bail!(
+            "this swarm signs with a key of its own ({}). It hands the trust to your SSH key, the one in your config \
+             that logs you in: dryserver replace-key (without --to). For another key, replace that one afterwards",
+            secrets.join(iso::SIGNING_KEY_NAME).display()
+        );
+    }
+    // The new key signs the list that carries the change: its private
+    // half has to be here before anything is signed.
+    let new_pub = secrets.join(".replace-key.pub");
+    fsx::write_new(&new_pub, format!("{to} dryserver-signing\n"), 0o644)?;
+    struct Rm<'a>(&'a Path);
+    impl Drop for Rm<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let _rm = Rm(&new_pub);
+    let new = signed::OwnKeySigner::for_user(new_pub.clone());
+    new.locate().map_err(|e| e.wrap("the new key"))?;
+    println!("Your swarm trusts {} now.", signed::short_key(&trusted));
+    println!("From now on it trusts {} instead:", signed::short_key(&to));
+    println!("  - every machine follows within a minute, and takes nothing the old key signs from then on");
+    if !legacy {
+        println!("  - the new key logs you in as {} on every machine, the old one no more", cfg.username);
+    }
+    println!("  - the newest release is signed again with the new key");
+    println!("This cannot be undone with the old key. Keep the new key safe, with a passphrase, and back it up.");
+    if !f.on("yes") && !confirm("Type yes to replace the key: ")? {
+        bail!("not replaced, nothing changed");
+    }
+    let done = a.replace_key(Box::new(new), &to, !legacy)?;
+    if signed::key_body(&cfg.admin_ssh_pubkey) != to && !legacy {
+        cfg.admin_ssh_pubkey = to.clone();
+        cfg.save(&cfg_path)?;
+    }
+    println!("Replaced: signed list version {} carries the change.", done.version);
+    if let Some(s) = done.release {
+        println!("Release {s} is signed with the new key too.");
+    }
+    if let Some(w) = done.warning {
+        eprintln!("warning: {w}");
+    }
+    println!(
+        "Build the USB stick again: machines installed from it then trust the new key from the start (an older stick \
+         still works: its machines follow the change)."
+    );
+    Ok(())
+}
+
+/// Asks on the terminal; true for "yes".
+fn confirm(q: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{q}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim() == "yes")
+}
+
 fn run_install(args: &[String]) -> Result<()> {
     let f = Flags::parse("install", args, &[("demo", "false", "show the setup screens without changing anything")]);
     let live = Config::load(LIVE_CONFIG);
@@ -833,7 +924,7 @@ fn run_registry(args: &[String]) -> Result<()> {
         &store,
         &rollout::Served::beside(&store, fsx::under(root, rollout::K3S_BIN)),
         &mesh::Subnet(f.get("subnet").to_string()),
-        &signed::SshVerifier::installed(root, std::env::temp_dir()),
+        &signed::Trust::for_registry(root, &fsx::under(root, registry::DEFAULT_PATH), std::env::temp_dir()),
         &host_key,
         &env("SSH_ORIGINAL_COMMAND"),
         &env("SSH_CLIENT"),
