@@ -422,9 +422,15 @@ fn run_init(args: &[String]) -> Result<()> {
         );
     }
     homedir::prepare(&l)?;
-    iso::ensure_keys(&Ctx::on_signals(), &l.secrets, &mut out)?;
+    // A config that does not load yet names no key to sign with: the
+    // build takes it from the config later.
+    let admin = Config::load(&l.config).ok().map(|c| c.admin_ssh_pubkey).filter(|k| !k.is_empty());
+    let keys = iso::ensure_keys(&Ctx::on_signals(), &l.secrets, admin.as_deref(), &mut out)?;
     println!("Ready. Your swarm on this computer:");
     homedir::describe(&l, homedir::look(&l, &homedir::candidates()).as_ref(), &mut out)?;
+    if keys.signing_pub.is_none() {
+        println!("\nSigning key: your SSH key, once it is in the config.");
+    }
     if !l.config.exists() {
         println!("\nNext: dryserver, then Config.");
     }
@@ -634,6 +640,34 @@ const DESKTOP_FLAGS: &[(&str, &str, &str)] = &[
     ("port", "22", "coordinator SSH port"),
 ];
 
+/// What signs: an older swarm's own key in secrets/, or else the admin's
+/// SSH key (ssh-agent or ~/.ssh) whose public half the machines trust.
+fn signer(secrets: &Path) -> Box<dyn signed::Signer> {
+    let legacy = secrets.join(iso::SIGNING_KEY_NAME);
+    if legacy.exists() {
+        return Box::new(signed::SshSigner { key: legacy });
+    }
+    Box::new(signed::OwnKeySigner::for_user(secrets.join(iso::SIGNING_PUB)))
+}
+
+/// Whether signing works without a terminal (the screens sign every few
+/// seconds and cannot ask a passphrase), or what to do.
+fn signs_without_terminal(secrets: &Path) -> Result<()> {
+    let legacy = secrets.join(iso::SIGNING_KEY_NAME);
+    if legacy.exists() {
+        if publish::has_passphrase(&legacy) {
+            bail!(
+                "{k} has a passphrase, and Machines signs every few seconds: it cannot ask for it. In a terminal, \
+                 dryserver release publish, status and resume ask for it at each signature. Or remove the passphrase: \
+                 ssh-keygen -p -f {k}",
+                k = legacy.display()
+            );
+        }
+        return Ok(());
+    }
+    signed::OwnKeySigner::for_user(secrets.join(iso::SIGNING_PUB)).ready_without_terminal()
+}
+
 /// The admin's link to the coordinator, with the keys from secrets/.
 /// Returns it with the coordinator's address.
 fn desktop_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
@@ -653,8 +687,7 @@ fn desktop_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
         Ok(p)
     };
     let registry_key = need(iso::KEY_NAME, "the key machines use to reach the coordinator's registry")?;
-    let signing_key = need(iso::SIGNING_KEY_NAME, "the key that signs your decisions")?;
-    let signing_pub = need(iso::SIGNING_PUB, "the public half of the signing key")?;
+    let signing_pub = need(iso::SIGNING_PUB, "the public half of the key your machines trust")?;
     need(iso::JOIN_SECRET, "the secret that proves a machine was installed from your stick")?;
     let host = if f.get("host").is_empty() { cfg.coord_lan_ip.clone() } else { f.get("host").to_string() };
     let link = admin::SshLink {
@@ -665,7 +698,7 @@ fn desktop_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
     };
     let a = admin::Admin::new(
         Box::new(link),
-        Box::new(signed::SshSigner { key: signing_key }),
+        signer(&secrets),
         Box::new(signed::SshVerifier { pubkey: signing_pub, tmp_dir: std::env::temp_dir() }),
         &secrets,
         &cfg.wg_subnet,
@@ -1094,16 +1127,9 @@ fn run_approve(args: &[String]) -> Result<()> {
 /// rollout go on and writes the server list.
 fn machines_model(f: &Flags) -> Result<tui::admin::Screen> {
     let (a, host) = desktop_admin(f, "approve")?;
-    let key = paths()?.secrets.join(iso::SIGNING_KEY_NAME);
-    if publish::has_passphrase(&key) {
-        // ssh-keygen would ask for it on the terminal the screen draws on.
-        bail!(
-            "{k} has a passphrase, and Machines signs every few seconds: it cannot ask for it. \
-             In a terminal, dryserver release publish, status and resume ask for it at each signature. \
-             Or remove the passphrase: ssh-keygen -p -f {k}",
-            k = key.display()
-        );
-    }
+    // ssh-keygen would ask for a passphrase on the terminal the screen
+    // draws on.
+    signs_without_terminal(&paths()?.secrets)?;
     let again = f.clone();
     let publisher = tui::admin::Publisher {
         admin: Arc::new(move || desktop_admin(&again, "approve").map(|(a, _)| a)),
@@ -1185,12 +1211,20 @@ fn run_release(args: &[String]) -> Result<()> {
 /// ssh-keygen is going to ask for the signing key's passphrase.
 fn release_admin(f: &Flags, cmd: &str) -> Result<(admin::Admin, String)> {
     let a = desktop_admin(f, cmd)?;
-    let key = paths()?.secrets.join(iso::SIGNING_KEY_NAME);
-    if publish::has_passphrase(&key) {
-        eprintln!(
-            "{} has a passphrase: ssh-keygen asks for it at each signature (to read the coordinator's state, and to sign).",
-            key.display()
-        );
+    let secrets = paths()?.secrets;
+    let legacy = secrets.join(iso::SIGNING_KEY_NAME);
+    let asks = if legacy.exists() {
+        publish::has_passphrase(&legacy).then(|| legacy.display().to_string())
+    } else {
+        match signed::OwnKeySigner::for_user(secrets.join(iso::SIGNING_PUB)).locate()? {
+            signed::KeyAt::File { path, passphrase: true } => {
+                Some(format!("{} (ssh-add {} once, and it asks no more)", path.display(), path.display()))
+            }
+            _ => None,
+        }
+    };
+    if let Some(k) = asks {
+        eprintln!("{k} has a passphrase: ssh-keygen asks for it at each signature (to read the coordinator's state, and to sign).");
     }
     Ok(a)
 }

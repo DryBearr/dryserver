@@ -119,8 +119,15 @@ pub fn layout(env: &Env) -> Result<Layout> {
 }
 
 /// Files in secrets/ that only dryserver makes.
-const MARKS: [&str; 6] =
-    [iso::KEY_NAME, iso::SIGNING_KEY_NAME, iso::JOIN_SECRET, iso::BACKUP_KEY_NAME, admin::SIGNED_COPY, admin::KNOWN_HOSTS];
+const MARKS: [&str; 7] = [
+    iso::KEY_NAME,
+    iso::SIGNING_KEY_NAME,
+    iso::SIGNING_PUB,
+    iso::JOIN_SECRET,
+    iso::BACKUP_KEY_NAME,
+    admin::SIGNED_COPY,
+    admin::KNOWN_HOSTS,
+];
 
 /// Whether dir holds a swarm the way older versions kept it: a config.env
 /// dryserver wrote, or a secrets/ with dryserver's keys in it. A folder
@@ -185,9 +192,11 @@ pub fn look(l: &Layout, candidates: &[PathBuf]) -> Option<Stray> {
 /// Whether every key in d's secrets/ is in the home's, byte for byte: the
 /// keys are what a swarm is. One that cannot be read counts as different.
 fn same_keys(d: &Path, l: &Layout) -> bool {
-    [iso::KEY_NAME, iso::SIGNING_KEY_NAME, iso::JOIN_SECRET, iso::BACKUP_KEY_NAME].iter().all(|n| match fs::read(d.join(SECRETS).join(n)) {
-        Err(e) => e.kind() == io::ErrorKind::NotFound,
-        Ok(a) => fs::read(l.secrets.join(n)).is_ok_and(|b| a == b),
+    [iso::KEY_NAME, iso::SIGNING_KEY_NAME, iso::SIGNING_PUB, iso::JOIN_SECRET, iso::BACKUP_KEY_NAME].iter().all(|n| {
+        match fs::read(d.join(SECRETS).join(n)) {
+            Err(e) => e.kind() == io::ErrorKind::NotFound,
+            Ok(a) => fs::read(l.secrets.join(n)).is_ok_and(|b| a == b),
+        }
     })
 }
 

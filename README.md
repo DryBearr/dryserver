@@ -114,7 +114,9 @@ Until you do, dryserver refuses to start a second swarm next to them.
    admin user name and your SSH public key. Copy the key with
    `wl-copy < ~/.ssh/id_ed25519.pub` (or `cat` it and copy the line) and
    paste it with Ctrl+Shift+V. The email at the end of the key is dropped;
-   a short label like `desktop` is used instead.
+   a short label like `desktop` is used instead. This one key logs you in
+   to your machines **and** signs every decision for the swarm: it has to
+   be an ed25519 key (`ssh-keygen -t ed25519` makes one).
 2. **Build installer ISO.** About 6 minutes; the first build downloads
    about 1 GB.
 3. **Save your keys.** The first build makes the keys of your swarm in
@@ -126,12 +128,16 @@ Until you do, dryserver refuses to start a second swarm next to them.
 > [!IMPORTANT]
 > **Back up `~/.config/dryserver/secrets/`**, to a second USB stick or a
 > password manager.
-> `signing_ed25519` is the key of your swarm: without it you cannot
-> approve a machine or publish an update, and every machine has to be
-> installed again. `backup_ed25519` is the only key that opens the
-> coordinator's backups. Neither is ever on the stick or a server. Once
-> your coordinator is signed, a lost key is never made again (a new one
-> would lock you out of your machines): dryserver asks you to restore it.
+> **Back up your SSH key `~/.ssh/id_ed25519` too, and give it a
+> passphrase** (`ssh-keygen -p -f ~/.ssh/id_ed25519`). It is the key of
+> your swarm: every machine trusts only what it signed. Without it you
+> cannot approve a machine or publish an update, and every machine has to
+> be installed again. With a passphrase, add it to ssh-agent once per login
+> (`ssh-add`): the screens sign every few seconds and cannot ask for it.
+> `backup_ed25519` is the only key that opens the coordinator's backups.
+> Neither private key is ever on the stick or a server. Once your
+> coordinator is signed, a lost key is never made again (a new one would
+> lock you out of your machines): dryserver asks you to restore it.
 
 After a `git pull`, build the stick again before you install a new
 machine: a stick carries the dryserver it was built with.
@@ -610,7 +616,7 @@ image in `~/.cache/dryserver/`; `dryserver where` shows both).
 | Path | What | Back it up? |
 |---|---|---|
 | `config.env` | your settings, with the WiFi password | |
-| `secrets/signing_ed25519` | signs the list of machines and every release; only its `.pub` half leaves this computer | **yes** |
+| `secrets/signing_ed25519.pub` | the public half of your SSH key: the key every machine trusts. Your SSH key (`~/.ssh/id_ed25519`, or ssh-agent) signs the list of machines and every release. A swarm made by an older dryserver also has `secrets/signing_ed25519`, its own key, which goes on signing | **yes** (and your SSH key) |
 | `secrets/backup_ed25519` | opens the coordinator's backups; only its `.pub` half leaves this computer | **yes** |
 | `secrets/join_secret` | proves a join request comes from a machine installed from your stick; never on an installed machine | **yes** |
 | `secrets/registry_ed25519` | the key machines use to ask to join | |

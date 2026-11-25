@@ -379,7 +379,7 @@ mod tests {
             cfg_time: None,
             iso: None,
             exe_time: None,
-            missing_keys: vec![iso::SIGNING_KEY_NAME.into()],
+            missing_keys: vec![iso::SIGNING_PUB.into()],
             started: false,
             signed: None,
             signed_time: None,
@@ -411,7 +411,7 @@ mod tests {
             if *f2.lock().unwrap() { Err("container build failed (exit status 1), see out/build.log".into()) } else { Ok(()) }
         }));
         let t = text(&b);
-        for want in ["What will be built", "coordinator 10.1.0.60, WiFi SNET2", "k3s", "made now: signing_ed25519", "made new"] {
+        for want in ["What will be built", "coordinator 10.1.0.60, WiFi SNET2", "k3s", "made now: signing_ed25519.pub", "made new"] {
             assert!(t.contains(want), "{want:?}:\n{t}");
         }
         let (emit, rx) = collector();

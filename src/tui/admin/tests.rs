@@ -527,10 +527,10 @@ fn a_missing_key_file_is_a_card_that_says_what_fixes_it() {
     let dir = TempDir::new();
     let (admin, _) = setup(&dir);
     keys(&dir);
-    std::fs::remove_file(dir.join("secrets").join(crate::iso::SIGNING_KEY_NAME)).unwrap();
+    std::fs::remove_file(dir.join("secrets").join(crate::iso::SIGNING_PUB)).unwrap();
     let s = Run::open(Screen::new(admin));
     let t = s.flat();
-    assert!(t.contains("A key is missing:") && t.contains("signing_ed25519 is not there") && t.contains("secrets/ back"), "{t}");
+    assert!(t.contains("A key is missing:") && t.contains("signing_ed25519.pub is not there") && t.contains("secrets/ back"), "{t}");
 }
 
 #[test]

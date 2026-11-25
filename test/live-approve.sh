@@ -23,9 +23,14 @@ mkdir -p "$S"/{root/etc/ssh,root/usr/local/share/dryserver,root/var/lib/dryserve
 keygen() { ssh-keygen -q -t ed25519 -N '' -C "$2" -f "$1"; }
 keygen "$S/hostkey" coord
 keygen "$S/desk/secrets/registry_ed25519" dryserver-registry
-keygen "$S/desk/secrets/signing_ed25519" dryserver-signing
+# The desktop signs with the admin's own SSH key (~/.ssh/id_ed25519 of a
+# home of its own): secrets/ holds only the public half the machines trust.
+mkdir -p "$S/deskhome/.ssh"
+keygen "$S/deskhome/.ssh/id_ed25519" admin@desk
+cp "$S/deskhome/.ssh/id_ed25519.pub" "$S/desk/secrets/signing_ed25519.pub"
 # A thief has the USB stick: the registry key and the public signing key,
-# but not the private signing key.
+# but not the private signing key; it signs with a key of its own (an
+# older swarm's secrets/signing_ed25519).
 cp "$S/desk/secrets/registry_ed25519"* "$S/thief/secrets/"
 keygen "$S/thief/secrets/signing_ed25519" thief
 
@@ -83,6 +88,13 @@ exec /usr/bin/ssh "\${args[@]}"
 EOF
 chmod +x "$S/bin/ssh"
 export PATH="$S/bin:$PATH"
+export DESK_HOME="$S/deskhome"
+# Whether a signed file (doc, sig) verifies with the admin's own SSH key.
+own_signed() { # file, namespace
+    python3 -I -c "import json,sys; d=json.load(open(sys.argv[1])); open(sys.argv[2],'w').write(d['doc']); open(sys.argv[3],'w').write(d['sig'])" "$1" "$S/own.doc" "$S/own.sig" &&
+        echo "a namespaces=\"$2\" $(cut -d' ' -f1,2 "$S/deskhome/.ssh/id_ed25519.pub")" > "$S/own.allowed" &&
+        ssh-keygen -Y verify -f "$S/own.allowed" -I a -n "$2" -s "$S/own.sig" < "$S/own.doc"
+}
 
 reg() { # command, stdin -> registry answer, like a node or anyone with the stick
     /usr/bin/ssh -i "$S/desk/secrets/registry_ed25519" -p $PORT -o BatchMode=yes -o IdentitiesOnly=yes \
@@ -103,6 +115,9 @@ if pid == 0:
     os.environ["TERM"] = "xterm-256color"
     # The folder is the swarm, as an older dryserver kept it.
     os.environ["DRYSERVER_HOME"] = os.path.abspath(cwd)
+    # The admin's ~/.ssh, and no agent of the real user's.
+    os.environ["HOME"] = os.environ["DESK_HOME"]
+    os.environ.pop("SSH_AUTH_SOCK", None)
     os.execv(binp, [binp, "approve", "--config", "config.env", "--host", "127.0.0.1", "--port", port])
 seen = ""
 def read_until(pat, timeout=20):
@@ -170,6 +185,8 @@ check "request settled as approved" test "$(jqr "d['requests'][0]['status']")" =
 V1=$(jqr "d['signed_version']")
 check "coordinator stores a signed list (version $V1)" test "$V1" -gt 1600000000
 check "desktop kept its own copy" test -s "$S/desk/secrets/members.signed.json"
+check_not "the desktop has no signing key of its own" test -e "$S/desk/secrets/signing_ed25519"
+check "the list is signed with the admin's own SSH key" own_signed "$S/desk/secrets/members.signed.json" dryserver-members
 check "desktop pinned the coordinator's SSH key" grep -q "^\[127.0.0.1\]:$PORT ssh-ed25519" "$S/desk/secrets/coordinator_known_hosts"
 check "the node gets approved status" bash -c "echo | /usr/bin/ssh -i $S/desk/secrets/registry_ed25519 -p $PORT -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR $USER@127.0.0.1 'status $(jqr "d['requests'][0]['id']")' | grep -q approved"
 
@@ -252,7 +269,7 @@ out=$(screen "$S/desk" "node-c" "" 2>&1)
 check_not "the screen is clean afterwards" grep -q "not signed\|Not signed\|Cannot talk\|another SSH key" <<<"$out"
 
 echo "== releases"
-desk() { (cd "$S/desk" && DRYSERVER_HOME="$S/desk" "$BIN" "$@" --config config.env --host 127.0.0.1 --port $PORT 2>&1); }
+desk() { (cd "$S/desk" && env -u SSH_AUTH_SOCK HOME="$S/deskhome" DRYSERVER_HOME="$S/desk" "$BIN" "$@" --config config.env --host 127.0.0.1 --port $PORT 2>&1); }
 REL=$S/root2/var/lib/dryserver/release
 out=$(desk release status)
 check "release status: nothing published yet" grep -q "No release published yet" <<<"$out"
@@ -279,7 +296,7 @@ doc = {"serial": now + off, "created": now - 60, "expires": now + 30 * 86400,
        "rollback": False, "urgent": True, "notes": "live test"}
 open(s + "/rel.doc", "w").write(json.dumps(doc, separators=(",", ":")))
 PY
-    ssh-keygen -Y sign -f "$S/desk/secrets/signing_ed25519" -n dryserver-release < "$S/rel.doc" > "$S/rel.sig" 2>/dev/null
+    ssh-keygen -Y sign -f "$S/deskhome/.ssh/id_ed25519" -n dryserver-release < "$S/rel.doc" > "$S/rel.sig" 2>/dev/null
 }
 upload() { # k3s size
     python3 -I -c "import json; print(json.dumps({'release': {'doc': open('$S/rel.doc').read(), 'sig': open('$S/rel.sig').read()}, 'k3s_size': $1}))"

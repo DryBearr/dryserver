@@ -34,11 +34,12 @@ pub const ITEMS: [(Place, &str); 9] = [
 /// The groups of Home: a title and how many items it has.
 const GROUPS: [(&str, usize); 3] = [("Set up", 3), ("Run", 5), ("When something is wrong", 1)];
 
-/// The keys a build makes.
-pub const KEYS: [&str; 6] =
-    [iso::SIGNING_KEY_NAME, iso::SIGNING_PUB, iso::KEY_NAME, iso::JOIN_SECRET, iso::BACKUP_KEY_NAME, iso::BACKUP_PUB];
+/// The keys a build makes. The signing key's private half is your SSH
+/// key's, in ~/.ssh or ssh-agent: only its public half is here (an older
+/// swarm also has its own private half here).
+pub const KEYS: [&str; 5] = [iso::SIGNING_PUB, iso::KEY_NAME, iso::JOIN_SECRET, iso::BACKUP_KEY_NAME, iso::BACKUP_PUB];
 /// Of those, what Machines signs and talks to the coordinator with.
-pub const ADMIN_KEYS: [&str; 4] = [iso::SIGNING_KEY_NAME, iso::SIGNING_PUB, iso::KEY_NAME, iso::JOIN_SECRET];
+pub const ADMIN_KEYS: [&str; 3] = [iso::SIGNING_PUB, iso::KEY_NAME, iso::JOIN_SECRET];
 
 #[derive(Debug, Clone)]
 pub enum Cfg {
@@ -439,7 +440,7 @@ mod tests {
         case(&|f| f.exe_time = Some(f.now), Place::Installer, "an older dryserver");
         case(
             &|f| {
-                f.missing_keys = vec![iso::SIGNING_KEY_NAME.into()];
+                f.missing_keys = vec![iso::SIGNING_PUB.into()];
                 f.started = false;
             },
             Place::Installer,
@@ -483,10 +484,13 @@ mod tests {
             let mut f = facts();
             f.cfg = cfg;
             f.iso = iso;
-            f.missing_keys = vec![iso::SIGNING_KEY_NAME.into(), iso::JOIN_SECRET.into()];
+            f.missing_keys = vec![iso::SIGNING_PUB.into(), iso::JOIN_SECRET.into()];
             let n = next(&f);
             assert_eq!(n.place, None, "{n:?}");
-            assert!(n.text.contains("Restore signing_ed25519, join_secret from your backup") && n.text.contains("lock you out"), "{n:?}");
+            assert!(
+                n.text.contains("Restore signing_ed25519.pub, join_secret from your backup") && n.text.contains("lock you out"),
+                "{n:?}"
+            );
         }
         // Under sudo the step says where it can be done.
         let mut f = facts();
@@ -521,7 +525,7 @@ mod tests {
         assert_eq!(l(&g, Place::Backups), (Mark::Bad, "newest copy is 11 days old: pull them".into()));
         g.missing_keys = vec![iso::BACKUP_KEY_NAME.into()];
         assert_eq!(l(&g, Place::Machines).0, Mark::Done, "Machines does not need the backup key");
-        g.missing_keys = vec![iso::SIGNING_KEY_NAME.into()];
+        g.missing_keys = vec![iso::SIGNING_PUB.into()];
         assert_eq!(l(&g, Place::Machines), (Mark::Bad, "a key is missing: restore it from your backup".into()));
         assert_eq!(l(&g, Place::Installer), (Mark::Bad, "a key is missing: restore it from your backup".into()));
         g.started = false;

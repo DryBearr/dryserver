@@ -92,10 +92,15 @@ Part of the [dryserver README](../README.md).
   name, key and address in the member list before it reaches `/etc/hosts`,
   WireGuard or the SSH trust files, and drop entries that are malformed or
   appear twice.
-- **Signed member list**: building the USB stick creates
-  `secrets/signing_ed25519` on your computer; its public half is installed
-  on every server. `dryserver approve` on your computer signs every
-  decision (approve, reject, remove) with it. The coordinator stores and
+- **Signed member list**: your own SSH key, the one in the config, signs
+  the swarm: building the USB stick copies its public half to
+  `secrets/signing_ed25519.pub` and onto every server. `dryserver approve`
+  on your computer signs every decision (approve, reject, remove) with it,
+  through ssh-agent or `~/.ssh`. The same key logs you in to the machines;
+  that is safe because every signature is made for one named use
+  (`dryserver-members`, `dryserver-release`...) and an SSH login signs
+  data of another form, so no signature passes for another. Servers do not
+  allow agent forwarding, so a server cannot borrow your agent to sign. The coordinator stores and
   hands out the signed list but cannot make or change one. Servers use only
   the machines in the signed list: one the coordinator adds by itself is
   ignored and logged, and an older list is refused, so a removed machine

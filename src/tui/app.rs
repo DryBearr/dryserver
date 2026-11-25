@@ -908,7 +908,7 @@ mod tests {
         Factories {
             machines: Box::new(move || {
                 c1.lock().unwrap().push("machines".into());
-                Err("secrets/signing_ed25519 has a passphrase".into())
+                Err("your SSH key ~/.ssh/id_ed25519 has a passphrase and is not in ssh-agent".into())
             }),
             cluster: Box::new(move || {
                 c2.lock().unwrap().push("cluster".into());
@@ -1017,7 +1017,7 @@ mod tests {
         press(&mut a, &[Key::Esc]);
         // A config but no keys: build the installer.
         ready(&dir);
-        std::fs::remove_file(test_paths(&dir).secrets.join(iso::SIGNING_KEY_NAME)).unwrap();
+        std::fs::remove_file(test_paths(&dir).secrets.join(iso::SIGNING_PUB)).unwrap();
         press(&mut a, &[Key::Char('4')]);
         let s = screen(&a);
         assert!(s.contains("A key is missing") && s.contains("signing_ed25519") && s.contains("Build the installer (2)"), "{s}");

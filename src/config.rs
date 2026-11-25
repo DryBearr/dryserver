@@ -394,13 +394,23 @@ pub fn valid_username(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// The admin's SSH key: it logs in to the machines and signs for the
+/// swarm, and the swarm signs with ed25519 keys only.
 pub fn valid_pubkey(s: &str) -> Result<()> {
+    if s.contains("PRIVATE KEY") {
+        return Err("that is a private key, use the .pub file".into());
+    }
     let f: Vec<&str> = s.split_whitespace().collect();
     if f.len() < 2 || !(f[0].starts_with("ssh-") || f[0].starts_with("ecdsa-") || f[0].starts_with("sk-")) {
         return Err("paste the line from ~/.ssh/id_ed25519.pub (starts with ssh-ed25519)".into());
     }
-    if s.contains("PRIVATE KEY") {
-        return Err("that is a private key, use the .pub file".into());
+    if f[0] != "ssh-ed25519" {
+        return Err(format!(
+            "it also signs for your swarm, so it must be an ed25519 key (this is {}): make one with ssh-keygen -t \
+             ed25519 and paste ~/.ssh/id_ed25519.pub",
+            f[0]
+        )
+        .into());
     }
     Ok(())
 }
@@ -487,6 +497,17 @@ mod tests {
             admin_ssh_pubkey: "ssh-ed25519 AAAAC3Nza".into(),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn the_admin_key_is_ed25519_because_it_signs() {
+        assert!(valid_pubkey("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI me@pc").is_ok());
+        for k in ["ssh-rsa AAAAB3NzaC1yc2E", "ecdsa-sha2-nistp256 AAAAE2Vj", "sk-ssh-ed25519@openssh.com AAAAGnNr"] {
+            let e = valid_pubkey(k).unwrap_err().to_string();
+            assert!(e.contains("must be an ed25519 key") && e.contains(k.split(' ').next().unwrap()), "{e}");
+        }
+        assert!(valid_pubkey("hello").unwrap_err().to_string().contains("paste the line"));
+        assert!(valid_pubkey("-----BEGIN OPENSSH PRIVATE KEY-----").unwrap_err().to_string().contains("private key"));
     }
 
     #[test]

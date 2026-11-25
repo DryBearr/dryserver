@@ -17,8 +17,12 @@ pub const IMAGE: &str = "docker.io/library/archlinux:latest";
 pub const ISO_NAME: &str = "dryserver.iso";
 pub const LOG_NAME: &str = "build.log";
 pub const KEY_NAME: &str = "registry_ed25519";
-/// The keypair that signs the member list. The private half never leaves
-/// secrets/ on the desktop; only SIGNING_PUB goes into the ISO.
+/// The key that signs the member list, releases and every decision. Its
+/// public half (SIGNING_PUB) goes into the ISO: the key every machine
+/// trusts. A new swarm signs with the admin's own SSH key (the one in the
+/// config, its private half in ~/.ssh or ssh-agent), so SIGNING_PUB is a
+/// copy of that; an older swarm has a pair of its own here, whose private
+/// half (SIGNING_KEY_NAME) never leaves secrets/.
 pub const SIGNING_KEY_NAME: &str = "signing_ed25519";
 pub const SIGNING_PUB: &str = "signing_ed25519.pub";
 /// The keypair backups of the coordinator are encrypted to. Only the
@@ -105,7 +109,9 @@ pub fn run(ctx: &Ctx, o: &Options, log: &mut (dyn Write + Send)) -> Result<()> {
     let file = File::create(&log_path).map_err(|e| Error::from(e).wrap(format!("open {}", log_path.display())))?;
     let mut tee = Tee { file, log };
 
-    let Keys { registry: key, signing_pub, backup_pub, join_secret } = ensure_keys(ctx, &o.secrets_dir, &mut tee)?;
+    let Keys { registry: key, signing_pub, backup_pub, join_secret } =
+        ensure_keys(ctx, &o.secrets_dir, Some(&o.config.admin_ssh_pubkey), &mut tee)?;
+    let signing_pub = signing_pub.ok_or_else(|| errf!("no signing key: put your SSH key in Config"))?;
 
     let stage = out_dir.join("stage");
     let stage_c = stage.clone();
@@ -257,21 +263,91 @@ fn lost(path: &Path, why: &str) -> Error {
 #[derive(Debug)]
 pub struct Keys {
     pub registry: PathBuf,
-    pub signing_pub: PathBuf,
+    /// None before there is a config to take the admin's key from.
+    pub signing_pub: Option<PathBuf>,
     pub backup_pub: PathBuf,
     pub join_secret: PathBuf,
 }
 
 /// Makes the keys and the secret that are missing, as long as the swarm
 /// has not started (see swarm_started), and checks the ones that are there.
-pub fn ensure_keys(ctx: &Ctx, dir: &Path, log: &mut dyn Write) -> Result<Keys> {
+/// admin is the SSH key in the config, which signs a new swarm.
+pub fn ensure_keys(ctx: &Ctx, dir: &Path, admin: Option<&str>, log: &mut dyn Write) -> Result<Keys> {
     let started = swarm_started(dir);
     Ok(Keys {
         registry: ensure_registry_key(ctx, dir, started, log)?,
-        signing_pub: ensure_signing_key(ctx, dir, started, log)?,
+        signing_pub: ensure_signer(ctx, dir, started, admin, log)?,
         backup_pub: ensure_backup_key(ctx, dir, started, log)?,
         join_secret: ensure_join_secret(dir, started, log)?,
     })
+}
+
+/// Makes sure secrets/ holds the public half of the key that signs, and
+/// returns its path. An older swarm's own pair is kept as it is. Otherwise
+/// it is the admin's SSH key: copied from the config the first time, and
+/// followed when the config's key changes before the swarm runs. Once it
+/// runs, the machines trust only the key they were installed with: another
+/// key in the config is an error, not a new signer.
+fn ensure_signer(ctx: &Ctx, dir: &Path, started: bool, admin: Option<&str>, log: &mut dyn Write) -> Result<Option<PathBuf>> {
+    let pubf = dir.join(SIGNING_PUB);
+    if dir.join(SIGNING_KEY_NAME).exists() {
+        return ensure_signing_key(ctx, dir, started, log).map(Some);
+    }
+    let admin = admin.map(key_body).filter(|k| !k.is_empty());
+    if let Some(k) = &admin
+        && !k.starts_with("ssh-ed25519 ")
+    {
+        return Err(errf!(
+            "dryserver signs with your SSH key, and it must be an ed25519 key (yours is {}). Make one with \
+             ssh-keygen -t ed25519, then put ~/.ssh/id_ed25519.pub in Config",
+            k.split_whitespace().next().unwrap_or("")
+        ));
+    }
+    let have = match std::fs::read_to_string(&pubf) {
+        Ok(t) => Some(key_body(&t)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(Error::from(e).wrap(format!("open {}", pubf.display()))),
+    };
+    match (have, admin) {
+        (Some(h), Some(a)) if h != a && started => Err(errf!(
+            "your machines trust the signing key {} ({}), and the SSH key in your config is another one ({}). Put the \
+             key they trust back in Config, with its private half in ~/.ssh or ssh-agent",
+            crate::signed::short_key(&h),
+            pubf.display(),
+            crate::signed::short_key(&a)
+        )),
+        (Some(h), _) if !h.starts_with("ssh-ed25519 ") => Err(errf!("{} is not an ed25519 public key", pubf.display())),
+        (Some(h), Some(a)) if h != a => {
+            let _ = writeln!(
+                log,
+                "==> Signing key: your SSH key {} from Config now, in place of {}",
+                crate::signed::short_key(&a),
+                crate::signed::short_key(&h)
+            );
+            fsx::write_new(&pubf, format!("{a} dryserver-signing\n"), 0o644)?;
+            Ok(Some(pubf))
+        }
+        (Some(_), _) => Ok(Some(pubf)),
+        (None, _) if started => Err(errf!(
+            "{} is missing, and this computer already runs a swarm: it is the key your machines trust. Restore it from \
+             your backup, or, if your SSH key is still the one they trust, copy its public half there: \
+             cp ~/.ssh/id_ed25519.pub {}",
+            pubf.display(),
+            pubf.display()
+        )),
+        (None, None) => Ok(None),
+        (None, Some(a)) => {
+            fsx::mkdir_all(dir, 0o700)?;
+            let _ = writeln!(
+                log,
+                "==> Signing key: your SSH key {} (the one in Config). Every decision is signed with it, through \
+                 ssh-agent or ~/.ssh: keep it safe, with a passphrase, and back it up.",
+                crate::signed::short_key(&a)
+            );
+            fsx::write_new(&pubf, format!("{a} dryserver-signing\n"), 0o644)?;
+            Ok(Some(pubf))
+        }
+    }
 }
 
 /// Creates the SSH keypair nodes use to register with the coordinator. The
@@ -682,51 +758,114 @@ mod tests {
         assert!(ensure_signing_key(&ctx, &secrets, false, &mut Vec::new()).is_err());
     }
 
+    const ADMIN: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAdminAdminAdminAdminAdminAdminAdminAdminAd";
+    const OTHER: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherOtherOtherOtherOtherOtherOtherOtherOt";
+
     #[test]
     fn once_the_swarm_runs_a_missing_key_is_never_made_again() {
         if !in_path("ssh-keygen") {
             return;
         }
         let ctx = Ctx::new();
-        // A new swarm: every key is made.
+        // A new swarm: every key is made; it signs with the admin's key,
+        // so no signing key of its own.
         let dir = TempDir::new();
         let secrets = dir.join("secrets");
         assert!(!swarm_started(&secrets));
-        let k = ensure_keys(&ctx, &secrets, &mut Vec::new()).unwrap();
-        for p in [&k.registry, &k.signing_pub, &k.backup_pub, &k.join_secret] {
+        let k = ensure_keys(&ctx, &secrets, Some(ADMIN), &mut Vec::new()).unwrap();
+        for p in [&k.registry, k.signing_pub.as_ref().unwrap(), &k.backup_pub, &k.join_secret] {
             assert!(p.exists(), "{}", p.display());
         }
+        assert!(!secrets.join(SIGNING_KEY_NAME).exists());
         // An older swarm with only the registry key (made by an older
         // version) gets the others, as long as it never ran.
         let dir = TempDir::new();
         let secrets = dir.join("secrets");
         ensure_registry_key(&ctx, &secrets, false, &mut Vec::new()).unwrap();
-        ensure_keys(&ctx, &secrets, &mut Vec::new()).unwrap();
+        ensure_keys(&ctx, &secrets, Some(ADMIN), &mut Vec::new()).unwrap();
 
         // Once it met the coordinator, signed a list or a release, every
         // missing key is an error that says to restore it.
         for mark in [crate::admin::SIGNED_COPY, crate::admin::KNOWN_HOSTS, crate::admin::RELEASE_COPY] {
-            for name in [KEY_NAME, SIGNING_KEY_NAME, BACKUP_KEY_NAME, JOIN_SECRET] {
+            for name in [KEY_NAME, SIGNING_PUB, BACKUP_KEY_NAME, JOIN_SECRET] {
                 let dir = TempDir::new();
                 let secrets = dir.join("secrets");
-                ensure_keys(&ctx, &secrets, &mut Vec::new()).unwrap();
+                ensure_keys(&ctx, &secrets, Some(ADMIN), &mut Vec::new()).unwrap();
                 std::fs::write(secrets.join(mark), "x").unwrap();
                 assert!(swarm_started(&secrets));
                 // Kept keys still pass.
-                ensure_keys(&ctx, &secrets, &mut Vec::new()).unwrap();
+                ensure_keys(&ctx, &secrets, Some(ADMIN), &mut Vec::new()).unwrap();
                 let before: Vec<_> = std::fs::read_dir(&secrets).unwrap().map(|e| e.unwrap().file_name()).collect();
                 std::fs::remove_file(secrets.join(name)).unwrap();
                 // The public half alone may stay: the error is the same
                 // either way for the private half.
                 let pubf = secrets.join(format!("{name}.pub"));
                 let _ = std::fs::remove_file(&pubf);
-                let e = ensure_keys(&ctx, &secrets, &mut Vec::new()).unwrap_err().to_string();
+                let e = ensure_keys(&ctx, &secrets, Some(ADMIN), &mut Vec::new()).unwrap_err().to_string();
                 assert!(e.contains("already runs a swarm") && e.contains("Restore it from your backup"), "{mark} {name}: {e}");
                 assert!(!secrets.join(name).exists(), "{mark} {name}: a new one was made");
                 let after: Vec<_> = std::fs::read_dir(&secrets).unwrap().map(|e| e.unwrap().file_name()).collect();
                 assert!(after.len() < before.len(), "nothing new is written");
             }
         }
+    }
+
+    #[test]
+    fn a_new_swarm_signs_with_the_admins_key() {
+        let ctx = Ctx::new();
+        let dir = TempDir::new();
+        let secrets = dir.join("secrets");
+        let pubf = secrets.join(SIGNING_PUB);
+        // No config yet: nothing to sign with, nothing written.
+        assert_eq!(ensure_signer(&ctx, &secrets, false, None, &mut Vec::new()).unwrap(), None);
+        assert!(!pubf.exists());
+        // The config's key, without its comment, as the key the stick's
+        // machines trust; the log says so.
+        let mut log = Vec::new();
+        assert_eq!(ensure_signer(&ctx, &secrets, false, Some(&format!("{ADMIN} me@pc")), &mut log).unwrap(), Some(pubf.clone()));
+        assert_eq!(std::fs::read_to_string(&pubf).unwrap(), format!("{ADMIN} dryserver-signing\n"));
+        assert!(String::from_utf8_lossy(&log).contains("your SSH key"), "{}", String::from_utf8_lossy(&log));
+        assert_eq!(std::fs::metadata(&pubf).unwrap().permissions().mode() & 0o777, 0o644);
+        // The same key again changes nothing; a later build without the
+        // config's key keeps it.
+        ensure_signer(&ctx, &secrets, false, Some(ADMIN), &mut Vec::new()).unwrap();
+        ensure_signer(&ctx, &secrets, false, None, &mut Vec::new()).unwrap();
+        assert_eq!(std::fs::read_to_string(&pubf).unwrap(), format!("{ADMIN} dryserver-signing\n"));
+        // A new key in the config before the swarm runs: followed.
+        let mut log = Vec::new();
+        ensure_signer(&ctx, &secrets, false, Some(OTHER), &mut log).unwrap();
+        assert_eq!(key_body(&std::fs::read_to_string(&pubf).unwrap()), OTHER);
+        assert!(String::from_utf8_lossy(&log).contains("in place of"));
+        // Once it runs: never. The trusted key stays, the error says which.
+        let e = ensure_signer(&ctx, &secrets, true, Some(ADMIN), &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("your machines trust the signing key") && e.contains("another one"), "{e}");
+        assert_eq!(key_body(&std::fs::read_to_string(&pubf).unwrap()), OTHER);
+        ensure_signer(&ctx, &secrets, true, Some(OTHER), &mut Vec::new()).unwrap();
+        // Lost once it runs: restore, or copy the .pub of the same key.
+        std::fs::remove_file(&pubf).unwrap();
+        let e = ensure_signer(&ctx, &secrets, true, Some(OTHER), &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("Restore it from your backup") && e.contains("cp ~/.ssh/id_ed25519.pub"), "{e}");
+        assert!(!pubf.exists());
+        // Only ed25519 keys sign; another kind is named.
+        let e = ensure_signer(&ctx, &secrets, false, Some("ssh-rsa AAAAB3Nza"), &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("must be an ed25519 key (yours is ssh-rsa)"), "{e}");
+        assert!(!pubf.exists());
+    }
+
+    #[test]
+    fn an_older_swarms_own_signing_pair_is_kept() {
+        if !in_path("ssh-keygen") {
+            return;
+        }
+        let ctx = Ctx::new();
+        let dir = TempDir::new();
+        let secrets = dir.join("secrets");
+        let legacy = ensure_signing_key(&ctx, &secrets, false, &mut Vec::new()).unwrap();
+        let first = std::fs::read_to_string(&legacy).unwrap();
+        // The admin's key in the config does not replace it.
+        let got = ensure_signer(&ctx, &secrets, true, Some(ADMIN), &mut Vec::new()).unwrap();
+        assert_eq!(got, Some(legacy.clone()));
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), first);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The signed member list. The admin's desktop signs who is in the mesh
-//! with secrets/signing_ed25519; the coordinator only stores and hands out
-//! the result, and cannot change it, because it has no private key.
+//! with the admin's own SSH key (an older swarm: secrets/signing_ed25519);
+//! the coordinator only stores and hands out the result, and cannot change
+//! it, because it has no private key.
 //!
 //! Only each member's identity is signed (host number, name, WireGuard key,
 //! SSH host key). Addresses and "last seen" change every minute and stay
@@ -262,9 +263,16 @@ pub trait Verifier: Send + Sync {
 }
 
 fn ssh_keygen(args: &[&str], stdin: &str) -> Result<std::process::Output> {
+    let mut c = Command::new("ssh-keygen");
+    c.args(args);
+    run_with_input(c, stdin)
+}
+
+/// Runs ssh-keygen with stdin as its input and returns what it said.
+/// Its terminal stays its own: a passphrase is asked on /dev/tty.
+fn run_with_input(mut c: Command, stdin: &str) -> Result<std::process::Output> {
     use std::io::Write;
-    let mut child = Command::new("ssh-keygen")
-        .args(args)
+    let mut child = c
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -282,7 +290,7 @@ fn ssh_keygen(args: &[&str], stdin: &str) -> Result<std::process::Output> {
     Ok(out)
 }
 
-/// Signs with a private key file (the desktop's secrets/signing_ed25519).
+/// Signs with a private key file (an older swarm's secrets/signing_ed25519).
 pub struct SshSigner {
     pub key: PathBuf,
 }
@@ -294,6 +302,127 @@ impl Signer for SshSigner {
         let sig = String::from_utf8_lossy(&out.stdout).into_owned();
         if !out.status.success() || !sig.contains("BEGIN SSH SIGNATURE") {
             return Err(errf!("cannot sign with {key}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(sig)
+    }
+}
+
+/// Where the private half of the admin's own key is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyAt {
+    /// Loaded in ssh-agent: signing needs nothing more.
+    Agent,
+    /// A file in ~/.ssh; with a passphrase ssh-keygen asks for it on the
+    /// terminal at each signature.
+    File { path: PathBuf, passphrase: bool },
+}
+
+/// Signs with the admin's own SSH key, the one that also logs in to the
+/// machines: the private half from ssh-agent, or from the file in ~/.ssh
+/// whose public half matches. The swarm trusts the public half in pubkey
+/// (secrets/signing_ed25519.pub, put there by the first build).
+///
+/// One key for both is safe: an SSH login signs data of its own form, and
+/// every signature here is made for one namespace (dryserver-members,
+/// dryserver-release...), so none passes for a login or for another use.
+pub struct OwnKeySigner {
+    pub pubkey: PathBuf,
+    /// ~/.ssh, where a key file is looked for.
+    pub ssh_dir: Option<PathBuf>,
+    /// The agent's socket (SSH_AUTH_SOCK); None: no agent.
+    pub agent: Option<PathBuf>,
+}
+
+impl OwnKeySigner {
+    /// For this user: ~/.ssh and the agent in SSH_AUTH_SOCK.
+    pub fn for_user(pubkey: PathBuf) -> OwnKeySigner {
+        let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+        let agent = std::env::var_os("SSH_AUTH_SOCK").filter(|s| !s.is_empty()).map(PathBuf::from);
+        OwnKeySigner { pubkey, ssh_dir: home.map(|h| h.join(".ssh")), agent }
+    }
+
+    fn trusted(&self) -> Result<String> {
+        let line = fsx::read_string(&self.pubkey).map_err(|e| e.wrap("the public half of your signing key"))?;
+        let k = key_body(&line);
+        if !k.starts_with("ssh-ed25519 ") {
+            bail!("{} is not an ed25519 public key", self.pubkey.display());
+        }
+        Ok(k)
+    }
+
+    /// Whether the agent holds the key: `ssh-add -L` lists it.
+    fn in_agent(&self, key: &str) -> bool {
+        let Some(sock) = &self.agent else { return false };
+        let out = Command::new("ssh-add").arg("-L").env("SSH_AUTH_SOCK", sock).stdin(Stdio::null()).stderr(Stdio::null()).output();
+        out.is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).lines().any(|l| key_body(l) == key))
+    }
+
+    /// The private key file in ~/.ssh whose .pub holds key.
+    fn key_file(&self, key: &str) -> Option<PathBuf> {
+        let dir = self.ssh_dir.as_ref()?;
+        let mut pubs: Vec<PathBuf> =
+            std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "pub")).collect();
+        pubs.sort();
+        pubs.into_iter().filter(|p| key_body(&fsx::read_or_empty(p)) == key).map(|p| p.with_extension("")).find(|k| k.is_file())
+    }
+
+    /// Where the private half is: the agent first, then ~/.ssh.
+    pub fn locate(&self) -> Result<KeyAt> {
+        let key = self.trusted()?;
+        if self.in_agent(&key) {
+            return Ok(KeyAt::Agent);
+        }
+        if let Some(path) = self.key_file(&key) {
+            let passphrase = crate::publish::has_passphrase(&path);
+            return Ok(KeyAt::File { path, passphrase });
+        }
+        Err(errf!(
+            "the private half of your signing key ({}) is neither in ssh-agent nor in ~/.ssh. It is your SSH key, \
+             the one in {}: add it with ssh-add, or put it back at ~/.ssh/id_ed25519",
+            short_key(&key),
+            self.pubkey.display()
+        ))
+    }
+
+    /// Signing works without a terminal to ask a passphrase on (the
+    /// screens), or why not and what to do.
+    pub fn ready_without_terminal(&self) -> Result<()> {
+        match self.locate()? {
+            KeyAt::File { path, passphrase: true } => Err(errf!(
+                "your SSH key {p} has a passphrase and is not in ssh-agent, and this screen cannot ask for it. Add it \
+                 once (it asks for the passphrase there): ssh-add {p}",
+                p = path.display()
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// "ssh-ed25519 …last8": enough to tell keys apart in a message.
+pub fn short_key(k: &str) -> String {
+    let b = k.split_whitespace().nth(1).unwrap_or("");
+    let tail = &b[b.len().saturating_sub(8)..];
+    format!("ssh-ed25519 …{tail}")
+}
+
+impl Signer for OwnKeySigner {
+    fn sign(&self, namespace: &str, doc: &str) -> Result<String> {
+        let what = match self.locate()? {
+            // The public half names the key; ssh-keygen asks the agent.
+            KeyAt::Agent => self.pubkey.clone(),
+            KeyAt::File { path, .. } => path,
+        };
+        let f = what.display().to_string();
+        let mut child = Command::new("ssh-keygen");
+        child.args(["-Y", "sign", "-f", &f, "-n", namespace]);
+        match &self.agent {
+            Some(sock) => child.env("SSH_AUTH_SOCK", sock),
+            None => child.env_remove("SSH_AUTH_SOCK"),
+        };
+        let out = run_with_input(child, doc)?;
+        let sig = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !out.status.success() || !sig.contains("BEGIN SSH SIGNATURE") {
+            return Err(errf!("cannot sign with your SSH key ({f}): {}", String::from_utf8_lossy(&out.stderr).trim()));
         }
         Ok(sig)
     }
@@ -595,5 +724,102 @@ mod tests {
         // A signing key that cannot be read gives a clear error.
         let e = SshSigner { key: dir.join("nokey") }.sign(NS_MEMBERS, "x").unwrap_err().to_string();
         assert!(e.contains("cannot sign"), "{e}");
+    }
+
+    /// An ssh-agent of a test's own, stopped when dropped.
+    struct Agent {
+        sock: PathBuf,
+        pid: u32,
+    }
+
+    impl Agent {
+        fn start(dir: &Path) -> Option<Agent> {
+            let sock = dir.join("agent.sock");
+            let out = Command::new("ssh-agent").arg("-a").arg(&sock).arg("-s").output().ok()?;
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let pid = text.split("SSH_AGENT_PID=").nth(1)?.split(';').next()?.trim().parse().ok()?;
+            Some(Agent { sock, pid })
+        }
+
+        fn add(&self, key: &Path) {
+            let st = Command::new("ssh-add").arg("-q").arg(key).env("SSH_AUTH_SOCK", &self.sock).stdin(Stdio::null()).status().unwrap();
+            assert!(st.success(), "ssh-add {}", key.display());
+        }
+    }
+
+    impl Drop for Agent {
+        fn drop(&mut self) {
+            let _ = Command::new("kill").arg(self.pid.to_string()).status();
+        }
+    }
+
+    #[test]
+    fn the_admins_own_key_signs_from_the_agent_or_from_ssh() {
+        if !crate::iso::in_path("ssh-keygen") || !crate::iso::in_path("ssh-agent") || !crate::iso::in_path("ssh-add") {
+            return;
+        }
+        let dir = TempDir::new();
+        let ssh = dir.join("ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let keygen = |path: &Path, pass: &str| {
+            let st = Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", pass, "-f"]).arg(path).status().unwrap();
+            assert!(st.success());
+        };
+        keygen(&ssh.join("id_ed25519"), "");
+        keygen(&dir.join("other"), "");
+        // The swarm trusts the admin's key: a copy of its public half.
+        let trusted = dir.join("signing_ed25519.pub");
+        std::fs::copy(ssh.join("id_ed25519.pub"), &trusted).unwrap();
+        let v = SshVerifier { pubkey: trusted.clone(), tmp_dir: dir.path().to_path_buf() };
+        let list = List { version: 3, members: vec![entry(1, "coord")], rejected: vec![] };
+
+        // No agent: the file in ~/.ssh signs.
+        let file = OwnKeySigner { pubkey: trusted.clone(), ssh_dir: Some(ssh.clone()), agent: None };
+        assert_eq!(file.locate().unwrap(), KeyAt::File { path: ssh.join("id_ed25519"), passphrase: false });
+        file.ready_without_terminal().unwrap();
+        let env = seal(&file, &list).unwrap();
+        assert_eq!(env.list(&v, fits).unwrap(), list);
+        // A signature for one use never passes for another.
+        let other_ns = Envelope { doc: env.doc.clone(), sig: file.sign(NS_ADMIN, &env.doc).unwrap() };
+        assert!(other_ns.list(&v, fits).is_err());
+
+        // A key file with another name is found by its public half.
+        std::fs::rename(ssh.join("id_ed25519"), ssh.join("laptop")).unwrap();
+        std::fs::rename(ssh.join("id_ed25519.pub"), ssh.join("laptop.pub")).unwrap();
+        assert_eq!(file.locate().unwrap(), KeyAt::File { path: ssh.join("laptop"), passphrase: false });
+
+        // In the agent: the agent signs, also with no file left in ~/.ssh.
+        let Some(agent) = Agent::start(dir.path()) else { return };
+        agent.add(&dir.join("other"));
+        let with_agent = OwnKeySigner { pubkey: trusted.clone(), ssh_dir: Some(ssh.clone()), agent: Some(agent.sock.clone()) };
+        // Another key in the agent is not used.
+        assert!(matches!(with_agent.locate().unwrap(), KeyAt::File { .. }));
+        agent.add(&ssh.join("laptop"));
+        std::fs::remove_file(ssh.join("laptop")).unwrap();
+        assert_eq!(with_agent.locate().unwrap(), KeyAt::Agent);
+        with_agent.ready_without_terminal().unwrap();
+        let env = seal(&with_agent, &list).unwrap();
+        assert_eq!(env.list(&v, fits).unwrap(), list);
+
+        // Nowhere: the error says where it looked and what to do.
+        let none = OwnKeySigner { pubkey: trusted.clone(), ssh_dir: Some(ssh.clone()), agent: None };
+        let e = none.locate().unwrap_err().to_string();
+        assert!(e.contains("neither in ssh-agent nor in ~/.ssh") && e.contains("ssh-add"), "{e}");
+        assert!(none.sign(NS_MEMBERS, "x").is_err());
+
+        // A passphrase and no agent: the screens cannot sign, and say how.
+        let ssh2 = dir.join("ssh2");
+        std::fs::create_dir_all(&ssh2).unwrap();
+        keygen(&ssh2.join("id_ed25519"), "secret passphrase");
+        let trusted2 = dir.join("trusted2.pub");
+        std::fs::copy(ssh2.join("id_ed25519.pub"), &trusted2).unwrap();
+        let locked = OwnKeySigner { pubkey: trusted2, ssh_dir: Some(ssh2.clone()), agent: Some(agent.sock.clone()) };
+        assert_eq!(locked.locate().unwrap(), KeyAt::File { path: ssh2.join("id_ed25519"), passphrase: true });
+        let e = locked.ready_without_terminal().unwrap_err().to_string();
+        assert!(e.contains("has a passphrase") && e.contains(&format!("ssh-add {}", ssh2.join("id_ed25519").display())), "{e}");
+
+        // A trusted file that is not an ed25519 key is refused.
+        std::fs::write(&trusted, "ssh-rsa AAAAB3Nza x\n").unwrap();
+        assert!(with_agent.locate().unwrap_err().to_string().contains("not an ed25519"));
     }
 }

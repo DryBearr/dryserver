@@ -77,10 +77,10 @@ is shown as maybe another build, never as the same.
   that updated already go back to it. Add `-arch-date` with the older day
   to take the Arch packages back too.
 
-`publish` signs with `secrets/signing_ed25519`, like the machine list:
-only what you signed is ever installed. If that key has a passphrase,
-`ssh-keygen` asks for it in the terminal at each signature; the approve
-screen cannot ask, so it refuses to start.
+`publish` signs with your SSH key, like the machine list: only what you
+signed is ever installed. If the key has a passphrase and is not in
+ssh-agent, `ssh-keygen` asks for it in the terminal at each signature;
+the approve screen cannot ask, so it says to `ssh-add` it first.
 
 Then the coordinator rolls it out:
 
