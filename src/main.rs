@@ -25,6 +25,7 @@ mod node;
 mod osupdate;
 mod owner;
 mod packages;
+mod people;
 mod publish;
 mod quarantine;
 mod registry;
@@ -77,6 +78,12 @@ commands:
                       config, keys and your SSH key, for a second computer
                       or a stick in a drawer (--no-ssh-key leaves it out)
   import FILE         put a swarm from export on this computer
+  people              who else may log in to your machines
+  people add NAME KEY.pub [--on m1,m2]
+                      let someone in: an account of their own on every
+                      server (--on: those machines only), their key only,
+                      no sudo, no docker, no cluster, nothing forwarded
+  people remove NAME  take them out: their account is locked everywhere
   replace-key [--to FILE.pub]
                       hand your swarm's trust to a new SSH key (default: the
                       one in your config): signed by the old key, followed
@@ -219,6 +226,7 @@ fn main() -> ExitCode {
         "export" => run_export(rest),
         "import" => run_import(rest),
         "replace-key" => run_replace_key(rest),
+        "people" => run_people(rest),
         "install" => run_install(rest),
         "build" => run_build(rest),
         "disks" => run_disks(rest),
@@ -530,6 +538,70 @@ fn run_import(args: &[String]) -> Result<()> {
         None => println!("  no SSH key in the file: copy your key (the one that signs) to ~/.ssh yourself"),
     }
     println!("\nThe newest list and release come from the coordinator: open Machines once.");
+    Ok(())
+}
+
+fn run_people(args: &[String]) -> Result<()> {
+    let mut spec = DESKTOP_FLAGS.to_vec();
+    spec.push(("on", "", "machine names, comma separated: let in on those only (default: every server, not the coordinator)"));
+    // Words first (add NAME KEY.pub...), then flags.
+    let words: Vec<String> = args.iter().take_while(|a| !a.starts_with('-')).cloned().collect();
+    let f = Flags::parse("people", &args[words.len()..], &spec);
+    if Path::new(LIVE_CONFIG).exists() {
+        bail!("people runs on your own computer, where your key is");
+    }
+    let (mut a, _) = desktop_admin(&f, "people")?;
+    let cfg = Config::load(config_file(&f)?)?;
+    let v = a.load()?;
+    for w in &v.warnings {
+        eprintln!("warning: {}", report::printable(w));
+    }
+    let servers = a.servers();
+    let show = |a: &admin::Admin| {
+        if a.people().is_empty() {
+            println!("Nobody else is let in. dryserver people add NAME KEY.pub lets someone in.");
+        }
+        for p in a.people() {
+            let on = if p.on.is_empty() { "every server".to_string() } else { p.on.join(", ") };
+            println!("{}  on {on}  ({} key{})", p.name, p.keys.len(), if p.keys.len() == 1 { "" } else { "s" });
+        }
+    };
+    match words.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        [] => show(&a),
+        ["add", name, files @ ..] if !files.is_empty() => {
+            let mut keys = Vec::new();
+            for file in files {
+                let text = fsx::read_string(file)?;
+                keys.extend(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from));
+            }
+            let on: Vec<String> = f.get("on").split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+            let p = signed::Person { name: name.to_string(), keys, on };
+            let version = a.let_in(&p, &cfg.username)?;
+            println!("{name} is let in (signed list version {version}); the machines follow within a minute.");
+            let coord = servers.iter().find(|s| s.mesh_ip == mesh::ip(&a.subnet, 1)).map(|s| s.name.clone());
+            let theirs: Vec<&mesh::Server> =
+                servers.iter().filter(|s| p.may_log_in(&s.name, Some(&s.name) == coord.as_ref()) && !s.lan_ip.is_empty()).collect();
+            if theirs.is_empty() {
+                println!(
+                    "\nNo LAN address is known yet for the machines {name} may use: run dryserver people add again later \
+                     for the lines for {name}'s ~/.ssh/known_hosts."
+                );
+            } else {
+                println!("\nGive {name} these, for ~/.ssh/known_hosts (so their ssh knows the machines are yours):");
+                for s in &theirs {
+                    println!("  {} {}", s.lan_ip, s.host_key);
+                }
+                println!("Then: ssh {name}@ADDRESS");
+            }
+        }
+        ["remove", name] => {
+            let version = a.take_out(name)?;
+            println!(
+                "{name} is taken out (signed list version {version}): within a minute every machine locks the account and ends its sessions."
+            );
+        }
+        _ => bail!("usage: dryserver people | people add NAME KEY.pub... [--on m1,m2] | people remove NAME"),
+    }
     Ok(())
 }
 

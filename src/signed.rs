@@ -88,7 +88,75 @@ pub struct List {
     /// change carries them, so a machine that was off catches up.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<Envelope>,
+    /// Other people who may log in to the machines: an account of their
+    /// own, a shell, no sudo, no forwarding (people.rs).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub people: Vec<Person>,
 }
+
+/// More people than this in one list are not a home swarm's.
+pub const MAX_PEOPLE: usize = 32;
+/// Keys one person may log in with.
+pub const MAX_PERSON_KEYS: usize = 8;
+
+/// Someone the admin lets log in.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Person {
+    /// The account's name on the machines.
+    pub name: String,
+    /// "type base64", without comments.
+    pub keys: Vec<String>,
+    /// The machines (by name) the person may log in to; none: every
+    /// server, not the coordinator.
+    pub on: Vec<String>,
+}
+
+impl Person {
+    /// Whether the person may log in to the machine called name.
+    pub fn may_log_in(&self, name: &str, coordinator: bool) -> bool {
+        if self.on.is_empty() { !coordinator } else { self.on.iter().any(|n| n == name) }
+    }
+}
+
+/// A name an account of a person can have: like a Linux user's, lowercase,
+/// and none of the machines' own accounts.
+pub fn valid_person_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= 32
+        && (b[0].is_ascii_lowercase() || b[0] == b'_')
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
+        && !RESERVED.contains(&s)
+}
+
+/// Accounts a machine has or may have that are never a person's.
+const RESERVED: [&str; 24] = [
+    "root",
+    "bin",
+    "daemon",
+    "mail",
+    "ftp",
+    "http",
+    "nobody",
+    "dbus",
+    "systemd-journal-remote",
+    "systemd-network",
+    "systemd-oom",
+    "systemd-resolve",
+    "systemd-timesync",
+    "systemd-coredump",
+    "uuidd",
+    "polkitd",
+    "git",
+    "docker",
+    "admin",
+    "dryreg",
+    "wheel",
+    "sshd",
+    "k3s",
+    "users",
+];
 
 /// The swarm trusts another key from now on: to, in place of from. Signed
 /// (NS_KEY) by from, so only the holder of the key trusted now can hand
@@ -166,6 +234,24 @@ impl List {
         }
         if !ok.iter().any(|m| m.host == 1) {
             bail!("the signed list has no coordinator");
+        }
+        if self.people.len() > MAX_PEOPLE {
+            bail!("the signed list has {} people, more than {MAX_PEOPLE}", self.people.len());
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for p in &self.people {
+            if !valid_person_name(&p.name) || !names.insert(p.name.as_str()) {
+                bail!("the signed list has a person with a bad or repeated name: {:?}", p.name);
+            }
+            if p.keys.is_empty() || p.keys.len() > MAX_PERSON_KEYS {
+                bail!("{} has {} keys (1 to {MAX_PERSON_KEYS})", p.name, p.keys.len());
+            }
+            if let Some(k) = p.keys.iter().find(|k| key_body(k) != **k || !registry::valid_ssh_key(k)) {
+                bail!("{} has a bad SSH key: {k:?}", p.name);
+            }
+            if let Some(n) = p.on.iter().find(|n| !registry::valid_name(n)) {
+                bail!("{} is let in on a bad machine name: {n:?}", p.name);
+            }
         }
         Ok(())
     }
@@ -796,7 +882,7 @@ mod tests {
     }
 
     fn list() -> List {
-        List { version: 3, members: vec![entry(1, "coord"), entry(2, "nodeb")], rejected: vec![], keys: vec![] }
+        List { version: 3, members: vec![entry(1, "coord"), entry(2, "nodeb")], rejected: vec![], keys: vec![], people: vec![] }
     }
 
     #[test]
@@ -931,7 +1017,13 @@ mod tests {
         let v = SshVerifier { pubkey: dir.join("signing.pub"), tmp_dir: dir.path().to_path_buf() };
 
         // A full-size list: 254 members.
-        let big = List { version: 7, members: (1..=254).map(|h| entry(h, &format!("node{h}"))).collect(), rejected: vec![], keys: vec![] };
+        let big = List {
+            version: 7,
+            members: (1..=254).map(|h| entry(h, &format!("node{h}"))).collect(),
+            rejected: vec![],
+            keys: vec![],
+            people: vec![],
+        };
         let env = seal(&signer, &big).unwrap();
         assert_eq!(env.list(&v, fits).unwrap(), big);
 
@@ -1004,7 +1096,7 @@ mod tests {
     fn a_list_after_a_key_change_proves_its_signer() {
         use fake::Key;
         let (k1, k2) = (Key("k1"), Key("k2"));
-        let base = List { version: 5, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![] };
+        let base = List { version: 5, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![], people: vec![] };
         let old = seal(&k1, &base).unwrap();
         let with = List { version: 6, keys: vec![change(&k1, &k1, &k2, 10, true)], ..base.clone() };
         let new = seal(&k2, &with).unwrap();
@@ -1048,7 +1140,7 @@ mod tests {
         assert!(t.verify(NS_ADMIN, doc, &by2).is_err());
         // A list with the change, signed by k2, proves itself from k1...
         let c = seal_key_change(&s1, &KeyChange { serial: 7, from: p1.clone(), to: p2.clone(), login: true }).unwrap();
-        let list = List { version: 2, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![c] };
+        let list = List { version: 2, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![c], people: vec![] };
         let env = seal(&s2, &list).unwrap();
         assert_eq!(env.list_signed_by(&t, fits).unwrap(), (list.clone(), Some(p2.clone())));
         // ...and once it is the list taken, k2 is trusted and k1 no more.
@@ -1110,7 +1202,7 @@ mod tests {
         let trusted = dir.join("signing_ed25519.pub");
         std::fs::copy(ssh.join("id_ed25519.pub"), &trusted).unwrap();
         let v = SshVerifier { pubkey: trusted.clone(), tmp_dir: dir.path().to_path_buf() };
-        let list = List { version: 3, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![] };
+        let list = List { version: 3, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![], people: vec![] };
 
         // No agent: the file in ~/.ssh signs.
         let file = OwnKeySigner { pubkey: trusted.clone(), ssh_dir: Some(ssh.clone()), agent: None };

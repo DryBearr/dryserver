@@ -101,6 +101,15 @@ Part of the [dryserver README](../README.md).
   (`dryserver-members`, `dryserver-release`...) and an SSH login signs
   data of another form, so no signature passes for another. Servers do not
   allow agent forwarding, so a server cannot borrow your agent to sign.
+- **Other people** (`dryserver people`): the signed list names them, so
+  the coordinator cannot let anyone in. Each machine gives them an
+  account of their own in the group `dryserver-people` and nothing else
+  (not wheel: no sudo, no cluster; not docker), their keys in
+  `/etc/ssh/authorized_keys.d/NAME` (root's, so they cannot add one and
+  root never writes into their home), and sshd gives the group no
+  forwarding of any kind. A name a machine has already is refused, never
+  taken over. Taken out: locked, expired, no shell, sessions ended. A
+  shell on a server is still a foothold: let in only people you trust.
 - **Replacing the key** (`dryserver replace-key`): the old key signs a key
   change ("trust this key from now on"), carried in every member list
   after it, which the new key signs. Each machine follows the changes from

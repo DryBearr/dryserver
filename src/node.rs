@@ -1478,6 +1478,24 @@ impl Node {
         if let Err(e) = self.follow_login(&list) {
             eprintln!("dryserver: the admin's new login key is not in place yet: {e}");
         }
+        // The people the admin lets in, here: their accounts follow the list.
+        if let Some(mine) = list.members.iter().find(|e| self.is_me(me, e)) {
+            let here = crate::people::Here {
+                root: &self.root,
+                run: self.run.as_ref(),
+                name: &mine.name,
+                coordinator: me == 1,
+                admin: &self.cfg.username,
+            };
+            match here.reconcile(&Ctx::new(), &list.people) {
+                Ok(d) => {
+                    for r in &d.refused {
+                        eprintln!("dryserver: a person was not let in: {r}");
+                    }
+                }
+                Err(e) => eprintln!("dryserver: the people's accounts are not in place yet: {e}"),
+            }
+        }
         let members: Vec<Member> = list
             .members
             .iter()
@@ -2427,7 +2445,8 @@ mod tests {
         // The change, in a list the new key signed.
         let change =
             signed::seal_key_change(&k1, &signed::KeyChange { serial: 9, from: k1.public(), to: k2.public(), login: true }).unwrap();
-        let v6 = seal(&k2, &List { version: 6, members: members.clone(), rejected: vec![], keys: vec![change.clone()] }).unwrap();
+        let v6 = seal(&k2, &List { version: 6, members: members.clone(), rejected: vec![], keys: vec![change.clone()], people: vec![] })
+            .unwrap();
         n.signed_members(2, &[], &v6).unwrap();
         assert_eq!(n.verifier.key(), Some(k2.public()), "the list taken says who signs now");
         // The admin logs in with the new key, under the old label; others stay.
@@ -2441,18 +2460,18 @@ mod tests {
         let e = n.signed_members(2, &[], &sign(&k1, 7, members.clone())).unwrap_err().to_string();
         assert!(e.contains("bad signature"), "{e}");
         // Newer lists of the new key carry the change and are taken.
-        let v8 = seal(&k2, &List { version: 8, members: members.clone(), rejected: vec![], keys: vec![change] }).unwrap();
+        let v8 = seal(&k2, &List { version: 8, members: members.clone(), rejected: vec![], keys: vec![change], people: vec![] }).unwrap();
         n.signed_members(2, &[], &v8).unwrap();
         // A key change that does not log in leaves the login alone.
         let (_dir2, n2, _) = setup(vec![]);
         put(&n2.root, &keys, format!("{} desktop\n", k1.public()));
         let c = signed::seal_key_change(&k1, &signed::KeyChange { serial: 3, from: k1.public(), to: k2.public(), login: false }).unwrap();
-        n2.follow_login(&List { version: 1, members: vec![], rejected: vec![], keys: vec![c] }).unwrap();
+        n2.follow_login(&List { version: 1, members: vec![], rejected: vec![], keys: vec![c], people: vec![] }).unwrap();
         assert_eq!(get(&n2.root, &keys), format!("{} desktop\n", k1.public()));
     }
 
     fn sign(key: &Key, version: u64, members: Vec<Entry>) -> Envelope {
-        seal(key, &List { version, members, rejected: vec![], keys: vec![] }).unwrap()
+        seal(key, &List { version, members, rejected: vec![], keys: vec![], people: vec![] }).unwrap()
     }
 
     fn coord_member() -> Member {

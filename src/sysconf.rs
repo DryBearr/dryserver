@@ -829,7 +829,17 @@ AllowTcpForwarding yes
 # after a minute and a half.
 ClientAliveInterval 30
 ClientAliveCountMax 3
-{registry}"
+{registry}
+# Other people the admin lets in (dryserver people): their keys are in a
+# file only root writes, and they get a shell and nothing more: no
+# forwarding of any kind. 05-dryserver-people.conf names them.
+Match Group {people}
+	AuthorizedKeysFile {people_keys}/%u
+	DisableForwarding yes
+	PermitTunnel no
+",
+        people = crate::people::GROUP,
+        people_keys = crate::people::KEYS_DIR
     )
 }
 
@@ -1245,7 +1255,17 @@ mod tests {
         assert!(sshd_coord.contains("AllowUsers admin dryreg"));
         // Connections do not pile up: dead clients go, and the registry
         // account's idle ones too.
-        assert!(sshd_coord.ends_with("\tUnusedConnectionTimeout 30\n\tChannelTimeout session=60\n"), "{sshd_coord}");
+        assert!(sshd_coord.contains("\tUnusedConnectionTimeout 30\n\tChannelTimeout session=60\n"), "{sshd_coord}");
+        // Other people: their keys where only root writes, nothing
+        // forwarded, and last, so no Match block swallows the rest.
+        for s in [sshd, sshd_coord] {
+            assert!(
+                s.ends_with(
+                    "Match Group dryserver-people\n\tAuthorizedKeysFile /etc/ssh/authorized_keys.d/%u\n\tDisableForwarding yes\n\tPermitTunnel no\n"
+                ),
+                "{s}"
+            );
+        }
         // The registry account: whatever key it has, only the registry runs,
         // with no terminal and nothing forwarded; its key is read from where
         // only root writes (and, on machines installed before, from its
@@ -1270,7 +1290,12 @@ mod tests {
         assert!(crate::update::managed(REGISTRY_TMPFILES) && !has(&node, REGISTRY_TMPFILES));
         assert_eq!(REGISTRY_KEYS, format!("/etc/ssh/authorized_keys.d/{REGISTRY_USER}"));
         let sshd_node = &find(&node, "/etc/ssh/sshd_config.d/10-dryserver.conf").content;
-        assert!(sshd_node.contains("ClientAliveInterval 30\nClientAliveCountMax 3\n") && !sshd_node.contains("Match"), "{sshd_node}");
+        // A server has no registry account: its only Match is the people's.
+        assert!(
+            sshd_node.contains("ClientAliveInterval 30\nClientAliveCountMax 3\n") && sshd_node.matches("Match").count() == 1,
+            "{sshd_node}"
+        );
+        assert!(!sshd_node.contains("Match User"), "{sshd_node}");
 
         let sw = &find(&node, "/etc/systemd/network/10-switch.network").content;
         assert!(sw.contains("Address=172.16.66.5/24") && sw.contains("MACAddress=52:54:66:aa:bb:cc"), "{sw}");

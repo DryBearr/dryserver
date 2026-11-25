@@ -569,6 +569,7 @@ mod tests {
             ],
             rejected: vec![],
             keys: vec![],
+            people: vec![],
         };
         let env = signed::Envelope { doc: serde_json::to_string(&list).unwrap(), sig: "sig".into() };
         std::fs::write(p.secrets.join(admin::SIGNED_COPY), serde_json::to_string(&env).unwrap()).unwrap();

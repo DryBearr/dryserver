@@ -389,6 +389,27 @@ Restoring is not built yet. To look inside one:
 `age -d -i ~/.config/dryserver/secrets/backup_ed25519 FILE | tar -tv`. More:
 [docs/backups.md](docs/backups.md).
 
+### Let someone else in
+
+A friend who helps, or a second account for yourself without the keys to
+the swarm:
+
+```sh
+dryserver people add alice alice.pub              # every server
+dryserver people add alice alice.pub --on node-a  # node-a only (the coordinator: name it)
+dryserver people                                  # who is let in
+dryserver people remove alice
+```
+
+Within a minute every machine it names gives `alice` an account of her
+own: she logs in with her key only and gets a shell, nothing more. No
+sudo, no docker, no `kubectl`, no forwarding of any kind (so no tunnel
+into your mesh), and she cannot add another key: hers are in a file only
+root writes. `add` prints the lines for her `~/.ssh/known_hosts`, so her
+ssh knows the machines are yours. Taken out, her account is locked on
+every machine and her sessions end; her home folder stays. An account a
+machine has already (like yours) is never taken over.
+
 ### Replace your key
 
 A new laptop, a key you want to retire, or one you think someone copied:
@@ -548,6 +569,7 @@ On your desktop:
 | `dryserver export [FILE]` | your swarm in one file locked with a passphrase (`--no-ssh-key` leaves your SSH key out) |
 | `dryserver import FILE` | put a swarm from `export` on this computer |
 | `dryserver replace-key --to FILE.pub` | hand your swarm's trust (and your login) to a new SSH key, signed by the old one |
+| `dryserver people [add NAME KEY.pub [--on m1,m2] \| remove NAME]` | who else may log in: an account of their own, a shell and nothing more |
 | `dryserver build` | build the ISO, with its log in the terminal |
 | `dryserver disks` | list disks and which ones may be flashed |
 | `sudo "$(command -v dryserver)" flash --iso FILE` | flash any image to a USB drive (sudo does not look in `~/.local/bin`) |

@@ -251,6 +251,14 @@ AllowTcpForwarding yes
 # after a minute and a half.
 ClientAliveInterval 30
 ClientAliveCountMax 3
+
+# Other people the admin lets in (dryserver people): their keys are in a
+# file only root writes, and they get a shell and nothing more: no
+# forwarding of any kind. 05-dryserver-people.conf names them.
+Match Group dryserver-people
+	AuthorizedKeysFile /etc/ssh/authorized_keys.d/%u
+	DisableForwarding yes
+	PermitTunnel no
 ===== /home/admin/.ssh/authorized_keys (0600)
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest desktop
 ===== /etc/sudoers.d/10-wheel (0440)

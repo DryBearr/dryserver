@@ -349,7 +349,7 @@ fn machine(host: u32, name: &str) -> Box_ {
     put(dir.path(), crate::node::JOIN_STATE, format!("{{\"host\":{host}}}"));
     let coord =
         crate::signed::Entry { host: 1, name: "coord".into(), wg_key: crate::admin::tests::key32(1), ssh_host_key: host_key("coord") };
-    let list = crate::signed::List { version: 1, members: vec![coord], rejected: vec![], keys: vec![] };
+    let list = crate::signed::List { version: 1, members: vec![coord], rejected: vec![], keys: vec![], people: vec![] };
     put(dir.path(), crate::node::SIGNED_FILE, serde_json::to_string(&crate::signed::seal(&ADMIN, &list).unwrap()).unwrap());
     put(dir.path(), "/tmp/.keep", "");
     put(dir.path(), FIREWALL, FIREWALL_TEXT);

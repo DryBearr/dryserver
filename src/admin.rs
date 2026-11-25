@@ -1225,6 +1225,59 @@ impl Admin {
         Ok(())
     }
 
+    /// The people the signed list lets in, as last loaded.
+    pub fn people(&self) -> &[signed::Person] {
+        &self.base.people
+    }
+
+    /// Lets a person in (or changes who they are let in as): their own
+    /// account on the machines named in on (none: every server), their
+    /// keys only. admin is the admin's own account, never a person's.
+    /// Returns the version that carries it.
+    pub fn let_in(&mut self, p: &signed::Person, admin: &str) -> Result<u64> {
+        if !signed::valid_person_name(&p.name) || p.name == admin {
+            bail!(
+                "{:?} cannot be a person's account: lowercase letters, digits, _ and -, at most 32, and none of the \
+                 machines' own accounts",
+                p.name
+            );
+        }
+        let mut keys = Vec::new();
+        for k in &p.keys {
+            let k = key_body(k);
+            if !registry::valid_ssh_key(&k) {
+                bail!("not an SSH public key: {k:?}");
+            }
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        if keys.is_empty() {
+            bail!("{} needs at least one SSH public key", p.name);
+        }
+        let person = signed::Person { name: p.name.clone(), keys, on: p.on.clone() };
+        self.publish(|list, _| {
+            if let Some(n) = person.on.iter().find(|n| !list.members.iter().any(|e| e.name == **n)) {
+                bail!("there is no machine called {n} in your swarm");
+            }
+            list.people.retain(|q| q.name != person.name);
+            list.people.push(person);
+            Ok(())
+        })
+    }
+
+    /// Takes a person out: within a minute their account on every machine
+    /// is locked and their sessions end.
+    pub fn take_out(&mut self, name: &str) -> Result<u64> {
+        self.publish(|list, _| {
+            if !list.people.iter().any(|p| p.name == name) {
+                bail!("{name} is not let in");
+            }
+            list.people.retain(|p| p.name != name);
+            Ok(())
+        })
+    }
+
     /// The first signature: signs the coordinator's own entry, which
     /// nothing vouches for but the code the admin compared. Later machines
     /// come in only through approve.
@@ -2344,6 +2397,7 @@ pub mod tests {
                 members: vec![Entry { host: 1, name: "coord".into(), wg_key: key32(1), ssh_host_key: COORD_KEY.into() }],
                 rejected: vec![],
                 keys: vec![],
+                people: vec![],
             },
         )
         .unwrap();
@@ -2469,7 +2523,7 @@ pub mod tests {
         assert!(a.load().unwrap_err().to_string().contains("bad signature"), "the registry opened for a wrong key");
         let forged = signed::seal(
             a.signer.as_ref(),
-            &List { version: u64::MAX, members: vec![Entry::of(&s.members[0])], rejected: vec![], keys: vec![] },
+            &List { version: u64::MAX, members: vec![Entry::of(&s.members[0])], rejected: vec![], keys: vec![], people: vec![] },
         )
         .unwrap();
         assert!(a.link.call("publish", &serde_json::to_string(&forged).unwrap()).unwrap_err().to_string().contains("bad signature"));
@@ -2559,6 +2613,43 @@ pub mod tests {
             uploads: Arc::default(),
         });
         (a, store, fails)
+    }
+
+    #[test]
+    fn people_are_let_in_and_taken_out_by_signed_list() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        a.load().unwrap();
+        a.sign_coordinator().unwrap();
+        let alice = signed::Person { name: "alice".into(), keys: vec!["ssh-ed25519 AAAAalice alice@laptop".into()], on: vec![] };
+        let v = a.let_in(&alice, "admin").unwrap();
+        let s = store.read().unwrap();
+        let list = s.signed.list(&Key("admin"), |h| h < 255).unwrap();
+        assert_eq!(list.version, v);
+        // Keys without their comments.
+        assert_eq!(list.people, vec![signed::Person { keys: vec!["ssh-ed25519 AAAAalice".into()], ..alice.clone() }]);
+        // Again with another key and a machine: changed, not twice.
+        let on = signed::Person { keys: vec!["ssh-ed25519 AAAAnew".into()], on: vec!["coord".into()], ..alice.clone() };
+        a.let_in(&on, "admin").unwrap();
+        assert_eq!(a.people().len(), 1);
+        assert_eq!(a.people()[0].on, vec!["coord"]);
+        // Refused before anything is signed.
+        let v = a.load().unwrap().version;
+        for (p, why) in [
+            (signed::Person { name: "admin".into(), ..alice.clone() }, "cannot be a person's account"),
+            (signed::Person { name: "root".into(), ..alice.clone() }, "cannot be a person's account"),
+            (signed::Person { name: "Al ice".into(), ..alice.clone() }, "cannot be a person's account"),
+            (signed::Person { keys: vec![], ..alice.clone() }, "at least one"),
+            (signed::Person { keys: vec!["hello".into()], ..alice.clone() }, "not an SSH public key"),
+            (signed::Person { on: vec!["nowhere".into()], ..alice.clone() }, "no machine called nowhere"),
+        ] {
+            let e = a.let_in(&p, "admin").unwrap_err().to_string();
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        assert_eq!(a.load().unwrap().version, v);
+        a.take_out("alice").unwrap();
+        assert!(a.people().is_empty());
+        assert!(a.take_out("alice").unwrap_err().to_string().contains("not let in"));
     }
 
     #[test]

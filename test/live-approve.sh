@@ -376,6 +376,23 @@ check "with the new key there it goes on" grep -qv "replaced on another computer
 out=$(desk replace-key --to "$S/deskhome/.ssh/id_new.pub" --yes)
 check "the key trusted now is not replaced by itself" grep -q "trusts now" <<<"$out"
 
+echo "== people"
+keygen "$S/alice" alice@laptop
+out=$(desk people add alice "$S/alice.pub")
+check "people add lets alice in" grep -q "alice is let in" <<<"$out"
+check "and names the machines' keys for her known_hosts" grep -q "known_hosts" <<<"$out"
+check "the coordinator's list lets her in, signed" bash -c "python3 -I -c \"import json; d=json.load(open('$S/root2/var/lib/dryserver/registry.json'))['signed']; l=json.loads(d['doc']); p=l['people'][0]; assert p['name']=='alice' and p['on']==[] and len(p['keys'])==1, p\""
+check "signed by the key trusted now" own_signed "$S/root2/var/lib/dryserver/registry.json" dryserver-members "$S/deskhome/.ssh/id_new.pub"
+out=$(desk people)
+check "people lists her" grep -q "^alice  on every server" <<<"$out"
+out=$(desk people add admin "$S/alice.pub")
+check "the admin's own account is no person's" grep -q "cannot be a person's account" <<<"$out"
+out=$(desk people add bob "$S/alice.pub" --on nowhere)
+check "a machine that is not there is refused" grep -q "no machine called nowhere" <<<"$out"
+out=$(desk people remove alice)
+check "people remove takes her out" grep -q "alice is taken out" <<<"$out"
+check "the list lets nobody in" bash -c "python3 -I -c \"import json; d=json.load(open('$S/root2/var/lib/dryserver/registry.json'))['signed']; assert 'people' not in json.loads(d['doc'])\""
+
 echo "== connections"
 # The screen asks the coordinator every few seconds over one shared
 # connection. Open for 20 seconds (four rounds), it must not leave a
