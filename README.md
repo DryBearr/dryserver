@@ -316,7 +316,14 @@ dryserver release publish -notes "fixes the join timeout"
 ```
 
 Or press `p` in `dryserver approve` (Machines). Either way you see what changes
-before anything is signed:
+before anything is signed. A release also carries the ports in your
+config (`MESH_PORTS`, `EGRESS_PORTS`): change them in Config, publish,
+and every machine's firewall follows, checked and reverted with the rest
+of the update when the machine does not come back healthy. The rest of
+the config (addresses, the mesh, WiFi, the tools) stays as installed; your
+login key moves with `dryserver replace-key`. A coordinator that runs a
+dryserver older than 0.2.0 gets the ports with the release after it
+updated.
 
 ```
 Release 1795400000 for 3 machines:
@@ -326,6 +333,7 @@ Release 1795400000 for 3 machines:
   urgent     no: machines update only 03:00-05:00 on the coordinator's clock
   rollback   no
   notes      fixes the join timeout
+  settings   MESH_PORTS none, EGRESS_PORTS '25/tcp': the machines take these from your config
 coord updates itself first, then the servers one at a time: node-a and
 node-b (node-a is the canary, watched for 5m).
 Sign it and send it to the coordinator at 192.168.1.50? [y/N]

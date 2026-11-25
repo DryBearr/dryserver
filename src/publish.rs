@@ -389,6 +389,9 @@ pub struct Choice {
     pub notes: String,
     pub urgent: bool,
     pub rollback: bool,
+    /// The swarm's settings from this computer's config, for the machines
+    /// to take with the release.
+    pub settings: Option<release::Settings>,
 }
 
 /// A release checked and ready to sign, and what it changes.
@@ -411,6 +414,8 @@ pub struct Plan {
     pub unsent: Option<u64>,
     /// How the Arch day was found.
     pub arch_how: String,
+    /// Why the settings stay out of this release, if they do.
+    pub settings_left: Option<String>,
     pub k3s: K3sFile,
     /// The coordinator's name, and the servers in the order of the list.
     pub brain: Option<String>,
@@ -485,6 +490,22 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
     // Everything else the machines would refuse, with a stand-in day: the
     // one named, or today.
     let probe = if given.is_empty() { day_text(today) } else { given.clone() };
+    // An older coordinator refuses a release with settings: they wait for
+    // a release once it runs this one.
+    let brain_ds = v.members.iter().find(|(m, _)| m.host == 1).and_then(|(m, _)| m.report.as_ref()).map(|r| r.dryserver.clone());
+    let since = Version::parse(release::SETTINGS_SINCE)?;
+    let (settings, settings_left) = match (&c.settings, brain_ds.as_deref().map(Version::parse)) {
+        (None, _) => (None, None),
+        (Some(s), Some(Ok(b))) if b >= since => (Some(s.clone()), None),
+        (Some(_), Some(Ok(_))) | (Some(_), Some(Err(_))) => (
+            None,
+            Some(format!(
+                "the coordinator runs dryserver {}, which does not know them: they go with the next release, once it runs this one",
+                brain_ds.clone().unwrap_or_default()
+            )),
+        ),
+        (Some(_), None) => (None, Some("the coordinator has not said which dryserver it runs yet: they go with a later release".into())),
+    };
     let draft = |day: &str| {
         a.draft_release(&release::Draft {
             binary: &parts.binary,
@@ -493,6 +514,7 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
             rollback: c.rollback,
             urgent: c.urgent,
             notes: &c.notes,
+            settings: settings.clone(),
         })
     };
     draft(&probe)?;
@@ -535,6 +557,7 @@ pub fn plan(ctx: &Ctx, a: &Admin, v: &View, days: &dyn Days, parts: &Parts, c: &
         went_back,
         runs,
         arch_how: day.how,
+        settings_left,
         k3s,
         brain: brain.map(|m| m.name.clone()),
         servers: members.iter().filter(|m| m.host != 1).map(|m| m.name.clone()).collect(),
@@ -652,6 +675,19 @@ impl Plan {
         ));
         out.push(row("rollback", if r.rollback { "yes: older versions than the swarm runs are allowed".into() } else { "no".into() }));
         out.push(row("notes", if r.notes.is_empty() { "none".into() } else { r.notes.clone() }));
+        let shown = |v: &str| if v.is_empty() { "none".to_string() } else { format!("'{v}'") };
+        out.push(row(
+            "settings",
+            match (&r.settings, &self.settings_left) {
+                (Some(s), _) => format!(
+                    "MESH_PORTS {}, EGRESS_PORTS {}: the machines take these from your config",
+                    shown(&s.mesh_ports),
+                    shown(&s.egress_ports)
+                ),
+                (None, Some(why)) => format!("not in this release: {why}"),
+                (None, None) => "none: the machines keep theirs".into(),
+            },
+        ));
         match (&self.current, self.went_back) {
             (Some(cur), Some(m)) => {
                 let what = if m > 0 { format!("release {m}") } else { "what they ran before it".into() };

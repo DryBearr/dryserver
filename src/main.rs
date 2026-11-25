@@ -1382,6 +1382,7 @@ fn machines_model(f: &Flags) -> Result<tui::admin::Screen> {
         days: Arc::new(publish::Archive::new()),
         parts: publish::Parts::this_program(&paths()?.out_dir, None)?,
         today: || chrono::Utc::now().date_naive(),
+        settings: Config::load(config_file(f)?).ok().map(|c| release::Settings::of(&c)),
     };
     let list = f.clone();
     let write_list: tui::kill::WriteList = Arc::new(move || Ok(ssh_config(&list)?.summary));
@@ -1514,6 +1515,7 @@ fn release_publish(args: &[String]) -> Result<()> {
         notes: f.get("notes").into(),
         urgent: f.on("urgent"),
         rollback: f.on("rollback"),
+        settings: Some(release::Settings::of(&Config::load(config_file(&f)?)?)),
     };
     println!("Checking the release: the binary, the k3s file, the Arch archive, the coordinator...");
     let today = chrono::Utc::now().date_naive();

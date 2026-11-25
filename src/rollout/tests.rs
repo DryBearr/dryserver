@@ -689,6 +689,7 @@ impl Swarm {
             rollback: false,
             urgent,
             notes: format!("release {serial}"),
+            settings: None,
         };
         (release::seal(&ADMIN, &r).unwrap(), bin)
     }
@@ -2871,6 +2872,7 @@ fn an_old_rollback_sent_again_does_not_move_a_fresh_machine_below_its_install() 
         rollback: true,
         urgent: true,
         notes: "old".into(),
+        settings: None,
     };
     sw.upload(&release::seal(&ADMIN, &r).unwrap(), &bin, None).unwrap();
     sw.ticks(3);

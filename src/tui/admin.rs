@@ -302,6 +302,9 @@ pub struct Publisher {
     pub parts: Parts,
     /// The date in UTC.
     pub today: fn() -> NaiveDate,
+    /// The swarm's settings from this computer's config, carried by the
+    /// release.
+    pub settings: Option<crate::release::Settings>,
 }
 
 /// A decision, as the admin confirmed it.
@@ -448,6 +451,7 @@ fn work(ctx: &Ctx, admin: &mut Admin, tools: &Tools, job: Job) -> Msg {
             let p = tools.publisher.as_ref().ok_or_else(|| Error::new("this screen cannot publish"))?;
             let mut a = (p.admin)()?;
             let v = a.load()?;
+            let c = Choice { settings: p.settings.clone(), ..c };
             publish::plan(ctx, &a, &v, p.days.as_ref(), &p.parts, &c, (p.today)()).map(Box::new)
         })()),
         Job::Act(act) => {

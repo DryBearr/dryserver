@@ -197,8 +197,11 @@ release that brings it. Step by step:
    the update here with the mirrorlist put back: *postponed*, tried again
    at the next sync (10 times), not a failed release.
 5. **The new dryserver takes the old one's place** in one rename (a power
-   cut leaves one of the two, never half a file). It rewrites the system
-   files it manages from `/etc/dryserver/config.env`, each validated first
+   cut leaves one of the two, never half a file). The settings the release
+   carries (`MESH_PORTS`, `EGRESS_PORTS`, from the admin's config) go into
+   `/etc/dryserver/config.env` first, which is then one of the files it
+   writes, with a backup like the rest, so a revert puts it back too. It
+   rewrites the system files it manages from that config, each validated first
    (`nft -c`, `sshd -t`, `systemd-analyze verify`), and reloads only what
    changed.
 6. **k3s**, when this machine runs another binary than the release's: put

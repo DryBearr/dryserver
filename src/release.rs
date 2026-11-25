@@ -101,6 +101,53 @@ pub struct Release {
     /// What the release is for ("fixes X"), shown on the desktop and in
     /// the monitor. Printable ASCII, at most MAX_NOTES bytes, may be empty.
     pub notes: String,
+    /// The swarm's settings the machines take with this release (their
+    /// config.env), from the admin's config. Left out: they keep theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Settings>,
+}
+
+/// The first dryserver that knows Release::settings: an older one refuses
+/// a release that has them (deny_unknown_fields), so they go only to a
+/// coordinator that runs this one or newer.
+pub const SETTINGS_SINCE: &str = "0.2.0";
+
+/// Settings of the swarm a release carries. Only ones that change what
+/// the machines' own files say (the firewall), so the update's checks and
+/// its revert cover them; not the addresses, the mesh or the admin's
+/// account, which every machine has to agree on at once.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    /// MESH_PORTS: open to the other members, like "8080/tcp 53/udp".
+    pub mesh_ports: String,
+    /// EGRESS_PORTS: what the machines may reach outside the mesh.
+    pub egress_ports: String,
+}
+
+impl Settings {
+    /// The settings of a config.
+    pub fn of(c: &crate::config::Config) -> Settings {
+        Settings { mesh_ports: c.mesh_ports.clone(), egress_ports: c.egress_ports.clone() }
+    }
+
+    /// Puts them into a machine's config; whether anything changed.
+    pub fn apply(&self, c: &mut crate::config::Config) -> bool {
+        let before = (c.mesh_ports.clone(), c.egress_ports.clone());
+        c.mesh_ports = self.mesh_ports.clone();
+        c.egress_ports = self.egress_ports.clone();
+        before != (c.mesh_ports.clone(), c.egress_ports.clone())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (name, v) in [("MESH_PORTS", &self.mesh_ports), ("EGRESS_PORTS", &self.egress_ports)] {
+            if v.len() > 512 {
+                bail!("{name} in the release is longer than 512 bytes");
+            }
+            crate::config::parse_ports(v).map_err(|e| errf!("{name} in the release: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +279,9 @@ impl Release {
         }
         let day = arch_day(&self.arch_date)?;
         check_notes(&self.notes)?;
+        if let Some(s) = &self.settings {
+            s.validate()?;
+        }
         if self.created <= 0 {
             bail!("the release has no creation time");
         }
@@ -499,11 +549,12 @@ pub struct Draft<'a> {
     pub rollback: bool,
     pub urgent: bool,
     pub notes: &'a str,
+    pub settings: Option<Settings>,
 }
 
 impl Default for Draft<'_> {
     fn default() -> Self {
-        Draft { binary: Path::new(""), version: "", arch_date: "", rollback: false, urgent: false, notes: "" }
+        Draft { binary: Path::new(""), version: "", arch_date: "", rollback: false, urgent: false, notes: "", settings: None }
     }
 }
 
@@ -530,6 +581,7 @@ pub fn build_after(d: &Draft, after: Option<u64>, base: Option<&Release>, now: i
         rollback: d.rollback,
         urgent: d.urgent,
         notes: d.notes.into(),
+        settings: d.settings.clone(),
     };
     r.validate(now)?;
     decide(&r, base, Place::Brain, now)?;
@@ -653,6 +705,7 @@ mod tests {
             rollback: false,
             urgent: false,
             notes: String::new(),
+            settings: None,
         }
     }
 
@@ -668,6 +721,7 @@ mod tests {
             rollback: false,
             urgent: false,
             notes: "fixes the join timeout".into(),
+            settings: None,
         }
     }
 
@@ -681,6 +735,34 @@ mod tests {
         let key = fake::Key("admin");
         let env = seal(&key, r).unwrap();
         check(&key, &env, installed, place, now).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn settings_travel_only_when_there_are_some() {
+        let r = old();
+        // A release without settings reads as before: an older machine
+        // (deny_unknown_fields) takes it.
+        assert!(!serde_json::to_string(&r).unwrap().contains("settings"));
+        let s = Settings { mesh_ports: "8080/tcp".into(), egress_ports: "25/tcp".into() };
+        let with = Release { settings: Some(s.clone()), ..r.clone() };
+        let text = serde_json::to_string(&with).unwrap();
+        assert_eq!(serde_json::from_str::<Release>(&text).unwrap(), with);
+        with.validate(now()).unwrap();
+        // Ports a config would refuse, or anything else in them, are refused.
+        for bad in [
+            Settings { mesh_ports: "99999/tcp".into(), ..s.clone() },
+            Settings { egress_ports: "22/sctp".into(), ..s.clone() },
+            Settings { egress_ports: "x".repeat(600), ..s.clone() },
+        ] {
+            assert!(Release { settings: Some(bad.clone()), ..r.clone() }.validate(now()).is_err(), "{bad:?}");
+        }
+        let unknown = text.replace("\"egress_ports\"", "\"wifi_pass\":\"x\",\"egress_ports\"");
+        assert!(serde_json::from_str::<Release>(&unknown).is_err(), "nothing else rides along");
+        // Into a machine's config.
+        let mut c = crate::config::Config::default();
+        assert!(s.apply(&mut c));
+        assert!(!s.apply(&mut c), "the same again changes nothing");
+        assert_eq!((c.mesh_ports.as_str(), c.egress_ports.as_str()), ("8080/tcp", "25/tcp"));
     }
 
     #[test]

@@ -717,6 +717,7 @@ fn status_is_one_line_per_machine_and_says_what_to_do() {
         rollback: false,
         urgent: true,
         notes: "fixes X".into(),
+        settings: None,
     };
     let s = r.serial;
     let v = View {
@@ -924,15 +925,26 @@ fn a_load_takes_the_rollout_and_the_cuts_as_plain_text() {
 #[test]
 fn no_release_yet_the_same_version_is_not_called_the_same() {
     let dir = TempDir::new();
-    let (mut a, _, _, _, _) = desk(&dir);
+    let (mut a, store, _, _, _) = desk(&dir);
+    // The machines report the version this dryserver is.
+    store
+        .update(|s| {
+            for m in &mut s.members {
+                if let Some(r) = m.report.as_mut() {
+                    r.dryserver = "0.2.0".into();
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
     let days = FakeDays::with(&[days_ago(0)]);
     let v = a.load().unwrap();
-    let rebuilt = super::tests::parts(&dir, "0.1.0");
+    let rebuilt = super::tests::parts(&dir, "0.2.0");
     let p = plan(&Ctx::new(), &a, &v, &days, &rebuilt, &Choice::default(), today()).unwrap();
     let lines = p.lines();
-    assert_eq!(lines[1], "  dryserver  0.1.0 (the machines report 0.1.0, not which build: they all get this one)");
+    assert_eq!(lines[1], "  dryserver  0.2.0 (the machines report 0.2.0, not which build: they all get this one)");
     assert_eq!(lines[2], format!("  k3s        same ({})", iso::K3S_VERSION), "a k3s version is one pinned binary");
-    assert!(!lines.join("\n").contains("same (0.1.0)"), "{lines:?}");
+    assert!(!lines.join("\n").contains("same (0.2.0)"), "{lines:?}");
 }
 
 /// An urgent release keeps the swarm's Arch day unless one is named: no
@@ -1186,4 +1198,38 @@ fn copies_of_signed_releases_are_kept_and_few() {
     assert!(signed_copy(&a, 5).is_none() && signed_copy(&a, 0).is_none(), "not a signed release");
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(std::fs::metadata(copies.join(format!("{}.json", p.release.serial))).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn settings_go_with_a_release_once_the_coordinator_knows_them() {
+    let dir = TempDir::new();
+    let (mut a, store, _, _, parts) = desk(&dir);
+    let days = FakeDays::with(&[days_ago(0)]);
+    let s = release::Settings { mesh_ports: "8080/tcp".into(), egress_ports: "25/tcp".into() };
+    let c = Choice { settings: Some(s.clone()), ..Choice::default() };
+    // The coordinator runs 0.1.0, which would refuse them: left out, and
+    // the preview says why.
+    let v = a.load().unwrap();
+    let p = plan(&Ctx::new(), &a, &v, &days, &parts, &c, today()).unwrap();
+    assert_eq!(p.release.settings, None);
+    let lines = p.lines().join("\n");
+    assert!(lines.contains("settings") && lines.contains("runs dryserver 0.1.0, which does not know them"), "{lines}");
+    // Once it runs a dryserver that knows them, they go.
+    store
+        .update(|st| {
+            if let Some(r) = st.members.iter_mut().find(|m| m.host == 1).and_then(|m| m.report.as_mut()) {
+                r.dryserver = release::SETTINGS_SINCE.into();
+            }
+            Ok(())
+        })
+        .unwrap();
+    let v = a.load().unwrap();
+    let p = plan(&Ctx::new(), &a, &v, &days, &parts, &c, today()).unwrap();
+    assert_eq!(p.release.settings, Some(s));
+    let lines = p.lines().join("\n");
+    assert!(lines.contains("MESH_PORTS '8080/tcp', EGRESS_PORTS '25/tcp': the machines take these from your config"), "{lines}");
+    // None chosen: none carried, and said.
+    let p = plan(&Ctx::new(), &a, &v, &days, &parts, &Choice::default(), today()).unwrap();
+    assert_eq!(p.release.settings, None);
+    assert!(p.lines().join("\n").contains("none: the machines keep theirs"));
 }

@@ -688,6 +688,7 @@ fn with_release(store: &Store, rollout: Rollout, failed_on: Option<u32>) -> u64 
         rollback: false,
         urgent: true,
         notes: "fixes the relay timeout that drops long uploads on slow links".into(),
+        settings: None,
     };
     let served = crate::fsx::dir(&store.path).join(crate::rollout::SERVED_DIR);
     let at = served.join(r.serial.to_string());
@@ -785,6 +786,7 @@ fn publishing(dir: &TempDir, days: &Arc<FakeDays>) -> (Run, Store, Sent, Arc<Ato
         days: days.clone(),
         parts,
         today,
+        settings: None,
     };
     (Run::open(Screen::new(admin).with_publisher(p)), store, sent, hold)
 }

@@ -2786,20 +2786,20 @@ pub mod tests {
             std::fs::write(served.join("current"), format!("{serial}\n")).unwrap();
         };
         let at = |v: &str| static_binary(&dir, &format!("dryserver-{v}"), v);
-        let (b1, b3, b2, b0) = (at("0.1.0"), at("0.3.0"), at("0.2.0"), at("0.0.9"));
+        let (b1, b3, b2, b0) = (at("0.2.0"), at("0.4.0"), at("0.3.0"), at("0.1.9"));
         fn d<'a>(bin: &'a Path, version: &'a str) -> release::Draft<'a> {
             release::Draft { binary: bin, version, arch_date: "2026/11/19", ..release::Draft::default() }
         }
-        let m = a.publish_release(&d(&b1, "0.1.0"), &k3s).unwrap();
+        let m = a.publish_release(&d(&b1, "0.2.0"), &k3s).unwrap();
         took(m.serial);
         let copies = dir.join("secrets").join(crate::publish::COPIES);
         std::fs::create_dir_all(&copies).unwrap();
         std::fs::copy(dir.join("secrets").join(RELEASE_COPY), copies.join(format!("{}.json", m.serial))).unwrap();
-        let n = a.publish_release(&d(&b3, "0.3.0"), &k3s).unwrap();
+        let n = a.publish_release(&d(&b3, "0.4.0"), &k3s).unwrap();
         took(n.serial);
-        // Before it went back: 0.2.0 is older than the swarm's.
+        // Before it went back: 0.3.0 is older than the swarm's.
         a.load().unwrap();
-        assert!(a.draft_release(&d(&b2, "0.2.0")).unwrap_err().to_string().contains("rollback"));
+        assert!(a.draft_release(&d(&b2, "0.3.0")).unwrap_err().to_string().contains("rollback"));
         store
             .update(|s| {
                 s.rollout = Rollout { serial: n.serial, phase: rollout::Phase::Failed, paused: "it reverted".into(), ..Rollout::default() };
@@ -2814,8 +2814,8 @@ pub mod tests {
             .unwrap();
         a.load().unwrap();
         assert_eq!(a.release_base().map(|r| r.serial), Some(m.serial));
-        assert!(a.draft_release(&d(&b0, "0.0.9")).unwrap_err().to_string().contains("rollback"), "below M");
-        let r = a.publish_release(&d(&b2, "0.2.0"), &k3s).unwrap();
+        assert!(a.draft_release(&d(&b0, "0.1.9")).unwrap_err().to_string().contains("rollback"), "below M");
+        let r = a.publish_release(&d(&b2, "0.3.0"), &k3s).unwrap();
         assert!(r.serial > n.serial && !r.rollback, "{r:?}");
         // Without this computer's copy of M: the versions go by what this
         // dryserver is, as before any release, and by the machines
@@ -2827,7 +2827,7 @@ pub mod tests {
         std::fs::write(a2.secrets.join(crate::iso::JOIN_SECRET), format!("{SECRET}\n")).unwrap();
         a2.load().unwrap();
         assert!(a2.release_base().is_none());
-        assert!(a2.draft_release(&d(&b2, "0.2.0")).unwrap().serial > n.serial);
+        assert!(a2.draft_release(&d(&b2, "0.3.0")).unwrap().serial > n.serial);
     }
 
     #[test]
@@ -2925,6 +2925,7 @@ pub mod tests {
             rollback: false,
             urgent: true,
             notes: "fixes X".into(),
+            settings: None,
         };
         let served = fsx::dir(&store.path).join(rollout::SERVED_DIR);
         let put_release = |key: &Key| {

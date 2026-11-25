@@ -975,9 +975,25 @@ pub fn managed(path: &str) -> bool {
 }
 
 /// The system files this machine gets from this binary.
+#[cfg(test)]
 pub fn render_managed(m: &Machine) -> Result<Vec<sysconf::File>> {
-    let p = machine_params(m)?;
+    render_managed_with(m, None)
+}
+
+/// render_managed, from the config with the settings a release carries put
+/// in first. config.env is one of the files then, written like the rest:
+/// checked with them, and put back with them by a revert.
+pub fn render_managed_with(m: &Machine, settings: Option<&crate::release::Settings>) -> Result<Vec<sysconf::File>> {
+    let mut p = machine_params(m)?;
+    let mut config = None;
+    if let Some(s) = settings {
+        s.validate()?;
+        if s.apply(&mut p.config) {
+            config = Some(sysconf::File { path: CONFIG.into(), mode: 0o600, content: p.config.render() });
+        }
+    }
     let mut files: Vec<sysconf::File> = sysconf::render(&p)?.into_iter().filter(|f| managed(&f.path)).collect();
+    files.extend(config);
     // The registry account's limits: the installer writes them under its
     // uid, which only the machine knows; an update keeps them in step too.
     // A coordinator without that account has nothing to limit.
@@ -2543,7 +2559,9 @@ pub fn activate(m: &Machine, ctx: &Ctx, id: &str, out: &mut dyn Write) -> Result
         let _mesh = fsx::lock(m.path(quarantine::MESH_LOCK))?;
         let p = handed(m, id, STAGE_INSTALLING, "activate")?;
         refuse_if_cut(m)?;
-        let files = render_managed(m)?;
+        // Checked by the apply that handed over; root's record.
+        let settings = serde_json::from_str::<crate::release::Release>(&p.release.doc).ok().and_then(|r| r.settings);
+        let files = render_managed_with(m, settings.as_ref())?;
         let mut ch = Changes::new(m, p);
         for f in &files {
             ch.put(&f.path, f.mode, f.content.as_bytes())?;
@@ -3340,6 +3358,7 @@ mod tests {
             rollback: false,
             urgent: false,
             notes: "fixes the join timeout".into(),
+            settings: None,
         }
     }
 
@@ -4657,6 +4676,40 @@ mod tests {
         save_pending(&lab.m(), &p).unwrap();
         let e = confirm(&lab.m(), &Ctx::new(), None, now(), &mut Vec::new()).unwrap_err().to_string();
         assert!(e.contains("did not finish applying"), "{e}");
+    }
+
+    #[test]
+    fn a_release_with_settings_changes_the_config_and_a_revert_puts_it_back() {
+        let lab = Lab::new();
+        let before = lab.get(CONFIG);
+        let s = release::Settings { mesh_ports: "8080/tcp".into(), egress_ports: "2525/tcp 5353/udp".into() };
+        lab.apply(&Release { settings: Some(s), ..rel(7, NEW) }).unwrap();
+        let after = lab.get(CONFIG);
+        assert!(after.contains("EGRESS_PORTS='2525/tcp 5353/udp'") && after.contains("MESH_PORTS='8080/tcp'"), "{after}");
+        // Everything else in it as it was.
+        let rest =
+            |t: &str| t.lines().filter(|l| !l.starts_with("EGRESS_PORTS=") && !l.starts_with("MESH_PORTS=")).collect::<Vec<_>>().join("\n");
+        assert_eq!(rest(&after), rest(&before));
+        // The firewall the machine loaded lets the new ports through.
+        let fw = lab.fake.loaded.lock().unwrap().last().cloned().unwrap_or_default();
+        assert!(fw.contains("2525") && fw.contains("8080"), "{fw}");
+        // A revert puts the config back with the rest.
+        revert_by_hand(&lab.m(), &Ctx::new(), now() + 60, &mut Vec::new()).unwrap();
+        assert_eq!(lab.get(CONFIG), before);
+        lab.assert_old("settings reverted");
+        // A release without settings leaves the machine's alone.
+        lab.apply(&rel(8, NEW)).unwrap();
+        assert_eq!(lab.get(CONFIG), before);
+    }
+
+    #[test]
+    fn settings_that_do_not_check_out_are_refused() {
+        let lab = Lab::new();
+        let before = lab.get(CONFIG);
+        let bad = release::Settings { mesh_ports: "99999/tcp".into(), egress_ports: String::new() };
+        assert!(lab.apply(&Release { settings: Some(bad), ..rel(7, NEW) }).is_err());
+        assert_eq!(lab.get(CONFIG), before);
+        lab.assert_old("refused");
     }
 
     #[test]
