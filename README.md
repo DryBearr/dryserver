@@ -104,6 +104,15 @@ dryserver works from any folder. It keeps your swarm in one place:
 | `~/.config/dryserver/secrets/` | your keys | **back it up** |
 | `~/.cache/dryserver/` | the installer image and the package cache | made again by a build |
 
+**A second computer, or a copy in a drawer:** `dryserver export` writes
+your whole swarm (config, keys, and your SSH key when it is a file in
+`~/.ssh`) to one file locked with a passphrase that gpg asks for.
+`dryserver import FILE` on the laptop puts it in place; it never writes
+over another swarm or another SSH key (the swarm's key then goes to
+`~/.ssh/dryserver_ed25519`). Both computers can sign: each takes the
+newest list from the coordinator. Anyone with the file and its passphrase
+controls your swarm, so keep the two apart.
+
 `dryserver where` shows them. An older dryserver kept `config.env` and
 `secrets/` in the folder you ran it from: copy them over once with
 `dryserver init --from ~/path/to/that/folder` (it changes nothing there).
@@ -512,6 +521,8 @@ On your desktop:
 | `dryserver` | the menu: config, build, flash, machines, apps, outside |
 | `dryserver where` | the folders that hold your config, keys and images |
 | `dryserver init --from DIR` | copy the swarm an older dryserver kept in `DIR` to where it belongs now |
+| `dryserver export [FILE]` | your swarm in one file locked with a passphrase (`--no-ssh-key` leaves your SSH key out) |
+| `dryserver import FILE` | put a swarm from `export` on this computer |
 | `dryserver build` | build the ISO, with its log in the terminal |
 | `dryserver disks` | list disks and which ones may be flashed |
 | `sudo "$(command -v dryserver)" flash --iso FILE` | flash any image to a USB drive (sudo does not look in `~/.local/bin`) |

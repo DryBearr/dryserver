@@ -12,6 +12,7 @@ mod ctx;
 mod disks;
 mod entrance;
 mod err;
+mod export;
 mod flash;
 mod fsx;
 mod gotime;
@@ -72,6 +73,10 @@ commands:
                       copy the swarm an older version kept in DIR (its
                       config.env and secrets/) to where it belongs now
   where               the folders that hold your config, keys and images
+  export [FILE]       your swarm in one file locked with a passphrase (gpg):
+                      config, keys and your SSH key, for a second computer
+                      or a stick in a drawer (--no-ssh-key leaves it out)
+  import FILE         put a swarm from export on this computer
   install [--demo]    laptop setup screen (runs from the installer USB);
                       --demo only shows the screens, nothing is changed
   build               build the installer image from your config, log to stdout
@@ -206,6 +211,8 @@ fn main() -> ExitCode {
     let res = match cmd.as_str() {
         "init" => run_init(rest),
         "where" => run_where(rest),
+        "export" => run_export(rest),
+        "import" => run_import(rest),
         "install" => run_install(rest),
         "build" => run_build(rest),
         "disks" => run_disks(rest),
@@ -441,6 +448,82 @@ fn run_where(args: &[String]) -> Result<()> {
     Flags::parse("where", args, &[]);
     let l = homedir::layout(&homedir::Env::current())?;
     homedir::describe(&l, homedir::look(&l, &homedir::candidates()).as_ref(), &mut std::io::stdout())?;
+    Ok(())
+}
+
+/// The flags of export and import, and the one file they take.
+fn file_arg(cmd: &str, args: &[String], spec: &[(&'static str, &str, &str)]) -> (Flags, Option<String>) {
+    let (files, flags): (Vec<String>, Vec<String>) = args.iter().cloned().partition(|a| !a.starts_with('-'));
+    if files.len() > 1 {
+        eprintln!("{cmd}: one file only, not {}", files.join(" "));
+        std::process::exit(2);
+    }
+    (Flags::parse(cmd, &flags, spec), files.into_iter().next())
+}
+
+fn run_export(args: &[String]) -> Result<()> {
+    let (f, file) = file_arg("export", args, &[("no-ssh-key", "false", "leave your SSH key (the one that signs) out of the file")]);
+    if fsx::is_root() {
+        bail!("run export as your normal user, not with sudo");
+    }
+    let l = homedir::layout(&homedir::Env::current())?;
+    let out = PathBuf::from(file.unwrap_or_else(|| format!("dryserver-swarm-{}.gpg", chrono::Local::now().format("%Y-%m-%d"))));
+    let legacy = l.secrets.join(iso::SIGNING_KEY_NAME).exists();
+    let key = if f.on("no-ssh-key") || legacy {
+        None
+    } else {
+        let k = signed::OwnKeySigner::for_user(l.secrets.join(iso::SIGNING_PUB)).trusted_file();
+        if k.is_none() {
+            eprintln!("note: your SSH key (the one that signs) is not a file in ~/.ssh, so it is not in the export: back it up yourself");
+        }
+        k
+    };
+    println!("gpg asks for a passphrase twice: the one that opens the file again. Keep it apart from the file.");
+    let p = export::export(&l, key.as_deref(), &export::Gpg::asking(), &out)?;
+    println!(
+        "Wrote {} ({} files of your swarm{}).",
+        out.display(),
+        p.files.len(),
+        match &p.ssh_key {
+            Some(k) => format!(", and your SSH key {}", k.display()),
+            None => String::new(),
+        }
+    );
+    println!(
+        "Not in it: the backups in {}. Anyone with the file and the passphrase controls your swarm.",
+        l.secrets.join("backups").display()
+    );
+    Ok(())
+}
+
+fn run_import(args: &[String]) -> Result<()> {
+    let (_, file) = file_arg("import", args, &[]);
+    let Some(file) = file else {
+        bail!("import: name the file, e.g. dryserver import dryserver-swarm-2026-11-25.gpg");
+    };
+    if fsx::is_root() {
+        bail!("run import as your normal user, not with sudo: the files must be yours");
+    }
+    if Path::new(LIVE_CONFIG).exists() {
+        bail!("import runs on your own computer, not on a server");
+    }
+    let l = homedir::layout(&homedir::Env::current())?;
+    let ssh = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".ssh"));
+    let u = export::import(Path::new(&file), &l, ssh.as_deref(), &export::Gpg::asking())?;
+    let made = chrono::DateTime::from_timestamp(u.made, 0).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default();
+    println!("From {file} (made {made}):");
+    for p in &u.brought.copied {
+        println!("  put in place  {}", p.display());
+    }
+    for p in &u.brought.same {
+        println!("  already here  {}", p.display());
+    }
+    match u.ssh_key {
+        Some(Ok(k)) => println!("  your SSH key  {} (add it to ssh-agent: ssh-add {})", k.display(), k.display()),
+        Some(Err(e)) => eprintln!("warning: {e}"),
+        None => println!("  no SSH key in the file: copy your key (the one that signs) to ~/.ssh yourself"),
+    }
+    println!("\nThe newest list and release come from the coordinator: open Machines once.");
     Ok(())
 }
 

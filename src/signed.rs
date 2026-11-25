@@ -357,6 +357,12 @@ impl OwnKeySigner {
         out.is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).lines().any(|l| key_body(l) == key))
     }
 
+    /// The private key file in ~/.ssh whose public half the swarm trusts,
+    /// also when the agent has it.
+    pub fn trusted_file(&self) -> Option<PathBuf> {
+        self.key_file(&self.trusted().ok()?)
+    }
+
     /// The private key file in ~/.ssh whose .pub holds key.
     fn key_file(&self, key: &str) -> Option<PathBuf> {
         let dir = self.ssh_dir.as_ref()?;
