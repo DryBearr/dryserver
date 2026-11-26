@@ -42,6 +42,15 @@ const MAX_ZONES: usize = 50;
 pub struct Zone {
     pub id: String,
     pub name: String,
+    /// What Cloudflare says of it: "active" once its nameservers point at
+    /// Cloudflare, "pending" before.
+    pub status: String,
+}
+
+impl Zone {
+    pub fn active(&self) -> bool {
+        self.status == "active"
+    }
 }
 
 /// A tunnel named dryserver in the account, live or deleted.
@@ -188,6 +197,15 @@ pub struct Plan {
     pub notes: Vec<String>,
     /// Why a sync after an app changed leaves Cloudflare as it is.
     pub held: Option<String>,
+    /// Names in no zone the token can see: not routed.
+    pub unrouted: Vec<String>,
+}
+
+/// Whether host is two or more labels below zone (a.b.example.com in
+/// example.com): Cloudflare's free certificate covers the zone and one
+/// level below it only, so browsers refuse such a name.
+pub fn deep(host: &str, zone: &str) -> bool {
+    host.strip_suffix(zone).and_then(|s| s.strip_suffix('.')).is_some_and(|below| below.contains('.'))
 }
 
 /// Why a sync after an app changed (not open) must not touch Cloudflare.
@@ -208,13 +226,13 @@ fn held(seen: &Seen) -> Option<String> {
     };
     match seen.cluster_mark.as_deref() {
         None => Some(format!(
-            "the tunnel does not run in the cluster, so nothing changed in Cloudflare. s on the Outside screen sets up the tunnel \
+            "the tunnel does not run in the cluster, so nothing changed in Cloudflare. dryserver app sync (or s on the Outside screen) sets up the tunnel \
              {TUNNEL_NAME} and opens it"
         )),
         Some(m) if live.as_deref() == Some(m) || ours(m) => None,
         Some(_) => Some(format!(
             "the cluster runs a tunnel dryserver did not make (one set up by hand; its names are routed in the dashboard), so \
-             nothing changed in Cloudflare. s on the Outside screen switches to the tunnel {TUNNEL_NAME}"
+             nothing changed in Cloudflare. dryserver app sync (or s on the Outside screen) switches to the tunnel {TUNNEL_NAME}"
         )),
     }
 }
@@ -247,12 +265,35 @@ pub fn plan(seen: &Seen, want: &Want, open: bool) -> Plan {
             continue;
         }
         match seen.zone_of(&n.host) {
-            Some(z) => routed.push((&n.host, &n.app, z)),
-            None => p.notes.push(format!("{} ({}) is not in a zone this API token can see; not routed", n.host, n.app)),
+            Some(z) => {
+                if deep(&n.host, &z.name) {
+                    p.notes.push(format!(
+                        "{} ({}) is two or more levels below {}: Cloudflare's free certificate covers only {} and its \
+                         first level, so browsers show a certificate error unless your plan covers it (Advanced \
+                         Certificate Manager)",
+                        n.host, n.app, z.name, z.name
+                    ));
+                }
+                routed.push((&n.host, &n.app, z));
+            }
+            None => {
+                p.unrouted.push(n.host.clone());
+                p.notes.push(format!("{} ({}) is not in a zone this API token can see; not routed", n.host, n.app))
+            }
         }
     }
     routed.sort_by(|a, b| a.0.cmp(b.0));
     routed.dedup_by(|a, b| a.0 == b.0);
+    let mut pending: Vec<&Zone> = routed.iter().map(|r| r.2).filter(|z| !z.active()).collect();
+    pending.sort_by(|a, b| a.name.cmp(&b.name));
+    pending.dedup_by(|a, b| a.id == b.id);
+    for z in pending {
+        p.notes.push(format!(
+            "{} is not active in Cloudflare yet ({}): its names answer once its nameservers point at Cloudflare and \
+             Cloudflare made its certificate (15 minutes to 24 hours after that)",
+            z.name, z.status
+        ));
+    }
     let hosts: Vec<String> = routed.iter().map(|r| r.0.to_string()).collect();
     let mut rules: Vec<(String, String)> = hosts.iter().map(|h| (h.clone(), TARGET.to_string())).collect();
     rules.push((String::new(), "http_status:404".into()));
@@ -273,8 +314,10 @@ pub fn plan(seen: &Seen, want: &Want, open: bool) -> Plan {
                 Some(_) => Was::Other,
             }));
         } else {
-            p.notes
-                .push(format!("secrets/{} holds the token of another tunnel; s on the Outside screen replaces it", cloudflare::TOKEN_FILE));
+            p.notes.push(format!(
+                "secrets/{} holds the token of another tunnel; dryserver app sync (or s on the Outside screen) replaces it",
+                cloudflare::TOKEN_FILE
+            ));
         }
     }
     let mark = token.as_deref().map(cloudflare::token_mark);
@@ -285,11 +328,11 @@ pub fn plan(seen: &Seen, want: &Want, open: bool) -> Plan {
             if open || runs_ours {
                 p.steps.push(Step::Connect(if runs_ours { Was::Older } else { Was::Other }));
             } else {
-                p.notes.push(format!("the cluster runs another tunnel; s on the Outside screen switches it to the tunnel {TUNNEL_NAME}"));
+                p.notes.push(format!("the cluster runs another tunnel; dryserver app sync (or s on the Outside screen) switches it to the tunnel {TUNNEL_NAME}"));
             }
         }
         None if open => p.steps.push(Step::Connect(Was::Nothing)),
-        None => p.notes.push("the tunnel is closed in the cluster; s on the Outside screen opens it".into()),
+        None => p.notes.push("the tunnel is closed in the cluster; dryserver app sync (or s on the Outside screen) opens it".into()),
     }
     // DNS, name by name; a name's changes stay together, in the order
     // they must be made.
@@ -374,6 +417,7 @@ struct ApiAccount {
 struct ApiZone {
     id: String,
     name: String,
+    status: String,
     account: ApiAccount,
 }
 
@@ -441,9 +485,9 @@ fn verify(api: &Api) -> Result<()> {
     Ok(())
 }
 
-/// What Cloudflare has now. saved_token and cluster_mark come from this
-/// desktop and the cluster.
-pub fn look(api: &Api, saved_token: Option<String>, cluster_mark: Option<String>) -> Result<Seen> {
+/// The account and the zones the token can see, once the token checked
+/// out.
+pub fn zones(api: &Api) -> Result<(String, Vec<Zone>)> {
     verify(api)?;
     let zones: Vec<ApiZone> = api.list("/zones?per_page=50", NEED_ZONE_READ)?;
     let mut accounts: Vec<&str> = zones.iter().map(|z| z.account.id.as_str()).collect();
@@ -458,13 +502,29 @@ pub fn look(api: &Api, saved_token: Option<String>, cluster_mark: Option<String>
     if zones.len() > MAX_ZONES {
         bail!("the API token sees more than {MAX_ZONES} zones; limit it to the zones you use with dryserver");
     }
-    let mut seen = Seen { account: account.clone(), saved_token, cluster_mark, ..Seen::default() };
+    let mut out = Vec::new();
     for z in &zones {
         match cfapi::host(&z.name) {
-            Some(name) if cfapi::valid_id(&z.id) => seen.zones.push(Zone { id: z.id.clone(), name }),
+            Some(name) if cfapi::valid_id(&z.id) => {
+                let status = if z.status.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') && z.status.len() <= 20 {
+                    z.status.clone()
+                } else {
+                    "?".into()
+                };
+                out.push(Zone { id: z.id.clone(), name, status })
+            }
             _ => bail!("Cloudflare sent a zone that is not one"),
         }
     }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok((account, out))
+}
+
+/// What Cloudflare has now. saved_token and cluster_mark come from this
+/// desktop and the cluster.
+pub fn look(api: &Api, saved_token: Option<String>, cluster_mark: Option<String>) -> Result<Seen> {
+    let (account, zones) = zones(api)?;
+    let mut seen = Seen { account: account.clone(), saved_token, cluster_mark, zones, ..Seen::default() };
     let tunnels: Vec<ApiTunnel> = api.list(&format!("/accounts/{account}/cfd_tunnel?name={TUNNEL_NAME}&per_page=100"), NEED_TUNNEL)?;
     for t in tunnels.iter().filter(|t| t.name == TUNNEL_NAME) {
         if !cfapi::valid_uuid(&t.id) {
@@ -617,7 +677,7 @@ impl Sync<'_> {
         let saved = std::fs::read_to_string(self.token_file).ok().and_then(|t| cloudflare::tunnel_token(&t).ok());
         let seen = look(&api, saved, self.cluster_mark.clone())?;
         let p = plan(&seen, want, open);
-        let mut r = super::Report { conflicts: p.conflicts, notes: p.notes, changes: Vec::new(), held: p.held };
+        let mut r = super::Report { conflicts: p.conflicts, notes: p.notes, changes: Vec::new(), held: p.held, unrouted: p.unrouted };
         let steps: Vec<String> = p.steps.iter().map(Step::describe).collect();
         if dry {
             r.changes = steps;
@@ -627,7 +687,9 @@ impl Sync<'_> {
         // cluster or the apps changed since the look, the plan is another
         // one, and none of it is made unseen.
         if want.confirmed.as_ref().is_some_and(|c| *c != steps) {
-            bail!("something changed since you looked, so nothing was changed. s looks again");
+            bail!(
+                "something changed since you looked, so nothing was changed in Cloudflare. Look again: s on Outside, or dryserver app sync"
+            );
         }
         let (done, err) = apply(&api, ctx, c, &seen, &p.steps, self.token_file);
         r.changes = done;
@@ -662,6 +724,8 @@ pub mod tests {
         pub records: Vec<Record>,
         /// What token verify says; "" answers 401.
         pub verify: String,
+        /// Zones (by id) Cloudflare has not activated yet.
+        pub pending: Vec<String>,
         n: u32,
     }
 
@@ -747,7 +811,13 @@ pub mod tests {
                 ("GET", ["user", "tokens", "verify"]) if cf.verify.is_empty() => no(401, 1000, "Invalid API Token"),
                 ("GET", ["user", "tokens", "verify"]) => ok(json!({"id": "t", "status": cf.verify})),
                 ("GET", ["zones"]) => ok(json!(
-                    cf.zones.iter().map(|(id, name, a)| json!({"id": id, "name": name, "account": {"id": a}})).collect::<Vec<_>>()
+                    cf.zones
+                        .iter()
+                        .map(|(id, name, a)| {
+                            let status = if cf.pending.contains(id) { "pending" } else { "active" };
+                            json!({"id": id, "name": name, "status": status, "account": {"id": a}})
+                        })
+                        .collect::<Vec<_>>()
                 )),
                 ("GET", ["accounts", _, "cfd_tunnel"]) => {
                     let name = query("name");
@@ -1202,7 +1272,7 @@ pub mod tests {
         let other = Some("0123456789abcdef".to_string());
         let r = w.sync_with(&names, false, other.clone(), false).unwrap();
         assert!(r.changes.is_empty() && r.held.as_deref().is_some_and(|h| h.contains("a tunnel dryserver did not make")), "{r:?}");
-        assert!(r.summary(false).contains("s on the Outside screen switches to the tunnel dryserver"), "{r:?}");
+        assert!(r.summary(false).contains("(or s on the Outside screen) switches to the tunnel dryserver"), "{r:?}");
         assert_eq!(w.cf.changes.load(SeqCst), 0);
         // Also with a tunnel dryserver in Cloudflare that the cluster does
         // not run: no DNS name is pointed at it.
@@ -1279,7 +1349,7 @@ pub mod tests {
         let token = token_of(&id);
         let seen = Seen {
             account: ACCOUNT.into(),
-            zones: vec![Zone { id: ZONE.into(), name: "example.com".into() }],
+            zones: vec![Zone { id: ZONE.into(), name: "example.com".into(), status: "active".into() }],
             tunnels: vec![
                 Tunnel { id: id.clone(), deleted: false, created: "2026-01-01".into() },
                 Tunnel { id: "a0000000-0000-4000-8000-000000000000".into(), deleted: false, created: "2026-02-01".into() },

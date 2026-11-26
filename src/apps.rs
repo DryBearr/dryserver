@@ -69,15 +69,37 @@ pub(crate) const DNS_RULE: &str = r#"    - to:
 pub struct App {
     pub name: String,
     pub image: String,
-    /// The port the container listens on.
+    /// The port the container listens on: http://NAME inside the cluster
+    /// leads there, and so does every public name without a port of its
+    /// own.
     pub port: u16,
-    /// Public host name routed to it; "" keeps it inside the cluster.
-    pub host: String,
-    /// The way in from outside its host name comes through
-    /// (entrance::IDS). Only matters with a host name.
+    /// The public names routed to it, each to one of its ports. None keeps
+    /// it inside the cluster.
+    pub hosts: Vec<Host>,
+    /// The way in from outside its names come through (entrance::IDS).
+    /// Only matters with a name.
     pub entrance: String,
     pub copies: u32,
 }
+
+/// A public name of an app, and the app's port it leads to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Host {
+    pub name: String,
+    pub port: u16,
+}
+
+/// Public names one app may have.
+pub const MAX_HOSTS: usize = 50;
+/// Ports one app may take connections on, its main port included.
+pub const MAX_PORTS: usize = 10;
+/// The annotation that says which dryserver wrote an app's objects: a
+/// newer one may write what this one would get wrong, so this one then
+/// changes nothing (see Running::newer).
+pub const FORMAT_ANNOTATION: &str = "dryserver/format";
+/// 2: several public names, each with a port. An app without the
+/// annotation is from before (one name, the main port).
+pub const FORMAT: u32 = 2;
 
 pub fn valid_image(s: &str) -> Result<()> {
     let ok = !s.is_empty()
@@ -87,13 +109,51 @@ pub fn valid_image(s: &str) -> Result<()> {
     if ok { Ok(()) } else { Err("an image name like nginx:1.27 or ghcr.io/you/app:v1 (lowercase, no spaces)".into()) }
 }
 
-/// A DNS name: labels of letters, digits and -, joined by dots.
+/// A DNS name: labels of letters, digits and -, joined by dots. The last
+/// label has a letter in it: an IP address is not a host name.
 pub fn valid_host(s: &str) -> Result<()> {
     if s.is_empty() {
         return Ok(());
     }
-    let ok = s.len() <= 253 && s.contains('.') && s.split('.').all(registry::valid_name);
+    let ok = s.len() <= 253
+        && s.contains('.')
+        && s.split('.').all(registry::valid_name)
+        && s.rsplit('.').next().is_some_and(|tld| tld.bytes().any(|b| b.is_ascii_lowercase()));
     if ok { Ok(()) } else { Err("a host name like app.example.com, or empty".into()) }
+}
+
+/// A public name as people type it, made plain: lowercase, without the
+/// dot a name may end with. Says what is wrong with one that is no name.
+pub fn clean_host(s: &str) -> Result<String> {
+    let t = s.trim();
+    let t = t.strip_suffix('.').unwrap_or(t);
+    if t.is_empty() {
+        bail!("an empty name");
+    }
+    if !t.is_ascii() {
+        bail!(
+            "{t}: a name with letters outside a-z is written in its xn-- form (punycode) here; your domain company or \
+             Cloudflare shows it"
+        );
+    }
+    let h = t.to_ascii_lowercase();
+    if h.contains("://") || h.contains('/') {
+        bail!("{h}: only the name, without http:// or a path");
+    }
+    if h.contains('*') {
+        bail!("{h}: names with * (every subdomain) are not supported yet; list each name");
+    }
+    if h.contains(':') {
+        bail!("{h}: a port goes after the name only in an app file (HOST=name:port)");
+    }
+    if valid_host(&h).is_err() {
+        let tld = h.rsplit('.').next().unwrap_or("");
+        if h.contains('.') && !tld.is_empty() && tld.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("{h}: an IP address is not a host name");
+        }
+        bail!("{h}: a host name like app.example.com: letters, digits and - between dots, at most 253 characters");
+    }
+    Ok(h)
 }
 
 /// An app's name is a DNS name inside the cluster (http://NAME) and the
@@ -115,8 +175,44 @@ impl App {
         if self.port == 0 {
             bail!("port: 1 to 65535");
         }
-        valid_host(&self.host).map_err(|e| e.wrap("public host name"))?;
-        if !self.host.is_empty() {
+        if self.hosts.len() > MAX_HOSTS {
+            bail!("public host name: at most {MAX_HOSTS} per app, this one has {}", self.hosts.len());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for h in &self.hosts {
+            if h.name.is_empty() {
+                bail!("public host name: an empty name");
+            }
+            valid_host(&h.name).map_err(|e| e.wrap("public host name"))?;
+            if !seen.insert(h.name.as_str()) {
+                bail!("public host name: {} is listed twice", h.name);
+            }
+            if h.port == 0 {
+                bail!("public host name: {} needs a port, 1 to 65535", h.name);
+            }
+            // Port 80 of the app's service is the main port (http://NAME
+            // inside the cluster): another port cannot have it too.
+            if h.port == 80 && self.port != 80 {
+                bail!(
+                    "public host name: {}: port 80 can only be the app's PORT (inside the cluster, http://{} leads there)",
+                    h.name,
+                    self.name
+                );
+            }
+            // The ingress speaks https to a service port 443, and checks
+            // the app's certificate: it speaks plain http to every other.
+            if h.port == 443 && self.port != 443 {
+                bail!(
+                    "public host name: {}: port 443 would make the ingress speak https to the app; let the app speak plain \
+                     http on another port (Cloudflare does the https part)",
+                    h.name
+                );
+            }
+        }
+        if 1 + self.extra_ports().len() > MAX_PORTS {
+            bail!("public host name: at most {MAX_PORTS} ports per app, the main one included");
+        }
+        if !self.hosts.is_empty() {
             entrance::valid_id(&self.entrance).map_err(|e| e.wrap("entrance"))?;
         }
         if !(1..=20).contains(&self.copies) {
@@ -125,12 +221,32 @@ impl App {
         Ok(())
     }
 
+    /// The ports names lead to besides the main one, sorted, each once.
+    pub fn extra_ports(&self) -> Vec<u16> {
+        let mut p: Vec<u16> = self.hosts.iter().map(|h| h.port).filter(|p| *p != self.port).collect();
+        p.sort_unstable();
+        p.dedup();
+        p
+    }
+
+    /// The public names, sorted.
+    pub fn names(&self) -> Vec<String> {
+        let mut n: Vec<String> = self.hosts.iter().map(|h| h.name.clone()).collect();
+        n.sort();
+        n
+    }
+
     /// The Kubernetes objects for this app.
     pub fn manifest(&self) -> Result<String> {
         self.validate()?;
-        let App { name, image, port, host, entrance, copies } = self;
+        let App { name, image, port, hosts, entrance, copies } = self;
         let mark = entrance::ANNOTATION;
         let tolerations = tolerations();
+        let extra = self.extra_ports();
+        let container_ports: String = extra.iter().map(|p| format!("            - containerPort: {p}\n")).collect();
+        let policy_ports: String = extra.iter().map(|p| format!("        - port: {p}\n")).collect();
+        let service_ports: String =
+            extra.iter().map(|p| format!("    - name: \"p{p}\"\n      port: {p}\n      targetPort: {p}\n")).collect();
         let mut y = format!(
             r#"apiVersion: v1
 kind: Namespace
@@ -193,7 +309,7 @@ spec:
         - podSelector: {{}}
       ports:
         - port: {port}
----
+{policy_ports}---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -201,6 +317,8 @@ metadata:
   namespace: {NAMESPACE}
   labels:
     app: "{name}"
+  annotations:
+    {FORMAT_ANNOTATION}: "{FORMAT}"
 spec:
   replicas: {copies}
   selector:
@@ -227,7 +345,7 @@ spec:
           image: "{image}"
           ports:
             - containerPort: {port}
-          securityContext:
+{container_ports}          securityContext:
             allowPrivilegeEscalation: false
             # No raw packets: a taken-over app cannot pose as another
             # address on the pod network.
@@ -249,11 +367,12 @@ spec:
   selector:
     app: "{name}"
   ports:
-    - port: 80
+    - name: http
+      port: 80
       targetPort: {port}
-"#
+{service_ports}"#
         );
-        if !host.is_empty() {
+        if !hosts.is_empty() {
             y += &format!(
                 r#"---
 apiVersion: networking.k8s.io/v1
@@ -265,9 +384,19 @@ metadata:
     app: "{name}"
   annotations:
     {mark}: "{entrance}"
+    {FORMAT_ANNOTATION}: "{FORMAT}"
 spec:
   rules:
-    - host: "{host}"
+"#
+            );
+            let mut sorted = hosts.clone();
+            sorted.sort();
+            for h in sorted {
+                // The service's port 80 is the main port; the others keep
+                // their own number.
+                let to = if h.port == *port { 80 } else { h.port };
+                y += &format!(
+                    r#"    - host: "{}"
       http:
         paths:
           - path: /
@@ -276,11 +405,27 @@ spec:
               service:
                 name: "{name}"
                 port:
-                  number: 80
-"#
-            );
+                  number: {to}
+"#,
+                    h.name
+                );
+            }
         }
         Ok(y)
+    }
+
+    /// The app as the cluster runs it, to change or keep as a file. None
+    /// when the cluster's objects do not say enough (made by hand).
+    pub fn of(r: &Running) -> Option<App> {
+        let a = App {
+            name: r.name.clone(),
+            image: r.image.clone(),
+            port: r.port,
+            hosts: r.hosts.clone(),
+            entrance: r.entrance.clone(),
+            copies: r.copies,
+        };
+        a.validate().is_ok().then_some(a)
     }
 }
 
@@ -301,12 +446,43 @@ pub struct Running {
     pub image: String,
     pub ready: u32,
     pub copies: u32,
-    pub host: String,
-    /// The entrance its host name comes through; "?" when its Ingress
-    /// names one this dryserver does not know.
+    /// Its main port (the container's first); 0 when not known.
+    pub port: u16,
+    /// Its public names, sorted, each once.
+    pub hosts: Vec<Host>,
+    /// The entrance its names come through; "?" when its Ingress names
+    /// one this dryserver does not know.
     pub entrance: String,
     /// The servers its pods are on.
     pub nodes: Vec<String>,
+    /// Written by a newer dryserver (its format annotation is higher than
+    /// FORMAT): this one would read it wrong, so it changes nothing.
+    pub newer: bool,
+}
+
+impl Running {
+    /// Whether anything comes to it from outside.
+    pub fn public(&self) -> bool {
+        !self.hosts.is_empty()
+    }
+
+    pub fn names(&self) -> Vec<&str> {
+        self.hosts.iter().map(|h| h.name.as_str()).collect()
+    }
+
+    /// Its names for people: "a.com, shop.a.com".
+    pub fn names_text(&self) -> String {
+        self.names().join(", ")
+    }
+
+    pub fn has(&self, host: &str) -> bool {
+        self.hosts.iter().any(|h| h.name == host)
+    }
+}
+
+/// Whether a format annotation says a newer dryserver wrote the object.
+fn newer_format(m: &Meta) -> bool {
+    m.annotations.get(FORMAT_ANNOTATION).is_some_and(|v| v.trim().parse::<u32>().map_or(true, |n| n > FORMAT))
 }
 
 /// A way to run kubectl on the coordinator. The screens call it from a
@@ -647,24 +823,50 @@ pub fn overview(ctx: &Ctx, c: &dyn Cluster) -> Result<Overview> {
         if it.metadata.namespace != NAMESPACE || !registry::valid_name(&it.metadata.name) {
             continue;
         }
-        let image = it.spec["template"]["spec"]["containers"][0]["image"].as_str().unwrap_or("").to_string();
+        let container = &it.spec["template"]["spec"]["containers"][0];
+        let image = container["image"].as_str().unwrap_or("").to_string();
+        let port = container["ports"][0]["containerPort"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(0);
         o.apps.push(Running {
             name: it.metadata.name.clone(),
             image: if valid_image(&image).is_ok() { image } else { "?".into() },
             ready,
             copies,
+            port,
             entrance: entrance::DEFAULT.into(),
+            newer: newer_format(&it.metadata),
             ..Running::default()
         });
     }
     for it in l.items.iter().filter(|i| i.metadata.namespace == NAMESPACE) {
         let Some(app) = it.metadata.labels.get("app").and_then(|n| o.apps.iter_mut().find(|a| a.name == *n)) else { continue };
         match it.kind.as_str() {
-            "Ingress" => {
-                let host = it.spec["rules"][0]["host"].as_str().unwrap_or("");
-                if !host.is_empty() && valid_host(host).is_ok() {
-                    app.host = host.to_string();
+            // Only the Ingress named after the app is its own: one made
+            // by hand with its label is not read as the app's names.
+            "Ingress" if it.metadata.name == app.name => {
+                app.newer |= newer_format(&it.metadata);
+                // Each rule: a name, and the service port it goes to (80
+                // is the main port). A name that is no name is left out;
+                // one listed twice counts once, with its first port. No
+                // app of dryserver has more than MAX_HOSTS: an answer with
+                // more is not read past them.
+                let mut seen = std::collections::HashSet::new();
+                let rules = it.spec["rules"].as_array().map(Vec::as_slice).unwrap_or_default();
+                for rule in rules.iter().take(MAX_HOSTS * 4) {
+                    if app.hosts.len() >= MAX_HOSTS {
+                        break;
+                    }
+                    let host = rule["host"].as_str().unwrap_or("");
+                    if host.is_empty() || valid_host(host).is_err() || !seen.insert(host) {
+                        continue;
+                    }
+                    let to = rule["http"]["paths"][0]["backend"]["service"]["port"]["number"].as_u64().unwrap_or(80);
+                    let port = match u16::try_from(to) {
+                        Ok(80) | Err(_) => app.port,
+                        Ok(p) => p,
+                    };
+                    app.hosts.push(Host { name: host.to_string(), port });
                 }
+                app.hosts.sort();
                 // Without the annotation: Cloudflare, as before there was
                 // a choice.
                 app.entrance = match it.metadata.annotations.get(entrance::ANNOTATION) {
@@ -689,7 +891,7 @@ pub fn overview(ctx: &Ctx, c: &dyn Cluster) -> Result<Overview> {
 pub fn deploy(ctx: &Ctx, c: &dyn Cluster, app: &App) -> Result<()> {
     let manifest = app.manifest()?;
     c.kubectl(ctx, &["apply", "-f", "-"], &manifest)?;
-    if app.host.is_empty() {
+    if app.hosts.is_empty() {
         // Started again without a public name: the old way in goes.
         c.kubectl(ctx, &["-n", NAMESPACE, "delete", "ingress", &app.name, "--ignore-not-found"], "")?;
     }
@@ -717,10 +919,15 @@ pub mod tests {
             name: "blog".into(),
             image: "ghcr.io/me/blog:v2".into(),
             port: 8080,
-            host: "blog.example.com".into(),
+            hosts: vec![Host { name: "blog.example.com".into(), port: 8080 }],
             entrance: crate::entrance::CLOUDFLARE.into(),
             copies: 2,
         }
+    }
+
+    /// One public name for port.
+    pub fn host(name: &str, port: u16) -> Host {
+        Host { name: name.into(), port }
     }
 
     #[test]
@@ -744,7 +951,10 @@ pub mod tests {
             "allowPrivilegeEscalation: false",
             "targetPort: 8080",
             "kind: Ingress",
-            "  annotations:\n    dryserver/entrance: \"cloudflare\"\nspec:\n  rules:\n    - host: \"blog.example.com\"",
+            "  annotations:\n    dryserver/entrance: \"cloudflare\"\n    dryserver/format: \"2\"\nspec:\n  rules:\n    - host: \"blog.example.com\"",
+            "kind: Deployment\nmetadata:\n  name: \"blog\"\n  namespace: apps\n  labels:\n    app: \"blog\"\n  annotations:\n    dryserver/format: \"2\"\n",
+            "  ports:\n    - name: http\n      port: 80\n      targetPort: 8080\n",
+            "                port:\n                  number: 80\n",
         ] {
             assert!(y.contains(want), "manifest missing {want:?}:\n{y}");
         }
@@ -760,13 +970,13 @@ pub mod tests {
             assert!(out.contains(want), "outgoing policy missing {want:?}:\n{out}");
         }
         // Without a public name there is no way in from outside.
-        let inside = App { host: String::new(), ..app() }.manifest().unwrap();
+        let inside = App { hosts: vec![], ..app() }.manifest().unwrap();
         assert!(!inside.contains("kind: Ingress") && inside.matches("\n---\n").count() == 5);
         // Another entrance is another annotation; without a public name
         // the entrance does not matter.
         let vps = App { entrance: "vps".into(), ..app() }.manifest().unwrap();
         assert!(vps.contains("dryserver/entrance: \"vps\""), "{vps}");
-        App { host: String::new(), entrance: String::new(), ..app() }.manifest().unwrap();
+        App { hosts: vec![], entrance: String::new(), ..app() }.manifest().unwrap();
     }
 
     #[test]
@@ -783,9 +993,16 @@ pub mod tests {
             (App { image: String::new(), ..app() }, "image"),
             (App { image: "-evil".into(), ..app() }, "image"),
             (App { port: 0, ..app() }, "port"),
-            (App { host: "blog".into(), ..app() }, "public host name"),
-            (App { host: "a b.example.com".into(), ..app() }, "public host name"),
-            (App { host: "x.example.com\"\n".into(), ..app() }, "public host name"),
+            (App { hosts: vec![host("blog", 8080)], ..app() }, "public host name"),
+            (App { hosts: vec![host("a b.example.com", 8080)], ..app() }, "public host name"),
+            (App { hosts: vec![host("x.example.com\"\n", 8080)], ..app() }, "public host name"),
+            (App { hosts: vec![host("", 8080)], ..app() }, "public host name"),
+            (App { hosts: vec![host("10.1.0.60", 8080)], ..app() }, "public host name"),
+            (App { hosts: vec![host("a.example.com", 8080), host("a.example.com", 9000)], ..app() }, "public host name"),
+            (App { hosts: vec![host("a.example.com", 0)], ..app() }, "public host name"),
+            (App { hosts: vec![host("a.example.com", 80)], ..app() }, "public host name"),
+            (App { hosts: (0..51).map(|i| host(&format!("n{i}.example.com"), 8080)).collect(), ..app() }, "public host name"),
+            (App { hosts: (0..10).map(|i| host(&format!("n{i}.example.com"), 9000 + i)).collect(), ..app() }, "public host name"),
             (App { entrance: String::new(), ..app() }, "entrance"),
             (App { entrance: "cloudflare\"\n  x: y".into(), ..app() }, "entrance"),
             (App { copies: 0, ..app() }, "copies"),
@@ -835,6 +1052,9 @@ pub mod tests {
         pub cut_off: std::sync::atomic::AtomicUsize,
         /// The listing once something was deleted.
         pub after_delete: Mutex<Option<String>>,
+        /// The listing once a manifest with this text in it was applied
+        /// (each is used once).
+        pub after_apply: Mutex<Vec<(String, String)>>,
     }
 
     impl Cluster for Fake {
@@ -857,6 +1077,12 @@ pub mod tests {
             {
                 *self.listing.lock().unwrap() = l;
             }
+            if args.contains(&"apply") {
+                let mut next = self.after_apply.lock().unwrap();
+                if let Some(i) = next.iter().position(|(has, _)| stdin.contains(has.as_str())) {
+                    *self.listing.lock().unwrap() = next.remove(i).1;
+                }
+            }
             Ok(if args.contains(&"get") {
                 match self.listing.lock().unwrap().as_str() {
                     "" => r#"{"items":[]}"#.into(),
@@ -872,7 +1098,7 @@ pub mod tests {
     }
 
     pub const LISTING: &str = r#"{"items":[
-      {"kind":"Deployment","metadata":{"name":"blog","namespace":"apps","labels":{"app":"blog"}},"spec":{"replicas":2,"template":{"spec":{"containers":[{"image":"ghcr.io/me/blog:v2"}]}}},"status":{"readyReplicas":1}},
+      {"kind":"Deployment","metadata":{"name":"blog","namespace":"apps","labels":{"app":"blog"}},"spec":{"replicas":2,"template":{"spec":{"containers":[{"image":"ghcr.io/me/blog:v2","ports":[{"containerPort":8080}]}]}}},"status":{"readyReplicas":1}},
       {"kind":"Deployment","metadata":{"name":"api","namespace":"apps","labels":{"app":"api"}},"spec":{"replicas":1,"template":{"spec":{"containers":[{"image":"evil\u001b[2Jimage"}]}}},"status":{}},
       {"kind":"Deployment","metadata":{"name":"Bad Name","namespace":"apps","labels":{}},"spec":{},"status":{}},
       {"kind":"Deployment","metadata":{"name":"local-path-provisioner","namespace":"kube-system","labels":{"app":"local-path-provisioner"}},"spec":{"replicas":1},"status":{"readyReplicas":1}},
@@ -884,6 +1110,139 @@ pub mod tests {
       {"kind":"Pod","metadata":{"name":"blog-2","namespace":"apps","labels":{"app":"blog"}},"spec":{"nodeName":"node-b"}},
       {"kind":"Pod","metadata":{"name":"blog-3","namespace":"apps","labels":{"app":"blog"}},"spec":{"nodeName":"node-a"}}
     ]}"#;
+
+    #[test]
+    fn names_as_people_type_them() {
+        for (typed, want) in [
+            ("Shop.Example.COM", "shop.example.com"),
+            ("  shop.example.com.  ", "shop.example.com"),
+            ("example.com", "example.com"),
+            ("xn--bcher-kva.de", "xn--bcher-kva.de"),
+            ("a.b.c.example.com", "a.b.c.example.com"),
+        ] {
+            assert_eq!(clean_host(typed).unwrap(), want, "{typed:?}");
+        }
+        for (typed, why) in [
+            ("", "an empty name"),
+            (".", "an empty name"),
+            ("bücher.de", "xn-- form"),
+            ("*.example.com", "not supported yet"),
+            ("https://shop.example.com", "without http://"),
+            ("shop.example.com/admin", "without http://"),
+            ("shop.example.com:8080", "only in an app file"),
+            ("10.1.0.60", "an IP address"),
+            ("localhost", "a host name like"),
+            ("shop..example.com", "a host name like"),
+            ("-shop.example.com", "a host name like"),
+            ("shop_x.example.com", "a host name like"),
+            ("shop example.com", "a host name like"),
+        ] {
+            let e = clean_host(typed).unwrap_err().to_string();
+            assert!(e.contains(why), "{typed:?}: {e}");
+        }
+        let long = format!("{}.example.com", "a".repeat(64));
+        assert!(clean_host(&long).is_err(), "a label is at most 63");
+        let many = format!("{}example.com", "abcdefghi.".repeat(25));
+        assert!(many.len() > 253 && clean_host(&many).is_err());
+    }
+
+    #[test]
+    fn many_names_and_ports() {
+        let a = App {
+            hosts: vec![
+                host("www.example.com", 8080),
+                host("admin.example.com", 9000),
+                host("example.com", 8080),
+                host("stats.example.net", 9100),
+                host("api.example.com", 9000),
+            ],
+            ..app()
+        };
+        let y = a.manifest().unwrap();
+        // One Ingress, its rules sorted; the main port is the service's
+        // port 80, the others keep their number.
+        assert_eq!(y.matches("kind: Ingress").count(), 1);
+        let rules: Vec<(&str, &str)> = y
+            .split("    - host: \"")
+            .skip(1)
+            .map(|r| (r.split('"').next().unwrap(), r.split("number: ").nth(1).unwrap().lines().next().unwrap()))
+            .collect();
+        assert_eq!(
+            rules,
+            vec![
+                ("admin.example.com", "9000"),
+                ("api.example.com", "9000"),
+                ("example.com", "80"),
+                ("stats.example.net", "9100"),
+                ("www.example.com", "80"),
+            ]
+        );
+        // Every port the names lead to: on the container, in the wall, on
+        // the service, each once.
+        for want in [
+            "            - containerPort: 8080\n            - containerPort: 9000\n            - containerPort: 9100\n          securityContext:",
+            "        - port: 8080\n        - port: 9000\n        - port: 9100\n---\n",
+            "    - name: http\n      port: 80\n      targetPort: 8080\n    - name: \"p9000\"\n      port: 9000\n      targetPort: 9000\n    - name: \"p9100\"\n      port: 9100\n      targetPort: 9100\n",
+        ] {
+            assert!(y.contains(want), "missing {want:?}:\n{y}");
+        }
+        assert_eq!(a.extra_ports(), vec![9000, 9100]);
+        assert_eq!(a.names()[0], "admin.example.com");
+        // Port 80 is fine as the main port, for every name.
+        App { port: 80, hosts: vec![host("a.example.com", 80), host("b.example.com", 80)], ..app() }.manifest().unwrap();
+        // Ten ports in all is the most.
+        App { hosts: (0..9).map(|i| host(&format!("n{i}.example.com"), 9000 + i)).collect(), ..app() }.manifest().unwrap();
+        App { hosts: (0..50).map(|i| host(&format!("n{i}.example.com"), 8080)).collect(), ..app() }.manifest().unwrap();
+    }
+
+    #[test]
+    fn the_cluster_says_what_names_an_app_has() {
+        let dep = |name: &str, port: &str, format: &str| {
+            format!(
+                r#"{{"kind":"Deployment","metadata":{{"name":"{name}","namespace":"apps","labels":{{"app":"{name}"}}{format}}},"spec":{{"replicas":1,"template":{{"spec":{{"containers":[{{"image":"shop:v1"{port}}}]}}}}}},"status":{{}}}}"#
+            )
+        };
+        let listing = format!(
+            r#"{{"items":[{},{},{},{},
+            {{"kind":"Ingress","metadata":{{"name":"shop","namespace":"apps","labels":{{"app":"shop"}},"annotations":{{"dryserver/format":"2"}}}},"spec":{{"rules":[
+              {{"host":"www.example.com","http":{{"paths":[{{"backend":{{"service":{{"name":"shop","port":{{"number":80}}}}}}}}]}}}},
+              {{"host":"admin.example.com","http":{{"paths":[{{"backend":{{"service":{{"name":"shop","port":{{"number":9000}}}}}}}}]}}}},
+              {{"host":"admin.example.com","http":{{"paths":[{{"backend":{{"service":{{"name":"shop","port":{{"number":9100}}}}}}}}]}}}},
+              {{"host":"Not A Host"}},
+              {{"host":""}},
+              {{"host":"example.com"}}
+            ]}}}},
+            {{"kind":"Ingress","metadata":{{"name":"extra","namespace":"apps","labels":{{"app":"shop"}}}},"spec":{{"rules":[{{"host":"sneaky.example.com"}}]}}}},
+            {{"kind":"Ingress","metadata":{{"name":"next","namespace":"apps","labels":{{"app":"next"}},"annotations":{{"dryserver/format":"3"}}}},"spec":{{"rules":[{{"host":"next.example.com"}}]}}}}
+            ]}}"#,
+            dep("shop", r#","ports":[{"containerPort":8080},{"containerPort":9000}]"#, ""),
+            dep("old", r#","ports":[{"containerPort":3000}]"#, ""),
+            dep("next", r#","ports":[{"containerPort":3000}]"#, ""),
+            dep("odd", "", r#","annotations":{"dryserver/format":"two"}"#),
+        );
+        let c = Fake::default();
+        *c.listing.lock().unwrap() = listing;
+        let o = overview(&Ctx::new(), &c).unwrap();
+        let shop = o.apps.iter().find(|a| a.name == "shop").unwrap();
+        assert_eq!(
+            shop.hosts,
+            vec![host("admin.example.com", 9000), host("example.com", 8080), host("www.example.com", 8080)],
+            "every rule, the first port of a name listed twice, never a broken name, never another Ingress's"
+        );
+        assert_eq!((shop.port, shop.newer, shop.names_text().as_str()), (8080, false, "admin.example.com, example.com, www.example.com"));
+        assert!(shop.public() && shop.has("example.com") && !shop.has("sneaky.example.com"));
+        let old = o.apps.iter().find(|a| a.name == "old").unwrap();
+        assert!(!old.public() && !old.newer, "{old:?}");
+        assert!(o.apps.iter().find(|a| a.name == "next").unwrap().newer, "a newer format is seen");
+        assert!(o.apps.iter().find(|a| a.name == "odd").unwrap().newer, "a format this one cannot read counts as newer");
+        // What runs, as an app to change: the same objects again.
+        let back = App::of(shop).unwrap();
+        assert_eq!((back.port, back.hosts.len(), back.image.as_str()), (8080, 3, "shop:v1"));
+        let again = back.manifest().unwrap();
+        assert!(again.contains("number: 9000") && again.contains("- host: \"www.example.com\""), "{again}");
+        // Without a port it cannot be made again.
+        assert!(App::of(o.apps.iter().find(|a| a.name == "odd").unwrap()).is_none());
+    }
 
     #[test]
     fn another_host_key_is_named() {
@@ -902,24 +1261,18 @@ pub mod tests {
             o.apps,
             vec![
                 // Its Ingress names an entrance nobody knows.
-                Running {
-                    name: "api".into(),
-                    image: "?".into(),
-                    ready: 0,
-                    copies: 1,
-                    host: String::new(),
-                    entrance: "?".into(),
-                    nodes: vec![]
-                },
+                Running { name: "api".into(), image: "?".into(), ready: 0, copies: 1, entrance: "?".into(), ..Running::default() },
                 // No annotation: Cloudflare, as before entrances.
                 Running {
                     name: "blog".into(),
                     image: "ghcr.io/me/blog:v2".into(),
                     ready: 1,
                     copies: 2,
-                    host: "blog.example.com".into(),
+                    port: 8080,
+                    hosts: vec![host("blog.example.com", 8080)],
                     entrance: "cloudflare".into(),
-                    nodes: vec!["node-a".into(), "node-b".into()]
+                    nodes: vec!["node-a".into(), "node-b".into()],
+                    newer: false,
                 },
             ],
             "what the cluster says is checked before it is shown, and only the apps namespace counts"
@@ -932,7 +1285,7 @@ pub mod tests {
         assert_eq!(stdin, app().manifest().unwrap());
         assert!(deploy(&Ctx::new(), &c, &App { name: "no good".into(), ..app() }).is_err());
         // Started again without a public name: the old way in is taken away.
-        deploy(&Ctx::new(), &c, &App { host: String::new(), ..app() }).unwrap();
+        deploy(&Ctx::new(), &c, &App { hosts: vec![], ..app() }).unwrap();
         assert_eq!(c.calls.lock().unwrap().last().unwrap().0, "-n apps delete ingress blog --ignore-not-found");
 
         remove(&Ctx::new(), &c, "blog").unwrap();

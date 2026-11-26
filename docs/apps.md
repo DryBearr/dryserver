@@ -16,6 +16,125 @@ server dead, 30 more until it moves the app). With two copies the app keeps
 answering; for the first 45 seconds about every second request still goes to
 the dead copy and fails.
 
+## An app as a file
+
+Each app is a small text file you keep, in the style of `config.env`:
+
+```sh
+# shop.app
+NAME=shop
+IMAGE=ghcr.io/you/shop:v1
+PORT=8080
+COPIES=2
+HOST=shop.example.com
+HOST=www.example.com example.com shop.example.net
+HOST=admin.example.com:9000
+```
+
+| Key | What | |
+|---|---|---|
+| `NAME` | the app's name: a-z, 0-9 and -, starting with a letter, at most 40 | needed |
+| `IMAGE` | the container image, best pinned: `ghcr.io/you/shop@sha256:...` | needed |
+| `PORT` | the port the app listens on. Inside the cluster `http://shop` leads there, and so does every name without a port of its own | needed |
+| `COPIES` | how many run, 1 to 20 | 1 |
+| `HOST` | public names, as many lines as you need, several per line (spaces or commas between). `name:port` leads that name to another port of the app | none: inside only |
+| `ENTRANCE` | the way in from outside: `cloudflare` (the VPS comes later) | `cloudflare` |
+
+Keys may be written in any case; `#` starts a comment. Anything else is
+refused with its line number, never passed over: an app started without a
+line you wrote would be another app. A name is written the way DNS has it:
+`Shop.Example.COM.` becomes `shop.example.com`; a name with letters outside
+a-z goes in its `xn--` form; `*.example.com`, an IP address, `https://` or a
+path are refused. One app has at most 50 names and 10 ports, and port 80
+can only be its `PORT`; the ingress speaks plain http to the app, so port
+443 is refused as a name's own port too.
+
+```sh
+dryserver app deploy shop.app    # show every change, make them on y (-yes: without asking)
+dryserver app list               # each app, its servers, its names, and how each answers
+dryserver app show shop          # the app as a file: dryserver app show shop > shop.app
+dryserver app remove shop        # stop it, take its names out of Cloudflare
+dryserver app sync               # bring Cloudflare in step (and set up the tunnel)
+dryserver domains                # the domains your Cloudflare API token sees
+```
+
+`deploy` looks at what runs now and shows the difference before it changes
+anything:
+
+```
+shop:
+  image   ghcr.io/you/shop:v1 -> ghcr.io/you/shop:v2
+  + www.example.com
+  - old.example.com (stops answering)
+  = 3 names stay as they are
+  Its copies are replaced one at a time (the image or a port changed).
+Cloudflare Tunnel:
+  - route admin.example.com, example.com, shop.example.com, www.example.com through the tunnel
+  - add www.example.com to DNS, pointing at the tunnel
+  - delete the DNS record of old.example.com (no app uses it)
+Apply? [y/N]
+```
+
+On `y` it applies the app, then makes exactly the Cloudflare changes shown.
+When Cloudflare would now make other ones (something changed in between),
+it makes none there and says so; `dryserver app sync` looks again. Adding
+or dropping a name that leads to the main port leaves the running copies
+alone; a new image, another `PORT` or a port that comes or goes replaces
+them one at a time (with two copies, nobody notices).
+
+It stops before anything changes when:
+
+- a name belongs to another app (each such name is listed),
+- a name is in no domain your API token can see (it would be half public),
+- a name has an A or CNAME record dryserver did not make: it is listed with
+  what it points at. `-take-over NAME` lets dryserver replace that record;
+  the change shows first. A name's other records (MX, TXT) are never
+  touched, so email on `example.com` keeps working,
+- the entrance is not set up (the VPS, for now),
+- an app in the cluster was set up by a newer dryserver: this one would
+  read its names wrong. Update this computer first.
+
+It warns, and goes on after `y`, when a name is two levels below its domain
+(`a.b.example.com`: Cloudflare's free certificate does not cover it, so
+browsers refuse it) and when a domain is not active in Cloudflare yet. When
+Cloudflare does not answer while it looks, it says so: on `y` the app starts
+and its names are synced later with `dryserver app sync`. A change cut off
+half way is finished by the next `deploy` or `sync`. Without an API token
+it says which names to add or remove in the Cloudflare dashboard.
+
+`app list` asks each name over https, the way a visitor's browser does:
+`answers (HTTP 200)`, `HTTP 502: the app does not answer yet`, `HTTP 530`
+(Cloudflare cannot reach the tunnel), `not in DNS yet`, `certificate
+error`. `-no-check` leaves that out.
+
+**Apps with a reverse proxy of their own** (nginx or Caddy inside the
+container, choosing by name) work as they are: the name the visitor typed
+reaches the app unchanged (the `Host` header). Let it speak plain http on
+`PORT`, with its own https and certificates off: Cloudflare already did
+that part. What the app sees of the visit:
+
+- The ingress tells every app `X-Forwarded-Proto: http`, since the tunnel
+  reaches it over plain http. An app that sends http visitors on to https
+  (nginx `return 301 https://...`, Django's `SECURE_SSL_REDIRECT`) would
+  send them round and round: leave that to Cloudflare instead (SSL/TLS,
+  Edge Certificates, Always Use HTTPS). Cloudflare's own `CF-Visitor`
+  header says `{"scheme":"https"}` when the visitor used https.
+- The visitor's address is in `CF-Connecting-IP`, which Cloudflare sets
+  itself. `X-Forwarded-For` and `X-Real-Ip` carry the tunnel's address.
+- Many apps check the name they are called by (Django's `ALLOWED_HOSTS`,
+  Nextcloud's `trusted_domains`, Vite's `allowedHosts`): list your names
+  there too.
+- Cookies and logins belong to one name: logged in on `example.com` is
+  not logged in on `example.net`.
+
+**Coming from dryserver 0.2.0**: run `make install` on every computer you
+run dryserver on. An older dryserver reads only an app's first name, and
+its next Cloudflare sync would delete the others' DNS records. The machines
+need nothing new for this. Apps started from the menu keep working, as
+files with one name.
+
+## The menu
+
 ```sh
 dryserver apps           # or "Apps" in the menu
 ```
@@ -29,7 +148,8 @@ reached from outside; `enter` shows an app's details, long names whole, and
 what can be done to it; `d` removes an app after saying what that does (its
 containers stop, its host name stops answering); `o` goes to the ways in from
 outside. Under it is plain Kubernetes: on the coordinator, `k3s kubectl`
-works for you without sudo.
+works for you without sudo. The form knows one name and one port: an app
+with more (from its file) is changed with its file, and the form says so.
 
 The screen never waits for the coordinator: every question and change runs
 in the background with a time limit (15 seconds for a look, a minute for a
@@ -57,8 +177,8 @@ What dryserver sets up around every app (namespace `apps`):
   rather than on the coordinator once there are two servers, so apps and
   the tunnel keep finding each other when one machine is off, the
   coordinator included,
-- a public host name makes the built-in ingress (Traefik) route that name to
-  the app. The ingress has no port on any machine: what comes in from
+- each public host name makes the built-in ingress (Traefik) route that name
+  to the app, on the port the name leads to. The ingress has no port on any machine: what comes in from
   outside reaches it through a tunnel that runs inside the cluster. It runs
   on every machine, so it does not go down with one server,
 - containers cannot gain privileges and get no cluster credentials,
@@ -97,7 +217,8 @@ dryserver outside        # or "Outside" in the menu, or o on the apps screen
 - **Your VPS**: not built yet. A server you rent will relay web and game
   ports (TCP and UDP) to the cluster over WireGuard.
 
-Each public host name belongs to one app and comes in through one entrance.
+Each public host name belongs to one app and comes in through one entrance;
+an app may have many names, all through its entrance.
 The choice is stored on the app's Ingress as the annotation
 `dryserver/entrance`; an Ingress without it comes in through Cloudflare, so
 apps started before there was a choice keep working. The apps form asks

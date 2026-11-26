@@ -267,6 +267,15 @@ impl Cloudflare {
         Ok(Some(text.trim().to_string()))
     }
 
+    /// The zones (domains) the API token can see, with what Cloudflare
+    /// says of each. None without an API token.
+    pub fn zones(&self, ctx: &Ctx) -> Result<Option<Vec<cfsync::Zone>>> {
+        let Some(token) = self.api_token()? else { return Ok(None) };
+        let http = (self.http)(token);
+        let api = super::cfapi::Api { http: http.as_ref(), ctx };
+        cfsync::zones(&api).map(|(_, z)| Some(z))
+    }
+
     /// The token the admin saved, checked.
     pub fn saved_token(&self) -> Result<String> {
         let text = std::fs::read_to_string(&self.token_file).map_err(|_| {
@@ -318,6 +327,15 @@ impl Entrance for Cloudflare {
     /// to match want (cfsync). Without it the host names are routed in the
     /// dashboard: there is nothing to change from here.
     fn sync(&self, ctx: &Ctx, c: &dyn Cluster, seen: &Overview, want: &Want, dry: bool) -> Result<Report> {
+        // A newer dryserver set up an app this one would read wrong (names
+        // it does not see would be taken out of DNS): nothing is changed.
+        if let Some(a) = seen.apps.iter().find(|a| a.newer) {
+            bail!(
+                "{} was set up by a newer dryserver; update dryserver on this computer first (git pull && make install). \
+                 Nothing was changed in Cloudflare",
+                a.name
+            );
+        }
         if let Some(token) = self.api_token()? {
             let http = (self.http)(token);
             let cluster_mark = seen.tunnel.map(|_| seen.tunnel_mark.clone());

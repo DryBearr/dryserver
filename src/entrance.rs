@@ -140,6 +140,9 @@ pub struct Report {
     /// Why a sync after an app changed left everything as it is on
     /// purpose (Cloudflare: the cluster runs a tunnel set up by hand).
     pub held: Option<String>,
+    /// Names the entrance cannot route (Cloudflare: in no zone the API
+    /// token can see).
+    pub unrouted: Vec<String>,
 }
 
 impl Report {
@@ -215,8 +218,10 @@ pub fn carries(e: &dyn Entrance) -> String {
 /// gets nothing.
 pub fn wants(apps: &[Running]) -> (BTreeMap<&'static str, Want>, Vec<String>) {
     let mut by_host: BTreeMap<&str, Vec<&Running>> = BTreeMap::new();
-    for a in apps.iter().filter(|a| !a.host.is_empty()) {
-        by_host.entry(&a.host).or_default().push(a);
+    for a in apps {
+        for h in &a.hosts {
+            by_host.entry(&h.name).or_default().push(a);
+        }
     }
     let mut out: BTreeMap<&'static str, Want> = IDS.iter().map(|id| (*id, Want::default())).collect();
     let mut problems = Vec::new();
@@ -240,19 +245,26 @@ pub fn wants(apps: &[Running]) -> (BTreeMap<&'static str, Want>, Vec<String>) {
 
 /// The apps that come in through an entrance, by name.
 pub fn users(id: &str, apps: &[Running]) -> Vec<String> {
-    apps.iter().filter(|a| !a.host.is_empty() && a.entrance == id).map(|a| a.name.clone()).collect()
+    apps.iter().filter(|a| a.public() && a.entrance == id).map(|a| a.name.clone()).collect()
 }
 
-/// Whether app may take its public name: a name belongs to one app (and so
-/// to one entrance). The same app may move it to another entrance.
+/// Whether app may take its public names: a name belongs to one app (and
+/// so to one entrance). The same app may move them to another entrance.
+/// Every name another app has is named at once.
 pub fn check_host(app: &App, apps: &[Running]) -> Result<()> {
-    if app.host.is_empty() {
-        return Ok(());
+    let taken: Vec<(&str, &str)> = app
+        .hosts
+        .iter()
+        .filter_map(|h| apps.iter().find(|a| a.has(&h.name) && a.name != app.name).map(|a| (h.name.as_str(), a.name.as_str())))
+        .collect();
+    match taken.as_slice() {
+        [] => Ok(()),
+        [(host, other)] => bail!("{host} is already a public name of {other}; remove it there first"),
+        many => {
+            let list: Vec<String> = many.iter().map(|(h, a)| format!("{h} ({a})")).collect();
+            bail!("these names belong to other apps: {}; remove them there first", list.join(", "))
+        }
     }
-    if let Some(other) = apps.iter().find(|a| a.host == app.host && a.name != app.name) {
-        bail!("{} is already the public name of {}; remove it there first", app.host, other.name);
-    }
-    Ok(())
 }
 
 /// Your own VPS. It will relay web and game ports to the cluster over
@@ -298,7 +310,8 @@ mod tests {
     use super::*;
 
     fn running(name: &str, host: &str, entrance: &str) -> Running {
-        Running { name: name.into(), host: host.into(), entrance: entrance.into(), ..Running::default() }
+        let hosts = if host.is_empty() { vec![] } else { vec![crate::apps::Host { name: host.into(), port: 80 }] };
+        Running { name: name.into(), port: 80, hosts, entrance: entrance.into(), ..Running::default() }
     }
 
     #[test]
@@ -334,12 +347,12 @@ mod tests {
         let apps = vec![running("blog", "blog.example.com", CLOUDFLARE)];
         let app = |name: &str, host: &str, entrance: &str| App {
             name: name.into(),
-            host: host.into(),
+            hosts: if host.is_empty() { vec![] } else { vec![crate::apps::tests::host(host, 8080)] },
             entrance: entrance.into(),
             ..crate::apps::tests::app()
         };
         let e = check_host(&app("shop", "blog.example.com", VPS), &apps).unwrap_err();
-        assert!(e.to_string().contains("already the public name of blog"), "{e}");
+        assert!(e.to_string().contains("blog.example.com is already a public name of blog"), "{e}");
         assert!(check_host(&app("shop", "blog.example.com", CLOUDFLARE), &apps).is_err());
         // The same app may keep it, or move it to another entrance.
         check_host(&app("blog", "blog.example.com", VPS), &apps).unwrap();
@@ -349,6 +362,42 @@ mod tests {
             valid_id(id).unwrap();
         }
         assert!(valid_id("").is_err() && valid_id("Cloudflare").is_err() && valid_id("vps\n").is_err());
+    }
+
+    #[test]
+    fn many_names_per_app() {
+        let mut shop = running("shop", "shop.example.com", CLOUDFLARE);
+        shop.hosts.push(crate::apps::Host { name: "example.com".into(), port: 80 });
+        shop.hosts.push(crate::apps::Host { name: "shop.example.net".into(), port: 9000 });
+        shop.hosts.sort();
+        let mut other = running("other", "other.example.com", CLOUDFLARE);
+        other.hosts.push(crate::apps::Host { name: "shop.example.net".into(), port: 80 });
+        let apps = vec![shop.clone(), other, running("blog", "blog.example.com", CLOUDFLARE)];
+        let (w, problems) = wants(&apps);
+        let names: Vec<String> = w[CLOUDFLARE].names.iter().map(|n| format!("{}={}", n.host, n.app)).collect();
+        assert_eq!(
+            names,
+            vec!["blog.example.com=blog", "example.com=shop", "other.example.com=other", "shop.example.com=shop"],
+            "every name of every app, sorted; the one two apps claim goes to neither"
+        );
+        assert_eq!(w[CLOUDFLARE].disputed, vec!["shop.example.net"]);
+        assert!(problems[0].contains("shop.example.net is the public name of shop and other"), "{problems:?}");
+        // Every name another app has is named, not only the first.
+        let a = App {
+            name: "new".into(),
+            hosts: vec![
+                crate::apps::tests::host("blog.example.com", 8080),
+                crate::apps::tests::host("free.example.com", 8080),
+                crate::apps::tests::host("shop.example.com", 8080),
+            ],
+            ..crate::apps::tests::app()
+        };
+        let e = check_host(&a, &apps).unwrap_err().to_string();
+        assert!(e.contains("blog.example.com (blog), shop.example.com (shop)") && !e.contains("free"), "{e}");
+        // An app keeps its own names, adds new ones and drops others.
+        let again = App { name: "shop".into(), hosts: vec![crate::apps::tests::host("www.example.com", 8080)], ..a };
+        check_host(&again, &apps).unwrap();
+        check_host(&App { hosts: vec![], ..again }, &apps).unwrap();
     }
 
     #[test]

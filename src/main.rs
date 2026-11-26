@@ -2,6 +2,8 @@
 //! the setup screen and mesh tools on the servers it installs.
 
 mod admin;
+mod appcmd;
+mod appfile;
 mod apps;
 mod assets;
 mod backup;
@@ -105,6 +107,12 @@ commands:
   approve             the app at Machines: approve or reject machines,
                       remove members, publish an update (u); every
                       decision is signed with your signing key
+  app deploy FILE     start or change an app from its file: an image, its
+                      port and any number of public names (app help)
+  app list|show|remove|sync
+                      what runs and how each name answers; an app as a
+                      file; stop one; bring Cloudflare in step
+  domains             the domains your Cloudflare API token can see
   apps                the app at Apps: what runs on your cluster
   backup-pull         copy the coordinator's newest backups into the
                       backups folder next to your keys (encrypted; signed
@@ -233,7 +241,10 @@ fn main() -> ExitCode {
         "flash" => run_flash(rest),
         "sysconf" => run_sysconf(rest),
         "ssh-config" => run_ssh_config(rest),
+        "app" => run_app_cmd(rest),
+        "apps" if rest.first().is_some_and(|w| APP_WORDS.contains(&w.as_str())) => run_app_cmd(rest),
         "apps" => run_apps(rest, tui::Place::Apps),
+        "domains" => run_domains(rest),
         "outside" => run_apps(rest, tui::Place::Outside),
         "quarantine-all" => run_quarantine_all(rest),
         "quarantine" => run_quarantine(rest),
@@ -1342,6 +1353,176 @@ fn desktop_cluster(f: &Flags, cmd: &str) -> Result<apps::SshCluster> {
         user: cfg.username,
         known_hosts: paths()?.secrets.join(admin::KNOWN_HOSTS),
     })
+}
+
+/// The words of `dryserver app` (also after `dryserver apps`).
+const APP_WORDS: [&str; 6] = ["deploy", "list", "show", "remove", "sync", "help"];
+
+const APP_USAGE: &str = r#"usage: dryserver app deploy|list|show|remove|sync [flags]
+
+  deploy FILE    start or change the app FILE describes. Shows every change
+                 first (to the app, and in Cloudflare) and makes exactly
+                 those on y.
+                   -take-over NAME[,NAME]  let a name whose DNS record
+                                           dryserver did not make point at
+                                           this app (the change shows first)
+  list           every app, where it runs, its names and whether each name
+                 answers from the internet (-no-check: do not ask them)
+  show NAME      the app as a file, to keep or change:
+                   dryserver app show shop > shop.app
+  remove NAME    stop the app and take its names out of Cloudflare
+  sync           make Cloudflare match the apps, and set up the tunnel when
+                 it is not there (after a deploy whose Cloudflare part
+                 failed). -take-over as with deploy.
+
+  -yes           make the changes without asking
+  -config, -host, -port  as for the other desktop commands
+
+An app file (any name, for example shop.app):
+
+  NAME=shop                      starts with a letter: a-z, 0-9 and -
+  IMAGE=ghcr.io/you/shop:v1      the container image
+  PORT=8080                      the port it listens on
+  COPIES=2                       how many run (1 to 20; default 1)
+  HOST=shop.example.com          a public name; as many HOST lines as you
+  HOST=www.example.com a.com     need, several names on one line are fine
+  HOST=admin.example.com:9000    this name leads to port 9000 of the app
+
+More: docs/apps.md
+"#;
+
+fn run_app_cmd(args: &[String]) -> Result<()> {
+    if Path::new(LIVE_CONFIG).exists() {
+        bail!("app runs on your own computer:\n  dryserver app list\nOn the coordinator itself, use: k3s kubectl");
+    }
+    let mut spec = DESKTOP_FLAGS.to_vec();
+    spec.extend([
+        ("yes", "false", "make the changes without asking"),
+        ("take-over", "", "names (comma separated) whose DNS record dryserver did not make, to point at this app"),
+        ("no-check", "false", "list: do not ask each name whether it answers"),
+    ]);
+    // Words and flags in any order: app deploy -yes shop.app works too.
+    let (mut words, mut flags) = (Vec::new(), Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if !a.starts_with('-') || a == "-" {
+            words.push(a.clone());
+            continue;
+        }
+        flags.push(a.clone());
+        let name = a.trim_start_matches('-');
+        let takes_value = spec.iter().any(|(n, def, _)| *n == name && *def != "false");
+        if takes_value && let Some(v) = it.next() {
+            flags.push(v.clone());
+        }
+    }
+    let f = Flags::parse("app", &flags, &spec);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let opts = appcmd::Opts { yes: f.on("yes"), take_over: vec![f.get("take-over").to_string()] };
+    // SAFETY: isatty only looks at the file descriptor.
+    let interactive = unsafe { libc::isatty(0) } == 1;
+    let needs_terminal = |w: &str| matches!(w, "deploy" | "remove" | "sync") && !opts.yes && !interactive;
+    if words.first().is_some_and(|w| needs_terminal(w)) {
+        bail!("nobody is at a terminal to say yes: add -yes to make the changes without asking");
+    }
+    let mut out = std::io::stdout();
+    let mut ask = |q: &str| {
+        use std::io::Write;
+        print!("{q}");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
+    };
+    let ctx = Ctx::new();
+    let cluster = || desktop_cluster(&f, "app");
+    match words.as_slice() {
+        [] | ["help"] => {
+            print!("{APP_USAGE}");
+            Ok(())
+        }
+        ["deploy", file] => {
+            let app = read_app_file(Path::new(file))?;
+            let (c, doors) = (cluster()?, desktop_doors()?);
+            appcmd::deploy(&ctx, &c, &doors, &app, &opts, &mut appcmd::Io { out: &mut out, ask: &mut ask })
+        }
+        ["list"] => {
+            let (c, doors) = (cluster()?, desktop_doors()?);
+            let check = |h: &str| answers(h);
+            let check: Option<appcmd::Check> = if f.on("no-check") { None } else { Some(&check) };
+            appcmd::list(&ctx, &c, &doors, check, &mut appcmd::Io { out: &mut out, ask: &mut ask })
+        }
+        ["show", name] => appcmd::show(&ctx, &cluster()?, name, &mut appcmd::Io { out: &mut out, ask: &mut ask }),
+        ["remove", name] => {
+            let (c, doors) = (cluster()?, desktop_doors()?);
+            appcmd::remove(&ctx, &c, &doors, name, &opts, &mut appcmd::Io { out: &mut out, ask: &mut ask })
+        }
+        ["sync"] => {
+            let (c, doors) = (cluster()?, desktop_doors()?);
+            appcmd::sync(&ctx, &c, &doors, &opts, &mut appcmd::Io { out: &mut out, ask: &mut ask })
+        }
+        _ => {
+            eprint!("{APP_USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Reads an app file: text, not too large.
+fn read_app_file(path: &Path) -> Result<apps::App> {
+    let meta = std::fs::metadata(path).map_err(|e| err::Error::from(e).wrap(path.display()))?;
+    if !meta.is_file() {
+        bail!("{}: not a file", path.display());
+    }
+    if meta.len() > appfile::MAX_LEN as u64 {
+        bail!("{}: an app file is at most {} KiB", path.display(), appfile::MAX_LEN >> 10);
+    }
+    let bytes = std::fs::read(path).map_err(|e| err::Error::from(e).wrap(path.display()))?;
+    let text = String::from_utf8(bytes).map_err(|_| errf!("{}: not a text file", path.display()))?;
+    appfile::parse(&text).map_err(|e| e.wrap(path.display()))
+}
+
+/// How a public name answers from the internet: one HTTPS request, as a
+/// visitor's browser makes it.
+fn answers(host: &str) -> String {
+    // Only checked names reach here; they are never options to curl.
+    if apps::valid_host(host).is_err() || host.is_empty() {
+        return "not checked".into();
+    }
+    let out = Command::new("curl")
+        .args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "8", "--proto", "=https", "--"])
+        .arg(format!("https://{host}/"))
+        .stdin(std::process::Stdio::null())
+        .output();
+    let Ok(out) = out else { return "not checked (no curl)".into() };
+    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    match out.status.code() {
+        Some(0) => match code.as_str() {
+            "530" => "HTTP 530: Cloudflare cannot reach the tunnel (is it running? dryserver app sync)".into(),
+            "502" | "503" | "504" => format!("HTTP {code}: the app does not answer yet (starting, or its PORT is wrong)"),
+            "404" => "answers, HTTP 404 (the app, or no route for this name yet)".into(),
+            c => format!("answers (HTTP {c})"),
+        },
+        Some(6) => "not in DNS yet (a new name takes a minute; a pending domain longer)".into(),
+        Some(7) => "refused the connection".into(),
+        Some(28) => "no answer within 8 seconds".into(),
+        Some(35) | Some(60) => "certificate error (a name two levels deep? dryserver domains)".into(),
+        Some(n) => format!("did not answer (curl exit {n})"),
+        None => "not checked".into(),
+    }
+}
+
+/// The domains the Cloudflare API token can see.
+fn run_domains(args: &[String]) -> Result<()> {
+    let f = Flags::parse("domains", args, DESKTOP_FLAGS);
+    if Path::new(LIVE_CONFIG).exists() {
+        bail!("domains runs on your own computer, where the Cloudflare API token is");
+    }
+    let cf = entrance::cloudflare::Cloudflare::new(&paths()?.secrets);
+    let c = desktop_cluster(&f, "domains")?;
+    let mut out = std::io::stdout();
+    let mut ask = |_: &str| false;
+    appcmd::domains(&Ctx::new(), &c, &cf, &mut appcmd::Io { out: &mut out, ask: &mut ask })
 }
 
 fn run_apps(args: &[String], place: tui::Place) -> Result<()> {

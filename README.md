@@ -228,14 +228,32 @@ machine whose new skin does not fit goes back to the old one by itself.
 
 ### Run an app
 
+Write the app in a small file, for example `shop.app`:
+
 ```sh
-dryserver apps           # or "Apps" in the menu
+NAME=shop                       # a-z, 0-9 and -, starting with a letter
+IMAGE=ghcr.io/you/shop:v1       # the container image
+PORT=8080                       # the port the app listens on
+COPIES=2                        # how many run (default 1)
+HOST=shop.example.com           # a public name: as many HOST lines as you need
+HOST=www.example.com example.com
+HOST=admin.example.com:9000     # this name goes to port 9000 of the app
 ```
 
-Press `n` and give the app a name, its container image, the port it
-listens on and, if it should be reachable from outside, a public host
-name. The cluster picks a server for it. The screen shows what runs where;
-`d` removes an app.
+Then:
+
+```sh
+dryserver app deploy shop.app   # shows every change first, makes them on y
+dryserver app list              # what runs where, and whether each name answers
+dryserver app show shop         # the app as a file again (> shop.app to keep it)
+dryserver app remove shop       # stops it, takes its names out of Cloudflare
+```
+
+To change an app, edit its file and run `deploy` again: names you added are
+added, names you dropped stop answering, and the preview shows both before
+anything happens. An app without `HOST` lines is reached only by your other
+apps, as `http://shop`. The cluster picks the servers. The menu
+(`dryserver apps`) shows the same apps and starts simple ones too.
 
 - When a server loses power, an app with one copy runs on another server
   after about a minute and a half. With two copies it keeps answering.
@@ -243,6 +261,13 @@ name. The cluster picks a server for it. The screen shows what runs where;
 - Each app is fenced in: it takes connections only from the ingress and
   your other apps, and reaches only your other apps, DNS and the internet,
   never your home network.
+- A name belongs to one app. One app may have up to 50 names, in any of
+  your domains, and up to 10 ports.
+- An app that has its own reverse proxy inside (nginx, Caddy) works as it
+  is: the name the visitor typed reaches it. Let it speak plain http, and
+  do not let it send visitors on to https: Cloudflare does the https part
+  (turn on Always Use HTTPS there). More:
+  [docs/apps.md](docs/apps.md#an-app-as-a-file).
 
 Under it is plain Kubernetes (k3s): on the coordinator, `k3s kubectl` works
 for you without sudo. More: [docs/apps.md](docs/apps.md).
@@ -271,22 +296,33 @@ DNS records for you:
    | Zone | Zone | Read |
 
    Under Account Resources pick your account, under Zone Resources the
-   zone (domain) your apps' host names are in. Newer dashboards call Edit
-   "Write". An expiry date and an IP filter (your home address) are a good
-   idea.
+   zones (domains) your apps' host names are in: "All zones from an
+   account" covers domains you add later too. Each domain must be in
+   Cloudflare first (Add a domain, then set its nameservers at the company
+   you bought it from to the two Cloudflare shows). Newer dashboards call
+   Edit "Write". An expiry date and an IP filter (your home address) are a
+   good idea.
 2. Save the token on your computer as
    `~/.config/dryserver/secrets/cloudflare_api_token`, and make it yours
    alone: `chmod 600 ~/.config/dryserver/secrets/cloudflare_api_token`.
    dryserver refuses it while other users can read it.
-3. In `dryserver outside`, press `s` on the Cloudflare Tunnel. It lists
-   every change it would make, in order (`pgdn` scrolls a long list). `y`
-   makes exactly those; when something changed since it looked, it makes
-   none and says so.
+3. Run `dryserver app sync` (or press `s` on the Cloudflare Tunnel in
+   `dryserver outside`). It lists every change it would make, in order,
+   and makes exactly those on `y`; when something changed since it
+   looked, it makes none and says so. `dryserver domains` shows which
+   domains the token sees, and whether Cloudflare has activated each.
 
-From then on, starting or removing an app with a host name updates
-Cloudflare by itself. dryserver changes only the DNS records it made;
-a record that points elsewhere is shown and left alone, until you take
-the name over with `t`.
+From then on, deploying or removing an app updates Cloudflare by itself.
+dryserver changes only the DNS records it made, and never a name's other
+records (MX, TXT: your email keeps working). A name whose A or CNAME record
+points elsewhere is shown and left alone, until you take it over with
+`dryserver app deploy FILE -take-over NAME` (or `t` in `dryserver outside`).
+
+Cloudflare's free certificate covers `example.com` and `x.example.com`,
+not `a.b.example.com`: browsers refuse a name two levels deep unless your
+Cloudflare plan covers it, and dryserver warns before it sets one up. A
+domain new in Cloudflare answers once Cloudflare has made its certificate,
+15 minutes to 24 hours after the domain is active.
 
 **By hand**, without an API token:
 
@@ -582,7 +618,13 @@ On your desktop:
 | `dryserver disks` | list disks and which ones may be flashed |
 | `sudo "$(command -v dryserver)" flash --iso FILE` | flash any image to a USB drive (sudo does not look in `~/.local/bin`) |
 | `dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed. `p` publishes an update; `enter` on a stopped rollout tries it again or skips the machine |
-| `dryserver apps` | start an app from a container image, remove one, see what runs where |
+| `dryserver app deploy FILE` | start or change an app from its file, with any number of public names; every change is shown first (`-yes`, `-take-over NAME`) |
+| `dryserver app list` | every app, its servers, its names and whether each one answers (`-no-check`) |
+| `dryserver app show NAME` | the app as a file, to keep or edit |
+| `dryserver app remove NAME` | stop an app and take its names out of Cloudflare |
+| `dryserver app sync` | bring Cloudflare in step with the apps, and set up the tunnel |
+| `dryserver domains` | the domains your Cloudflare API token can see, and the names in each |
+| `dryserver apps` | the menu's Apps: start a simple app, remove one, see what runs where |
 | `dryserver outside` | the ways in from the internet: open, sync or close the Cloudflare Tunnel |
 | `dryserver release publish` | check a release, show what changes, sign it and roll it out (`-urgent`, `-notes`, `-rollback`, `-arch-date`, `-k3s`) |
 | `dryserver release status` | the release on every machine, and what to do when it stopped |

@@ -109,7 +109,7 @@ fn listing(ctx: &Ctx, c: &dyn Cluster, limits: Limits) -> Result<Overview> {
 
 /// The entrance an app's public name came in through, if it had one.
 fn came_through(before: &Overview, name: &str) -> Option<String> {
-    before.apps.iter().find(|a| a.name == name && !a.host.is_empty()).map(|a| a.entrance.clone())
+    before.apps.iter().find(|a| a.name == name && a.public()).map(|a| a.entrance.clone())
 }
 
 /// After an app changed: the entrances its name came or comes through
@@ -162,8 +162,13 @@ fn start(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, limits: Limits, d: Draft
         }),
         retry: Some(d.clone()),
     };
-    step(if app.host.is_empty() { "Looking at the cluster".into() } else { format!("Checking that {} is free", app.host) }, 0.1);
-    let before = match listing(ctx, c, limits).and_then(|o| entrance::check_host(&app, &o.apps).map(|_| o)) {
+    step(
+        if app.hosts.is_empty() { "Looking at the cluster".into() } else { format!("Checking that {} is free", app.names().join(", ")) },
+        0.1,
+    );
+    let before = match listing(ctx, c, limits)
+        .and_then(|o| entrance::check_host(&app, &o.apps).and_then(|_| form_may_change(&app, &o)).map(|_| o))
+    {
         Ok(o) => o,
         Err(e) => return not_started(e, "Nothing was sent to the cluster."),
     };
@@ -172,11 +177,40 @@ fn start(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, limits: Limits, d: Draft
         return not_started(e, "Part of it may have reached the cluster: r shows what runs.");
     }
     let mut ids: Vec<String> = came_through(&before, &app.name).into_iter().collect();
-    if !app.host.is_empty() {
+    if !app.hosts.is_empty() {
         ids.push(app.entrance.clone());
     }
     let (synced, failed) = sync_after(ctx, c, doors, limits, &ids, &app.name, step);
     Outcome { notice: Notice::ok(format!("{} is starting. The cluster picks a server for it.{synced}", app.name)), failed, retry: None }
+}
+
+/// The form knows one public name and one port. An app that runs with
+/// more (set up from an app file), or that a newer dryserver wrote, would
+/// lose them when started again from here: that is done with its file.
+fn form_may_change(app: &App, now: &Overview) -> Result<()> {
+    // Any app a newer dryserver set up: this one's sync would read its
+    // names wrong, so nothing is started that would sync.
+    if let Some(r) = now.apps.iter().find(|a| a.newer && a.name != app.name) {
+        crate::bail!("{} was set up by a newer dryserver; update dryserver on this computer first (git pull && make install)", r.name);
+    }
+    let Some(r) = now.apps.iter().find(|a| a.name == app.name) else { return Ok(()) };
+    let why = if r.newer {
+        "a newer dryserver set it up".to_string()
+    } else if r.hosts.len() > 1 {
+        format!("it has {} public names", r.hosts.len())
+    } else if r.hosts.iter().any(|h| h.port != r.port) {
+        "its public name leads to a port of its own".to_string()
+    } else {
+        return Ok(());
+    };
+    crate::bail!(
+        "{} already runs and {why}; starting it from this form would lose that. Change it with its app file: dryserver app \
+         show {} > {}.app, edit it, then dryserver app deploy {}.app",
+        app.name,
+        app.name,
+        app.name,
+        app.name
+    )
 }
 
 /// Removes an app, then syncs the way in its name came through.
@@ -246,11 +280,14 @@ impl Draft {
     }
 
     fn app(&self) -> App {
+        let port = self.port.trim().parse().unwrap_or(0);
+        // The form checked it; what is left is the name as DNS has it.
+        let host = apps::clean_host(&self.host).unwrap_or_else(|_| self.host.trim().to_ascii_lowercase());
         App {
             name: self.name.trim().into(),
             image: self.image.trim().into(),
-            port: self.port.trim().parse().unwrap_or(0),
-            host: self.host.trim().to_ascii_lowercase(),
+            port,
+            hosts: if host.is_empty() { vec![] } else { vec![apps::Host { name: host, port }] },
             entrance: self.entrance.clone(),
             copies: if self.copies.trim().is_empty() { 1 } else { self.copies.trim().parse().unwrap_or(0) },
         }
@@ -289,8 +326,10 @@ fn new_app_form(draft: Draft, taken: Vec<(String, String)>, doors: Vec<(String, 
                     .placeholder("blog.example.com")
                     .desc("Leave it empty to keep the app inside the cluster. With a name, the ingress sends\nthat name to the app; Outside shows how it comes in.")
                     .validate(move |v, d| {
-                        let host = v.trim().to_ascii_lowercase();
-                        apps::valid_host(&host)?;
+                        if v.trim().is_empty() {
+                            return Ok(());
+                        }
+                        let host = apps::clean_host(v)?;
                         match taken.iter().find(|(h, a)| *h == host && *a != d.name.trim()) {
                             Some((_, other)) => Err(crate::errf!("already the public name of {other}")),
                             None => Ok(()),
@@ -602,7 +641,7 @@ impl Screen {
     }
 
     fn open_form(&mut self) {
-        let taken = self.now.apps.iter().filter(|a| !a.host.is_empty()).map(|a| (a.host.clone(), a.name.clone())).collect();
+        let taken = self.now.apps.iter().flat_map(|a| a.hosts.iter().map(|h| (h.name.clone(), a.name.clone()))).collect();
         let doors: Vec<(String, String)> =
             self.doors.iter().filter(|d| d.ready()).map(|d| (d.id().to_string(), d.title().to_string())).collect();
         let first = doors.first().map(|d| d.0.clone()).unwrap_or_else(|| entrance::DEFAULT.into());
@@ -742,30 +781,38 @@ impl Screen {
         ]
     }
 
-    /// The other apps that claim a's public name.
-    fn claimed_too(&self, a: &Running) -> Vec<&str> {
-        if a.host.is_empty() {
-            return Vec::new();
-        }
-        self.now.apps.iter().filter(|o| o.host == a.host && o.name != a.name).map(|o| o.name.as_str()).collect()
+    /// The other apps that claim host, a name of a, too.
+    fn claimed_by(&self, a: &Running, host: &str) -> Vec<&str> {
+        self.now.apps.iter().filter(|o| o.has(host) && o.name != a.name).map(|o| o.name.as_str()).collect()
+    }
+
+    /// a's public names that another app claims too.
+    fn claimed_too<'a>(&self, a: &'a Running) -> Vec<&'a str> {
+        a.names().into_iter().filter(|h| !self.claimed_by(a, h).is_empty()).collect()
     }
 
     /// How an app is reached from outside, in words.
     fn outside_words(&self, a: &Running) -> String {
-        if a.host.is_empty() {
+        if !a.public() {
             return "inside only: it has no public host name".into();
         }
-        let others = self.claimed_too(a);
-        if !others.is_empty() {
-            return format!("{} is claimed by {} too, so none of them gets it from outside", a.host, others.join(" and "));
+        let twice = self.claimed_too(a);
+        let served: Vec<&str> = a.names().into_iter().filter(|h| !twice.contains(h)).collect();
+        let mut words: Vec<String> = Vec::new();
+        if !served.is_empty() {
+            let names = served.join(", ");
+            words.push(match self.doors.iter().position(|d| d.id() == a.entrance) {
+                None => format!("{names} asks for a way in this dryserver does not know, so it is not served"),
+                Some(i) => match self.states.get(i) {
+                    Some(s) => format!("{names} through {}: {}", self.doors[i].title(), s.summary),
+                    None => format!("{names} through {}", self.doors[i].title()),
+                },
+            });
         }
-        match self.doors.iter().position(|d| d.id() == a.entrance) {
-            None => format!("{} asks for a way in this dryserver does not know, so it is not served", a.host),
-            Some(i) => match self.states.get(i) {
-                Some(s) => format!("{} through {}: {}", a.host, self.doors[i].title(), s.summary),
-                None => format!("{} through {}", a.host, self.doors[i].title()),
-            },
+        for h in twice {
+            words.push(format!("{h} is claimed by {} too, so none of them gets it from outside", self.claimed_by(a, h).join(" and ")));
         }
+        words.join("; ")
     }
 
     /// The sheet's title: the app and its details, each whole.
@@ -792,20 +839,31 @@ impl Screen {
             format!("Its containers stop{on}; what they keep inside them is lost."),
             format!("Your other apps no longer reach http://{name}."),
         ];
-        if let Some(a) = a.filter(|a| !a.host.is_empty()) {
-            match self.claimed_too(a).as_slice() {
-                [] => {
-                    c.push(format!("{} stops answering from outside.", a.host));
-                    match self.doors.iter().find(|d| d.id() == a.entrance) {
-                        Some(d) if d.automatic() => c.push(format!("{}: dryserver deletes its DNS name right after.", d.title())),
-                        Some(d) if d.id() == entrance::CLOUDFLARE => {
-                            c.push("Its public hostname in the Cloudflare dashboard stays until you remove it there.".into())
-                        }
-                        _ => {}
+        if let Some(a) = a.filter(|a| a.public()) {
+            let twice = self.claimed_too(a);
+            let own: Vec<&str> = a.names().into_iter().filter(|h| !twice.contains(h)).collect();
+            if !own.is_empty() {
+                c.push(format!("{} {} answering from outside.", own.join(", "), if own.len() == 1 { "stops" } else { "stop" }));
+                match self.doors.iter().find(|d| d.id() == a.entrance) {
+                    Some(d) if d.automatic() => c.push(format!(
+                        "{}: dryserver deletes {} right after.",
+                        d.title(),
+                        if own.len() == 1 { "its DNS name" } else { "their DNS names" }
+                    )),
+                    Some(d) if d.id() == entrance::CLOUDFLARE && own.len() == 1 => {
+                        c.push("Its public hostname in the Cloudflare dashboard stays until you remove it there.".into())
                     }
+                    Some(d) if d.id() == entrance::CLOUDFLARE => {
+                        c.push("Its public hostnames in the Cloudflare dashboard stay until you remove them there.".into())
+                    }
+                    _ => {}
                 }
-                [one] => c.push(format!("{} is claimed by {one} too: after this, {one} gets it from outside.", a.host)),
-                many => c.push(format!("{} stays claimed by {}, so none of them gets it.", a.host, many.join(" and "))),
+            }
+            for h in twice {
+                match self.claimed_by(a, h).as_slice() {
+                    [one] => c.push(format!("{h} is claimed by {one} too: after this, {one} gets it from outside.")),
+                    many => c.push(format!("{h} stays claimed by {}, so none of them gets it.", many.join(" and "))),
+                }
             }
         }
         c
@@ -821,15 +879,15 @@ impl Screen {
             (r, c) => (Mark::Wait, format!("{r} of {c} running")),
         };
         let twice = !self.claimed_too(a).is_empty();
-        let unknown = !a.host.is_empty() && !self.doors.iter().any(|d| d.id() == a.entrance);
+        let unknown = a.public() && !self.doors.iter().any(|d| d.id() == a.entrance);
         if twice || unknown {
             m = Mark::Bad;
         }
         let way = match () {
-            _ if a.host.is_empty() => Seg("inside only".into(), p.hint()),
-            _ if twice => Seg(format!("claimed twice: {}", a.host), p.text()),
-            _ if unknown => Seg(format!("unknown way in: {}", a.host), p.text()),
-            _ => Seg(a.host.clone(), p.text()),
+            _ if !a.public() => Seg("inside only".into(), p.hint()),
+            _ if twice => Seg(format!("claimed twice: {}", self.claimed_too(a).join(", ")), p.text()),
+            _ if unknown => Seg(format!("unknown way in: {}", a.names_text()), p.text()),
+            _ => Seg(a.names_text(), p.text()),
         };
         let on = if a.nodes.is_empty() { "no server yet".to_string() } else { a.nodes.join(", ") };
         let servers = 14 + width.saturating_sub(75).min(6);
@@ -1280,6 +1338,45 @@ pub mod tests {
     }
 
     #[test]
+    fn the_form_does_not_drop_what_a_file_set_up() {
+        use crate::apps::Host;
+        let h = |n: &str, p: u16| Host { name: n.into(), port: p };
+        let run = |name: &str, hosts: Vec<Host>, newer: bool| Running { name: name.into(), port: 80, hosts, newer, ..Running::default() };
+        let now = Overview {
+            apps: vec![
+                run("one", vec![h("one.example.com", 80)], false),
+                run("many", vec![h("a.example.com", 80), h("b.example.com", 80)], false),
+                run("port", vec![h("admin.example.com", 9000)], false),
+            ],
+            ..Overview::default()
+        };
+        let draft = |name: &str| {
+            Draft {
+                name: name.into(),
+                image: "nginx:1".into(),
+                port: "80".into(),
+                host: "x.example.com.".into(),
+                entrance: "cloudflare".into(),
+                copies: "1".into(),
+            }
+            .app()
+        };
+        assert_eq!(draft("new").hosts, vec![h("x.example.com", 80)], "the name as DNS has it");
+        form_may_change(&draft("new"), &now).unwrap();
+        form_may_change(&draft("one"), &now).unwrap();
+        let e = form_may_change(&draft("many"), &now).unwrap_err().to_string();
+        assert!(e.contains("many already runs and it has 2 public names") && e.contains("dryserver app show many > many.app"), "{e}");
+        let e = form_may_change(&draft("port"), &now).unwrap_err().to_string();
+        assert!(e.contains("leads to a port of its own"), "{e}");
+        let mut newer = now.clone();
+        newer.apps.push(run("next", vec![h("next.example.com", 80)], true));
+        let e = form_may_change(&draft("new"), &newer).unwrap_err().to_string();
+        assert!(e.contains("next was set up by a newer dryserver"), "{e}");
+        let e = form_may_change(&draft("next"), &newer).unwrap_err().to_string();
+        assert!(e.contains("a newer dryserver set it up"), "{e}");
+    }
+
+    #[test]
     fn one_name_one_app() {
         let fake = Arc::new(Fake::default());
         *fake.listing.lock().unwrap() = LISTING.into();
@@ -1313,7 +1410,7 @@ pub mod tests {
         s.settle();
         let v = s.flat();
         assert!(s.notice().contains("news was not started"), "{:?}", s.notice());
-        assert!(v.contains("news was not started: news.example.com is already the public name of blog"), "{v}");
+        assert!(v.contains("news was not started: news.example.com is already a public name of blog"), "{v}");
         assert!(v.contains("Nothing was sent to the cluster.") && v.contains("n try again with your answers"), "{v}");
         assert_eq!(calls(&fake, "apply"), applied, "nothing was applied");
         // n brings the answers back.
@@ -1649,7 +1746,7 @@ pub mod tests {
         s.settle();
         let n = s.notice();
         assert!(n.contains("blog is starting") && n.contains("Cloudflare Tunnel: left as it is: the cluster runs a tunnel"), "{n:?}");
-        assert!(n.contains("s on the Outside screen switches to the tunnel dryserver"), "{n:?}");
+        assert!(n.contains("(or s on the Outside screen) switches to the tunnel dryserver"), "{n:?}");
         assert_eq!(cf.changes.load(SeqCst), 0);
         assert!(cf.cf.lock().unwrap().tunnels.is_empty() && names(&cf).is_empty());
         assert!(!fake.calls.lock().unwrap().iter().any(|(a, m)| a == "apply -f -" && m.contains("cloudflared")), "left running");

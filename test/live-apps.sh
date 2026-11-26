@@ -200,6 +200,36 @@ after=$(wc -l < "$S/calls")
 check "it asked every 15 seconds ($((after - before)) calls)" test $((after - before)) -ge 3 -a $((after - before)) -le 4
 check "one shared connection after three rounds ($(masters))" test "$(masters)" -le 1
 
+echo "== apps from a file, on the command line"
+# Run from the swarm's folder, as the screens are (another folder may hold
+# another swarm).
+ds() { (cd "$S/desk" && DRYSERVER_HOME="$S/desk" "$BIN" "$@" --config "$S/desk/config.env" --host 127.0.0.1 --port "$PORT"); }
+app() { ds app "$@"; }
+out=$(app list -no-check 2>&1)
+check "app list shows what runs" grep -q "^blog  1 of 1 running" <<<"$out"
+check "an app without names is inside only" grep -q "inside only" <<<"$out"
+printf 'NAME=shop\nIMAGE=shop:v1\nPORT=8080\nHOST=shop.example.com www.example.com\nHOST=admin.example.com:9000\n' > "$S/shop.app"
+out=$(app deploy "$S/shop.app" < /dev/null 2>&1); rc=$?
+check "without a terminal and without -yes nothing is changed" test "$rc" -ne 0
+check "and it says to add -yes" grep -q "add -yes" <<<"$out"
+check "nothing was applied" bash -c "! grep -q 'name: \"shop\"' '$S/applied'"
+out=$(app deploy -yes "$S/shop.app" < /dev/null 2>&1)
+check "deploy shows the change first" grep -q "shop (new):" <<<"$out"
+check "every name is in the preview" grep -q "+ admin.example.com (port 9000)" <<<"$out"
+check "without an API token it says what to add in the dashboard" grep -q "add admin.example.com, shop.example.com, www.example.com with the service" <<<"$out"
+check "the coordinator got every name" grep -q 'host: "www.example.com"' "$S/applied"
+check "a name leads to its own port" grep -q "number: 9000" "$S/applied"
+printf 'NAME=shop\nIMAGE=shop:v1\nPORT=8080\nHOSTS=a.example.com\n' > "$S/bad.app"
+out=$(app deploy "$S/bad.app" -yes 2>&1); rc=$?
+check "a key it does not know is refused, with its line" bash -c "[ $rc -ne 0 ] && grep -q 'line 4: HOSTS is not a key' <<<'$out'"
+out=$(app show blog 2>&1); rc=$?
+check "show refuses an app it cannot write as a file ($rc)" test "$rc" -ne 0
+check "and says why" grep -q "do not say all an app file needs" <<<"$out"
+out=$(ds apps list -no-check 2>&1)
+check "dryserver apps list works too" grep -q "^blog  1 of 1 running" <<<"$out"
+out=$(ds domains 2>&1)
+check "domains needs the API token, and says so" grep -q "no Cloudflare API token on this computer" <<<"$out"
+
 echo "== the coordinator stops answering"
 echo slow > "$S/mode"
 out=$(screen "asking the coordinator" "r" "Already asking the coordinator" "" "not answering \([0-9]+s\)" "" "did not answer within 15s" "" 2>&1)
