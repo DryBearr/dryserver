@@ -34,7 +34,7 @@ HOST=admin.example.com:9000
 | Key | What | |
 |---|---|---|
 | `NAME` | the app's name: a-z, 0-9 and -, starting with a letter, at most 40 | needed |
-| `IMAGE` | the container image, best pinned: `ghcr.io/you/shop@sha256:...` | needed |
+| `IMAGE` | an image you built on this computer, `localhost/NAME:TAG` (see below), or one from a registry, best pinned: `ghcr.io/you/shop@sha256:...` | needed |
 | `PORT` | the port the app listens on. Inside the cluster `http://shop` leads there, and so does every name without a port of its own | needed |
 | `COPIES` | how many run, 1 to 20 | 1 |
 | `HOST` | public names, as many lines as you need, several per line (spaces or commas between). `name:port` leads that name to another port of the app | none: inside only |
@@ -57,6 +57,52 @@ dryserver app remove shop        # stop it, take its names out of Cloudflare
 dryserver app sync               # bring Cloudflare in step (and set up the tunnel)
 dryserver domains                # the domains your Cloudflare API token sees
 ```
+
+## Your own image
+
+Build it on your desktop and name it in the app file as `localhost/NAME:TAG`:
+
+```sh
+podman build -t shop:v1 .        # podman calls it localhost/shop:v1
+docker build -t shop:v1 .        # docker too: dryserver tags it localhost/shop:v1
+```
+
+`app deploy` (or `app push localhost/shop:v1` alone) then:
+
+1. asks every server which images it holds, and stops when one cannot be
+   asked or is in the cluster but not in your server list (run
+   `dryserver ssh-config`): an app landing there would not start,
+2. saves the image to one file and signs what it is (its name, its build,
+   the file's sha256 and size) with your key, like every other order,
+3. sends file and signature over your own SSH login on the home network
+   into `~/.dryserver/images` on each server that lacks it,
+4. waits until each server took it. A server's sync looks every minute; as
+   root it checks your signature, the size and the sha256, that its disk
+   has room, keeps the file in `/var/lib/dryserver-images` and loads it
+   into the cluster,
+5. starts the app with that build. The cluster never tries to download a
+   `localhost/` image from anywhere, so it runs only what you signed.
+
+A tag is needed (`v1`, `2026-11-26`, ...). A new build under the same tag
+is another build: `deploy` copies it and replaces the running copies one at
+a time. To be able to go back, give each release its own tag: each server
+keeps the three newest tags of an image, and every tag a pod on it runs,
+pinned so the cluster's own cleanup leaves them alone (one dropped all the
+same is loaded again from the kept file). The image must be built for
+amd64 (x86-64). When podman and docker both have the name as different
+builds, dryserver does not guess: remove the one you do not use.
+
+A server checks, before it loads anything: your signature, the file's size
+and sha256, that the file loads as exactly the one name you signed and as
+that build (so it never overwrites another image), that nothing newer was
+signed for the name before, that the document is not dated ahead of its
+clock, and that its disk keeps room (three times the image, and a fifth of
+the disk). A refused file is deleted; `sudo dryserver images` on the server
+says what it holds and why it refused the last ones. Files a send left half
+way are deleted after a day.
+Your servers need this dryserver for it: publish a release once.
+
+## Changing an app
 
 `deploy` looks at what runs now and shows the difference before it changes
 anything:

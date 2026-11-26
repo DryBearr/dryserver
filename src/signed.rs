@@ -28,6 +28,8 @@ pub const NS_MEMBERS: &str = "dryserver-members";
 pub const NS_ADMIN: &str = "dryserver-admin";
 /// A change of the key the swarm trusts, signed by the key it replaces.
 pub const NS_KEY: &str = "dryserver-key";
+/// An image the admin built, for the servers (images.rs).
+pub const NS_IMAGE: &str = "dryserver-image";
 /// More key changes than this in one list are not a swarm's.
 pub const MAX_KEY_CHANGES: usize = 64;
 /// The signer name in the allowed-signers file.

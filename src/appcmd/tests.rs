@@ -15,9 +15,13 @@ type Listed<'a> = (&'a str, u16, &'a [(&'a str, u16)]);
 
 /// What kubectl lists for these apps, with the tunnel running with mark.
 fn listing(apps: &[Listed], mark: &str) -> String {
-    let mut items = vec![format!(
-        r#"{{"kind":"Deployment","metadata":{{"name":"cloudflared","namespace":"edge","labels":{{"app":"cloudflared"}}}},"spec":{{"replicas":2,"template":{{"metadata":{{"annotations":{{"dryserver/token-mark":"{mark}"}}}}}}}},"status":{{"readyReplicas":2}}}}"#
-    )];
+    let mut items = vec![
+        r#"{"kind":"Node","metadata":{"name":"coord","labels":{"node-role.kubernetes.io/control-plane":"true"}}}"#.to_string(),
+        r#"{"kind":"Node","metadata":{"name":"node-a","labels":{}}}"#.to_string(),
+        format!(
+            r#"{{"kind":"Deployment","metadata":{{"name":"cloudflared","namespace":"edge","labels":{{"app":"cloudflared"}}}},"spec":{{"replicas":2,"template":{{"metadata":{{"annotations":{{"dryserver/token-mark":"{mark}"}}}}}}}},"status":{{"readyReplicas":2}}}}"#
+        ),
+    ];
     for (name, port, hosts) in apps {
         items.push(format!(
             r#"{{"kind":"Deployment","metadata":{{"name":"{name}","namespace":"apps","labels":{{"app":"{name}"}},"annotations":{{"dryserver/format":"2"}}}},"spec":{{"replicas":1,"template":{{"spec":{{"containers":[{{"image":"{name}:v1","ports":[{{"containerPort":{port}}}]}}]}}}}}},"status":{{"readyReplicas":1}}}}"#
@@ -124,7 +128,7 @@ impl World {
 
     fn deploy(&self, file: &str, opts: Opts, yes: bool) -> (String, Result<()>) {
         let app = appfile::parse(file).unwrap();
-        let (out, _, res) = self.run(yes, |ctx, c, d, io| deploy(ctx, c, d, &app, &opts, io));
+        let (out, _, res) = self.run(yes, |ctx, c, d, io| deploy(ctx, c, d, None, &app, &opts, io));
         (out, res)
     }
 }
@@ -169,7 +173,7 @@ fn deploy_shows_first_then_makes_exactly_that() {
     assert_eq!(w.routed(), w.dns());
 
     // The same file again: nothing to change, nothing asked.
-    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, &appfile::parse(SHOP).unwrap(), &Opts::default(), io));
+    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, None, &appfile::parse(SHOP).unwrap(), &Opts::default(), io));
     res.unwrap();
     assert_eq!(out, "shop: nothing to change (applied again, as the file says).\n");
     assert_eq!(w.applies(), 2, "applied again: what was changed by hand is put back");
@@ -491,4 +495,78 @@ fn the_hosts_of_a_deploy_are_as_the_file_says() {
     assert!(after_remove(&now, "shop").apps.is_empty());
     assert_eq!(touched(now.apps.first(), Some(&app)), vec!["cloudflare"]);
     assert!(touched(None, Some(&appfile::parse("NAME=db\nIMAGE=p:1\nPORT=5432\n").unwrap())).is_empty());
+}
+
+/// The listing of one app whose pods run image (built as id).
+fn runs_own(w: &World, name: &str, image: &str, id: &str) -> String {
+    listing(&[(name, 80, &[])], &w.mark).replace(
+        &format!(r#""template":{{"spec":{{"containers":[{{"image":"{name}:v1""#),
+        &format!(r#""template":{{"metadata":{{"annotations":{{"dryserver/image-id":"{id}"}}}},"spec":{{"containers":[{{"image":"{image}""#),
+    )
+}
+
+#[test]
+fn an_image_of_your_own_goes_to_the_servers_first() {
+    use crate::images::tests::{FakeDesk, FakeServers, ID, ID2};
+    let w = World::new();
+    let desk = FakeDesk::with(ID, "amd64");
+    let servers = FakeServers::with(&["node-a"]);
+    let own = Own { desk: &desk, servers: &servers };
+    let file = "NAME=shop\nIMAGE=localhost/shop:v1\nPORT=80\n";
+    let app = appfile::parse(file).unwrap();
+    // Without a way to the servers: refused, nothing sent.
+    let (_, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, None, &app, &Opts::default(), io));
+    assert!(res.unwrap_err().to_string().contains("cannot reach your servers"));
+    // Asked first; no: nothing copied, nothing applied.
+    let (out, _, res) = w.run(false, |ctx, c, d, io| deploy(ctx, c, d, Some(&own), &app, &Opts::default(), io));
+    res.unwrap();
+    assert!(out.contains("  localhost/shop:v1 (30 MB): copy it to node-a") && out.contains("Nothing changed."), "{out}");
+    assert!(servers.sent.lock().unwrap().is_empty() && w.applies() == 0);
+    // Yes: copied, loaded, then applied with that build and never pulled.
+    *w.cluster.after_apply.lock().unwrap() = vec![("localhost/shop:v1".into(), runs_own(&w, "shop", "localhost/shop:v1", ID))];
+    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own), &app, &Opts::default(), io));
+    res.unwrap();
+    assert!(out.contains("node-a: has localhost/shop:v1.") && out.contains("shop: applied."), "{out}");
+    let m = w.last_manifest();
+    assert!(m.contains("imagePullPolicy: Never") && m.contains(&format!("dryserver/image-id: \"{ID}\"")), "{m}");
+    // The same build again: nothing to copy, nothing to change.
+    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own), &app, &Opts::default(), io));
+    res.unwrap();
+    assert!(out.contains("nothing to change"), "{out}");
+    assert_eq!(servers.sent.lock().unwrap().len(), 1);
+    // Built again under the same tag: copied, and the copies replaced.
+    let desk2 = FakeDesk::with(ID2, "amd64");
+    let own2 = Own { desk: &desk2, servers: &servers };
+    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own2), &app, &Opts::default(), io));
+    res.unwrap();
+    assert!(out.contains("  image   localhost/shop:v1 rebuilt: 111111111111 -> 222222222222"), "{out}");
+    assert!(out.contains("Its copies are replaced one at a time"), "{out}");
+    assert!(w.last_manifest().contains(&format!("dryserver/image-id: \"{ID2}\"")));
+    // A server refuses it: the app is not changed.
+    let applied = w.applies();
+    *servers.refuse.lock().unwrap() = Some("not enough room on this server's disk".into());
+    let desk3 = FakeDesk::with(&format!("sha256:{}", "3".repeat(64)), "amd64");
+    let own3 = Own { desk: &desk3, servers: &servers };
+    let (_, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own3), &app, &Opts::default(), io));
+    let e = res.unwrap_err().to_string();
+    assert!(e.contains("shop was not applied, nothing changed in the cluster") && e.contains("refused it: not enough room"), "{e}");
+    assert_eq!(w.applies(), applied);
+    // A server of the cluster that is not in the server list would never
+    // get it: refused before anything is copied.
+    *servers.refuse.lock().unwrap() = None;
+    let other = FakeServers::with(&["node-b"]);
+    let own4 = Own { desk: &desk3, servers: &other };
+    let (_, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own4), &app, &Opts::default(), io));
+    let e = res.unwrap_err().to_string();
+    assert!(e.contains("node-a run apps but is not in your server list") && e.contains("dryserver ssh-config"), "{e}");
+    assert!(other.sent.lock().unwrap().is_empty());
+    // app push alone: the same, without the app.
+    let (out, _, res) = w.run(true, |ctx, c, _, io| push(ctx, c, &own3, "localhost/shop:v1", &Opts::default(), io));
+    res.unwrap();
+    assert!(out.contains("copy it to node-a") && out.contains("localhost/shop:v1 is on every server."), "{out}");
+    let (out, asked, res) = w.run(true, |ctx, c, _, io| push(ctx, c, &own3, "localhost/shop:v1", &Opts::default(), io));
+    res.unwrap();
+    assert!(out.contains("on every server already") && asked.is_empty(), "{out}");
+    // Without a tag it is refused: say which build is meant.
+    assert!(appfile::parse("NAME=shop\nIMAGE=localhost/shop\nPORT=80\n").is_err());
 }

@@ -188,6 +188,14 @@ fn start(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, limits: Limits, d: Draft
 /// more (set up from an app file), or that a newer dryserver wrote, would
 /// lose them when started again from here: that is done with its file.
 fn form_may_change(app: &App, now: &Overview) -> Result<()> {
+    // An image of the admin's own must reach the servers first; the form
+    // cannot bring it there.
+    if crate::images::is_local(&app.image) {
+        crate::bail!(
+            "{} is an image of your own: start it with an app file (dryserver app deploy FILE), which copies it to the servers first",
+            app.image
+        );
+    }
     // Any app a newer dryserver set up: this one's sync would read its
     // names wrong, so nothing is started that would sync.
     if let Some(r) = now.apps.iter().find(|a| a.newer && a.name != app.name) {
@@ -290,6 +298,7 @@ impl Draft {
             hosts: if host.is_empty() { vec![] } else { vec![apps::Host { name: host, port }] },
             entrance: self.entrance.clone(),
             copies: if self.copies.trim().is_empty() { 1 } else { self.copies.trim().parse().unwrap_or(0) },
+            image_id: String::new(),
         }
     }
 }

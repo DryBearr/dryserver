@@ -2117,6 +2117,12 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
     if !coordinator && q.coordinator_cut() {
         return Ok(false);
     }
+    // Images the admin sent: taken apart from the sync (it may take a
+    // while), started when there is something to do. The coordinator has
+    // no part in it, so it goes on while the coordinator does not answer.
+    if !coordinator && host != 0 {
+        crate::images::kick(ctx, n, Time::now().0.timestamp());
+    }
     let mut cuts = q.reports();
     // No more than the coordinator keeps: the heartbeat stays small.
     cuts.truncate(registry::MAX_CUT_REPORTS);

@@ -118,6 +118,7 @@ pub fn parse(text: &str) -> Result<App> {
         hosts: hosts.into_iter().map(|(name, p, _)| Host { name, port: p.unwrap_or(port) }).collect(),
         entrance,
         copies,
+        image_id: String::new(),
     };
     app.hosts.sort();
     app.validate()?;

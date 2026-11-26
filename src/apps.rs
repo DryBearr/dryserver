@@ -80,7 +80,15 @@ pub struct App {
     /// Only matters with a name.
     pub entrance: String,
     pub copies: u32,
+    /// For an image of the admin's own (localhost/...): the id of the
+    /// build the servers hold. A new build under the same name is
+    /// another id, so its copies are replaced. Not in the app file: the
+    /// desktop takes it from podman or docker when it deploys.
+    pub image_id: String,
 }
+
+/// The annotation on an app's pods that names the build of its own image.
+pub const IMAGE_ID_ANNOTATION: &str = "dryserver/image-id";
 
 /// A public name of an app, and the app's port it leads to.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -172,6 +180,12 @@ impl App {
     pub fn validate(&self) -> Result<()> {
         valid_app_name(&self.name).map_err(|e| e.wrap("name"))?;
         valid_image(&self.image).map_err(|e| e.wrap("image"))?;
+        if crate::images::is_local(&self.image) {
+            crate::images::local_name(&self.image).map_err(|e| e.wrap("image"))?;
+            if !self.image_id.is_empty() && !crate::images::valid_id(&self.image_id) {
+                bail!("image: the id of {} is not one", self.image);
+            }
+        }
         if self.port == 0 {
             bail!("port: 1 to 65535");
         }
@@ -239,7 +253,17 @@ impl App {
     /// The Kubernetes objects for this app.
     pub fn manifest(&self) -> Result<String> {
         self.validate()?;
-        let App { name, image, port, hosts, entrance, copies } = self;
+        let App { name, image, port, hosts, entrance, copies, image_id } = self;
+        // An image of the admin's own is on the servers, put there by
+        // dryserver: it is never asked for anywhere else.
+        let (pod_annotations, pull) = if crate::images::is_local(image) {
+            (
+                format!("      annotations:\n        {IMAGE_ID_ANNOTATION}: \"{image_id}\"\n"),
+                "          imagePullPolicy: Never\n".to_string(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         let mark = entrance::ANNOTATION;
         let tolerations = tolerations();
         let extra = self.extra_ports();
@@ -328,7 +352,7 @@ spec:
     metadata:
       labels:
         app: "{name}"
-    spec:
+{pod_annotations}    spec:
       automountServiceAccountToken: false
       securityContext:
         seccompProfile:
@@ -343,7 +367,7 @@ spec:
 {tolerations}      containers:
         - name: "{name}"
           image: "{image}"
-          ports:
+{pull}          ports:
             - containerPort: {port}
 {container_ports}          securityContext:
             allowPrivilegeEscalation: false
@@ -424,6 +448,7 @@ spec:
             hosts: r.hosts.clone(),
             entrance: r.entrance.clone(),
             copies: r.copies,
+            image_id: r.image_id.clone(),
         };
         a.validate().is_ok().then_some(a)
     }
@@ -458,6 +483,9 @@ pub struct Running {
     /// Written by a newer dryserver (its format annotation is higher than
     /// FORMAT): this one would read it wrong, so it changes nothing.
     pub newer: bool,
+    /// The build of an image of the admin's own that its pods run ("" for
+    /// other images, or when not known).
+    pub image_id: String,
 }
 
 impl Running {
@@ -834,6 +862,11 @@ pub fn overview(ctx: &Ctx, c: &dyn Cluster) -> Result<Overview> {
             port,
             entrance: entrance::DEFAULT.into(),
             newer: newer_format(&it.metadata),
+            image_id: it.spec["template"]["metadata"]["annotations"][IMAGE_ID_ANNOTATION]
+                .as_str()
+                .filter(|id| crate::images::valid_id(id))
+                .unwrap_or("")
+                .to_string(),
             ..Running::default()
         });
     }
@@ -888,6 +921,19 @@ pub fn overview(ctx: &Ctx, c: &dyn Cluster) -> Result<Overview> {
     Ok(o)
 }
 
+/// The servers apps may run on: the cluster's nodes, the coordinator (its
+/// control plane) left out.
+pub fn servers(ctx: &Ctx, c: &dyn Cluster) -> Result<Vec<String>> {
+    let out = c.kubectl(ctx, &["get", "nodes", "-o", "json"], "")?;
+    let l: List = serde_json::from_str(&out).map_err(|_| errf!("the cluster sent a list of servers that is not one"))?;
+    Ok(l.items
+        .iter()
+        .filter(|i| i.kind == "Node" && registry::valid_name(&i.metadata.name))
+        .filter(|i| !i.metadata.labels.contains_key("node-role.kubernetes.io/control-plane"))
+        .map(|i| i.metadata.name.clone())
+        .collect())
+}
+
 pub fn deploy(ctx: &Ctx, c: &dyn Cluster, app: &App) -> Result<()> {
     let manifest = app.manifest()?;
     c.kubectl(ctx, &["apply", "-f", "-"], &manifest)?;
@@ -922,6 +968,7 @@ pub mod tests {
             hosts: vec![Host { name: "blog.example.com".into(), port: 8080 }],
             entrance: crate::entrance::CLOUDFLARE.into(),
             copies: 2,
+            image_id: String::new(),
         }
     }
 
@@ -1273,6 +1320,7 @@ pub mod tests {
                     entrance: "cloudflare".into(),
                     nodes: vec!["node-a".into(), "node-b".into()],
                     newer: false,
+                    image_id: String::new(),
                 },
             ],
             "what the cluster says is checked before it is shown, and only the apps namespace counts"

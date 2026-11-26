@@ -19,6 +19,7 @@ mod flash;
 mod fsx;
 mod gotime;
 mod homedir;
+mod images;
 mod install;
 mod iso;
 mod k3stoken;
@@ -129,6 +130,8 @@ commands:
 on servers:
   join                ask the coordinator to join (runs at boot until approved)
   sync                update the mesh from the member list (runs every minute)
+  images              take the images the admin sent and load them into the
+                      cluster (started by sync); shows what this server holds
   quarantine          cut the coordinator (or -name a,b) off this server;
                       -lift undoes it (-same: trust the same coordinator
                       again), -status shows it
@@ -251,6 +254,7 @@ fn main() -> ExitCode {
         "registry" => run_registry(rest),
         "join" => run_join(rest),
         "sync" => run_sync(rest),
+        "images" => run_images(rest),
         "scan" => run_scan(rest),
         "report" => run_report(rest),
         "approve" => run_approve(rest),
@@ -1036,6 +1040,41 @@ fn run_sync(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// On a server: takes the images the admin sent (started by the sync).
+fn run_images(args: &[String]) -> Result<()> {
+    Flags::parse("images", args, &[]);
+    if !fsx::is_root() {
+        bail!("images runs as root: sudo dryserver images");
+    }
+    let (n, _) = server_node()?;
+    let ctx = Ctx::on_signals().with_timeout(Duration::from_secs(25 * 60));
+    let d = images::take(&ctx, &n, chrono::Utc::now().timestamp())?;
+    for t in &d.taken {
+        println!("taken: {t}");
+    }
+    for r in &d.reloaded {
+        println!("loaded again: {r}");
+    }
+    for r in &d.dropped {
+        println!("an older version dropped: {r}");
+    }
+    for r in &d.refused {
+        println!("refused: {r}");
+    }
+    let st = images::load(&n);
+    for r in st.refused.iter().rev().take(5) {
+        let when = chrono::DateTime::from_timestamp(r.at, 0).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default();
+        println!("refused at {when}: {} {}", if r.name.is_empty() { "?" } else { &r.name }, r.why);
+    }
+    if st.images.is_empty() {
+        println!("No image of yours on this server.");
+    }
+    for h in &st.images {
+        println!("{}  {}  {} MB", h.name, h.id.trim_start_matches("sha256:").chars().take(12).collect::<String>(), (h.size >> 20).max(1));
+    }
+    Ok(())
+}
+
 const QUARANTINE_FLAGS: &[(&str, &str, &str)] = &[
     ("name", "", "members to cut, comma separated (default: the coordinator)"),
     ("lift", "false", "undo every cut"),
@@ -1356,7 +1395,7 @@ fn desktop_cluster(f: &Flags, cmd: &str) -> Result<apps::SshCluster> {
 }
 
 /// The words of `dryserver app` (also after `dryserver apps`).
-const APP_WORDS: [&str; 6] = ["deploy", "list", "show", "remove", "sync", "help"];
+const APP_WORDS: [&str; 7] = ["deploy", "push", "list", "show", "remove", "sync", "help"];
 
 const APP_USAGE: &str = r#"usage: dryserver app deploy|list|show|remove|sync [flags]
 
@@ -1366,6 +1405,9 @@ const APP_USAGE: &str = r#"usage: dryserver app deploy|list|show|remove|sync [fl
                    -take-over NAME[,NAME]  let a name whose DNS record
                                            dryserver did not make point at
                                            this app (the change shows first)
+  push IMAGE     copy an image you built (localhost/NAME:TAG) to every
+                 server, signed with your key; deploy does this by itself
+                 for an app whose IMAGE is one
   list           every app, where it runs, its names and whether each name
                  answers from the internet (-no-check: do not ask them)
   show NAME      the app as a file, to keep or change:
@@ -1381,7 +1423,9 @@ const APP_USAGE: &str = r#"usage: dryserver app deploy|list|show|remove|sync [fl
 An app file (any name, for example shop.app):
 
   NAME=shop                      starts with a letter: a-z, 0-9 and -
-  IMAGE=ghcr.io/you/shop:v1      the container image
+  IMAGE=localhost/shop:v1        an image you built here (podman build -t
+                                 shop:v1 .), or one from a registry like
+                                 ghcr.io/you/shop:v1
   PORT=8080                      the port it listens on
   COPIES=2                       how many run (1 to 20; default 1)
   HOST=shop.example.com          a public name; as many HOST lines as you
@@ -1421,7 +1465,7 @@ fn run_app_cmd(args: &[String]) -> Result<()> {
     let opts = appcmd::Opts { yes: f.on("yes"), take_over: vec![f.get("take-over").to_string()] };
     // SAFETY: isatty only looks at the file descriptor.
     let interactive = unsafe { libc::isatty(0) } == 1;
-    let needs_terminal = |w: &str| matches!(w, "deploy" | "remove" | "sync") && !opts.yes && !interactive;
+    let needs_terminal = |w: &str| matches!(w, "deploy" | "push" | "remove" | "sync") && !opts.yes && !interactive;
     if words.first().is_some_and(|w| needs_terminal(w)) {
         bail!("nobody is at a terminal to say yes: add -yes to make the changes without asking");
     }
@@ -1444,7 +1488,15 @@ fn run_app_cmd(args: &[String]) -> Result<()> {
         ["deploy", file] => {
             let app = read_app_file(Path::new(file))?;
             let (c, doors) = (cluster()?, desktop_doors()?);
-            appcmd::deploy(&ctx, &c, &doors, &app, &opts, &mut appcmd::Io { out: &mut out, ask: &mut ask })
+            let (desk, servers) = own_images()?;
+            let own = appcmd::Own { desk: &desk, servers: &servers };
+            appcmd::deploy(&ctx, &c, &doors, Some(&own), &app, &opts, &mut appcmd::Io { out: &mut out, ask: &mut ask })
+        }
+        ["push", image] => {
+            let c = cluster()?;
+            let (desk, servers) = own_images()?;
+            let own = appcmd::Own { desk: &desk, servers: &servers };
+            appcmd::push(&ctx, &c, &own, image, &opts, &mut appcmd::Io { out: &mut out, ask: &mut ask })
         }
         ["list"] => {
             let (c, doors) = (cluster()?, desktop_doors()?);
@@ -1466,6 +1518,16 @@ fn run_app_cmd(args: &[String]) -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+/// The images of this desktop and the servers of its server list.
+fn own_images() -> Result<(images::Tools, images::Ssh)> {
+    let p = paths()?;
+    let desk = images::Tools { signer: signer(&p.secrets), scratch: p.out_dir.join("images") };
+    let home = PathBuf::from(std::env::var("HOME").map_err(|_| errf!("$HOME is not defined"))?);
+    let conf = fsx::read_or_empty(home.join(".ssh/config.d/dryserver"));
+    let known_hosts = home.join(".ssh/known_hosts.d/dryserver").display().to_string();
+    Ok((desk, images::Ssh { servers: quarantine::remotes(&conf), known_hosts }))
 }
 
 /// Reads an app file: text, not too large.

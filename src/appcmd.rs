@@ -24,7 +24,7 @@ use crate::ctx::Ctx;
 use crate::entrance::cloudflare::{Cloudflare, TARGET};
 use crate::entrance::{self, Entrance, Entrances, Report};
 use crate::err::{Error, Kind, Result};
-use crate::{appfile, bail, errf};
+use crate::{appfile, bail, errf, images};
 
 /// How long a look at the cluster or Cloudflare may take.
 pub const READ: Duration = Duration::from_secs(30);
@@ -280,6 +280,11 @@ fn app_changes(before: Option<&Running>, app: &App) -> (Vec<String>, bool) {
     if b.image != app.image {
         lines.push(format!("  image   {} -> {}", b.image, app.image));
         restart = true;
+    } else if crate::images::is_local(&app.image) && b.image_id != app.image_id {
+        let short = |id: &str| id.trim_start_matches("sha256:").chars().take(12).collect::<String>();
+        let was = if b.image_id.is_empty() { "?".to_string() } else { short(&b.image_id) };
+        lines.push(format!("  image   {} rebuilt: {was} -> {}", app.image, short(&app.image_id)));
+        restart = true;
     }
     if b.port != app.port {
         lines.push(format!("  port    {} -> {}", b.port, app.port));
@@ -336,7 +341,48 @@ fn agreed(q: &str, opts: &Opts, io: &mut Io) -> bool {
 }
 
 /// Starts or changes the app.
-pub fn deploy(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, app: &App, opts: &Opts, io: &mut Io) -> Result<()> {
+/// The desktop's own images and the servers they go to (images.rs).
+pub struct Own<'a> {
+    pub desk: &'a dyn images::Desk,
+    pub servers: &'a dyn images::Servers,
+}
+
+/// For an image of the admin's own: which servers still need it, and
+/// that every server of the cluster is one dryserver can reach.
+fn own_image(ctx: &Ctx, c: &dyn Cluster, own: Option<&Own>, image: &str) -> Result<images::Push> {
+    let Some(own) = own else { bail!("{image} is an image of your own, and this computer cannot reach your servers to bring it") };
+    let p = images::plan(ctx, own.desk, own.servers, image)?;
+    let listed = own.servers.names();
+    let missing: Vec<String> = apps::servers(&ctx.with_timeout(READ), c)?.into_iter().filter(|s| !listed.contains(s)).collect();
+    if !missing.is_empty() {
+        bail!(
+            "{} run apps but {} not in your server list, so {image} would not reach {}: run dryserver ssh-config, then again",
+            missing.join(", "),
+            if missing.len() == 1 { "is" } else { "are" },
+            if missing.len() == 1 { "it" } else { "them" }
+        );
+    }
+    Ok(p)
+}
+
+/// Copies an image of the admin's own to every server that lacks it.
+pub fn push(ctx: &Ctx, c: &dyn Cluster, own: &Own, image: &str, opts: &Opts, io: &mut Io) -> Result<()> {
+    let p = own_image(ctx, c, Some(own), image)?;
+    io.say(p.line());
+    if p.todo.is_empty() {
+        return Ok(());
+    }
+    if !agreed("Copy it? [y/N] ", opts, io) {
+        io.say("Nothing copied.");
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    images::send(ctx, own.desk, own.servers, &p, now, &mut |l| io.say(l))?;
+    io.say(format!("{image} is on every server."));
+    Ok(())
+}
+
+pub fn deploy(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, own: Option<&Own>, app: &App, opts: &Opts, io: &mut Io) -> Result<()> {
     let mut app = app.clone();
     app.hosts.sort();
     if app.hosts.is_empty() {
@@ -357,6 +403,15 @@ pub fn deploy(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, app: &App, opts: &O
     let now = look(ctx, c)?;
     refuse_newer(&now)?;
     entrance::check_host(&app, &now.apps)?;
+    // An image of the admin's own goes to the servers first; its build
+    // is what the app runs.
+    let push = if images::is_local(&app.image) {
+        let p = own_image(ctx, c, own, &app.image)?;
+        app.image_id = p.local.id.clone();
+        Some(p)
+    } else {
+        None
+    };
     let before = now.apps.iter().find(|a| a.name == app.name);
     let (lines, _) = app_changes(before, &app);
     let after = after_deploy(&now, &app);
@@ -365,7 +420,8 @@ pub fn deploy(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, app: &App, opts: &O
     refuse_unrouted(&looks, before, &app)?;
 
     let cf_changes = looks.iter().any(|l| l.res.as_ref().is_ok_and(|r| !r.changes.is_empty() && r.held.is_none()));
-    if lines.is_empty() && !cf_changes && looks.iter().all(|l| l.res.is_ok()) {
+    let copies = push.as_ref().is_some_and(|p| !p.todo.is_empty());
+    if lines.is_empty() && !cf_changes && !copies && looks.iter().all(|l| l.res.is_ok()) {
         // Nothing that dryserver reads back differs; the objects are
         // applied again all the same, which changes nothing when they are
         // as the file says and puts back what was changed by hand or left
@@ -388,6 +444,9 @@ pub fn deploy(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, app: &App, opts: &O
     for l in &lines {
         io.say(l);
     }
+    if let Some(p) = &push {
+        io.say(format!("  {}", p.line()));
+    }
     for l in &looks {
         show_look(doors[l.door].as_ref(), &l.res, Some(&app.name), &take_over, io)?;
     }
@@ -395,6 +454,11 @@ pub fn deploy(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, app: &App, opts: &O
     if !agreed("Apply? [y/N] ", opts, io) {
         io.say("Nothing changed.");
         return Ok(());
+    }
+    if let (Some(p), Some(own)) = (&push, own) {
+        let now = chrono::Utc::now().timestamp();
+        images::send(ctx, own.desk, own.servers, p, now, &mut |l| io.say(l))
+            .map_err(|e| e.wrap(format!("{} was not applied, nothing changed in the cluster", app.name)))?;
     }
     apps::deploy(&ctx.with_timeout(CHANGE), c, &app).map_err(|e| {
         timed(e, CHANGE).wrap(format!("{} was not applied (part of it may have reached the cluster: dryserver app list)", app.name))

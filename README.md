@@ -228,11 +228,17 @@ machine whose new skin does not fit goes back to the old one by itself.
 
 ### Run an app
 
+Build your app's image on your desktop, as you always do:
+
+```sh
+podman build -t shop:v1 .       # or: docker build -t shop:v1 .
+```
+
 Write the app in a small file, for example `shop.app`:
 
 ```sh
 NAME=shop                       # a-z, 0-9 and -, starting with a letter
-IMAGE=ghcr.io/you/shop:v1       # the container image
+IMAGE=localhost/shop:v1         # the image you built (or one from a registry: ghcr.io/you/shop:v1)
 PORT=8080                       # the port the app listens on
 COPIES=2                        # how many run (default 1)
 HOST=shop.example.com           # a public name: as many HOST lines as you need
@@ -248,6 +254,11 @@ dryserver app list              # what runs where, and whether each name answers
 dryserver app show shop         # the app as a file again (> shop.app to keep it)
 dryserver app remove shop       # stops it, takes its names out of Cloudflare
 ```
+
+`deploy` copies an image you built to every server first, signed with
+your key, over your home network: no registry, nothing public. A new build
+under the same tag is noticed and replaces the running copies. Your
+servers need this dryserver for that once: `dryserver release publish`.
 
 To change an app, edit its file and run `deploy` again: names you added are
 added, names you dropped stop answering, and the preview shows both before
@@ -619,6 +630,7 @@ On your desktop:
 | `sudo "$(command -v dryserver)" flash --iso FILE` | flash any image to a USB drive (sudo does not look in `~/.local/bin`) |
 | `dryserver approve` | approve, reject or remove machines and see unknown devices; every decision is signed. `p` publishes an update; `enter` on a stopped rollout tries it again or skips the machine |
 | `dryserver app deploy FILE` | start or change an app from its file, with any number of public names; every change is shown first (`-yes`, `-take-over NAME`) |
+| `dryserver app push IMAGE` | copy an image you built (`localhost/NAME:TAG`) to every server, signed; `deploy` does it by itself |
 | `dryserver app list` | every app, its servers, its names and whether each one answers (`-no-check`) |
 | `dryserver app show NAME` | the app as a file, to keep or edit |
 | `dryserver app remove NAME` | stop an app and take its names out of Cloudflare |
@@ -646,6 +658,7 @@ On a machine:
 | `sudo dryserver update apply` | install a release you signed by hand; it goes back by itself unless `update confirm` follows in time (`update revert`) |
 | `sudo dryserver selfcheck` | check this binary, its settings, the firewall, SSH and WireGuard, without the network |
 | `sudo dryserver boot status` | which kernel runs, its boot images and whether the fallback kernel waits |
+| `sudo dryserver images` | the images of yours this server holds, and why one was refused |
 | `dryserver sync`, `join`, `scan`, `registry`, `cluster-dns` | run by systemd, cron and SSH by themselves |
 
 ## FAQ

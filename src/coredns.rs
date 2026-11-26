@@ -791,8 +791,15 @@ mod tests {
     fn dns_policies_of_apps_and_tunnel_follow_the_copies() {
         // The apps and the tunnel may reach DNS by the pods' label, not by
         // a machine or an address: wherever the copies run, it is allowed.
-        let app =
-            crate::apps::App { name: "blog".into(), image: "nginx:1".into(), port: 80, hosts: vec![], entrance: String::new(), copies: 1 };
+        let app = crate::apps::App {
+            name: "blog".into(),
+            image: "nginx:1".into(),
+            port: 80,
+            hosts: vec![],
+            entrance: String::new(),
+            copies: 1,
+            image_id: String::new(),
+        };
         let tunnel = crate::entrance::cloudflare::tunnel_manifest(&"a".repeat(64)).unwrap();
         for m in [app.manifest().unwrap(), tunnel] {
             let rule = "kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n      ports:\n        - port: 53";
