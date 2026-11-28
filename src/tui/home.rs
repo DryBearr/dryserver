@@ -54,6 +54,10 @@ pub enum Cfg {
 pub struct Signed {
     pub coordinator: Option<String>,
     pub servers: usize,
+    /// Others let in, the VPN's gateway and its devices.
+    pub people: usize,
+    pub gateway: Option<String>,
+    pub devices: usize,
 }
 
 /// What Home knows, all of it read from local files.
@@ -97,6 +101,9 @@ pub fn read_signed(path: &Path) -> Option<Signed> {
     Some(Signed {
         coordinator: list.members.iter().find(|m| m.host == 1).map(|m| m.name.clone()),
         servers: list.members.iter().filter(|m| m.host != 1).count(),
+        people: list.people.len(),
+        gateway: list.vpn.map(|p| p.gateway),
+        devices: list.devices.len(),
     })
 }
 
@@ -233,7 +240,17 @@ pub fn line(f: &Facts, place: Place) -> (Mark, String) {
         Place::Machines => match f.signed.as_ref().filter(|s| s.coordinator.is_some()) {
             None => (Mark::Act, "sign your coordinator once it is installed".into()),
             Some(s) if s.servers == 0 => (Mark::Done, "coordinator signed, no server yet".into()),
-            Some(s) => (Mark::Done, format!("coordinator and {} {}", s.servers, if s.servers == 1 { "server" } else { "servers" })),
+            Some(s) => {
+                let n = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+                let mut line = format!("coordinator and {}", n(s.servers, "server", "servers"));
+                if s.people > 0 {
+                    line += &format!(" · {} let in", n(s.people, "person", "people"));
+                }
+                if let Some(g) = &s.gateway {
+                    line += &format!(" · VPN on {g}, {}", n(s.devices, "device", "devices"));
+                }
+                (Mark::Done, line)
+            }
         },
         Place::Apps | Place::Outside => {
             let what = if place == Place::Apps { "what runs on your servers" } else { "the ways in from the internet" };
@@ -411,7 +428,7 @@ mod tests {
             exe_time: Some(t),
             missing_keys: vec![],
             started: true,
-            signed: Some(Signed { coordinator: Some("coord".into()), servers: 2 }),
+            signed: Some(Signed { coordinator: Some("coord".into()), servers: 2, ..Signed::default() }),
             signed_time: Some(t),
             release: Some(1_795_400_000),
             backups: vec![Copy { name: "brain-x".into(), made: t + Duration::from_secs(86_400), size: 1 }],
@@ -447,7 +464,7 @@ mod tests {
             "makes your keys",
         );
         case(&|f| f.signed = None, Place::Machines, "sign it in Machines (4)");
-        case(&|f| f.signed = Some(Signed { coordinator: None, servers: 1 }), Place::Machines, "sign it");
+        case(&|f| f.signed = Some(Signed { coordinator: None, servers: 1, ..Signed::default() }), Place::Machines, "sign it");
         case(&|f| f.signed.as_mut().unwrap().servers = 0, Place::Machines, "Install a server");
         case(&|f| f.now += Duration::from_secs(9 * 86_400), Place::Backups, "Pull the backups (8): the newest here is 10 days old");
         // No backup at all, long after the coordinator was signed.
@@ -508,6 +525,9 @@ mod tests {
         assert_eq!(l(&f, Place::Config), (Mark::Done, "coordinator 10.1.0.60, WiFi SNET2".into()));
         assert_eq!(l(&f, Place::Installer).0, Mark::Done);
         assert_eq!(l(&f, Place::Machines), (Mark::Done, "coordinator and 2 servers".into()));
+        let mut g = facts();
+        g.signed = Some(Signed { coordinator: Some("coord".into()), servers: 1, people: 2, gateway: Some("node-a".into()), devices: 1 });
+        assert_eq!(l(&g, Place::Machines).1, "coordinator and 1 server · 2 people let in · VPN on node-a, 1 device");
         assert_eq!(l(&f, Place::Updates), (Mark::Done, "release 1795400000".into()));
         assert_eq!(l(&f, Place::Backups), (Mark::Done, "newest copy is 1 day old".into()));
         assert_eq!(l(&f, Place::Stick).0, Mark::Off);
@@ -579,7 +599,7 @@ mod tests {
         std::fs::write(p.secrets.join(admin::RELEASE_COPY), serde_json::to_string(&rel).unwrap()).unwrap();
         std::fs::write(p.secrets.join(admin::SIGNED_COPY.to_string() + "x"), "{broken").unwrap();
         let f = Facts::read(&p, None, false);
-        assert_eq!(f.signed, Some(Signed { coordinator: Some("coord".into()), servers: 1 }));
+        assert_eq!(f.signed, Some(Signed { coordinator: Some("coord".into()), servers: 1, ..Signed::default() }));
         assert_eq!(f.release, Some(1_795_400_000));
         // A damaged copy is no list.
         std::fs::write(p.secrets.join(admin::SIGNED_COPY), "{broken").unwrap();

@@ -1115,6 +1115,15 @@ pub fn targets(all: &[Remote], names: &[String]) -> Vec<Remote> {
 /// The ssh command line for one server: straight to its LAN address, never
 /// through the coordinator, with its pinned host key and no agent.
 pub fn remote_args(r: &Remote, known_hosts: &str, action: &[String]) -> Vec<String> {
+    let mut command = vec!["quarantine".to_string()];
+    command.extend(action.iter().cloned());
+    ssh_args(r, known_hosts, &command)
+}
+
+/// ssh's arguments for running dryserver with sudo on r, straight over the
+/// WiFi/router network (never through the coordinator), its host key
+/// checked against the pinned one.
+pub fn ssh_args(r: &Remote, known_hosts: &str, command: &[String]) -> Vec<String> {
     let mut a: Vec<String> = [
         "-t",
         "-o",
@@ -1137,8 +1146,8 @@ pub fn remote_args(r: &Remote, known_hosts: &str, action: &[String]) -> Vec<Stri
         a.extend(["-l".into(), r.user.clone()]);
     }
     a.push(r.addr.clone());
-    a.extend(["sudo".into(), SERVER_BIN.into(), "quarantine".into()]);
-    a.extend(action.iter().cloned());
+    a.extend(["sudo".into(), SERVER_BIN.into()]);
+    a.extend(command.iter().cloned());
     a
 }
 

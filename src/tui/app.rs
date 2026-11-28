@@ -205,6 +205,9 @@ pub struct Factories {
     pub server_list: Option<PathBuf>,
     /// This program, for sudo to run.
     pub exe: Option<PathBuf>,
+    /// What an app file does (deploy, a secret, a rollback), on the
+    /// terminal; None: Apps cannot.
+    pub app_tools: Option<Arc<super::apps::AppTools>>,
 }
 
 /// What a card's key does.
@@ -487,7 +490,7 @@ impl App {
                 };
                 self.cluster = Some((c.clone(), doors.clone()));
                 Ok(if place == Place::Apps {
-                    host(super::apps::Screen::new(c, doors), generation)
+                    host(super::apps::Screen::new(c, doors).with_tools(self.make.app_tools.clone()), generation)
                 } else {
                     host(super::outside::Screen::new(c, doors), generation)
                 })
@@ -919,6 +922,7 @@ mod tests {
             quarantine: Arc::new(|_| Ok(())),
             server_list: None,
             exe: None,
+            app_tools: None,
         }
     }
 

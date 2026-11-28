@@ -108,7 +108,7 @@ fn a_device_gets_a_config_without_dns() {
     // gateway down, the device's internet still works.
     assert!(!c.contains("DNS") && !c.contains("0.0.0.0/0"), "{c}");
     let own = client_config(&plan(), &d, None, MESH_KEY);
-    assert!(own.contains("# PrivateKey: the one this device made") && !own.contains("PrivateKey ="), "{own}");
+    assert!(own.contains("# PrivateKey: the one this device has already") && !own.contains("PrivateKey ="), "{own}");
 }
 
 #[test]

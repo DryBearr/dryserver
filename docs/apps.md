@@ -319,6 +319,18 @@ outside. Under it is plain Kubernetes: on the coordinator, `k3s kubectl`
 works for you without sudo. The form knows one name and one port: an app
 with more (from its file) is changed with its file, and the form says so.
 
+What an app file does is here too, run on the terminal as `dryserver app`
+runs it (the screen comes back after, once you press enter):
+
+- `f` deploys an app file: you type its path, then see every change and
+  say `y` there. A `SECRET` without a value yet is asked for first (not
+  shown).
+- `s` (on an app) sets one of its secrets: its value is asked for, twice,
+  not shown.
+- `b` (on an app GitHub builds) goes back to the build before.
+- `w` (on an app) writes its file, `~/NAME.app`, to change and deploy
+  again with `f`; never over a file that is there.
+
 The screen never waits for the coordinator: every question and change runs
 in the background with a time limit (15 seconds for a look, a minute for a
 change), a change shows its steps as it goes, and the screen says when the

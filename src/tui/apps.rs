@@ -1,8 +1,11 @@
 //! Apps: what runs on the cluster and on which server, and how each app is
 //! reached from outside. n starts one from a container image (a form by
-//! steps, with every answer shown before it starts), d removes one, enter
-//! shows an app's details and what can be done to it, and o goes to the
-//! ways in from outside (Outside).
+//! steps, with every answer shown before it starts), f deploys an app file,
+//! d removes one, enter shows an app's details and what can be done to it
+//! (a secret, the build before, its app file), and o goes to the ways in
+//! from outside (Outside). An app file's deploy, a secret and a rollback
+//! run on the terminal as `dryserver app` does: each shows what it changes
+//! and asks there.
 //!
 //! Every question and change goes to the coordinator over SSH, which can
 //! be slow or not answer at all. They run on the screen's worker thread,
@@ -11,6 +14,7 @@
 //! waits for and how long, and shows a change's steps as it goes.
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,6 +29,77 @@ use crate::apps::{self, App, Cluster, Overview, Running};
 use crate::ctx::Ctx;
 use crate::entrance::{self, Entrances, Health, State};
 use crate::err::{Error, Kind, Result};
+
+/// Runs `dryserver app ARGS` on the terminal, with this app's -config,
+/// -host and -port.
+pub type AppCmd = Arc<dyn Fn(&[String]) -> Result<()> + Send + Sync>;
+
+/// What Apps needs from this computer for the work an app file does.
+pub struct AppTools {
+    pub run: AppCmd,
+    /// Where an app's file is written: the home folder.
+    pub files: Option<PathBuf>,
+}
+
+/// The answer of a small form: an app file to deploy, or the secret to set.
+#[derive(Debug, Clone, Default)]
+struct Pick {
+    value: String,
+    /// The app whose secret is set; empty: an app file to deploy.
+    app: String,
+}
+
+/// A path as typed: ~ is the home folder.
+fn expand(path: &str, home: Option<&Path>) -> PathBuf {
+    match (path.trim().strip_prefix("~/"), home) {
+        (Some(rest), Some(h)) => h.join(rest),
+        _ => PathBuf::from(path.trim()),
+    }
+}
+
+fn file_form(home: Option<PathBuf>) -> Form<Pick> {
+    Form::new(
+        Pick::default(),
+        vec![Group::new(vec![
+            Field::input("App file", |p: &Pick| p.value.clone(), |p, v| p.value = v)
+                .placeholder("~/shop.app")
+                .desc(
+                    "The app's file: its NAME, IMAGE (or REPO), PORT, names and settings (dryserver app help shows them). Every \
+                     change shows on the terminal first, and is made on y.",
+                )
+                .validate(move |v, _| {
+                    let path = expand(v, home.as_deref());
+                    if v.trim().is_empty() {
+                        crate::bail!("the path of an app file, like ~/shop.app");
+                    }
+                    if !path.is_file() {
+                        crate::bail!("there is no file {}", path.display());
+                    }
+                    Ok(())
+                }),
+        ])
+        .title("Deploy an app file")],
+        "cancel",
+    )
+    .without_review()
+}
+
+fn secret_form(app: &str, names: Vec<String>) -> Form<Pick> {
+    let first = names.first().cloned().unwrap_or_default();
+    Form::new(
+        Pick { value: first, app: app.into() },
+        vec![Group::new(vec![Field::select(
+            "Secret",
+            move |_| names.iter().map(|n| (n.clone(), n.clone())).collect(),
+            |p: &Pick| p.value.clone(),
+            |p, v| p.value = v,
+        )
+        .desc("Its value is asked for on the terminal next (not shown), and kept only in the cluster, encrypted.")])
+        .title(&format!("A secret of {app}"))],
+        "cancel",
+    )
+    .without_review()
+}
 
 /// Each refresh asks the coordinator once, over the shared connection.
 pub(super) const REFRESH: Duration = Duration::from_secs(15);
@@ -558,6 +633,13 @@ pub struct Screen {
     quit_armed: bool,
     /// Where to go after this screen closes.
     next: Option<Place>,
+    tools: Option<Arc<AppTools>>,
+    /// An app file to deploy, or which secret to set.
+    pick: Option<Form<Pick>>,
+    /// Work for the terminal: an app file's deploy, a secret, a rollback.
+    job: Option<super::Job>,
+    /// What runs on the terminal, for what to say when it is back.
+    handed: Option<String>,
 }
 
 impl Screen {
@@ -583,7 +665,17 @@ impl Screen {
             last_load: None,
             quit_armed: false,
             next: None,
+            tools: None,
+            pick: None,
+            job: None,
+            handed: None,
         }
+    }
+
+    /// The work an app file does, on the terminal.
+    pub fn with_tools(mut self, t: Option<Arc<AppTools>>) -> Screen {
+        self.tools = t;
+        self
     }
 
     #[cfg(test)]
@@ -690,6 +782,15 @@ impl Screen {
     }
 
     fn key(&mut self, k: Key) -> Flow {
+        if let Some(mut f) = self.pick.take() {
+            f.update(&k);
+            match f.status {
+                Status::Completed => self.hand_over(f.state),
+                Status::Aborted => self.notice = Some(Notice::info("Nothing changed.")),
+                Status::Active => self.pick = Some(f),
+            }
+            return Flow::Continue;
+        }
         if let Some(f) = self.form.as_mut() {
             f.update(&k);
             match f.status {
@@ -739,6 +840,7 @@ impl Screen {
             },
             Key::Char('o') => return self.go(Place::Outside, "o"),
             Key::Char('m') if self.host_key() => return self.go(Place::Machines, "m"),
+            Key::Char(c @ ('f' | 's' | 'b' | 'w')) => self.file_work(c),
             Key::Char('r') => {
                 if self.failed.as_ref().is_some_and(|f| f.key.0 == "r") {
                     self.failed = None;
@@ -794,7 +896,14 @@ impl Screen {
 
     /// What can be done to an app, for its sheet.
     fn items(&self, a: &Running) -> Vec<Item> {
+        let secret = match a.run.secrets.as_slice() {
+            [one] => format!("set its secret {one}"),
+            _ => "set one of its secrets".into(),
+        };
         vec![
+            Item { key: "s".into(), label: secret, why_not: self.why_not('s', Some(a)) },
+            Item { key: "b".into(), label: "go back to the build before".into(), why_not: self.why_not('b', Some(a)) },
+            Item { key: "w".into(), label: format!("write its app file, {}.app, to change it", a.name), why_not: self.why_not('w', Some(a)) },
             Item { key: "d".into(), label: format!("remove {}", a.name), why_not: None },
             Item {
                 key: "o".into(),
@@ -843,15 +952,26 @@ impl Screen {
         let runs = if a.copies == 0 { "stopped".to_string() } else { format!("{} of {} copies", a.ready, a.copies) };
         let on = if a.nodes.is_empty() { "on no server yet".to_string() } else { format!("on {}", a.nodes.join(", ")) };
         let image = if a.image == "?" { "not known: the cluster's answer did not check out".to_string() } else { a.image.clone() };
-        frame::sheet_title(
-            &a.name,
-            &[
-                ("Running", format!("{runs}, {on}")),
-                ("Image", image),
-                ("Inside", format!("your other apps reach it as http://{}", a.name)),
-                ("Outside", self.outside_words(a)),
-            ],
-        )
+        let mut d = vec![
+            ("Running", format!("{runs}, {on}")),
+            ("Image", image),
+            ("Inside", format!("your other apps reach it as http://{}", a.name)),
+            ("Outside", self.outside_words(a)),
+        ];
+        // What an app file set: only what is there, so the sheet fits.
+        if !a.run.env.is_empty() {
+            d.push(("Settings", names(a.run.env.iter().map(|(k, _)| k.as_str()))));
+        }
+        if !a.run.secrets.is_empty() {
+            d.push(("Secrets", names(a.run.secrets.iter().map(String::as_str))));
+        }
+        if ![0, apps::DEFAULT_MEMORY_MIB].contains(&a.run.memory_mib) || ![0, apps::DEFAULT_CPU_MILLI].contains(&a.run.cpu_milli) {
+            d.push(("Limits", limits(&a.run)));
+        }
+        if a.gh.source.is_some() || crate::images::is_local(&a.image) {
+            d.push(("Built", built(a)));
+        }
+        frame::sheet_title(&a.name, &d)
     }
 
     /// Everything removing name does, for the confirm.
@@ -980,6 +1100,117 @@ impl Screen {
     }
 }
 
+/// Names for people: "A, B and 2 more".
+fn names<'a>(all: impl Iterator<Item = &'a str>) -> String {
+    let all: Vec<&str> = all.collect();
+    match all.len() {
+        0..=4 => all.join(", "),
+        n => format!("{} and {} more", all[..3].join(", "), n - 3),
+    }
+}
+
+/// What a copy may use, in words.
+fn limits(r: &apps::Runtime) -> String {
+    let mem = if r.memory_mib == 0 { "no memory limit".to_string() } else { format!("{} MiB", r.memory_mib) };
+    let cpu = match r.cpu_milli {
+        0 => "no CPU limit".to_string(),
+        m if m % 1000 == 0 => format!("{} CPU", m / 1000),
+        m => format!("{:.1} CPU", m as f64 / 1000.0),
+    };
+    format!("{mem}, {cpu} a copy")
+}
+
+/// Where its image comes from, in words.
+fn built(a: &Running) -> String {
+    match &a.gh.source {
+        Some(s) => {
+            let commit = a.gh.commit.get(..7).unwrap_or("?");
+            format!("by GitHub from {}/{} {}: build {} ({commit})", s.owner, s.repo, s.branch, a.gh.run)
+        }
+        None => "here: an image of your own, copied to the servers".into(),
+    }
+}
+
+impl Screen {
+    /// Why the key's work cannot be done now for a; None: it can.
+    fn why_not(&self, c: char, a: Option<&Running>) -> Option<String> {
+        if self.tools.is_none() {
+            return Some("this screen cannot: dryserver app in a terminal does".into());
+        }
+        if let Some(w) = self.waiting.change() {
+            return Some(format!("once {w} is done"));
+        }
+        if c == 'f' {
+            return None;
+        }
+        let Some(a) = a else { return Some("no app is selected: n or f starts one".into()) };
+        match c {
+            's' if a.run.secrets.is_empty() => Some("it has no SECRET line: its app file names its secrets".into()),
+            'b' if a.gh.source.is_none() => Some("GitHub does not build it".into()),
+            'b' if a.gh.history.is_empty() => Some("there is no build before this one".into()),
+            'w' if self.tools.as_ref().is_some_and(|t| t.files.is_none()) => Some("there is no home folder to write it in".into()),
+            'w' if a.newer => Some("a newer dryserver set it up".into()),
+            'w' if a.copies == 0 => Some("it is scaled to 0 copies by hand; an app file has 1 to 20".into()),
+            'w' if App::of(a).is_none() => Some("its objects do not say all an app file needs: dryserver did not make it".into()),
+            _ => None,
+        }
+    }
+
+    /// f, s, b and w: the work an app file does.
+    fn file_work(&mut self, c: char) {
+        let a = self.now.apps.get(self.cursor).cloned();
+        if let Some(why) = self.why_not(c, a.as_ref()) {
+            self.notice = Some(Notice::info(format!("Not now: {why}.")));
+            return;
+        }
+        let home = self.tools.as_ref().and_then(|t| t.files.clone());
+        match (c, a) {
+            ('f', _) => self.pick = Some(file_form(home)),
+            ('s', Some(a)) if a.run.secrets.len() == 1 => {
+                self.hand_over(Pick { value: a.run.secrets[0].clone(), app: a.name.clone() });
+            }
+            ('s', Some(a)) => self.pick = Some(secret_form(&a.name, a.run.secrets.clone())),
+            ('b', Some(a)) => self.terminal(format!("the rollback of {}", a.name), vec!["rollback".into(), a.name.clone()]),
+            ('w', Some(a)) => self.write_file(&a, home),
+            _ => {}
+        }
+    }
+
+    /// What a small form chose, on the terminal.
+    fn hand_over(&mut self, p: Pick) {
+        if p.app.is_empty() {
+            let home = self.tools.as_ref().and_then(|t| t.files.clone());
+            // Whole, so a name like -yes is never taken for a flag.
+            let path = expand(&p.value, home.as_deref());
+            let path = std::path::absolute(&path).unwrap_or(path).display().to_string();
+            self.terminal(format!("the deploy of {path}"), vec!["deploy".into(), path]);
+        } else {
+            self.terminal(format!("the secret {} of {}", p.value, p.app), vec!["secret".into(), p.app, p.value]);
+        }
+    }
+
+    fn terminal(&mut self, what: String, args: Vec<String>) {
+        let Some(t) = self.tools.clone() else { return };
+        self.handed = Some(what.clone());
+        self.job = Some(super::Job { title: format!("dryserver app {}", args.join(" ")), run: Box::new(move || (t.run)(&args)) });
+    }
+
+    /// Writes a's app file from what the cluster said last: never over a
+    /// file that is there.
+    fn write_file(&mut self, a: &Running, home: Option<PathBuf>) {
+        let (Some(app), Some(dir)) = (App::of(a), home) else { return };
+        let path = dir.join(format!("{}.app", a.name));
+        self.notice = Some(if path.symlink_metadata().is_ok() {
+            Notice::bad(format!("Not written: there is a file at {} already; move it away first.", path.display()))
+        } else {
+            match crate::fsx::create_file(&path, crate::appfile::render(&app), 0o644) {
+                Ok(()) => Notice::ok(format!("Wrote {}: change it, then f deploys it.", path.display())),
+                Err(e) => Notice::bad(format!("Not written: {e}")),
+            }
+        });
+    }
+}
+
 fn help() -> Help {
     Help {
         about: "Your apps run on your servers, one or more copies each. The cluster picks a server for each, and moves an app \
@@ -992,6 +1223,8 @@ fn help() -> Help {
             ("↑↓ j k".into(), "move".into()),
             ("enter".into(), "the app's details, and what you can do to it".into()),
             ("n".into(), "start a new app: the form, then a review".into()),
+            ("f".into(), "deploy an app file (on the terminal: it shows the changes, y makes them)".into()),
+            ("s b w".into(), "a secret of the app; the build before (GitHub); write its app file".into()),
             ("d".into(), "remove the selected app (asks first)".into()),
             ("o".into(), "the ways in from outside".into()),
             ("r".into(), "look again now".into()),
@@ -1021,8 +1254,21 @@ impl PlaceScreen for Screen {
                 }
                 Flow::Continue
             }
-            Event::Resize(..) | Event::Back(_) => Flow::Continue,
+            Event::Back(res) => {
+                let what = self.handed.take().unwrap_or_else(|| "it".into());
+                self.notice = Some(match res {
+                    Ok(()) => Notice::ok(format!("Back from {what}; the list shows how it is now.")),
+                    Err(e) => Notice::bad(format!("{what} did not finish: {}", crate::report::printable(&e.to_string()))),
+                });
+                self.load();
+                Flow::Continue
+            }
+            Event::Resize(..) => Flow::Continue,
         }
+    }
+
+    fn job(&mut self) -> Option<super::Job> {
+        self.job.take()
     }
 
     fn page(&self, size: Size) -> Page {
@@ -1033,6 +1279,18 @@ impl PlaceScreen for Screen {
         page.help = Some(help());
         if let Some(f) = &self.form {
             self.form_page(&mut page, f, size);
+            return page;
+        }
+        if let Some(f) = &self.pick {
+            let (body, focus) = f.body(size.width);
+            page.body = body;
+            page.focus = focus.map(Focus::keep);
+            page.keys = f.keys();
+            page.key("esc", &f.esc_label());
+            page.back = Back::Nothing;
+            if f.typing() {
+                page.help = None;
+            }
             return page;
         }
         let w = size.width;
@@ -1079,6 +1337,9 @@ impl PlaceScreen for Screen {
             page.key("m", "open Machines");
         }
         page.key("n", "new app");
+        if self.tools.is_some() {
+            page.key("f", "deploy a file");
+        }
         if !apps.is_empty() {
             page.key("enter", "details").key("d", "remove");
         }
@@ -1099,7 +1360,7 @@ impl PlaceScreen for Screen {
     }
 
     fn typing(&self) -> bool {
-        self.form.as_ref().is_some_and(|f| f.typing())
+        self.form.as_ref().is_some_and(|f| f.typing()) || self.pick.as_ref().is_some_and(|f| f.typing())
     }
 }
 
@@ -1349,8 +1610,11 @@ pub mod tests {
         assert!(matches!(s.s.over, Some(Over::Sheet(0))));
         s.key(Key::Esc);
         assert!(s.s.over.is_none());
-        // enter on an action is its key.
+        // enter on an action is its key (remove is the fourth).
         s.key(Key::Enter);
+        for _ in 0..3 {
+            s.key(Key::Down);
+        }
         s.key(Key::Enter);
         assert!(s.flat().contains(&format!("Remove {long}?")) || s.flat().contains("Remove a-name"), "{}", s.view());
         s.key(Key::Esc);
@@ -1934,5 +2198,146 @@ pub mod tests {
         // Under 80 x 24 the frame says so.
         s.resize(70, 20);
         assert!(s.flat().contains("Make this window at least"));
+    }
+
+    /// The tools of the tests: what would run on the terminal, recorded.
+    fn tools(dir: &crate::testutil::TempDir, ran: &Arc<std::sync::Mutex<Vec<Vec<String>>>>) -> Option<Arc<AppTools>> {
+        let r = ran.clone();
+        Some(Arc::new(AppTools {
+            run: Arc::new(move |args: &[String]| {
+                r.lock().unwrap().push(args.to_vec());
+                Ok(())
+            }),
+            files: Some(dir.path().to_path_buf()),
+        }))
+    }
+
+    /// Runs the job the screen handed over, then gives the terminal back.
+    fn run_job(s: &mut Opened<Screen>) {
+        let job = s.s.job().expect("a job for the terminal");
+        (job.run)().unwrap();
+        s.s.update(Event::Back(Ok(())), &s.emit.clone());
+        s.settle();
+    }
+
+    #[test]
+    fn an_app_file_a_secret_and_a_rollback_run_on_the_terminal() {
+        let fake = Arc::new(Fake::default());
+        let dir = crate::testutil::TempDir::new();
+        let ran: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
+        let mut s = Opened::new(Screen::new(fake.clone(), doors(&dir)).with_tools(tools(&dir, &ran)));
+        s.settle();
+        let shop = |secrets: &[&str], gh: bool| Running {
+            name: "shop".into(),
+            // GitHub's builds run its image, without a tag.
+            image: if gh { "ghcr.io/me/shop".into() } else { "ghcr.io/me/shop:v1".into() },
+            port: 8080,
+            copies: 1,
+            ready: 1,
+            entrance: "cloudflare".into(),
+            run: apps::Runtime {
+                env: vec![("MODE".into(), "prod".into())],
+                secrets: secrets.iter().map(|s| s.to_string()).collect(),
+                ..apps::Runtime::default()
+            },
+            gh: if gh {
+                crate::github::State {
+                    source: Some(crate::github::Source { owner: "me".into(), repo: "shop".into(), branch: "main".into() }),
+                    run: 12,
+                    commit: "abcdef1234567".into(),
+                    history: vec![(11, "sha256:00".into(), "1234567abcdef".into())],
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            },
+            ..Running::default()
+        };
+        s.s.now = Overview { apps: vec![shop(&["TOKEN"], false)], ..Overview::default() };
+
+        // f: an app file, checked to be there, then deployed on the terminal.
+        // type_in ends with enter.
+        s.key(Key::Char('f'));
+        s.type_in("~/nothing.app");
+        assert!(s.flat().contains("there is no file"), "{}", s.flat());
+        std::fs::write(dir.join("shop.app"), "NAME=shop\n").unwrap();
+        for _ in 0.."~/nothing.app".len() {
+            s.key(Key::Backspace);
+        }
+        s.type_in("~/shop.app");
+        run_job(&mut s);
+        let file = dir.join("shop.app").display().to_string();
+        assert_eq!(ran.lock().unwrap().last().unwrap(), &vec!["deploy".to_string(), file.clone()]);
+        assert!(s.notice().contains(&format!("Back from the deploy of {file}")), "{}", s.notice());
+        // The look after it found nothing in the fake cluster: shop again.
+        let put = |s: &mut Opened<Screen>, a: Running| s.s.now = Overview { apps: vec![a], ..Overview::default() };
+        put(&mut s, shop(&["TOKEN"], false));
+
+        // The sheet: its settings, secrets, limits and where it is built.
+        s.key(Key::Enter);
+        let v = s.flat();
+        assert!(v.contains("Settings MODE") && v.contains("Secrets TOKEN") && !v.contains("Limits"), "{v}");
+        assert!(!v.contains("Built") && v.contains("set its secret TOKEN"), "{v}");
+        assert!(v.contains("GitHub does not build it"), "b says why not: {v}");
+        s.key(Key::Esc);
+
+        // s: its one secret, asked for on the terminal.
+        s.key(Key::Char('s'));
+        run_job(&mut s);
+        assert_eq!(ran.lock().unwrap().last().unwrap(), &vec!["secret".to_string(), "shop".into(), "TOKEN".into()]);
+        // Two: which one first.
+        put(&mut s, shop(&["A", "B"], true));
+        s.key(Key::Char('s'));
+        s.key(Key::Down);
+        s.key(Key::Enter);
+        run_job(&mut s);
+        assert_eq!(ran.lock().unwrap().last().unwrap(), &vec!["secret".to_string(), "shop".into(), "B".into()]);
+        put(&mut s, shop(&["A", "B"], true));
+        // b: back to the build before, which GitHub made.
+        s.key(Key::Enter);
+        assert!(s.flat().contains("by GitHub from me/shop main: build 12 (abcdef1)"), "{}", s.flat());
+        s.key(Key::Esc);
+        s.key(Key::Char('b'));
+        run_job(&mut s);
+        assert_eq!(ran.lock().unwrap().last().unwrap(), &vec!["rollback".to_string(), "shop".into()]);
+        put(&mut s, shop(&["A", "B"], true));
+
+        // w: its app file, never over one that is there.
+        s.key(Key::Char('w'));
+        assert!(s.notice().contains("Not written: there is a file at"), "shop.app is there: {}", s.notice());
+        std::fs::remove_file(dir.join("shop.app")).unwrap();
+        s.key(Key::Char('w'));
+        let text = std::fs::read_to_string(dir.join("shop.app")).unwrap();
+        assert!(text.contains("NAME=shop") && text.contains("SECRET=A") && text.contains("REPO=github.com/me/shop"), "{text}");
+        assert!(s.notice().contains("change it, then f deploys it"), "{}", s.notice());
+
+        // Without a secret: nothing to set.
+        put(&mut s, shop(&[], false));
+        s.key(Key::Char('s'));
+        assert!(s.notice().contains("it has no SECRET line"), "{}", s.notice());
+        assert_eq!(ran.lock().unwrap().len(), 4, "nothing more ran");
+    }
+
+    #[test]
+    fn a_file_named_like_a_flag_is_deployed_as_a_file() {
+        let fake = Arc::new(Fake::default());
+        let dir = crate::testutil::TempDir::new();
+        let ran: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::default();
+        let mut s = Opened::new(Screen::new(fake.clone(), doors(&dir)).with_tools(tools(&dir, &ran)));
+        s.settle();
+        s.s.hand_over(Pick { value: "-yes".into(), app: String::new() });
+        run_job(&mut s);
+        let args = ran.lock().unwrap()[0].clone();
+        assert!(args[0] == "deploy" && args[1].starts_with('/') && args[1].ends_with("/-yes"), "{args:?}");
+    }
+
+    #[test]
+    fn without_tools_the_file_work_says_where_it_is_done() {
+        let fake = Arc::new(Fake::default());
+        let dir = crate::testutil::TempDir::new();
+        let mut s = open(&fake, &dir);
+        s.key(Key::Char('f'));
+        assert!(s.notice().contains("dryserver app in a terminal does") && s.s.pick.is_none(), "{}", s.notice());
+        assert!(s.s.job().is_none());
     }
 }

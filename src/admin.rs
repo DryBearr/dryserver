@@ -423,6 +423,16 @@ pub struct View {
     pub rollout: Rollout,
     /// The coordinator's clock, unix seconds (0: an older one).
     pub coordinator_now: i64,
+    /// What the newest signed list says beyond its members: who else may
+    /// log in, the VPN and its devices.
+    pub people: Vec<signed::Person>,
+    pub vpn: Option<crate::vpn::Plan>,
+    pub devices: Vec<crate::vpn::Device>,
+    /// The signed machines, with the LAN address each one signed itself.
+    pub servers: Vec<crate::mesh::Server>,
+    /// The gateway's WireGuard key as the signed list has it ("" without
+    /// a VPN): the one devices check it by.
+    pub gateway_key: String,
 }
 
 /// A machine at the coordinator's address with other keys than the ones
@@ -923,6 +933,11 @@ impl Admin {
         self.members = members;
         self.pending = v.pending.clone();
         self.unproved = v.unproved.clone();
+        v.people = self.base.people.clone();
+        v.vpn = self.base.vpn.clone();
+        v.devices = self.base.devices.clone();
+        v.servers = self.servers();
+        v.gateway_key = v.vpn.as_ref().and_then(|p| self.machine_key(&p.gateway)).unwrap_or_default();
         Ok(v)
     }
 
@@ -1200,9 +1215,11 @@ impl Admin {
     }
 
     /// Removes a member, signed or not. The coordinator stays. Its number
-    /// is kept back from the next machines (RETIRED).
-    pub fn remove(&mut self, name: &str) -> Result<()> {
+    /// is kept back from the next machines (RETIRED). Returns what else
+    /// the admin should know (it was the VPN's gateway), as sentences.
+    pub fn remove(&mut self, name: &str) -> Result<Vec<String>> {
         let mut gone = Vec::new();
+        let mut notes = Vec::new();
         self.publish(|list, a| {
             if a.members.iter().any(|m| m.name == name && m.host == 1) {
                 bail!("the coordinator cannot be removed");
@@ -1216,7 +1233,21 @@ impl Admin {
             // made the gateway (the devices stay listed).
             if list.vpn.as_ref().is_some_and(|p| p.gateway == name) {
                 list.vpn = None;
-                eprintln!("note: {name} was the VPN's gateway: no VPN until another one is set (dryserver vpn on SERVER)");
+                notes.push(format!("{name} was the VPN's gateway: there is no VPN until another server is made the gateway."));
+            }
+            // Its name goes from where people may log in. Someone who could
+            // log in there only is taken out: an empty list would be every
+            // server.
+            let mut out = Vec::new();
+            for p in list.people.iter_mut().filter(|p| p.on.iter().any(|n| n == name)) {
+                p.on.retain(|n| n != name);
+                if p.on.is_empty() {
+                    out.push(p.name.clone());
+                }
+            }
+            list.people.retain(|p| !out.contains(&p.name));
+            for n in out {
+                notes.push(format!("{n} could log in only on {name}: taken out too (let them in again on another machine)."));
             }
             Ok(())
         })?;
@@ -1226,9 +1257,9 @@ impl Admin {
         // The list is signed and sent: a lost record only means a number
         // may come back.
         if let Err(e) = self.save_retired(&retired) {
-            eprintln!("warning: cannot keep the removed member's number in {RETIRED}: {e}");
+            notes.push(format!("Its number may be given out again: it could not be kept in {RETIRED} ({e})."));
         }
-        Ok(())
+        Ok(notes)
     }
 
     /// The people the signed list lets in, as last loaded.
@@ -2752,6 +2783,29 @@ pub mod tests {
         a.take_out("alice").unwrap();
         assert!(a.people().is_empty());
         assert!(a.take_out("alice").unwrap_err().to_string().contains("not let in"));
+    }
+
+    #[test]
+    fn a_removed_machine_goes_from_where_people_may_log_in() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        let ida = ask(&store, "node-a", 2);
+        a.load().unwrap();
+        a.approve(&by_id(&a, &ida)).unwrap();
+        a.load().unwrap();
+        let p = |name: &str, on: &[&str]| signed::Person {
+            name: name.into(),
+            keys: vec![format!("ssh-ed25519 AAAA{name}")],
+            on: on.iter().map(|s| s.to_string()).collect(),
+        };
+        for q in [p("only", &["node-a"]), p("both", &["coord", "node-a"]), p("all", &[])] {
+            a.let_in(&q, "admin").unwrap();
+        }
+        let notes = a.remove("node-a").unwrap();
+        // Never widened to every server: someone let in only there is out.
+        let left: Vec<(String, Vec<String>)> = a.people().iter().map(|q| (q.name.clone(), q.on.clone())).collect();
+        assert_eq!(left, vec![("both".into(), vec!["coord".into()]), ("all".into(), vec![])]);
+        assert!(notes.iter().any(|n| n.contains("only could log in only on node-a: taken out too")), "{notes:?}");
     }
 
     #[test]

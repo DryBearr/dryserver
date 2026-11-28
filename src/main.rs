@@ -411,7 +411,7 @@ fn run_hub(f: &Flags, place: Option<tui::app::Place>) -> Result<()> {
 /// What the app needs from this computer and the coordinator, made when
 /// a place opens.
 fn factories(f: &Flags) -> tui::app::Factories {
-    let (machines, cluster, pull, list) = (f.clone(), f.clone(), f.clone(), f.clone());
+    let (machines, cluster, pull, list, app) = (f.clone(), f.clone(), f.clone(), f.clone(), f.clone());
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     tui::app::Factories {
         machines: Box::new(move || machines_model(&machines)),
@@ -434,8 +434,22 @@ fn factories(f: &Flags) -> tui::app::Factories {
             };
             quarantine_all(&[], lift, same, status)
         }),
-        server_list: home.map(|h| h.join(".ssh/config.d/dryserver")),
+        server_list: home.as_ref().map(|h| h.join(".ssh/config.d/dryserver")),
         exe: std::env::current_exe().ok(),
+        app_tools: Some(Arc::new(tui::apps::AppTools {
+            run: Arc::new(move |args: &[String]| {
+                // The app's own flags, so it talks to the same coordinator.
+                let mut a = args.to_vec();
+                for (name, def, _) in DESKTOP_FLAGS {
+                    let v = app.get(name);
+                    if !v.is_empty() && v != *def {
+                        a.extend([format!("-{name}"), v.to_string()]);
+                    }
+                }
+                run_app_cmd(&a)
+            }),
+            files: home,
+        })),
     }
 }
 
@@ -698,13 +712,9 @@ fn run_vpn(args: &[String]) -> Result<()> {
                 },
                 endpoint,
             };
-            if !a.servers().iter().any(|s| s.name == *server) {
-                bail!("there is no machine called {server} in your swarm (dryserver approve lists them)");
-            }
-            if plan.port.to_string() == cfg.wg_port {
-                bail!("--vpn-port {}: that is the mesh's port; the VPN needs one of its own", plan.port);
-            }
-            plan.clashes("the home network", &format!("{}/24", cfg.coord_lan_ip))?;
+            let servers = a.servers();
+            let coordinator = servers.iter().find(|s| s.mesh_ip == mesh::ip(&a.subnet, 1)).map(|s| s.name.as_str()).unwrap_or("");
+            vpn::fits(&plan, &servers, coordinator, &cfg.wg_port, &format!("{}/24", cfg.coord_lan_ip))?;
             let version = a.vpn_on(&plan)?;
             println!("{server} is the VPN's gateway (signed list version {version}); it follows within a minute.");
             println!();
@@ -740,17 +750,13 @@ fn run_vpn(args: &[String]) -> Result<()> {
             }
             let (private, public) = match f.get("key") {
                 "" => {
-                    let run = runner::ExecRunner::silent();
-                    let ctx = ctx::Ctx::new();
-                    let private = run.output(&ctx, &runner::Cmd::new("wg", &["genkey"]).quiet().stdout_only()).map_err(|_| {
+                    let (private, public) = vpn::make_key(&ctx::Ctx::new(), &runner::ExecRunner::silent()).map_err(|e| {
                         errf!(
-                            "this computer has no wg (wireguard-tools) to make the device's key with. Install it, or let the device \
-                             make its own: in the WireGuard app, add a tunnel from scratch, copy its public key, then dryserver vpn add \
-                             {name} --key PUBLICKEY"
+                            "{e}. Install it, or let the device make its own: in the WireGuard app, add a tunnel from scratch, copy \
+                             its public key, then dryserver vpn add {name} --key PUBLICKEY"
                         )
                     })?;
-                    let public = run.output(&ctx, &runner::Cmd::new("wg", &["pubkey"]).stdin(private.clone()).quiet().stdout_only())?;
-                    (Some(private.trim().to_string()), public.trim().to_string())
+                    (Some(private), public)
                 }
                 k => (None, k.trim().to_string()),
             };
@@ -769,12 +775,12 @@ fn run_vpn(args: &[String]) -> Result<()> {
                 // On a screen: the same as a QR code for the WireGuard app
                 // (add tunnel, scan from QR code), comments left out.
                 // SAFETY: isatty only looks at the file descriptor.
-                if private.is_some() && unsafe { libc::isatty(1) } == 1 {
-                    let plain: String = conf.lines().filter(|l| !l.starts_with('#')).map(|l| format!("{l}\n")).collect();
-                    if let Some(code) = qr::encode(plain.trim().as_bytes()) {
-                        println!("Or scan this in the WireGuard app (add a tunnel, scan from QR code); clear the screen after:\n");
-                        print!("{}", qr::terminal(&code));
-                    }
+                if private.is_some()
+                    && unsafe { libc::isatty(1) } == 1
+                    && let Some(code) = qr::encode(vpn::qr_text(&conf).as_bytes())
+                {
+                    println!("Or scan this in the WireGuard app (add a tunnel, scan from QR code); clear the screen after:\n");
+                    print!("{}", qr::terminal(&code));
                 }
             } else {
                 fsx::write_new(out, &conf, 0o600)?;
@@ -1742,7 +1748,7 @@ fn run_app_cmd(args: &[String]) -> Result<()> {
     }
     let f = Flags::parse("app", &flags, &spec);
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
-    let opts = appcmd::Opts { yes: f.on("yes"), take_over: vec![f.get("take-over").to_string()] };
+    let opts = appcmd::Opts { yes: f.on("yes"), take_over: vec![f.get("take-over").to_string()], ..Default::default() };
     // SAFETY: isatty only looks at the file descriptor.
     let interactive = unsafe { libc::isatty(0) } == 1;
     let needs_terminal = |w: &str| matches!(w, "deploy" | "push" | "remove" | "sync") && !opts.yes && !interactive;
@@ -1768,6 +1774,26 @@ fn run_app_cmd(args: &[String]) -> Result<()> {
         ["deploy", file] => {
             let app = read_app_file(Path::new(file))?;
             let (c, doors) = (cluster()?, desktop_doors()?);
+            // At a terminal, a secret without a value is asked for here
+            // (not shown), instead of stopping the deploy; it is set only
+            // after the y.
+            let mut opts = opts.clone();
+            if interactive && !opts.yes {
+                for k in appcmd::missing_secrets(&ctx, &c, &app)? {
+                    println!(
+                        "{} has no value for its secret {k} yet: type it now (not shown). It is set only once you say y to the deploy.",
+                        app.name
+                    );
+                    let v = secret_value(&k, "")?;
+                    if v.is_empty() {
+                        bail!("{k}: no value; nothing was changed");
+                    }
+                    if v.len() > appcmd::MAX_SECRET {
+                        bail!("{k}: at most {} KiB; nothing was changed", appcmd::MAX_SECRET >> 10);
+                    }
+                    opts.secrets.0.push((k, v));
+                }
+            }
             let (desk, servers) = own_images()?;
             let own = appcmd::Own { desk: &desk, servers: &servers };
             let (token, keys, rsa, run) = github_parts()?;
@@ -2023,7 +2049,47 @@ fn machines_model(f: &Flags) -> Result<tui::admin::Screen> {
     };
     let list = f.clone();
     let write_list: tui::kill::WriteList = Arc::new(move || Ok(ssh_config(&list)?.summary));
-    Ok(tui::admin::Screen::new(a).at(&host).with_publisher(publisher).with_write_list(write_list))
+    let cfg = Config::load(config_file(f)?)?;
+    let token = f.clone();
+    let desk = tui::admin::Desk {
+        mesh_port: cfg.wg_port.clone(),
+        home: format!("{}/24", cfg.coord_lan_ip),
+        admin_user: cfg.username.clone(),
+        files: std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
+        make_key: Arc::new(|| vpn::make_key(&ctx::Ctx::new(), &runner::ExecRunner::silent())),
+        token: Arc::new(move |gateway| token_on_gateway(&token, gateway)),
+    };
+    Ok(tui::admin::Screen::new(a).at(&host).with_publisher(publisher).with_write_list(write_list).with_desk(desk))
+}
+
+/// The VPN certificates' token, put on the gateway itself: ssh to it
+/// straight over the WiFi/router network (never through the coordinator,
+/// its host key the pinned one), where sudo and then dryserver ask for it.
+/// Runs on the terminal, which the app hands over.
+fn token_on_gateway(f: &Flags, gateway: &str) -> Result<()> {
+    let home = PathBuf::from(std::env::var("HOME").map_err(|_| errf!("$HOME is not defined"))?);
+    let conf_path = home.join(".ssh/config.d/dryserver");
+    let kh_path = home.join(".ssh/known_hosts.d/dryserver");
+    // Written again first: the gateway's address may have changed since.
+    match ssh_config(f) {
+        Ok(done) => println!("{}", done.summary),
+        Err(e) => println!("The server list was not written again ({}); the one there is used.", report::printable(&e.to_string())),
+    }
+    let r = quarantine::remotes(&fsx::read_or_empty(&conf_path)).into_iter().find(|r| r.name == gateway && !r.coordinator).ok_or_else(
+        || errf!("{gateway} has no address on your network in the server list yet (it reports one within a minute): try again then"),
+    )?;
+    println!(
+        "\nConnecting to {gateway} at {} over your network. sudo asks for your password there, then dryserver for the token \
+         (Zone: DNS: Edit and Zone: Zone: Read; it is not shown).\n",
+        r.addr
+    );
+    let args = quarantine::ssh_args(&r, &kh_path.display().to_string(), &["vpn".into(), "token".into()]);
+    let st = std::process::Command::new("ssh").args(args).status().map_err(|e| err::Error::from(e).wrap("ssh"))?;
+    match st.code() {
+        Some(0) => Ok(()),
+        Some(255) => bail!("cannot connect over ssh to {gateway} at {}: is it on? (its host key must be the one you signed)", r.addr),
+        _ => bail!("the token was not set on {gateway}"),
+    }
 }
 
 const RELEASE_USAGE: &str = r#"usage: dryserver release publish|status|resume [flags]

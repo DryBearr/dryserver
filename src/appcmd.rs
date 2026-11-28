@@ -41,6 +41,38 @@ pub struct Opts {
     /// Names whose DNS records something else holds, which the admin
     /// lets dryserver take over.
     pub take_over: Vec<String>,
+    /// Values for secrets the file names that have none yet, typed before
+    /// the preview: deploy sets them only after the y.
+    pub secrets: Pending,
+}
+
+/// Secret values waiting for the y. Debug names them, never a value.
+#[derive(Clone, Default)]
+pub struct Pending(pub Vec<(String, Vec<u8>)>);
+
+impl std::fmt::Debug for Pending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.iter().map(|(k, _)| k)).finish()
+    }
+}
+
+impl Pending {
+    fn has(&self, k: &str) -> bool {
+        self.0.iter().any(|(n, _)| n == k)
+    }
+}
+
+/// Sets the secrets that waited for the y, then takes the version the
+/// copies run with.
+fn set_pending(ctx: &Ctx, c: &dyn Cluster, app: &mut App, pending: &Pending, io: &mut Io) -> Result<()> {
+    if pending.0.is_empty() {
+        return Ok(());
+    }
+    for (k, v) in &pending.0 {
+        secret(ctx, c, &app.name, SecretOp::Set(k.clone(), v.clone()), io)?;
+    }
+    app.run.secrets_version = secret_state(ctx, c, &app.name)?.version;
+    Ok(())
 }
 
 /// Where a command writes, and how it asks.
@@ -754,14 +786,16 @@ pub fn deploy(
     // version, so a new value replaces them.
     if !app.run.secrets.is_empty() {
         let s = secret_state(ctx, c, &app.name)?;
-        let missing: Vec<&str> = app.run.secrets.iter().filter(|k| !s.keys.contains(k)).map(String::as_str).collect();
+        let missing: Vec<&str> =
+            app.run.secrets.iter().filter(|k| !s.keys.contains(k) && !opts.secrets.has(k)).map(String::as_str).collect();
         if !missing.is_empty() {
             bail!(
-                "{} has no value for {} yet. Set {}: dryserver app secret {} NAME (it asks for the value). Nothing was changed",
+                "{} has no value for {} yet. Set {}: dryserver app secret {} {} (it asks for the value). Nothing was changed",
                 app.name,
                 missing.join(", "),
                 if missing.len() == 1 { "it" } else { "each" },
-                app.name
+                app.name,
+                if missing.len() == 1 { missing[0] } else { "NAME" }
             );
         }
         app.run.secrets_version = s.version;
@@ -831,6 +865,7 @@ pub fn deploy(
                 io.say(format!("{}: left as it is: {why}", doors[l.door].title()));
             }
         }
+        set_pending(ctx, c, &mut app, &opts.secrets, io)?;
         apps::deploy(&ctx.with_timeout(CHANGE), c, &app).map_err(|e| timed(e, CHANGE).wrap(format!("{} was not applied", app.name)))?;
         io.say(format!("{}: nothing to change (applied again, as the file says).", app.name));
         return Ok(());
@@ -879,6 +914,7 @@ pub fn deploy(
         images::send(ctx, own.desk, own.servers, p, now, &mut |l| io.say(l))
             .map_err(|e| e.wrap(format!("{} was not applied, nothing changed in the cluster", app.name)))?;
     }
+    set_pending(ctx, c, &mut app, &opts.secrets, io).map_err(|e| e.wrap(format!("{} was not applied", app.name)))?;
     apps::deploy(&ctx.with_timeout(CHANGE), c, &app).map_err(|e| {
         timed(e, CHANGE).wrap(format!("{} was not applied (part of it may have reached the cluster: dryserver app list)", app.name))
     })?;
@@ -940,6 +976,15 @@ fn secret_state(ctx: &Ctx, c: &dyn Cluster, app: &str) -> Result<Secrets> {
         .kubectl(&ctx.with_timeout(READ), &["-n", apps::NAMESPACE, "get", "secret", &name, "-o", SECRET_NAMES, "--ignore-not-found"], "")
         .map_err(|e| timed(e, READ).wrap("the app's secrets"))?;
     Ok(secrets_of(&out))
+}
+
+/// The secrets app's file names that have no value in the cluster yet.
+pub fn missing_secrets(ctx: &Ctx, c: &dyn Cluster, app: &App) -> Result<Vec<String>> {
+    if app.run.secrets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let s = secret_state(ctx, c, &app.name)?;
+    Ok(app.run.secrets.iter().filter(|k| !s.keys.contains(k)).cloned().collect())
 }
 
 /// The version of a Secret, then the names in it: never a value.

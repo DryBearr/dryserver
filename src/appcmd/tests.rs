@@ -572,13 +572,36 @@ fn an_image_of_your_own_goes_to_the_servers_first() {
 }
 
 #[test]
+fn a_value_typed_before_the_preview_is_set_only_after_the_y() {
+    let w = World::new();
+    let file = "NAME=shop\nIMAGE=shop:v1\nPORT=80\nSECRET=TOKEN\n";
+    let opts = || Opts { secrets: Pending(vec![("TOKEN".into(), b"s3cret".to_vec())]), ..Opts::default() };
+    assert_eq!(format!("{:?}", opts().secrets), "[\"TOKEN\"]", "Debug never shows a value");
+    // Told no: the preview, then nothing set and nothing applied.
+    let (out, res) = w.deploy(file, opts(), false);
+    res.unwrap();
+    assert!(out.contains("  SECRET TOKEN") && out.contains("Nothing changed."), "{out}");
+    let patched = |w: &World| w.cluster.calls.lock().unwrap().iter().filter(|(a, _)| a.contains("patch secret app-shop")).count();
+    assert_eq!((patched(&w), w.applies()), (0, 0));
+    // y: the value first, then the app with the Secret's new version.
+    w.cluster.answers.lock().unwrap().push(("patch secret app-shop".into(), "90".into()));
+    w.cluster.answers.lock().unwrap().push(("get secret app-shop".into(), "90 TOKEN".into()));
+    let (out, res) = w.deploy(file, opts(), true);
+    res.unwrap();
+    assert!(out.contains("TOKEN is set for shop"), "{out}");
+    // Two applies: the Secret's skeleton, then the app.
+    assert_eq!((patched(&w), w.applies()), (1, 2));
+    assert!(w.last_manifest().contains("dryserver/secrets: \"90\""), "{}", w.last_manifest());
+}
+
+#[test]
 fn secrets_reach_the_app_and_never_a_command_line() {
     let w = World::new();
     let file = "NAME=shop\nIMAGE=shop:v1\nPORT=80\nENV=NODE_ENV=production\nSECRET=DATABASE_URL\n";
     // No value yet: refused before anything changes.
     let (_, res) = w.deploy(file, Opts::default(), true);
     let e = res.unwrap_err().to_string();
-    assert!(e.contains("shop has no value for DATABASE_URL yet") && e.contains("dryserver app secret shop NAME"), "{e}");
+    assert!(e.contains("shop has no value for DATABASE_URL yet") && e.contains("dryserver app secret shop DATABASE_URL"), "{e}");
     assert_eq!(w.applies(), 0);
     // Set it: the Secret is made, the value goes on stdin only.
     let value = b"postgres://u:p@db.example.com/shop".to_vec();

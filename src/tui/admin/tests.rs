@@ -96,6 +96,17 @@ impl Run {
     fn confirm(&self) -> Option<String> {
         self.s.ask.as_ref().map(|a| format!("{} {}", a.question, a.consequences.join(" ")))
     }
+
+    /// Tab until the screen is on t.
+    fn go(&mut self, t: Tab) {
+        for _ in 0..TABS.len() {
+            if self.s.tab == t {
+                return;
+            }
+            self.press(&[Key::Tab]);
+        }
+        assert_eq!(self.s.tab, t);
+    }
 }
 
 fn ch(c: char) -> Key {
@@ -490,7 +501,7 @@ fn resend_drops_what_nobody_signed() {
     s.press(&[ch('r')]);
     let t = s.flat();
     assert!(t.contains("Not signed by you: late.") && t.contains("1 warning on the Network tab"), "{t}");
-    s.press(&[Key::Tab, Key::Tab]);
+    s.go(Tab::Network);
     assert!(s.flat().contains("The coordinator has no valid signed list"), "{}", s.flat());
     // s signs the list again; the machine nobody signed goes.
     s.press(&[ch('s')]);
@@ -617,11 +628,15 @@ fn a_slow_or_silent_coordinator_never_holds_the_screen() {
     let t = s.flat();
     assert!(t.contains("Asking the coordinator at 192.168.1.50") && t.contains("○ asking"), "{t}");
     assert!(!t.contains("No machine waits to join") && !t.contains("Members"), "no empty lists before an answer: {t}");
-    s.key(Key::Tab);
+    for _ in 0..3 {
+        s.key(Key::Tab);
+    }
     assert_eq!(s.s.tab, Tab::Updates);
     let t = s.flat();
     assert!(t.contains("Asking the coordinator") && !t.contains("No release published yet"), "nothing that is not known: {t}");
-    s.key(Key::BackTab);
+    for _ in 0..3 {
+        s.key(Key::BackTab);
+    }
     s.key(ch('s'));
     assert!(s.notice().contains("has not answered yet"), "{}", s.notice());
     assert!(t0.elapsed() < Duration::from_secs(2), "a key waited for the coordinator");
@@ -732,7 +747,7 @@ fn the_release_and_a_stopped_rollout_are_shown() {
     let _g = theme::force(Tier::True, false);
     let dir = TempDir::new();
     let (mut s, store) = signed_with_node_a(&dir);
-    s.press(&[Key::Tab]);
+    s.go(Tab::Updates);
     let t = s.flat();
     assert!(t.contains("No release published yet.") && !t.contains("p publishes"), "no p without a publisher: {t}");
     assert!(!t.contains("dryserver release"), "the screen names its keys, not commands: {t}");
@@ -875,7 +890,8 @@ fn a_refused_update_is_a_card_that_says_why() {
     *days.fail.lock().unwrap() = Some("cannot find archive.archlinux.org (is this computer online?)".into());
     let (mut s, _, sent, _) = publishing(&dir, &days);
     // The selection is low on the tab: the card that comes is still seen first.
-    s.press(&[Key::Tab, Key::Down, Key::Down]);
+    s.go(Tab::Updates);
+    s.press(&[Key::Down, Key::Down]);
     rows(&s.draw(80, 24));
     s.press(&[ch('p'), Key::Enter, Key::Enter, Key::Enter, Key::Enter]);
     let r = rows(&s.draw(80, 24)).join("\n");
@@ -935,7 +951,8 @@ fn try_again_and_skip_ask_first_and_only_when_stopped() {
     let dir = TempDir::new();
     let days = Arc::new(FakeDays::with(&[days_ago(0)]));
     let (mut s, store, _, _) = publishing(&dir, &days);
-    s.press(&[Key::Tab, ch('t')]);
+    s.go(Tab::Updates);
+    s.press(&[ch('t')]);
     assert!(s.notice().contains("Nothing to try again: there is no rollout to resume"), "{}", s.notice());
     store
         .update(|st| {
@@ -1012,7 +1029,7 @@ fn the_network_tab_lists_devices_cuts_and_warnings() {
     let _g = theme::force(Tier::True, false);
     let dir = TempDir::new();
     let (mut s, store) = signed_with_node_a(&dir);
-    s.press(&[Key::Right, Key::Right]);
+    s.press(&[Key::Left]);
     let t = s.flat();
     assert!(t.contains("No scan yet") && t.contains("No machine has cut another off.") && t.contains("Nothing needs a look."), "{t}");
     store
@@ -1070,11 +1087,18 @@ fn tabs_move_and_keep_their_selection() {
     let dir = TempDir::new();
     let (mut s, store) = signed_with_node_a(&dir);
     assert_eq!(s.s.tab, Tab::Machines);
-    for (k, want) in [(Key::Tab, Tab::Updates), (Key::Right, Tab::Network), (Key::Tab, Tab::Machines), (Key::Left, Tab::Network)] {
+    for (k, want) in [
+        (Key::Tab, Tab::People),
+        (Key::Right, Tab::Vpn),
+        (Key::Tab, Tab::Updates),
+        (Key::Right, Tab::Network),
+        (Key::Tab, Tab::Machines),
+        (Key::Left, Tab::Network),
+    ] {
         s.press(&[k]);
         assert_eq!(s.s.tab, want);
     }
-    s.press(&[Key::BackTab, Key::BackTab]);
+    s.press(&[Key::BackTab, Key::BackTab, Key::BackTab, Key::BackTab]);
     assert_eq!(s.s.tab, Tab::Machines);
     // node-a is selected; a new request above it does not move the selection.
     s.press(&[Key::Down]);
@@ -1148,13 +1172,17 @@ fn help_fits_the_smallest_window() {
     let dir = TempDir::new();
     let (admin, _) = setup(&dir);
     keys(&dir);
-    let s = Run::open(Screen::new(admin));
-    let mut page = s.s.page(Size { width: frame::body_width(80), rows: frame::body_rows(24) });
-    page.overlay = Some(Overlay::Help);
-    for (tier, console) in [(Tier::True, false), (Tier::Console, true)] {
-        let _g = theme::force(tier, console);
-        let r = rows(&frame::draw(&page, &Scroll::default(), 80, 24)).join("\n");
-        assert!(r.contains("Any key closes this.") && r.contains("back; from the list, to Home"), "{tier:?}:\n{r}");
+    let mut s = Run::open(Screen::new(admin));
+    // Each tab's own help, whole.
+    for t in TABS {
+        s.go(t);
+        let mut page = s.s.page(Size { width: frame::body_width(80), rows: frame::body_rows(24) });
+        page.overlay = Some(Overlay::Help);
+        for (tier, console) in [(Tier::True, false), (Tier::Console, true)] {
+            let _g = theme::force(tier, console);
+            let r = rows(&frame::draw(&page, &Scroll::default(), 80, 24)).join("\n");
+            assert!(r.contains("Any key closes this.") && r.contains("back; from the list, to Home"), "{t:?} {tier:?}:\n{r}");
+        }
     }
 }
 
@@ -1201,4 +1229,370 @@ fn every_tier_and_size_draws_every_state_whole() {
             }
         }
     }
+}
+
+// ---- people and the VPN ----
+
+/// The desk of the tests: keys made from fixed bytes, the token recorded.
+fn test_desk(dir: &TempDir, calls: &Arc<Mutex<Vec<String>>>) -> Desk {
+    let c = calls.clone();
+    Desk {
+        mesh_port: "51820".into(),
+        home: "192.168.1.0/24".into(),
+        admin_user: "admin".into(),
+        files: Some(dir.path().to_path_buf()),
+        make_key: Arc::new(|| Ok((key32(77), key32(78)))),
+        token: Arc::new(move |gw| {
+            c.lock().unwrap().push(format!("token {gw}"));
+            Ok(())
+        }),
+    }
+}
+
+/// signed_with_node_a, with a desk.
+fn with_desk(dir: &TempDir) -> (Run, Store, Arc<Mutex<Vec<String>>>) {
+    let (admin, store) = setup(dir);
+    keys(dir);
+    store.update(|s| s.add_request(request("node-a", 2), COORD_KEY, Time::now()).map(|_| ())).unwrap();
+    let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut s = Run::open(Screen::new(admin).with_desk(test_desk(dir, &calls)));
+    s.press(&[ch('s'), ch('y'), ch('a'), ch('y')]);
+    assert!(s.notice().contains("approved"), "{}", s.notice());
+    (s, store, calls)
+}
+
+fn typed(s: &str) -> Vec<Key> {
+    crate::tui::type_text(s)
+}
+
+const ANA: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIana ana@laptop";
+const ANA2: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIana2 ana@phone";
+
+#[test]
+fn people_are_let_in_changed_and_taken_out_each_asking_first() {
+    let _g = theme::force(Tier::True, false);
+    let dir = TempDir::new();
+    let (mut s, _store, _) = with_desk(&dir);
+    s.go(Tab::People);
+    assert!(s.flat().contains("Nobody else may log in. a lets someone in"), "{}", s.flat());
+    s.press(&[ch('a')]);
+    assert!(matches!(s.s.entry, Some(Entry::Person(_))), "{}", s.flat());
+    // Not the admin's own account, not a bad name.
+    s.press(&typed("admin"));
+    s.press(&[Key::Enter]);
+    assert!(s.flat().contains("not your own account"), "{}", s.flat());
+    for _ in 0..5 {
+        s.press(&[Key::Backspace]);
+    }
+    s.press(&typed("ana"));
+    s.press(&[Key::Enter]);
+    // A private key, a word, a missing file: each said, nothing taken.
+    for bad in ["-----BEGIN OPENSSH PRIVATE KEY-----", "hello", "~/nothing.pub"] {
+        s.press(&[Key::Paste(bad.into()), Key::Enter]);
+        assert!(s.s.entry.is_some() && s.s.ask.is_none(), "{bad}: {}", s.flat());
+        for _ in 0..bad.len() {
+            s.press(&[Key::Backspace]);
+        }
+    }
+    s.press(&[Key::Paste(ANA.into()), Key::Enter]);
+    // Machines: none chosen is every server, as the review says; then y.
+    s.press(&[Key::Enter]);
+    assert!(s.flat().contains("Machines every server (not the coordinator)"), "{}", s.flat());
+    s.press(&[Key::Enter]);
+    let q = s.confirm().unwrap();
+    assert!(q.contains("Let ana in?") && q.contains("every server (not the coordinator)") && q.contains("ana@laptop"), "{q}");
+    s.press(&[ch('y')]);
+    assert!(s.notice().contains("ana is let in"), "{}", s.notice());
+    assert_eq!(s.s.view.people.len(), 1);
+    assert_eq!(s.s.view.people[0].keys, vec![signed::key_body(ANA)]);
+    // Their sheet opens, with the lines their ssh needs: node-a only.
+    let t = s.flat();
+    assert!(t.contains("For ana's ~/.ssh/known_hosts") && t.contains("192.168.1.23 ssh-ed25519"), "{t}");
+    assert!(!t.contains("192.168.1.50 ssh-ed25519"), "not the coordinator: {t}");
+    s.press(&[ch('f')]);
+    let file = dir.join("dryserver-ana-known_hosts");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("192.168.1.23 ssh-ed25519") && text.contains("ssh ana@ADDRESS"), "{text}");
+    assert!(s.notice().contains("give it to ana"), "{}", s.notice());
+    // Someone of that name again: their sheet changes them.
+    s.press(&[Key::Esc, ch('a')]);
+    s.press(&typed("ana"));
+    s.press(&[Key::Enter]);
+    assert!(s.flat().contains("ana is let in already"), "{}", s.flat());
+    s.press(&[Key::Esc]);
+    if s.s.entry.is_some() {
+        s.press(&[ch('y')]);
+    }
+    assert!(s.s.entry.is_none(), "{}", s.flat());
+    // A second key, the same key again, and the coordinator chosen.
+    s.press(&[ch('e'), Key::Paste(ANA2.into()), Key::Enter, Key::Enter]);
+    assert!(s.confirm().is_some_and(|c| c.contains("Add a key for ana?")), "{:?} {}", s.confirm(), s.flat());
+    s.press(&[ch('y')]);
+    assert_eq!(s.s.view.people[0].keys.len(), 2);
+    s.press(&[Key::Esc, ch('e'), Key::Paste(ANA.into()), Key::Enter, Key::Enter]);
+    assert!(s.notice().contains("has that key already") && s.confirm().is_none(), "{}", s.notice());
+    s.press(&[ch('m'), ch(' '), Key::Enter, Key::Enter]);
+    assert!(s.confirm().unwrap().contains("Let ana in on coord?"), "{:?}", s.confirm());
+    s.press(&[ch('y')]);
+    assert_eq!(s.s.view.people[0].on, vec!["coord".to_string()]);
+    // Out, after y; n keeps them.
+    s.press(&[Key::Esc, ch('d')]);
+    assert!(s.confirm().unwrap().contains("Take ana out?"), "{:?}", s.confirm());
+    s.press(&[ch('n')]);
+    assert_eq!(s.s.view.people.len(), 1);
+    s.press(&[ch('d'), ch('y')]);
+    assert!(s.s.view.people.is_empty() && s.notice().contains("ana is taken out"), "{}", s.notice());
+}
+
+#[test]
+fn keys_are_taken_from_a_file_too() {
+    let dir = TempDir::new();
+    std::fs::write(dir.join("ana.pub"), format!("# ana\n{ANA}\n\n{ANA2}\n{ANA}\n")).unwrap();
+    let keys = people_tab::parse_keys("~/ana.pub", Some(dir.path())).unwrap();
+    assert_eq!(keys, vec![ANA.to_string(), ANA2.to_string()], "each once, comments left out");
+    let path = dir.join("ana.pub").display().to_string();
+    assert_eq!(people_tab::parse_keys(&path, None).unwrap().len(), 2);
+    assert!(people_tab::parse_keys("", None).is_err());
+    std::fs::write(dir.join("empty.pub"), "# nothing\n").unwrap();
+    assert!(people_tab::parse_keys(&dir.join("empty.pub").display().to_string(), None).unwrap_err().to_string().contains("no key"));
+}
+
+/// The gateway's word about the VPN, in its heartbeat.
+fn gateway_says(store: &Store, status: vpn::Status) {
+    let now = Time::now().0.timestamp();
+    store
+        .update(|st| {
+            let r = Report { vpn: Some(status.clone()), ..healthy(now) };
+            st.heartbeat(2, Heartbeat { lan_ip: "192.168.1.23".into(), report: Some(r), ..Heartbeat::default() }, Time::now())
+        })
+        .unwrap();
+}
+
+/// Sets the VPN up on node-a through the form.
+fn vpn_on(s: &mut Run) {
+    s.go(Tab::Vpn);
+    s.press(&[ch('g'), Key::Enter]);
+    s.press(&typed("203.0.113.7"));
+    s.press(&[Key::Enter, Key::Enter, Key::Enter, Key::Enter, Key::Enter]);
+    let q = s.confirm().unwrap();
+    assert!(q.contains("Make node-a the VPN's gateway?"), "{q}");
+    assert!(q.contains("forward UDP port 51821 to node-a (192.168.1.23), port 51821") && q.contains("Devices dial 203.0.113.7:51821"), "{q}");
+    s.press(&[ch('y')]);
+    assert!(s.notice().contains("node-a is the VPN's gateway"), "{}", s.notice());
+}
+
+#[test]
+fn the_vpn_is_set_up_its_devices_added_seen_and_taken_off() {
+    let _g = theme::force(Tier::True, false);
+    let dir = TempDir::new();
+    let (mut s, store, calls) = with_desk(&dir);
+    s.go(Tab::Vpn);
+    assert!(s.flat().contains("No VPN") && s.flat().contains("g sets it up"), "{}", s.flat());
+    for k in ['a', 't', 'x'] {
+        s.press(&[ch(k)]);
+        assert!(s.notice().contains("Set the VPN up first") || s.notice().contains("not set up"), "{k}: {}", s.notice());
+    }
+    vpn_on(&mut s);
+    assert_eq!(s.s.view.vpn.as_ref().map(|p| p.gateway.as_str()), Some("node-a"));
+    assert!(s.flat().contains("node-a has not said it is up yet"), "{}", s.flat());
+    gateway_says(&store, vpn::Status { gateway: true, port: 51821, ..vpn::Status::default() });
+    s.press(&[ch('r')]);
+    assert!(s.flat().contains("node-a: up; no token for the certificates yet (t)"), "{}", s.flat());
+
+    // A device whose key is made here: its config, with a QR code.
+    s.press(&[ch('a')]);
+    s.press(&typed("phone"));
+    s.press(&[Key::Enter, Key::Enter, Key::Enter]);
+    let q = s.confirm().unwrap();
+    assert!(q.contains("Add phone to the VPN?") && q.contains("10.99.0.2") && q.contains("QR code"), "{q}");
+    s.press(&[ch('y')]);
+    let t = s.flat();
+    assert!(t.contains("phone's config, for the WireGuard app") && t.contains("Scan it in the WireGuard app"), "{t}");
+    assert!(t.contains("It holds phone's private key"), "{t}");
+    let sv = s.s.shown.as_ref().unwrap();
+    assert!(sv.conf_for_tests().contains(&format!("PrivateKey = {}", key32(77))), "{}", sv.conf_for_tests());
+    assert!(sv.conf_for_tests().contains(&format!("PublicKey = {}", key32(2))), "the gateway's signed key");
+    assert_eq!(s.s.view.devices[0].key, key32(78));
+    // tab shows it as text; one esc does not lose the key, w keeps it.
+    s.press(&[Key::Tab]);
+    assert!(s.flat().contains("Endpoint = 203.0.113.7:51821"), "{}", s.flat());
+    s.press(&[Key::Esc]);
+    assert!(s.s.shown.is_some() && s.notice().contains("private key is gone"), "{}", s.notice());
+    s.press(&[ch('w')]);
+    let file = dir.join("dryserver-phone.conf");
+    assert!(std::fs::read_to_string(&file).unwrap().contains("PrivateKey"));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    s.press(&[ch('w')]);
+    assert!(s.notice().contains("Not written: there is a file at"), "never over another file: {}", s.notice());
+    s.press(&[Key::Esc]);
+    assert!(s.s.shown.is_none(), "written, one esc closes it");
+
+    // A device with its own key: no private key here, no QR code.
+    s.press(&[ch('a')]);
+    s.press(&typed("laptop"));
+    s.press(&[Key::Enter, Key::Down, Key::Enter]);
+    s.press(&[Key::Paste(key32(78)), Key::Enter]);
+    assert!(s.flat().contains("another device's or a machine's"), "{}", s.flat());
+    for _ in 0..44 {
+        s.press(&[Key::Backspace]);
+    }
+    s.press(&[Key::Paste(key32(9)), Key::Enter, Key::Enter]);
+    s.press(&[ch('y')]);
+    let t = s.flat();
+    assert!(t.contains("# PrivateKey: the one this device has already") && !t.contains("Scan it"), "{t}");
+    s.press(&[Key::Esc]);
+    assert!(s.s.shown.is_none());
+    assert_eq!(s.s.view.devices.iter().map(|d| d.addr.as_str()).collect::<Vec<_>>(), ["10.99.0.2", "10.99.0.3"]);
+
+    // When each was last seen, as the gateway says.
+    let now = Time::now().0.timestamp();
+    gateway_says(
+        &store,
+        vpn::Status {
+            gateway: true,
+            port: 51821,
+            token: true,
+            devices: vec![
+                vpn::Seen { key: key32(78)[..vpn::KEY_PREFIX].into(), handshake: now - 30 },
+                vpn::Seen { key: key32(9)[..vpn::KEY_PREFIX].into(), handshake: 0 },
+            ],
+            ..vpn::Status::default()
+        },
+    );
+    s.press(&[ch('r')]);
+    let t = s.flat();
+    assert!(t.contains("node-a: up, with the certificates' token"), "{t}");
+    assert!(t.contains("phone 10.99.0.2 connected") && t.contains("laptop 10.99.0.3 never connected"), "{t}");
+
+    // c shows a config again, without a private key (laptop, added last, is selected).
+    s.press(&[Key::Up, ch('c')]);
+    assert!(s.flat().contains("# PrivateKey: the one this device has already") && s.flat().contains("Address = 10.99.0.2/32"), "{}", s.flat());
+    s.press(&[Key::Esc]);
+
+    // The token goes over ssh, on the terminal.
+    s.press(&[Key::Up, ch('t')]);
+    let job = s.s.job().expect("a job for the terminal");
+    (job.run)().unwrap();
+    assert_eq!(*calls.lock().unwrap(), vec!["token node-a".to_string()]);
+    let e = s.emit.clone();
+    s.s.update(Event::Back(Ok(())), &e);
+    assert!(s.notice().contains("The token is on node-a"), "{}", s.notice());
+    s.settle();
+
+    // Off a device, then off the VPN: the devices stay.
+    s.press(&[Key::Down, Key::Down, ch('d')]);
+    assert!(s.confirm().unwrap().contains("Take laptop off the VPN?"), "{:?}", s.confirm());
+    s.press(&[ch('y')]);
+    assert_eq!(s.s.view.devices.len(), 1);
+    s.press(&[ch('x')]);
+    assert!(s.confirm().unwrap().contains("Turn the VPN off?"), "{:?}", s.confirm());
+    s.press(&[ch('y')]);
+    assert!(s.s.view.vpn.is_none() && s.flat().contains("Off; 1 device kept for it"), "{}", s.flat());
+}
+
+#[test]
+fn the_vpn_form_keeps_clear_of_the_mesh_and_the_home_network() {
+    let dir = TempDir::new();
+    let (mut s, _, _) = with_desk(&dir);
+    s.go(Tab::Vpn);
+    // A server silent for days is named so before it is chosen.
+    s.s.now = || Time::now().add(chrono::TimeDelta::days(3));
+    s.press(&[ch('g')]);
+    assert!(s.flat().contains("node-a (192.168.1.23, silent for"), "{}", s.flat());
+    s.s.now = Time::now;
+    s.press(&[Key::Enter]);
+    s.press(&typed("203.0.113.7"));
+    s.press(&[Key::Enter]);
+    for _ in 0..5 {
+        s.press(&[Key::Backspace]);
+    }
+    s.press(&typed("51820"));
+    s.press(&[Key::Enter]);
+    assert!(s.flat().contains("that is the mesh's port"), "{}", s.flat());
+    for _ in 0..5 {
+        s.press(&[Key::Backspace]);
+    }
+    s.press(&typed("51821"));
+    s.press(&[Key::Enter, Key::Enter]);
+    for (net, says) in [("192.168.1.0/24", "the home network"), ("10.66.0.0/24", "the mesh"), ("8.8.8.0/24", "not a private one")] {
+        for _ in 0..20 {
+            s.press(&[Key::Backspace]);
+        }
+        s.press(&typed(net));
+        s.press(&[Key::Enter]);
+        assert!(s.flat().contains(says) && s.s.ask.is_none(), "{net}: {}", s.flat());
+    }
+}
+
+#[test]
+fn removing_the_gateway_says_the_vpn_goes_with_it() {
+    let dir = TempDir::new();
+    let (mut s, _, _) = with_desk(&dir);
+    vpn_on(&mut s);
+    s.go(Tab::Machines);
+    s.press(&[Key::Down, ch('d')]);
+    assert!(s.confirm().unwrap().contains("It is the VPN's gateway"), "{:?}", s.confirm());
+    s.press(&[ch('y')]);
+    assert!(s.notice().contains("node-a was the VPN's gateway") && s.s.view.vpn.is_none(), "{}", s.notice());
+}
+
+#[test]
+fn a_qr_code_needs_room_and_the_tabs_draw_whole() {
+    let dir = TempDir::new();
+    let (mut s, _, _) = with_desk(&dir);
+    vpn_on(&mut s);
+    s.press(&[ch('a')]);
+    s.press(&typed("phone"));
+    s.press(&[Key::Enter, Key::Enter, Key::Enter, ch('y')]);
+    let r = rows(&s.draw(80, 24)).join("\n");
+    assert!(r.contains("The QR code needs a window of") && r.contains("tab shows the config as text"), "{r}");
+    let r = rows(&s.draw(100, 50)).join("\n");
+    assert!(r.contains("Scan it in the WireGuard app"), "{r}");
+    s.press(&[Key::Tab]);
+    for t in [Tab::People, Tab::Vpn] {
+        for (tier, console) in [(Tier::True, false), (Tier::Console, true), (Tier::Plain, false)] {
+            let _g = theme::force(tier, console);
+            for (w, h) in [(80, 24), (200, 60)] {
+                let d = s.draw(w, h);
+                for l in rows(&d) {
+                    assert_eq!(l.width(), w as usize, "{t:?} {tier:?} {w}x{h}: {l:?}");
+                }
+                if tier == Tier::Plain {
+                    assert!(d.lines.iter().flatten().all(|s| s.1.fg.is_none() && s.1.bg.is_none()), "NO_COLOR colours nothing");
+                }
+            }
+        }
+        s.press(&[Key::Esc, Key::Esc]);
+        s.go(t);
+    }
+}
+
+
+#[test]
+fn a_config_is_drawn_over_a_form_and_waits_for_changes_to_end() {
+    let dir = TempDir::new();
+    let (mut s, _, _) = with_desk(&dir);
+    vpn_on(&mut s);
+    // A config that arrives while the release form is open takes the keys,
+    // and is what shows.
+    s.s.form = Some(publish_form(&Choice::default(), "0.2.0"));
+    s.s.shown = Some(ShownView::new("phone".into(), "[Interface]\nPrivateKey = x\n".into(), true));
+    assert!(s.flat().contains("phone's config, for the WireGuard app"), "{}", s.flat());
+    s.s.shown = None;
+    s.s.form = None;
+    // While a change runs, the token and a config wait: the VPN may be moving.
+    s.s.queue.push("making node-b the VPN's gateway".into(), true);
+    // key, not press: nothing answers that change.
+    s.key(ch('t'));
+    assert!(s.notice().contains("Still making node-b the VPN's gateway: once that is done") && s.s.job.is_none(), "{}", s.notice());
+    // Leaving while a device is added says what is lost.
+    s.s.queue = Queue::default();
+    s.s.queue.push("adding phone to the VPN".into(), true);
+    s.key(Key::Esc);
+    assert!(s.notice().contains("nobody has its private key"), "{}", s.notice());
+    assert_eq!(s.key(Key::Esc), Flow::Quit);
+    assert!(s.s.after.as_ref().unwrap().text.contains("its config was not shown"), "{:?}", s.s.after);
 }

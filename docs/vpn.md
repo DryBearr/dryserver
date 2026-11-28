@@ -7,6 +7,15 @@ gateway server, and the app's https certificate is your own.
 
 Part of the [dryserver README](../README.md).
 
+All of it is in the app too: Machines (4), VPN tab. `g` sets it up (or
+changes the gateway, its address or ports), `t` puts the certificates'
+token on the gateway (over ssh, on the terminal: sudo and then dryserver
+ask there), `a` adds a device and shows its config with a QR code to scan
+(`w` writes it to a file, `tab` shows it as text), `c` shows a device's
+config again (without its private key), `d` takes one off and `x` turns
+the VPN off. Every device shows when it was last seen. The steps below are
+the same with commands.
+
 ## Set it up
 
 1. **Choose the gateway**: one server (not the coordinator) your router can

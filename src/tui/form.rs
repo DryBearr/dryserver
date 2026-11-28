@@ -43,12 +43,14 @@ pub struct Field<S> {
     title: String,
     desc: Option<TextFn<S>>,
     kind: Kind<S>,
+    /// What an empty answer means, for the review ("not set" without).
+    empty: Option<String>,
 }
 
 impl<S: 'static> Field<S> {
     pub fn note(title: &str, desc: &str) -> Field<S> {
         let d = desc.to_string();
-        Field { title: title.into(), desc: Some(Box::new(move |_| d.clone())), kind: Kind::Note }
+        Field { title: title.into(), desc: Some(Box::new(move |_| d.clone())), kind: Kind::Note, empty: None }
     }
 
     pub fn input(title: &str, get: impl Fn(&S) -> String + 'static, set: impl Fn(&mut S, String) + 'static) -> Field<S> {
@@ -63,6 +65,7 @@ impl<S: 'static> Field<S> {
                 validate: None,
                 cursor: usize::MAX,
             },
+            empty: None,
         }
     }
 
@@ -73,7 +76,12 @@ impl<S: 'static> Field<S> {
         get: impl Fn(&S) -> String + 'static,
         set: impl Fn(&mut S, String) + 'static,
     ) -> Field<S> {
-        Field { title: title.into(), desc: None, kind: Kind::Select { options: Box::new(options), get: Box::new(get), set: Box::new(set) } }
+        Field {
+            title: title.into(),
+            desc: None,
+            kind: Kind::Select { options: Box::new(options), get: Box::new(get), set: Box::new(set) },
+            empty: None,
+        }
     }
 
     pub fn multi(
@@ -86,7 +94,14 @@ impl<S: 'static> Field<S> {
             title: title.into(),
             desc: None,
             kind: Kind::Multi { options: Box::new(options), get: Box::new(get), set: Box::new(set), cursor: 0 },
+            empty: None,
         }
+    }
+
+    /// What an empty answer means, as the review says it.
+    pub fn when_empty(mut self, t: &str) -> Field<S> {
+        self.empty = Some(t.into());
+        self
     }
 
     pub fn desc(mut self, d: &str) -> Field<S> {
@@ -583,7 +598,7 @@ impl<S: 'static> Form<S> {
                 let label = super::fit(&label, label_w);
                 d.s(format!("  {label}{}  ", " ".repeat(label_w - label.width())));
                 if a.is_empty() {
-                    d.add(Seg("not set".into(), p.faint()));
+                    d.add(Seg(f.empty.clone().unwrap_or_else(|| "not set".into()), p.faint()));
                 } else {
                     d.s(a);
                 }

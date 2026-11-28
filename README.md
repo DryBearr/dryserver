@@ -474,6 +474,11 @@ ssh knows the machines are yours. Taken out, her account is locked on
 every machine and her sessions end; her home folder stays. An account a
 machine has already (like yours) is never taken over.
 
+In the app: Machines (4), People tab. `a` lets someone in (paste their
+public key, or its file's path), `enter` on them shows the lines for their
+`known_hosts` and `f` writes those to a file for them, `e` adds a key, `m`
+changes the machines, `d` takes them out.
+
 ### Replace your key
 
 A new laptop, a key you want to retire, or one you think someone copied:

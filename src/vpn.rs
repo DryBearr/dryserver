@@ -261,7 +261,7 @@ pub fn client_config(plan: &Plan, d: &Device, private: Option<&str>, gateway_key
     let gw = plan.gateway_addr().map(|a| a.to_string()).unwrap_or_default();
     let key = match private {
         Some(k) => format!("PrivateKey = {}", k.trim()),
-        None => "# PrivateKey: the one this device made (its public key is the one you gave dryserver)".into(),
+        None => "# PrivateKey: the one this device has already (dryserver never keeps it)".into(),
     };
     format!(
         "# dryserver VPN: {name} ({addr}), through {gateway}.\n\
@@ -274,6 +274,42 @@ pub fn client_config(plan: &Plan, d: &Device, private: Option<&str>, gateway_key
         endpoint = plan.endpoint,
         port = plan.dial_port(),
     )
+}
+
+/// The config as a QR code carries it: the comment lines left out.
+pub fn qr_text(conf: &str) -> String {
+    conf.lines().filter(|l| !l.starts_with('#')).map(|l| format!("{l}\n")).collect::<String>().trim().to_string()
+}
+
+/// A key pair for a device, made on this computer with wg
+/// (wireguard-tools): (private, public). The private key is never kept.
+pub fn make_key(ctx: &Ctx, run: &dyn Runner) -> Result<(String, String)> {
+    let private = run
+        .output(ctx, &Cmd::new("wg", &["genkey"]).quiet().stdout_only())
+        .map_err(|_| errf!("this computer has no wg (wireguard-tools) to make the device's key with"))?;
+    let private = private.trim().to_string();
+    let public = run.output(ctx, &Cmd::new("wg", &["pubkey"]).stdin(private.clone()).quiet().stdout_only())?;
+    let public = public.trim().to_string();
+    if !registry::valid_wg_key(&private) || !registry::valid_wg_key(&public) {
+        bail!("wg made no WireGuard key (it said {:?})", crate::report::printable(&public));
+    }
+    Ok((private, public))
+}
+
+/// Whether plan fits the swarm as this computer knows it: its gateway a
+/// signed server and not the coordinator, its port not the mesh's, its
+/// subnet clear of the home network (home: like 192.168.1.0/24).
+pub fn fits(plan: &Plan, servers: &[crate::mesh::Server], coordinator: &str, mesh_port: &str, home: &str) -> Result<()> {
+    if !servers.iter().any(|s| s.name == plan.gateway) {
+        bail!("there is no machine called {} in your swarm", plan.gateway);
+    }
+    if plan.gateway == coordinator {
+        bail!("the coordinator cannot be the VPN's gateway: choose a server");
+    }
+    if plan.port.to_string() == mesh_port.trim() {
+        bail!("port {} is the mesh's; the VPN needs one of its own", plan.port);
+    }
+    plan.clashes("the home network", home)
 }
 
 // ---- on the gateway ----

@@ -1,5 +1,6 @@
-//! Machines: who asks to join, the members and how each one is, the
-//! release they run, and what else is on the network, in three tabs.
+//! Machines: who asks to join, the members and how each one is, who else
+//! may log in (People), the VPN for your own devices (VPN), the release
+//! they run, and what else is on the network, in five tabs.
 //! Every decision made here is signed with this computer's key before it
 //! reaches the coordinator, and each one asks for y first.
 //!
@@ -42,6 +43,12 @@ use crate::registry::{Member, Request};
 use crate::release;
 use crate::report::{self, Concern, percent, short_age};
 use crate::rollout::{self, Pause, Phase};
+use crate::{bail, signed, vpn};
+
+mod people_tab;
+mod vpn_tab;
+use people_tab::PersonDraft;
+use vpn_tab::{DeviceDraft, PlanDraft, ShownView};
 
 /// How often the screen looks again while the coordinator answers.
 const REFRESH: Duration = Duration::from_secs(5);
@@ -307,6 +314,36 @@ pub struct Publisher {
     pub settings: Option<crate::release::Settings>,
 }
 
+/// What a change shows whole after it.
+pub enum Shown {
+    /// A device's config: with its private key when it was made here,
+    /// shown this once and never kept.
+    Device { name: String, conf: String, private: bool },
+    /// The sheet of this row (its row_key), on its tab.
+    Sheet(String),
+}
+
+/// What the People and VPN tabs need from this computer.
+pub struct Desk {
+    /// The mesh's UDP port and the home network (like 192.168.1.0/24):
+    /// the VPN keeps clear of both.
+    pub mesh_port: String,
+    pub home: String,
+    /// The admin's own account on the machines: never a person's.
+    pub admin_user: String,
+    /// Where files for others go (a device's config, a person's
+    /// known_hosts lines): the home folder. None: nowhere.
+    pub files: Option<PathBuf>,
+    /// Makes a device's key pair here: (private, public).
+    pub make_key: MakeKey,
+    /// Puts the certificates' token on the gateway, on the terminal (ssh,
+    /// then sudo and dryserver ask there).
+    pub token: Token,
+}
+
+pub type MakeKey = Arc<dyn Fn() -> Result<(String, String)> + Send + Sync>;
+pub type Token = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
+
 /// A decision, as the admin confirmed it.
 #[derive(Debug, Clone)]
 enum Act {
@@ -326,6 +363,28 @@ enum Act {
     /// A rollout stopped at a server goes on without it.
     Skip,
     Publish(Box<Plan>),
+    /// Someone new let in.
+    LetIn(signed::Person),
+    /// More keys for someone let in, merged with their keys as the newest
+    /// list has them.
+    AddKeys {
+        name: String,
+        keys: Vec<String>,
+    },
+    /// Where someone let in may log in (none: every server).
+    PersonOn {
+        name: String,
+        on: Vec<String>,
+    },
+    TakeOut(String),
+    VpnOn(vpn::Plan),
+    VpnOff,
+    /// A device; key: its own public key, None: made here.
+    AddDevice {
+        name: String,
+        key: Option<String>,
+    },
+    RemoveDevice(String),
 }
 
 impl Act {
@@ -340,6 +399,14 @@ impl Act {
             Act::Resume => "asking the coordinator to try again".into(),
             Act::Skip => "asking the coordinator to skip the machine".into(),
             Act::Publish(p) => format!("publishing release {}", p.release.serial),
+            Act::LetIn(p) => format!("letting {} in", p.name),
+            Act::AddKeys { name, .. } => format!("adding a key for {name}"),
+            Act::PersonOn { name, .. } => format!("changing where {name} may log in"),
+            Act::TakeOut(n) => format!("taking {n} out"),
+            Act::VpnOn(p) => format!("making {} the VPN's gateway", p.gateway),
+            Act::VpnOff => "turning the VPN off".into(),
+            Act::AddDevice { name, .. } => format!("adding {name} to the VPN"),
+            Act::RemoveDevice(n) => format!("taking {n} off the VPN"),
         }
     }
 
@@ -355,6 +422,12 @@ impl Act {
             Act::Resume => "Not resumed",
             Act::Skip => "Not skipped",
             Act::Publish(_) => "Not published",
+            Act::LetIn(_) => "Not let in",
+            Act::AddKeys { .. } | Act::PersonOn { .. } => "Not changed",
+            Act::TakeOut(_) => "Not taken out",
+            Act::VpnOn(_) | Act::VpnOff => "The VPN was not changed",
+            Act::AddDevice { .. } => "Not added",
+            Act::RemoveDevice(_) => "Not taken off",
         }
     }
 }
@@ -396,6 +469,8 @@ pub enum Msg {
         /// The serial, when it was a publish.
         publish: Option<u64>,
         said: Result<String>,
+        /// What to show whole after it (a new device's config).
+        shown: Option<Shown>,
         view: Result<View>,
     },
     /// The thread stopped on a bug: what it said.
@@ -405,16 +480,23 @@ pub enum Msg {
 struct Tools {
     publisher: Option<Arc<Publisher>>,
     write_list: Option<WriteList>,
+    desk: Option<Arc<Desk>>,
 }
 
-fn run(admin: &mut Admin, tools: &Tools, act: Act) -> Result<String> {
+fn run(admin: &mut Admin, tools: &Tools, act: Act, shown: &mut Option<Shown>) -> Result<String> {
     let subnet = admin.subnet.clone();
     match act {
         Act::Approve(r) => admin
             .approve(&r)
             .map(|host| format!("{} approved and signed as {}. It joins within a minute.", r.name, mesh::ip(&subnet, host))),
         Act::Reject(r) => admin.reject(&r).map(|_| format!("{} rejected: it does not join.", r.name)),
-        Act::Remove(name) => admin.remove(&name).map(|_| format!("{name} removed; servers drop it within a minute.")),
+        Act::Remove(name) => admin.remove(&name).map(|notes| {
+            let mut said = format!("{name} removed; servers drop it within a minute.");
+            for n in notes {
+                said = format!("{said} {n}");
+            }
+            said
+        }),
         Act::SignCoordinator => admin.sign_coordinator().map(|_| "Coordinator signed. New machines can join now.".to_string()),
         Act::Resend => admin.resend().map(|v| format!("Signed list sent again as version {v}.")),
         Act::NewCoordinator(c) => admin.accept_new_coordinator(&c).map(|_| {
@@ -436,6 +518,65 @@ fn run(admin: &mut Admin, tools: &Tools, act: Act) -> Result<String> {
                 )
             })
         }
+        Act::LetIn(p) => {
+            let user = tools.desk.as_ref().map(|d| d.admin_user.clone()).unwrap_or_default();
+            // Someone let in meanwhile (on another computer) is not replaced.
+            if admin.people().iter().any(|q| q.name == p.name) {
+                bail!("{} is let in already (changed meanwhile?): look again, then change them in their sheet", p.name);
+            }
+            let key = format!("p:{}", p.name);
+            admin.let_in(&p, &user).map(|_| {
+                // Their sheet has the lines their ssh needs.
+                *shown = Some(Shown::Sheet(key));
+                format!(
+                    "{} is let in; the machines follow within a minute. Give them the lines below for their known_hosts (f writes \
+                     them to a file).",
+                    p.name
+                )
+            })
+        }
+        Act::AddKeys { name, keys } => {
+            let user = tools.desk.as_ref().map(|d| d.admin_user.clone()).unwrap_or_default();
+            let Some(mut p) = admin.people().iter().find(|q| q.name == name).cloned() else {
+                bail!("{name} is not let in any more");
+            };
+            // Machines removed since: never an empty list, which is every server.
+            let servers = admin.servers();
+            let was = p.on.len();
+            p.on.retain(|n| servers.iter().any(|s| s.name == *n));
+            if was > 0 && p.on.is_empty() {
+                bail!("{name} may log in only on machines that are gone: choose machines first (m), or take them out (d)");
+            }
+            let before = p.keys.len();
+            for k in keys {
+                if !p.keys.iter().any(|o| signed::key_body(o) == signed::key_body(&k)) {
+                    p.keys.push(k);
+                }
+            }
+            if p.keys.len() == before {
+                bail!("{name} has that key already");
+            }
+            admin.let_in(&p, &user).map(|_| format!("{name} may log in with the new key too, within a minute."))
+        }
+        Act::PersonOn { name, on } => {
+            let user = tools.desk.as_ref().map(|d| d.admin_user.clone()).unwrap_or_default();
+            let Some(mut p) = admin.people().iter().find(|q| q.name == name).cloned() else {
+                bail!("{name} is not let in any more");
+            };
+            p.on = on;
+            admin.let_in(&p, &user).map(|_| format!("{name} is changed; the machines follow within a minute."))
+        }
+        Act::TakeOut(n) => {
+            admin.take_out(&n).map(|_| format!("{n} is taken out: within a minute every machine locks the account and ends its sessions."))
+        }
+        Act::VpnOn(plan) => admin.vpn_on(&plan).map(|_| {
+            format!("{} is the VPN's gateway; it follows within a minute. Forward the port on your router (enter on the VPN).", plan.gateway)
+        }),
+        Act::VpnOff => admin
+            .vpn_off()
+            .map(|_| "The VPN is off: the gateway closes it within a minute. The devices stay listed.".to_string()),
+        Act::AddDevice { name, key } => vpn_tab::add_device(admin, tools.desk.as_deref(), &name, key, shown),
+        Act::RemoveDevice(n) => admin.vpn_remove(&n).map(|_| format!("{n} is off the VPN: the gateway forgets its key within a minute.")),
     }
 }
 
@@ -456,10 +597,16 @@ fn work(ctx: &Ctx, admin: &mut Admin, tools: &Tools, job: Job) -> Msg {
         })()),
         Job::Act(act) => {
             let (failed, publish) = (act.failed(), if let Act::Publish(p) = &act { Some(p.release.serial) } else { None });
-            let said = run(admin, tools, act);
-            Msg::Did { failed, publish, said, view: admin.load() }
+            let mut shown = None;
+            let said = run(admin, tools, act, &mut shown);
+            Msg::Did { failed, publish, said, shown, view: admin.load() }
         }
     }
+}
+
+/// A change that adds a device to the VPN: its config shows only after it.
+fn adding(what: &str) -> bool {
+    what.starts_with("adding ") && what.ends_with(" to the VPN")
 }
 
 /// The screen's thread. Dropping it lets the job that runs end by itself,
@@ -559,16 +706,20 @@ impl Queue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Machines,
+    People,
+    Vpn,
     Updates,
     Network,
 }
 
-const TABS: [Tab; 3] = [Tab::Machines, Tab::Updates, Tab::Network];
+const TABS: [Tab; 5] = [Tab::Machines, Tab::People, Tab::Vpn, Tab::Updates, Tab::Network];
 
 impl Tab {
     fn title(self) -> &'static str {
         match self {
             Tab::Machines => "Machines",
+            Tab::People => "People",
+            Tab::Vpn => "VPN",
             Tab::Updates => "Updates",
             Tab::Network => "Network",
         }
@@ -589,6 +740,12 @@ enum Row {
     Device(usize),
     Cut(usize),
     Warning(usize),
+    /// Someone else let in (People tab).
+    Person(usize),
+    /// The VPN itself: its gateway, or that there is none.
+    Gateway,
+    /// A device on the VPN.
+    VpnDevice(usize),
 }
 
 /// What a key or a line of a sheet does.
@@ -603,10 +760,26 @@ enum Do {
     TryAgain,
     Skip,
     Publish,
+    // People
+    LetIn,
+    AddKey,
+    OnMachines,
+    HostsFile,
+    TakeOut,
+    // VPN
+    Gateway,
+    Token,
+    VpnOff,
+    AddDevice,
+    DeviceConfig,
+    RemoveDevice,
 }
 
 const DOS: [Do; 9] =
     [Do::Approve, Do::Reject, Do::Remove, Do::Sign, Do::NewCoordinator, Do::WriteList, Do::TryAgain, Do::Skip, Do::Publish];
+/// The keys of the People and VPN tabs, before the ones of every tab.
+const PEOPLE_DOS: [Do; 5] = [Do::LetIn, Do::AddKey, Do::OnMachines, Do::HostsFile, Do::TakeOut];
+const VPN_DOS: [Do; 6] = [Do::Gateway, Do::Token, Do::VpnOff, Do::AddDevice, Do::DeviceConfig, Do::RemoveDevice];
 
 impl Do {
     fn key(self) -> char {
@@ -620,12 +793,31 @@ impl Do {
             Do::TryAgain => 't',
             Do::Skip => 'o',
             Do::Publish => 'p',
+            Do::LetIn => 'a',
+            // Not k: that moves up.
+            Do::AddKey => 'e',
+            Do::OnMachines => 'm',
+            Do::HostsFile => 'f',
+            Do::TakeOut => 'd',
+            Do::Gateway => 'g',
+            Do::Token => 't',
+            Do::VpnOff => 'x',
+            Do::AddDevice => 'a',
+            Do::DeviceConfig => 'c',
+            Do::RemoveDevice => 'd',
         }
     }
 
-    fn of(c: char) -> Option<Do> {
-        DOS.into_iter().find(|d| d.key() == c)
+    /// The action of key c on tab: the tab's own first.
+    fn of(c: char, tab: Tab) -> Option<Do> {
+        let own: &[Do] = match tab {
+            Tab::People => &PEOPLE_DOS,
+            Tab::Vpn => &VPN_DOS,
+            _ => &[],
+        };
+        own.iter().copied().chain(DOS).find(|d| d.key() == c)
     }
+
 }
 
 /// A question before a change: y does it.
@@ -633,6 +825,13 @@ struct Ask {
     question: String,
     consequences: Vec<String>,
     act: Act,
+}
+
+/// A form of the People or VPN tab, open in the body.
+enum Entry {
+    Person(Form<PersonDraft>),
+    Plan(Form<PlanDraft>),
+    Device(Form<DeviceDraft>),
 }
 
 /// A row's sheet, open in the body.
@@ -664,9 +863,9 @@ pub struct Screen {
     /// a new one is selected.
     stop: Option<String>,
     tab: Tab,
-    sel: [usize; 3],
+    sel: [usize; 5],
     /// The selected row of each tab, by row_key: kept across looks.
-    pick: [Option<String>; 3],
+    pick: [Option<String>; 5],
     opened: Option<Opened>,
     ask: Option<Ask>,
     notice: Option<Notice>,
@@ -689,6 +888,13 @@ pub struct Screen {
     fresh_card: bool,
     /// What to tell the admin after the screen closed.
     after: Option<Notice>,
+    desk: Option<Arc<Desk>>,
+    /// A form of the People or VPN tab.
+    entry: Option<Entry>,
+    /// A device's config, whole, after it was added (or asked for).
+    shown: Option<ShownView>,
+    /// Work for the terminal (the token, over ssh).
+    job: Option<super::Job>,
 }
 
 impl Screen {
@@ -708,7 +914,7 @@ impl Screen {
             missing: None,
             stop: None,
             tab: Tab::Machines,
-            sel: [0; 3],
+            sel: [0; 5],
             pick: Default::default(),
             opened: None,
             ask: None,
@@ -724,7 +930,17 @@ impl Screen {
             leave_armed: false,
             fresh_card: false,
             after: None,
+            desk: None,
+            entry: None,
+            shown: None,
+            job: None,
         }
+    }
+
+    /// What the People and VPN tabs need from this computer.
+    pub fn with_desk(mut self, d: Desk) -> Screen {
+        self.desk = Some(Arc::new(d));
+        self
     }
 
     pub fn with_publisher(mut self, p: Publisher) -> Screen {
@@ -832,7 +1048,8 @@ impl Screen {
                     "Fix that, then p tries again with the same choices.".into(),
                 ));
             }
-            Msg::Did { failed, publish, said, view } => {
+            Msg::Did { failed, publish, said, shown, view } => {
+                let worked = said.is_ok();
                 match (said, publish) {
                     (Ok(s), Some(_)) => {
                         // The next release starts from fresh choices.
@@ -851,6 +1068,17 @@ impl Screen {
                     (Err(e), None) => self.notice = Some(Notice::bad(format!("{failed}: {}", words(&e.to_string())))),
                 }
                 self.loaded(view);
+                match shown {
+                    Some(Shown::Device { name, conf, private }) if worked => self.shown = Some(ShownView::new(name, conf, private)),
+                    Some(Shown::Sheet(key)) if worked && self.find(&key).is_some() => {
+                        // Its keys go by its tab.
+                        self.tab = Tab::People;
+                        self.pick[Tab::People.at()] = Some(key.clone());
+                        self.reselect();
+                        self.opened = Some(Opened { key, cursor: 0 });
+                    }
+                    _ => {}
+                }
             }
             Msg::Lost(why) => {
                 self.line = None;
@@ -882,6 +1110,12 @@ impl Screen {
                 .chain((0..v.reports.len()).map(Row::Cut))
                 .chain((0..v.warnings.len()).map(Row::Warning))
                 .collect(),
+            Tab::People => (0..v.people.len()).map(Row::Person).collect(),
+            Tab::Vpn => {
+                // Nothing is known before the first answer: no row says otherwise.
+                let known = self.answered.is_some();
+                known.then_some(Row::Gateway).into_iter().chain((0..v.devices.len()).map(Row::VpnDevice)).collect()
+            }
         }
     }
 
@@ -894,6 +1128,9 @@ impl Screen {
             Row::Device(i) => format!("d:{}", v.unknown.get(i).map(|d| d.ip.as_str()).unwrap_or("")),
             Row::Cut(i) => format!("c:{}", v.reports.get(i).map(String::as_str).unwrap_or("")),
             Row::Warning(i) => format!("w:{i}"),
+            Row::Person(i) => format!("p:{}", v.people.get(i).map(|p| p.name.as_str()).unwrap_or("")),
+            Row::Gateway => "gateway".into(),
+            Row::VpnDevice(i) => format!("v:{}", v.devices.get(i).map(|d| d.name.as_str()).unwrap_or("")),
         }
     }
 
@@ -1019,6 +1256,10 @@ impl Screen {
             }
             Row::Stopped => vec![Do::TryAgain, Do::Skip, Do::Publish],
             Row::Device(_) | Row::Cut(_) | Row::Warning(_) => Vec::new(),
+            Row::Person(_) => vec![Do::AddKey, Do::OnMachines, Do::HostsFile, Do::TakeOut],
+            Row::Gateway if self.view.vpn.is_none() => vec![Do::Gateway],
+            Row::Gateway => vec![Do::Gateway, Do::Token, Do::AddDevice, Do::VpnOff],
+            Row::VpnDevice(_) => vec![Do::DeviceConfig, Do::RemoveDevice],
         }
     }
 
@@ -1044,6 +1285,7 @@ impl Screen {
                 _ => "skip this machine".into(),
             },
             Do::Publish => "publish a fixed release: it replaces this rollout".into(),
+            d => self.own_label(d, r),
         }
     }
 
@@ -1059,6 +1301,9 @@ impl Screen {
             } else {
                 None
             };
+        }
+        if let Some(why) = self.own_why_not(d, r) {
+            return why;
         }
         if let Some(what) = self.queue.change() {
             return Some(format!("Still {what}: one change at a time."));
@@ -1106,6 +1351,7 @@ impl Screen {
             }
             Do::Skip => publish::skip_does(&v.rollout).err().map(|e| format!("Nothing to skip: {}.", words(&e.to_string()))),
             Do::NewCoordinator | Do::Publish => None,
+            d => self.own_why_not_signed(d, r),
         }
     }
 
@@ -1159,10 +1405,23 @@ impl Screen {
                 let (m, _) = self.member(r).cloned().expect("why_not checked it");
                 ask(
                     format!("Remove {} from the swarm?", m.name),
-                    vec![
-                        "Servers drop it within a minute: it leaves the mesh and the cluster.".into(),
-                        format!("Its mesh address {} is kept back from the next machines.", mesh::ip(&self.subnet, m.host)),
-                    ],
+                    {
+                        let mut c = vec![
+                            "Servers drop it within a minute: it leaves the mesh and the cluster.".into(),
+                            format!("Its mesh address {} is kept back from the next machines.", mesh::ip(&self.subnet, m.host)),
+                        ];
+                        if v.vpn.as_ref().is_some_and(|p| p.gateway == m.name) {
+                            c.push(
+                                "It is the VPN's gateway: the VPN is off until another server is made the gateway (VPN tab).".into(),
+                            );
+                        }
+                        let only: Vec<&str> =
+                            v.people.iter().filter(|p| p.on.len() == 1 && p.on[0] == m.name).map(|p| p.name.as_str()).collect();
+                        if !only.is_empty() {
+                            c.push(format!("{} may log in only on it: taken out too.", only.join(", ")));
+                        }
+                        c
+                    },
                     self.drops(&m.name),
                     Act::Remove(m.name),
                 )
@@ -1218,7 +1477,58 @@ impl Screen {
                 self.open_form();
                 None
             }
+            d => {
+                let mut asked = self.own_act(d, r);
+                if let Some(a) = &mut asked {
+                    a.consequences.extend(first.clone());
+                    a.consequences.extend(also(self.drops("")));
+                }
+                asked
+            }
         };
+    }
+
+    // ---- the People and VPN tabs' actions (people_tab, vpn_tab) ----
+
+    fn own_label(&self, d: Do, r: Option<Row>) -> String {
+        if PEOPLE_DOS.contains(&d) { self.people_label(d, r) } else { self.vpn_label(d, r) }
+    }
+
+    /// Some: decided without the coordinator; None: the usual checks.
+    fn own_why_not(&self, d: Do, r: Option<Row>) -> Option<Option<String>> {
+        if PEOPLE_DOS.contains(&d) {
+            self.people_why_not(d, r)
+        } else if VPN_DOS.contains(&d) {
+            self.vpn_why_not(d, r)
+        } else {
+            None
+        }
+    }
+
+    fn own_why_not_signed(&self, d: Do, r: Option<Row>) -> Option<String> {
+        if PEOPLE_DOS.contains(&d) { self.people_why_not_signed(d, r) } else { self.vpn_why_not_signed(d, r) }
+    }
+
+    fn own_act(&mut self, d: Do, r: Option<Row>) -> Option<Ask> {
+        if PEOPLE_DOS.contains(&d) { self.people_act(d, r) } else { self.vpn_act(d, r) }
+    }
+
+    fn entry_key(&mut self, e: Entry, k: &Key) {
+        match e {
+            Entry::Person(f) => self.person_form_key(f, k),
+            Entry::Plan(f) => self.plan_form_key(f, k),
+            Entry::Device(f) => self.device_form_key(f, k),
+        }
+    }
+
+    /// The question with what else the signature does: drop the members
+    /// nobody signed.
+    fn with_drops(&self, mut a: Ask) -> Ask {
+        let drops = self.drops("");
+        if !drops.is_empty() {
+            a.consequences.push(format!("It also drops {} from the swarm: on the coordinator, not signed by you.", drops.join(", ")));
+        }
+        a
     }
 
     fn open_form(&mut self) {
@@ -1249,6 +1559,9 @@ impl Screen {
                 }));
             }
             return Flow::Quit;
+        }
+        if self.shown.is_some() {
+            return self.shown_key(k);
         }
         if let Some(a) = self.ask.take() {
             if k == Key::Char('y') {
@@ -1281,6 +1594,10 @@ impl Screen {
                 }
                 Status::Active => self.form = Some(f),
             }
+            return Flow::Continue;
+        }
+        if let Some(e) = self.entry.take() {
+            self.entry_key(e, &k);
             return Flow::Continue;
         }
         if let Some(p) = self.plan.take() {
@@ -1317,6 +1634,13 @@ impl Screen {
         match k {
             Key::Esc if self.opened.is_some() => self.opened = None,
             Key::Esc => match self.queue.change().map(str::to_string) {
+                Some(what) if !armed && adding(&what) => {
+                    self.leave_armed = true;
+                    self.notice = Some(Notice::bad(format!(
+                        "Still {what}. esc again leaves, and its config is never shown: with a key made here, nobody has its \
+                         private key, and the device must be taken off and added again."
+                    )));
+                }
                 Some(what) if !armed => {
                     self.leave_armed = true;
                     self.notice = Some(Notice::bad(format!(
@@ -1328,6 +1652,11 @@ impl Screen {
                         format!(
                             "Machines closed while {what}: it goes on while dryserver runs. Updates (7) shows whether it \
                              arrived; publish again if not (it gets a new serial)."
+                        )
+                    } else if adding(&what) {
+                        format!(
+                            "Machines closed while {what}: its config was not shown. Take it off in Machines (4), VPN tab, and add \
+                             it again."
                         )
                     } else {
                         format!("Machines closed while {what}: it goes on while dryserver runs. Machines (4) shows how it ended.")
@@ -1350,7 +1679,16 @@ impl Screen {
                 }
                 None => {
                     // A cut and a warning are whole in the list already.
-                    if let Some(r @ (Row::Request(_) | Row::Member(_) | Row::Stopped | Row::Device(_))) = self.selected() {
+                    if let Some(
+                        r @ (Row::Request(_)
+                        | Row::Member(_)
+                        | Row::Stopped
+                        | Row::Device(_)
+                        | Row::Person(_)
+                        | Row::Gateway
+                        | Row::VpnDevice(_)),
+                    ) = self.selected()
+                    {
                         self.opened = Some(Opened { key: self.row_key(r), cursor: 0 });
                     }
                 }
@@ -1364,7 +1702,7 @@ impl Screen {
                 }
             }
             Key::Char(c) => {
-                if let Some(d) = Do::of(c) {
+                if let Some(d) = Do::of(c, self.tab) {
                     let r = self.opened.as_ref().and_then(|o| self.find(&o.key)).or_else(|| self.selected());
                     self.act(d, r);
                 }
@@ -1894,6 +2232,9 @@ impl Screen {
                 d.ip.clone()
             }
             Row::Cut(_) | Row::Warning(_) => String::new(),
+            Row::Person(i) => self.person_about(i, &mut about),
+            Row::Gateway => self.gateway_about(&mut about),
+            Row::VpnDevice(i) => self.device_about(i, &mut about),
         };
         lines.extend(frame::wrap_line(&[Seg(title, p.title())], inner));
         lines.push(Vec::new());
@@ -1962,22 +2303,46 @@ impl Screen {
 
     fn help(&self) -> Help {
         let k = |a: &str, b: &str| (a.to_string(), b.to_string());
-        Help {
-            about: "Every decision here is signed with this computer's key, and asks first. Approve a machine only when its own \
-                    screen shows the same code."
-                .into(),
-            keys: vec![
-                k("tab ←→", "the other tabs"),
-                k("↑↓ enter", "move; enter shows the row whole, with what can be done"),
-                k("a x", "approve or reject the machine that waits to join"),
-                k("d", "remove the selected member"),
-                k("s", "sign: the coordinator first, later your list again"),
-                k("n", "look at a new coordinator, after a reinstall"),
-                k("p", "publish a release of this dryserver"),
-                k("t o", "a stopped rollout: try again, or skip its machine"),
-                k("esc", "back; from the list, to Home"),
-            ],
-        }
+        let mut keys = vec![k("tab ←→", "the other tabs"), k("↑↓ enter", "move; enter shows the row whole, with what can be done")];
+        let about = match self.tab {
+            Tab::Machines => {
+                keys.extend([
+                    k("a x", "approve or reject the machine that waits to join"),
+                    k("d", "remove the selected member"),
+                    k("s", "sign: the coordinator first, later your list again"),
+                    k("n", "look at a new coordinator, after a reinstall"),
+                ]);
+                "Every decision here is signed with this computer's key, and asks first. Approve a machine only when its own \
+                 screen shows the same code."
+            }
+            Tab::People => {
+                keys.extend([
+                    k("a", "let someone in: their own account, their SSH key only"),
+                    k("e m", "add a key; change where they may log in"),
+                    k("f", "write the lines their ssh needs (known_hosts) to a file"),
+                    k("d", "take them out: their account is locked everywhere"),
+                ]);
+                "Others who may log in to your servers: an account of their own, their keys only; no sudo, no docker, no \
+                 cluster. Every change is in the list you sign."
+            }
+            Tab::Vpn => {
+                keys.extend([
+                    k("g", "set the VPN up, or change its gateway, address or ports"),
+                    k("t", "the certificates' token, on the gateway (over ssh)"),
+                    k("a c d", "add a device; show its config; take it off"),
+                    k("x", "turn the VPN off (the devices stay listed)"),
+                ]);
+                "Your own devices reach the apps with ENTRANCE=vpn over a WireGuard VPN of their own, through one server, \
+                 the gateway. The gateway and every device are in the list you sign."
+            }
+            Tab::Updates => {
+                keys.extend([k("p", "publish a release of this dryserver"), k("t o", "a stopped rollout: try again, or skip its machine")]);
+                "A release is signed here and goes to the coordinator first, then to one server at a time."
+            }
+            Tab::Network => "What the coordinator sees on your WiFi/router network, the cuts members report, and the warnings.",
+        };
+        keys.extend([k("r", "look again"), k("esc", "back; from the list, to Home")]);
+        Help { about: about.into(), keys }
     }
 
     fn page_keys(&self, page: &mut Page) {
@@ -2031,6 +2396,42 @@ impl Screen {
             }
             Tab::Network => {
                 if let Some(Row::Device(_)) = sel {
+                    page.key("enter", "more");
+                }
+            }
+            Tab::People => {
+                if self.why_not(Do::LetIn, sel).is_none() {
+                    page.key("a", "let someone in");
+                }
+                if let Some(Row::Person(_)) = sel {
+                    page.key("enter", "more");
+                    if self.why_not(Do::TakeOut, sel).is_none() {
+                        page.key("d", "take out");
+                    }
+                }
+            }
+            Tab::Vpn => {
+                match sel {
+                    Some(Row::Gateway) => {
+                        if self.why_not(Do::Gateway, sel).is_none() {
+                            page.key("g", if self.view.vpn.is_none() { "set it up" } else { "change" });
+                        }
+                        if self.view.vpn.is_some() && self.why_not(Do::Token, sel).is_none() {
+                            page.key("t", "token");
+                        }
+                    }
+                    Some(Row::VpnDevice(_)) => {
+                        page.key("c", "its config");
+                        if self.why_not(Do::RemoveDevice, sel).is_none() {
+                            page.key("d", "take off");
+                        }
+                    }
+                    _ => {}
+                }
+                if self.why_not(Do::AddDevice, sel).is_none() {
+                    page.key("a", "add a device");
+                }
+                if sel.is_some() {
                     page.key("enter", "more");
                 }
             }
@@ -2097,7 +2498,7 @@ impl PlaceScreen for Screen {
 
     fn init(&mut self, emit: &Emit<Msg>) {
         let Some(admin) = self.admin.take() else { return };
-        let tools = Tools { publisher: self.publisher.clone(), write_list: self.write_list.clone() };
+        let tools = Tools { publisher: self.publisher.clone(), write_list: self.write_list.clone(), desk: self.desk.clone() };
         self.line = Some(Line::start(admin, tools, emit.clone()));
         self.look();
     }
@@ -2112,9 +2513,14 @@ impl PlaceScreen for Screen {
                     self.look();
                 }
             }
-            Event::Resize(..) | Event::Back(_) => {}
+            Event::Back(res) => self.token_back(res),
+            Event::Resize(..) => {}
         }
         Flow::Continue
+    }
+
+    fn job(&mut self) -> Option<super::Job> {
+        self.job.take()
     }
 
     fn page(&self, size: Size) -> Page {
@@ -2129,6 +2535,11 @@ impl PlaceScreen for Screen {
             let (what, t) = self.queue.running().filter(|(l, _)| *l != LOADING)?;
             Some(Notice::info(format!("{} {what}{} {}", spinner(), theme::ellipsis(), super::dur(t))))
         });
+        // What takes the keys first is drawn first (key()).
+        if let Some(sv) = &self.shown {
+            self.shown_page(sv, &mut page, size);
+            return page;
+        }
         if let Some(f) = &self.form {
             let (body, focus) = f.body(w);
             page.body = body;
@@ -2145,6 +2556,19 @@ impl PlaceScreen for Screen {
             page.back = Back::Nothing;
             return page;
         }
+        if let Some(e) = &self.entry {
+            let ((body, focus), keys, esc) = match e {
+                Entry::Person(f) => (f.body(w), f.keys(), f.esc_label()),
+                Entry::Plan(f) => (f.body(w), f.keys(), f.esc_label()),
+                Entry::Device(f) => (f.body(w), f.keys(), f.esc_label()),
+            };
+            page.body = body;
+            page.focus = focus.map(Focus::keep);
+            page.keys = keys;
+            page.key("esc", &esc);
+            page.back = Back::Nothing;
+            return page;
+        }
         let opened = self.opened.as_ref().and_then(|o| self.find(&o.key).map(|r| (r, o.cursor)));
         if let Some(Act::Publish(p)) = self.ask.as_ref().map(|a| &a.act) {
             page.body = self.summary_body(p);
@@ -2155,6 +2579,8 @@ impl PlaceScreen for Screen {
         } else {
             let (body, focus) = match self.tab {
                 Tab::Machines => self.machines_body(w),
+                Tab::People => self.people_body(w),
+                Tab::Vpn => self.vpn_body(w),
                 Tab::Updates => self.updates_body(w, size.rows),
                 Tab::Network => self.network_body(w),
             };
@@ -2180,7 +2606,13 @@ impl PlaceScreen for Screen {
     }
 
     fn typing(&self) -> bool {
-        self.ask.is_none() && self.form.as_ref().is_some_and(|f| f.typing())
+        let entry = match &self.entry {
+            Some(Entry::Person(f)) => f.typing(),
+            Some(Entry::Plan(f)) => f.typing(),
+            Some(Entry::Device(f)) => f.typing(),
+            None => false,
+        };
+        self.ask.is_none() && (self.form.as_ref().is_some_and(|f| f.typing()) || entry)
     }
 }
 

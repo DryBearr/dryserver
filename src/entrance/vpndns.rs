@@ -31,6 +31,9 @@ use crate::runner::ExecRunner;
 /// The comment on every DNS record the VPN made.
 pub const MARK: &str = "managed by dryserver vpn";
 
+/// Where the VPN is set up and its devices added.
+const SET_UP: &str = "the VPN's gateway and devices are in Machines (4), VPN tab (or dryserver vpn)";
+
 /// One change to Cloudflare DNS.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
@@ -190,11 +193,16 @@ impl Vpn {
         }
     }
 
-    /// The gateway's VPN address, as the list this desktop signed has it.
-    fn signed_addr(&self) -> Option<Ipv4Addr> {
+    /// The VPN as the list this desktop signed has it.
+    fn signed_plan(&self) -> Option<crate::vpn::Plan> {
         let env: crate::signed::Envelope = serde_json::from_slice(&std::fs::read(&self.signed_copy).ok()?).ok()?;
         let list: crate::signed::List = serde_json::from_str(&env.doc).ok()?;
-        list.vpn.as_ref().and_then(crate::vpn::Plan::gateway_addr)
+        list.vpn
+    }
+
+    /// The gateway's VPN address, as the list this desktop signed has it.
+    fn signed_addr(&self) -> Option<Ipv4Addr> {
+        self.signed_plan().as_ref().and_then(crate::vpn::Plan::gateway_addr)
     }
 
     fn api_token(&self) -> Result<Option<String>> {
@@ -223,19 +231,23 @@ impl Entrance for Vpn {
     }
     fn state(&self, _: &Ctx, seen: &Overview) -> State {
         let users = super::users(super::VPN, &seen.apps);
-        let mut s = if users.is_empty() {
-            State::not_set_up("no app comes in through it")
-        } else {
-            State { health: Health::Up, summary: format!("{} app(s): {}", users.len(), users.join(", ")), notes: Vec::new() }
+        let apps = format!("{} app(s): {}", users.len(), users.join(", "));
+        let mut s = match (self.signed_plan(), users.is_empty()) {
+            (None, true) => State::not_set_up("not set up"),
+            (None, false) => State { health: Health::Down, summary: format!("not set up, and {apps} choose it"), notes: Vec::new() },
+            (Some(p), true) => {
+                State { health: Health::Up, summary: format!("on {}; no app comes in through it yet", p.gateway), notes: Vec::new() }
+            }
+            (Some(p), false) => State { health: Health::Up, summary: format!("on {}: {apps}", p.gateway), notes: Vec::new() },
         };
-        s.notes.push("Its gateway and devices: dryserver vpn. Set up with dryserver vpn on SERVER --endpoint ADDRESS".into());
+        s.notes.push(format!("{SET_UP}. An app comes in through it with ENTRANCE=vpn in its file."));
         s
     }
     fn open_question(&self, _: &Overview) -> Result<String> {
-        bail!("the VPN is set up with dryserver vpn on SERVER --endpoint ADDRESS (it signs the member list)")
+        bail!("{SET_UP} (it signs the member list)")
     }
     fn open(&self, _: &Ctx, _: &dyn Cluster) -> Result<String> {
-        bail!("the VPN is set up with dryserver vpn on SERVER --endpoint ADDRESS")
+        bail!("{SET_UP}")
     }
     fn sync(&self, ctx: &Ctx, c: &dyn Cluster, seen: &Overview, want: &Want, dry: bool) -> Result<Report> {
         if let Some(a) = seen.apps.iter().find(|a| a.newer) {
@@ -248,7 +260,7 @@ impl Entrance for Vpn {
         let Some(ip) = self.signed_addr() else {
             if !want.names.is_empty() {
                 r.notes.push(format!(
-                    "the VPN is not set up yet (dryserver vpn on SERVER --endpoint ADDRESS): {} reach(es) no device until it is",
+                    "the VPN is not set up yet ({SET_UP}): {} reach(es) no device until it is",
                     want.names.iter().map(|n| n.host.as_str()).collect::<Vec<_>>().join(", ")
                 ));
             }
@@ -311,7 +323,7 @@ impl Entrance for Vpn {
         Ok(r)
     }
     fn close(&self, _: &Ctx, _: &dyn Cluster) -> Result<()> {
-        bail!("the VPN is taken down with dryserver vpn off; its apps' names go with ENTRANCE changes")
+        bail!("the VPN is turned off in Machines (4), VPN tab (or dryserver vpn off); its apps' names go with ENTRANCE changes")
     }
 }
 
