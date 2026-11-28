@@ -101,6 +101,19 @@ Part of the [dryserver README](../README.md).
   (`dryserver-members`, `dryserver-release`...) and an SSH login signs
   data of another form, so no signature passes for another. Servers do not
   allow agent forwarding, so a server cannot borrow your agent to sign.
+- **Your devices on the VPN** (`dryserver vpn`): the signed list names
+  the gateway and each device with its key and address, so the coordinator
+  cannot add one or move the gateway; a device taken out is gone from the
+  gateway within a minute. A device reaches the VPN's own ingress on the
+  gateway (its address there, ports 80 and 443) and a ping, nothing else:
+  not the gateway's SSH, the mesh, the home network or another device,
+  logged as `dryserver-vpn-drop`. That ingress (its own Traefik) serves
+  only apps with `ENTRANCE=vpn`, and the cluster's Traefik, which the
+  tunnel reaches, none of them; a VPN app takes connections from the
+  VPN's Traefik only, and that Traefik from the devices' addresses only.
+  Their certificates are proven through Cloudflare DNS with a token kept
+  on the gateway, never in the cluster: give it DNS edit on those domains
+  only. See [VPN for your devices](vpn.md).
 - **Other people** (`dryserver people`): the signed list names them, so
   the coordinator cannot let anyone in. Each machine gives them an
   account of their own in the group `dryserver-people` and nothing else

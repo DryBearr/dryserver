@@ -17,6 +17,7 @@ mod err;
 mod export;
 mod flash;
 mod fsx;
+mod github;
 mod gotime;
 mod homedir;
 mod images;
@@ -30,6 +31,7 @@ mod owner;
 mod packages;
 mod people;
 mod publish;
+mod qr;
 mod quarantine;
 mod registry;
 // Not called yet: later steps run the relay on the VPS entrance and wire
@@ -47,6 +49,7 @@ mod sysconf;
 mod testutil;
 mod tui;
 mod update;
+mod vpn;
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
@@ -87,6 +90,21 @@ commands:
                       server (--on: those machines only), their key only,
                       no sudo, no docker, no cluster, nothing forwarded
   people remove NAME  take them out: their account is locked everywhere
+  vpn                 the VPN for your own devices: its gateway, and when each
+                      device was last seen
+  vpn on SERVER --endpoint ADDRESS [--vpn-port 51821] [--public-port N]
+         [--subnet 10.99.0.0/24]
+                      make SERVER the gateway devices connect to; ADDRESS is
+                      your line's public IPv4 address or a DNS name for it.
+                      Forward UDP --public-port (default --vpn-port) on your
+                      router to SERVER's --vpn-port
+  vpn add NAME [--key PUBLICKEY] [--out FILE]
+                      a device: its config for the WireGuard app (made here
+                      with wg, or with the key the device made itself)
+  vpn remove NAME     cut a device off within a minute
+  vpn token           (on the gateway, with sudo) the Cloudflare token (DNS
+                      edit) the VPN's certificates are proven with
+  vpn off             no VPN; the devices stay listed for when it is back
   replace-key [--to FILE.pub]
                       hand your swarm's trust to a new SSH key (default: the
                       one in your config): signed by the old key, followed
@@ -238,6 +256,7 @@ fn main() -> ExitCode {
         "import" => run_import(rest),
         "replace-key" => run_replace_key(rest),
         "people" => run_people(rest),
+        "vpn" => run_vpn(rest),
         "install" => run_install(rest),
         "build" => run_build(rest),
         "disks" => run_disks(rest),
@@ -300,6 +319,12 @@ struct Flags {
 impl Flags {
     /// spec: (name, default, help); a default of "false" makes a bool flag.
     fn parse(cmd: &str, args: &[String], spec: &[(&'static str, &str, &str)]) -> Flags {
+        // One meaning per flag: a command's own may not take the name of
+        // one every desktop command has (--port is the coordinator's SSH
+        // port).
+        for (i, (name, _, _)) in spec.iter().enumerate() {
+            assert!(!spec[..i].iter().any(|(n, _, _)| n == name), "{cmd}: the flag -{name} is defined twice");
+        }
         let usage = || {
             let mut u = format!("Usage of {cmd}:\n");
             for (name, def, help) in spec {
@@ -617,6 +642,238 @@ fn run_people(args: &[String]) -> Result<()> {
         }
         _ => bail!("usage: dryserver people | people add NAME KEY.pub... [--on m1,m2] | people remove NAME"),
     }
+    Ok(())
+}
+
+fn run_vpn(args: &[String]) -> Result<()> {
+    let mut spec = DESKTOP_FLAGS.to_vec();
+    spec.push(("endpoint", "", "where devices find the gateway: your line's public IPv4 address, or a DNS name for it"));
+    // Not --port: that is the coordinator's SSH port, as for every
+    // command of this computer.
+    spec.push(("vpn-port", "", "the UDP port the gateway listens on (default 51821)"));
+    spec.push(("public-port", "", "the port on the endpoint, when your router forwards another one (default: --vpn-port)"));
+    spec.push(("subnet", "", "the devices' network (default 10.99.0.0/24)"));
+    spec.push(("key", "", "the device's own WireGuard public key (it keeps its private key)"));
+    spec.push(("out", "", "write the device's config to this file (yours alone) instead of showing it"));
+    let words: Vec<String> = args.iter().take_while(|a| !a.starts_with('-')).cloned().collect();
+    let f = Flags::parse("vpn", &args[words.len()..], &spec);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    if words.first() == Some(&"token") {
+        return vpn_token();
+    }
+    if Path::new(LIVE_CONFIG).parent().is_some_and(Path::exists) {
+        bail!("vpn runs on your own computer, where your key is (on the gateway: sudo dryserver vpn token)");
+    }
+    let (mut a, _) = desktop_admin(&f, "vpn")?;
+    let cfg = Config::load(config_file(&f)?)?;
+    let v = a.load()?;
+    for w in &v.warnings {
+        eprintln!("warning: {}", report::printable(w));
+    }
+    let port = |name: &str, default: u16| -> Result<u16> {
+        match f.get(name) {
+            "" => Ok(default),
+            p => p.parse::<u16>().ok().filter(|p| *p > 0).ok_or_else(|| errf!("--{name}: a port, 1 to 65535")),
+        }
+    };
+    match words.as_slice() {
+        [] => vpn_show(&a, &v),
+        ["on", server] => {
+            let old = a.vpn().cloned();
+            let endpoint = match (f.get("endpoint"), &old) {
+                ("", Some(o)) => o.endpoint.clone(),
+                ("", None) => bail!(
+                    "--endpoint: where devices find the gateway from the internet (your line's public IPv4 address, or a DNS name for it)"
+                ),
+                (e, _) => e.trim().to_ascii_lowercase(),
+            };
+            let keep = |pick: fn(&vpn::Plan) -> u16, d: u16| old.as_ref().map(pick).unwrap_or(d);
+            let plan = vpn::Plan {
+                gateway: server.to_string(),
+                port: port("vpn-port", keep(|o| o.port, vpn::DEFAULT_PORT))?,
+                public_port: port("public-port", keep(|o| o.public_port, 0))?,
+                subnet: match f.get("subnet") {
+                    "" => old.as_ref().map(|o| o.subnet.clone()).unwrap_or_else(|| vpn::DEFAULT_SUBNET.into()),
+                    s => s.to_string(),
+                },
+                endpoint,
+            };
+            if !a.servers().iter().any(|s| s.name == *server) {
+                bail!("there is no machine called {server} in your swarm (dryserver approve lists them)");
+            }
+            if plan.port.to_string() == cfg.wg_port {
+                bail!("--vpn-port {}: that is the mesh's port; the VPN needs one of its own", plan.port);
+            }
+            plan.clashes("the home network", &format!("{}/24", cfg.coord_lan_ip))?;
+            let version = a.vpn_on(&plan)?;
+            println!("{server} is the VPN's gateway (signed list version {version}); it follows within a minute.");
+            println!();
+            println!(
+                "On your router, forward UDP port {} to {server} port {} (Virtual Server / port forwarding).",
+                plan.dial_port(),
+                plan.port
+            );
+            if let Some(lan) = a.servers().iter().find(|s| s.name == *server).map(|s| s.lan_ip.clone()).filter(|l| !l.is_empty()) {
+                println!("  {server} is at {lan} on your network: give it that address for good (DHCP reservation) first.");
+            }
+            println!("Devices dial {}:{}. Then: dryserver vpn add phone", plan.endpoint, plan.dial_port());
+            println!("The certificates' token, once, on {server}: ssh {server}, then sudo dryserver vpn token.");
+            println!("Apps with ENTRANCE=vpn get their names pointed at the gateway with the next app deploy or dryserver app sync.");
+            if old.as_ref().is_some_and(|o| o.gateway != plan.gateway || o.endpoint != plan.endpoint || o.dial_port() != plan.dial_port())
+                && !a.devices().is_empty()
+            {
+                println!(
+                    "\nThe devices' configs name the old gateway or address: give each its new one (dryserver vpn remove NAME, \
+                     then vpn add NAME --key ITS-KEY keeps its key; the WireGuard app shows it)."
+                );
+            }
+        }
+        ["off"] => {
+            let version = a.vpn_off()?;
+            println!("No VPN any more (signed list version {version}): the gateway closes it within a minute. The devices stay listed.");
+        }
+        ["add", name] => {
+            let Some(plan) = a.vpn().cloned() else { bail!("set the VPN up first: dryserver vpn on SERVER --endpoint ADDRESS") };
+            let out = f.get("out");
+            if !out.is_empty() && Path::new(out).exists() {
+                bail!("{out} is there already; nothing was changed");
+            }
+            let (private, public) = match f.get("key") {
+                "" => {
+                    let run = runner::ExecRunner::silent();
+                    let ctx = ctx::Ctx::new();
+                    let private = run.output(&ctx, &runner::Cmd::new("wg", &["genkey"]).quiet().stdout_only()).map_err(|_| {
+                        errf!(
+                            "this computer has no wg (wireguard-tools) to make the device's key with. Install it, or let the device \
+                             make its own: in the WireGuard app, add a tunnel from scratch, copy its public key, then dryserver vpn add \
+                             {name} --key PUBLICKEY"
+                        )
+                    })?;
+                    let public = run.output(&ctx, &runner::Cmd::new("wg", &["pubkey"]).stdin(private.clone()).quiet().stdout_only())?;
+                    (Some(private.trim().to_string()), public.trim().to_string())
+                }
+                k => (None, k.trim().to_string()),
+            };
+            let gateway_key =
+                a.machine_key(&plan.gateway).ok_or_else(|| errf!("the gateway {} is not in the signed list", plan.gateway))?;
+            let (d, version) = a.vpn_add(name, &public)?;
+            let conf = vpn::client_config(&plan, &d, private.as_deref(), &gateway_key);
+            eprintln!("{name} is on the VPN at {} (signed list version {version}); the gateway lets it in within a minute.", d.addr);
+            if out.is_empty() {
+                if private.is_some() {
+                    eprintln!(
+                        "Its config follows. It holds the device's private key, which dryserver does not keep: import it into the WireGuard app now (or keep it somewhere only you can read).\n"
+                    );
+                }
+                println!("{conf}");
+                // On a screen: the same as a QR code for the WireGuard app
+                // (add tunnel, scan from QR code), comments left out.
+                // SAFETY: isatty only looks at the file descriptor.
+                if private.is_some() && unsafe { libc::isatty(1) } == 1 {
+                    let plain: String = conf.lines().filter(|l| !l.starts_with('#')).map(|l| format!("{l}\n")).collect();
+                    if let Some(code) = qr::encode(plain.trim().as_bytes()) {
+                        println!("Or scan this in the WireGuard app (add a tunnel, scan from QR code); clear the screen after:\n");
+                        print!("{}", qr::terminal(&code));
+                    }
+                }
+            } else {
+                fsx::write_new(out, &conf, 0o600)?;
+                eprintln!("Its config is in {out} (yours alone): import it into the WireGuard app, then delete the file.");
+            }
+        }
+        ["remove", name] => {
+            let version = a.vpn_remove(name)?;
+            println!("{name} is off the VPN (signed list version {version}): the gateway forgets its key within a minute.");
+        }
+        _ => bail!(
+            "usage: dryserver vpn | vpn on SERVER --endpoint ADDRESS | vpn add NAME [--key KEY] | vpn remove NAME | vpn token | vpn off"
+        ),
+    }
+    Ok(())
+}
+
+/// The VPN as the signed list has it, and how its gateway says it is.
+fn vpn_show(a: &admin::Admin, v: &admin::View) {
+    let Some(plan) = a.vpn() else {
+        println!("No VPN. dryserver vpn on SERVER --endpoint ADDRESS sets it up.");
+        if !a.devices().is_empty() {
+            println!("Devices kept for it: {}", a.devices().iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", "));
+        }
+        return;
+    };
+    println!(
+        "Gateway {}, devices dial {}:{} (forwarded to its port {}), subnet {}",
+        plan.gateway,
+        plan.endpoint,
+        plan.dial_port(),
+        plan.port,
+        plan.subnet
+    );
+    let status = v.members.iter().find(|(m, _)| m.name == plan.gateway).and_then(|(m, _)| m.report.as_ref()).and_then(|r| r.vpn.clone());
+    match &status {
+        Some(s) if s.gateway && !s.token => println!(
+            "  the gateway is up; no token for the certificates yet (on {}: sudo dryserver vpn token), so browsers warn",
+            plan.gateway
+        ),
+        Some(s) if s.gateway => println!("  the gateway is up, with the token for the certificates"),
+        Some(s) if !s.problem.is_empty() => println!("  the gateway is not up: {}", report::printable(&s.problem)),
+        _ => println!("  the gateway has not said it is up yet (it follows within a minute, once it runs this dryserver)"),
+    }
+    if a.devices().is_empty() {
+        println!("No devices yet: dryserver vpn add phone");
+    }
+    let now = chrono::Utc::now().timestamp();
+    for d in a.devices() {
+        let seen = status.as_ref().and_then(|s| s.devices.iter().find(|x| !x.key.is_empty() && d.key.starts_with(&x.key)));
+        let when = match seen {
+            Some(x) if x.handshake > 0 => {
+                let ago = (now - x.handshake).max(0);
+                if ago < 180 { "connected".to_string() } else { format!("last seen {} ago", tui::home::age(ago as u64)) }
+            }
+            Some(_) => "never connected".into(),
+            None => "not seen".into(),
+        };
+        println!("  {}  {}  {when}", d.name, d.addr);
+    }
+}
+
+/// The Cloudflare token the VPN's certificates are proven with: on the
+/// gateway, as root, into a file only the VPN's Traefik reads (checked
+/// with Cloudflare first). Never in the cluster, where the cluster's own
+/// Traefik on every machine may read every secret.
+fn vpn_token() -> Result<()> {
+    // A machine: its folder is there (only root may look inside it).
+    let machine = Path::new(LIVE_CONFIG).parent().is_some_and(Path::exists);
+    if !machine {
+        println!("The token goes onto the VPN's gateway itself, never into the cluster (where every machine's ingress may read it):");
+        println!("  ssh GATEWAY        (dryserver vpn names it; dryserver ssh-config once, for the name)");
+        println!("  sudo dryserver vpn token");
+        println!("It asks for the token there. Make one in the Cloudflare dashboard (My Profile, API Tokens) with Zone: DNS: Edit and");
+        println!("Zone: Zone: Read, for the domains of your VPN's apps only.");
+        return Ok(());
+    }
+    if !fsx::is_root() {
+        bail!("vpn token writes a file only root may: sudo dryserver vpn token");
+    }
+    let token = String::from_utf8(secret_value("the Cloudflare token", "")?).map_err(|_| errf!("the token is not text"))?;
+    let token = token.trim().to_string();
+    entrance::cfapi::valid_api_token(&token)?;
+    let ctx = ctx::Ctx::new().with_timeout(std::time::Duration::from_secs(30));
+    let run = runner::ExecRunner::silent();
+    let http = entrance::cfapi::Curl { token: token.clone(), run: Arc::new(run.clone()) };
+    let api = entrance::cfapi::Api { http: &http, ctx: &ctx };
+    let ok: serde_json::Value = api.get("/user/tokens/verify", "a valid token").map_err(|e| e.wrap("Cloudflare did not take the token"))?;
+    if ok["status"].as_str() != Some("active") {
+        bail!("Cloudflare says the token is not active");
+    }
+    let zones: Vec<serde_json::Value> = api.list("/zones?per_page=50", entrance::cfapi::NEED_ZONE_READ)?;
+    let names: Vec<String> = zones.iter().filter_map(|z| z["name"].as_str()).map(entrance::cfapi::clean).collect();
+    if names.is_empty() {
+        bail!("the token sees no domain: give it Zone: Zone: Read and Zone: DNS: Edit on the domains of your VPN's apps");
+    }
+    vpn::put_token(&ctx, Path::new("/"), &run, &token)?;
+    println!("The VPN's certificates are proven with this token from now on; it sees {}.", names.join(", "));
+    println!("It is in {} (only the VPN's Traefik reads it), and goes when this machine stops being the gateway.", vpn::TOKEN_FILE);
     Ok(())
 }
 
@@ -1395,7 +1652,7 @@ fn desktop_cluster(f: &Flags, cmd: &str) -> Result<apps::SshCluster> {
 }
 
 /// The words of `dryserver app` (also after `dryserver apps`).
-const APP_WORDS: [&str; 7] = ["deploy", "push", "list", "show", "remove", "sync", "help"];
+const APP_WORDS: [&str; 10] = ["deploy", "push", "list", "show", "remove", "sync", "secret", "rollback", "github", "help"];
 
 const APP_USAGE: &str = r#"usage: dryserver app deploy|list|show|remove|sync [flags]
 
@@ -1412,6 +1669,16 @@ const APP_USAGE: &str = r#"usage: dryserver app deploy|list|show|remove|sync [fl
                  answers from the internet (-no-check: do not ask them)
   show NAME      the app as a file, to keep or change:
                    dryserver app show shop > shop.app
+  secret APP NAME
+                 set the secret NAME for APP: typed (not shown), from a pipe
+                 (echo ... | dryserver app secret shop TOKEN), or -file F.
+                 -remove takes it away; secret APP lists the names
+  rollback NAME  an app GitHub builds: back to the build before; newer
+                 ones wait for the next push
+  github init    in your app's repository: write the workflow that builds
+                 it on every push to main (-branch B, -dir D, -force)
+  github token   keep a classic GitHub token (only read:packages) here and
+                 in the cluster, to pull the images GitHub builds
   remove NAME    stop the app and take its names out of Cloudflare
   sync           make Cloudflare match the apps, and set up the tunnel when
                  it is not there (after a deploy whose Cloudflare part
@@ -1426,11 +1693,19 @@ An app file (any name, for example shop.app):
   IMAGE=localhost/shop:v1        an image you built here (podman build -t
                                  shop:v1 .), or one from a registry like
                                  ghcr.io/you/shop:v1
+  REPO=github.com/you/shop       or: GitHub builds it on every push to
+  BRANCH=main                    BRANCH (main unless said), and your
+                                 coordinator deploys each build it proves
   PORT=8080                      the port it listens on
   COPIES=2                       how many run (1 to 20; default 1)
   HOST=shop.example.com          a public name; as many HOST lines as you
   HOST=www.example.com a.com     need, several names on one line are fine
   HOST=admin.example.com:9000    this name leads to port 9000 of the app
+  ENV=NODE_ENV=production        a setting the app reads (as many as needed)
+  SECRET=DATABASE_URL            a secret: only its name here, its value
+                                 with dryserver app secret shop DATABASE_URL
+  MEMORY=512Mi                   the most one copy may use (default 512Mi)
+  CPU=1                          the most CPU one copy may use (default 1)
 
 More: docs/apps.md
 "#;
@@ -1444,6 +1719,11 @@ fn run_app_cmd(args: &[String]) -> Result<()> {
         ("yes", "false", "make the changes without asking"),
         ("take-over", "", "names (comma separated) whose DNS record dryserver did not make, to point at this app"),
         ("no-check", "false", "list: do not ask each name whether it answers"),
+        ("remove", "false", "secret: remove the secret NAME instead of setting it"),
+        ("file", "", "secret, github token: take the value from this file (else it is asked for, or read from stdin)"),
+        ("dir", ".", "github init: the app's repository"),
+        ("branch", "main", "github init: the branch whose pushes deploy"),
+        ("force", "false", "github init: write dryserver's workflow over a different one"),
     ]);
     // Words and flags in any order: app deploy -yes shop.app works too.
     let (mut words, mut flags) = (Vec::new(), Vec::new());
@@ -1490,7 +1770,20 @@ fn run_app_cmd(args: &[String]) -> Result<()> {
             let (c, doors) = (cluster()?, desktop_doors()?);
             let (desk, servers) = own_images()?;
             let own = appcmd::Own { desk: &desk, servers: &servers };
-            appcmd::deploy(&ctx, &c, &doors, Some(&own), &app, &opts, &mut appcmd::Io { out: &mut out, ask: &mut ask })
+            let (token, keys, rsa, run) = github_parts()?;
+            let make = |t: String| -> Box<dyn github::Registry> { Box::new(github::Ghcr { token: t, run: run.clone() }) };
+            let gh = appcmd::GitHub { token, make: &make, keys: &keys, rsa: &rsa };
+            appcmd::deploy(&ctx, &c, &doors, Some(&own), Some(&gh), &app, &opts, &mut appcmd::Io { out: &mut out, ask: &mut ask })
+        }
+        ["rollback", name] => appcmd::rollback(&ctx, &cluster()?, name, &opts, &mut appcmd::Io { out: &mut out, ask: &mut ask }),
+        ["github", "init"] => {
+            appcmd::github_init(Path::new(f.get("dir")), f.get("branch"), f.on("force"), &mut appcmd::Io { out: &mut out, ask: &mut ask })
+        }
+        ["github", "token"] => {
+            let token = String::from_utf8(secret_value("the GitHub token", f.get("file"))?).map_err(|_| errf!("a token is text"))?;
+            let run = ExecRunner::silent();
+            let store = paths()?.secrets.join(GITHUB_TOKEN_FILE);
+            appcmd::github_token(&ctx, &cluster()?, &run, &token, &store, &mut appcmd::Io { out: &mut out, ask: &mut ask })
         }
         ["push", image] => {
             let c = cluster()?;
@@ -1513,11 +1806,108 @@ fn run_app_cmd(args: &[String]) -> Result<()> {
             let (c, doors) = (cluster()?, desktop_doors()?);
             appcmd::sync(&ctx, &c, &doors, &opts, &mut appcmd::Io { out: &mut out, ask: &mut ask })
         }
+        ["secret", app] => appcmd::secret(&ctx, &cluster()?, app, appcmd::SecretOp::List, &mut appcmd::Io { out: &mut out, ask: &mut ask }),
+        ["secret", app, key] => {
+            let op = if f.on("remove") {
+                appcmd::SecretOp::Remove(key.to_string())
+            } else {
+                appcmd::SecretOp::Set(key.to_string(), secret_value(key, f.get("file"))?)
+            };
+            appcmd::secret(&ctx, &cluster()?, app, op, &mut appcmd::Io { out: &mut out, ask: &mut ask })
+        }
         _ => {
             eprint!("{APP_USAGE}");
             std::process::exit(2);
         }
     }
+}
+
+/// A secret's value: from a file, typed without showing it, or read from
+/// stdin (piped). Never from the command line, where it would be in the
+/// shell's history and every process listing.
+fn secret_value(key: &str, file: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    if !file.is_empty() {
+        let meta = std::fs::metadata(file).map_err(|e| err::Error::from(e).wrap(file))?;
+        if !meta.is_file() || meta.len() > appcmd::MAX_SECRET as u64 {
+            bail!("{file}: a file of at most {} KiB", appcmd::MAX_SECRET >> 10);
+        }
+        return std::fs::read(file).map_err(|e| err::Error::from(e).wrap(file));
+    }
+    // SAFETY: isatty only looks at the file descriptor.
+    if unsafe { libc::isatty(0) } != 1 {
+        let mut v = Vec::new();
+        std::io::stdin().take(appcmd::MAX_SECRET as u64 + 2).read_to_end(&mut v)?;
+        // One line end from echo or a here-string is not part of it.
+        if v.ends_with(b"\n") {
+            v.pop();
+            if v.ends_with(b"\r") {
+                v.pop();
+            }
+        }
+        return Ok(v);
+    }
+    let first = read_hidden(&format!("Value of {key} (not shown): "))?;
+    let again = read_hidden("Once more: ")?;
+    if first != again {
+        bail!("the two values differ; nothing was changed");
+    }
+    Ok(first.into_bytes())
+}
+
+/// Reads a line from the terminal without echoing it.
+fn read_hidden(prompt: &str) -> Result<String> {
+    use std::io::Write;
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    // SAFETY: plain termios calls on stdin, restored before returning.
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    let got = unsafe { libc::tcgetattr(0, &mut old) } == 0;
+    if got {
+        let mut quiet = old;
+        quiet.c_lflag &= !libc::ECHO;
+        quiet.c_lflag |= libc::ECHONL;
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &quiet) };
+    }
+    let mut line = String::new();
+    let res = std::io::stdin().read_line(&mut line);
+    if got {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &old) };
+    }
+    res?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// Where this computer keeps the GitHub token (in secrets/).
+const GITHUB_TOKEN_FILE: &str = "github_token";
+
+/// The GitHub token this computer keeps (if any), and the ways to check
+/// GitHub's proofs: its keys (kept in the cache) and openssl.
+/// The token (if kept), GitHub's keys, openssl, and the runner they use.
+type GitHubParts = (Option<String>, github::CurlKeys, github::Openssl, Arc<dyn runner::Runner>);
+
+fn github_parts() -> Result<GitHubParts> {
+    let p = paths()?;
+    let file = p.secrets.join(GITHUB_TOKEN_FILE);
+    let token = match std::fs::metadata(&file) {
+        Ok(m) => {
+            use std::os::unix::fs::PermissionsExt;
+            if m.permissions().mode() & 0o077 != 0 {
+                bail!(
+                    "{} can be read by other users of this computer: chmod 600 it (and make a new token if someone may have read it)",
+                    file.display()
+                );
+            }
+            let t = fsx::read_string(&file)?.trim().to_string();
+            github::valid_token(&t).map_err(|e| e.wrap(file.display()))?;
+            Some(t)
+        }
+        Err(_) => None,
+    };
+    let run: Arc<dyn runner::Runner> = Arc::new(ExecRunner::silent());
+    let keys = github::CurlKeys { run: run.clone(), cache: p.out_dir.join("github-keys.json") };
+    let rsa = github::Openssl { run: run.clone(), tmp: p.out_dir.join("tmp") };
+    Ok((token, keys, rsa, run))
 }
 
 /// The images of this desktop and the servers of its server list.
@@ -1599,7 +1989,11 @@ fn run_apps(args: &[String], place: tui::Place) -> Result<()> {
 /// The ways in from outside this desktop knows, with its secrets.
 fn desktop_doors() -> Result<entrance::Entrances> {
     let secrets = paths()?.secrets;
-    Ok(Arc::new(vec![Box::new(entrance::cloudflare::Cloudflare::new(&secrets)), Box::new(entrance::Vps)]))
+    Ok(Arc::new(vec![
+        Box::new(entrance::cloudflare::Cloudflare::new(&secrets)),
+        Box::new(entrance::vpndns::Vpn::new(&secrets)),
+        Box::new(entrance::Vps),
+    ]))
 }
 
 fn run_approve(args: &[String]) -> Result<()> {

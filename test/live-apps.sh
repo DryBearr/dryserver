@@ -189,7 +189,7 @@ echo "== the ways in from outside"
 out=$(screen "blog" "o" "Your VPS +not set up" "a" "n new app" "" 2>&1)
 check "o goes to the Outside screen" grep -q "Cloudflare Tunnel .*not set up" <<<"$out"
 check "a comes back to the apps" grep -Eq "Your VPS.*n new app" <<<"$(tr '\n' ' ' <<<"$out")"
-out=$(SCREEN=outside screen "Your VPS +not set up" "j" "▌ · Your VPS" "x" "nothing to close" "" 2>&1)
+out=$(SCREEN=outside screen "Your VPS +not set up" "j" "▌ · VPN" "j" "▌ · Your VPS" "x" "nothing to close" "" 2>&1)
 check "./dryserver outside opens it directly" grep -q "Your VPS is not set up; there is nothing to close" <<<"$out"
 check "both screens share one connection" test "$(masters)" -eq 1
 

@@ -19,7 +19,8 @@
 #   test/qemu-lan.sh server NAME N    a server on switch socket N (1, 2, 3)
 #
 # SSH from this computer: the coordinator is 127.0.0.1:2201, server N is
-# 127.0.0.1:220(N+1). No window: QMP socket at DIR/vm-NAME.qmp, PID in
+# 127.0.0.1:220(N+1). Server N's UDP port 51821 (the VPN's, docs/vpn.md) is
+# 127.0.0.1:5182N here, which a VM reaches at 10.0.2.2:5182N. No window: QMP socket at DIR/vm-NAME.qmp, PID in
 # DIR/vm-NAME.pid. Once something is installed on the disk, the VM boots
 # from the disk. Nothing of this reaches your real network.
 #
@@ -70,7 +71,7 @@ server)
     n=${3:?switch socket number: 1, 2 or 3}
     [[ $n == [123] ]] || { echo "socket number must be 1, 2 or 3" >&2; exit 1; }
     args+=(
-        -netdev "user,id=router,hostfwd=tcp:127.0.0.1:220$((n + 1))-:22,guestfwd=tcp:10.0.2.100:22-cmd:nc 127.0.0.1 2201"
+        -netdev "user,id=router,hostfwd=tcp:127.0.0.1:220$((n + 1))-:22,hostfwd=udp:127.0.0.1:5182$n-:51821,guestfwd=tcp:10.0.2.100:22-cmd:nc 127.0.0.1 2201"
         -device "virtio-net-pci,netdev=router,mac=$(mac "$name-router")"
         -netdev "socket,id=sw,connect=127.0.0.1:1670$n"
         -device "virtio-net-pci,netdev=sw,mac=$(mac "$name-switch")"

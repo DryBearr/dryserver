@@ -30,7 +30,7 @@ use crate::{bail, errf};
 /// Larger than any app file needs.
 pub const MAX_LEN: usize = 64 << 10;
 
-const KEYS: [&str; 6] = ["NAME", "IMAGE", "PORT", "COPIES", "HOST", "ENTRANCE"];
+const KEYS: [&str; 12] = ["NAME", "IMAGE", "REPO", "BRANCH", "PORT", "COPIES", "HOST", "ENTRANCE", "ENV", "SECRET", "MEMORY", "CPU"];
 
 /// Reads an app file. Errors name the line.
 pub fn parse(text: &str) -> Result<App> {
@@ -42,6 +42,9 @@ pub fn parse(text: &str) -> Result<App> {
     let mut one: std::collections::BTreeMap<&str, (String, usize)> = std::collections::BTreeMap::new();
     // (name, port as written, line)
     let mut hosts: Vec<(String, Option<u16>, usize)> = Vec::new();
+    // (name, value, line)
+    let mut env: Vec<(String, String, usize)> = Vec::new();
+    let mut secrets: Vec<(String, usize)> = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let n = i + 1;
         let line = raw.trim();
@@ -56,7 +59,44 @@ pub fn parse(text: &str) -> Result<App> {
             let hint = if key == "HOSTS" { " (one HOST= per line, or several names after one HOST=)" } else { "" };
             bail!("line {n}: {} is not a key of an app file{hint}; the keys are {}", k.trim(), KEYS.join(", "));
         };
+        // A setting's value is taken as written, # and all: only a pair of
+        // quotes around it is dropped (to keep spaces at its ends).
+        if *key == "ENV" {
+            let v = v.trim();
+            let Some((name, value)) = v.split_once('=') else {
+                bail!("line {n}: ENV: NAME=value after it, like ENV=NODE_ENV=production");
+            };
+            let name = name.trim();
+            apps::valid_env_name(name).map_err(|e| errf!("line {n}: ENV: {e}"))?;
+            let value = value.trim();
+            let value = match (value.chars().next(), value.chars().last()) {
+                (Some(q @ ('"' | '\'')), Some(e)) if value.len() >= 2 && q == e => &value[1..value.len() - 1],
+                _ => value,
+            };
+            if let Some((_, _, first)) = env.iter().find(|(k, _, _)| k == name) {
+                bail!("line {n}: ENV: {name} is set twice (line {first} first)");
+            }
+            env.push((name.to_string(), value.to_string(), n));
+            continue;
+        }
         let value = unquote(strip_comment(v.trim())).map_err(|e| errf!("line {n}: {key}: {e}"))?;
+        if *key == "SECRET" {
+            let names: Vec<&str> = value.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).collect();
+            if names.is_empty() {
+                bail!("line {n}: SECRET: a name after the =, like SECRET=DATABASE_URL (its value: dryserver app secret APP DATABASE_URL)");
+            }
+            for name in names {
+                if let Some((k, _)) = name.split_once('=') {
+                    bail!("line {n}: SECRET: only the name goes in the app file; its value: dryserver app secret APP {k}");
+                }
+                apps::valid_env_name(name).map_err(|e| errf!("line {n}: SECRET: {e}"))?;
+                if let Some((_, first)) = secrets.iter().find(|(k, _)| k == name) {
+                    bail!("line {n}: SECRET: {name} is listed twice (line {first} first)");
+                }
+                secrets.push((name.to_string(), n));
+            }
+            continue;
+        }
         if *key == "HOST" {
             if value.is_empty() {
                 bail!("line {n}: HOST: a name after the =, like HOST=shop.example.com");
@@ -94,11 +134,32 @@ pub fn parse(text: &str) -> Result<App> {
     let need = |k: &str, example: &str| get(k).ok_or_else(|| errf!("{k} is missing: add a line like {k}={example}"));
     let (name, line) = need("NAME", "shop")?;
     apps::valid_app_name(name).map_err(|e| errf!("line {line}: NAME: {e}"))?;
-    let (image, line) = need("IMAGE", "ghcr.io/you/shop:v1")?;
+    // Built by GitHub (REPO), or an image (IMAGE): one or the other.
+    let source = match (get("REPO"), get("IMAGE"), get("BRANCH")) {
+        (Some((_, rline)), Some((_, iline)), _) => {
+            bail!("line {iline}: IMAGE: an app with REPO (line {rline}) runs what GitHub builds; leave IMAGE out")
+        }
+        (Some((repo, line)), None, branch) => Some(
+            crate::github::Source::parse(repo, branch.map(|(b, _)| b).unwrap_or("main"))
+                .map_err(|e| errf!("line {line}: REPO/BRANCH: {e}"))?,
+        ),
+        (None, _, Some((_, line))) => bail!("line {line}: BRANCH: only with REPO (the repository GitHub builds the app from)"),
+        (None, _, None) => None,
+    };
+    let image_owned = source.as_ref().map(|s| s.image());
+    let (image, line) = match &image_owned {
+        Some(i) => (i.as_str(), 0),
+        None => need("IMAGE", "ghcr.io/you/shop:v1 (or REPO=github.com/you/shop)")?,
+    };
     apps::valid_image(image).map_err(|e| errf!("line {line}: IMAGE: {e}"))?;
-    let (port, line) = need("PORT", "8080")?;
-    let port =
-        port.parse::<u16>().ok().filter(|p| *p > 0).ok_or_else(|| errf!("line {line}: PORT: the port the app listens on, 1 to 65535"))?;
+    let (port, line) = need("PORT", "8080 (or none, for an app that listens on no port)")?;
+    let port = if port.eq_ignore_ascii_case("none") {
+        apps::NO_PORT
+    } else {
+        port.parse::<u16>().ok().filter(|p| *p > 0).ok_or_else(|| {
+            errf!("line {line}: PORT: the port the app listens on, 1 to 65535, or none (a bot or a worker that takes no connections)")
+        })?
+    };
     let copies = match get("COPIES") {
         None => 1,
         Some((c, line)) => c.parse::<u32>().ok().filter(|c| (1..=20).contains(c)).ok_or_else(|| errf!("line {line}: COPIES: 1 to 20"))?,
@@ -111,6 +172,37 @@ pub fn parse(text: &str) -> Result<App> {
             e
         }
     };
+    for (k, _, line) in &env {
+        if let Some((_, first)) = secrets.iter().find(|(s, _)| s == k) {
+            bail!("line {line}: ENV: {k} is a SECRET too (line {first}): one or the other");
+        }
+    }
+    let memory_mib = match get("MEMORY") {
+        None => apps::DEFAULT_MEMORY_MIB,
+        Some((m, line)) => apps::parse_memory(m).map_err(|e| errf!("line {line}: MEMORY: {e}"))?,
+    };
+    let cpu_milli = match get("CPU") {
+        None => apps::DEFAULT_CPU_MILLI,
+        Some((c, line)) => apps::parse_cpu(c).map_err(|e| errf!("line {line}: CPU: {e}"))?,
+    };
+    if let Some((k, v, line)) = env.iter().find(|(k, _, _)| k == "PORT")
+        && port != apps::NO_PORT
+    {
+        if *v != port.to_string() {
+            bail!("line {line}: ENV: {k} is {v}, but PORT is {port}: they must agree (dryserver sets PORT for the app by itself)");
+        }
+        // The same as dryserver sets: one line less to compare.
+        env.retain(|(k, _, _)| k != "PORT");
+    }
+    let mut run = apps::Runtime {
+        env: env.into_iter().map(|(k, v, _)| (k, v)).collect(),
+        secrets: secrets.into_iter().map(|(k, _)| k).collect(),
+        memory_mib,
+        cpu_milli,
+        secrets_version: String::new(),
+    };
+    run.env.sort();
+    run.secrets.sort();
     let mut app = App {
         name: name.into(),
         image: image.into(),
@@ -119,6 +211,9 @@ pub fn parse(text: &str) -> Result<App> {
         entrance,
         copies,
         image_id: String::new(),
+        run,
+        source,
+        gh: Default::default(),
     };
     app.hosts.sort();
     app.validate()?;
@@ -153,7 +248,17 @@ fn unquote(v: &str) -> Result<String> {
 /// parse.
 pub fn render(app: &App) -> String {
     let mut s = String::from("# A dryserver app. Change it, then: dryserver app deploy THIS-FILE\n");
-    s += &format!("NAME={}\nIMAGE={}\nPORT={}\nCOPIES={}\n", app.name, app.image, app.port, app.copies);
+    let port = if app.port == apps::NO_PORT { "none".to_string() } else { app.port.to_string() };
+    match &app.source {
+        Some(src) => {
+            s += &format!("NAME={}\nREPO={}\n", app.name, src.text());
+            if src.branch != "main" {
+                s += &format!("BRANCH={}\n", src.branch);
+            }
+            s += &format!("PORT={port}\nCOPIES={}\n", app.copies);
+        }
+        None => s += &format!("NAME={}\nIMAGE={}\nPORT={port}\nCOPIES={}\n", app.name, app.image, app.copies),
+    }
     let mut hosts = app.hosts.clone();
     hosts.sort();
     for h in &hosts {
@@ -165,6 +270,20 @@ pub fn render(app: &App) -> String {
     }
     if !hosts.is_empty() && app.entrance != entrance::DEFAULT {
         s += &format!("ENTRANCE={}\n", app.entrance);
+    }
+    s += &format!("MEMORY={}\nCPU={}\n", apps::memory_text(app.run.memory_mib), apps::cpu_text(app.run.cpu_milli));
+    for (k, v) in &app.run.env {
+        // Quoted when its ends are spaces or quotes, so it reads back the same.
+        let quote = v.starts_with(char::is_whitespace) || v.ends_with(char::is_whitespace) || v.starts_with(['"', '\'']);
+        if quote {
+            let q = if v.contains('"') { '\'' } else { '"' };
+            s += &format!("ENV={k}={q}{v}{q}\n");
+        } else {
+            s += &format!("ENV={k}={v}\n");
+        }
+    }
+    for k in &app.run.secrets {
+        s += &format!("SECRET={k}\n");
     }
     s
 }
@@ -212,7 +331,71 @@ mod tests {
         assert_eq!(parse(&render(&small)).unwrap(), small);
         let vps = parse("NAME=game\nIMAGE=g:1\nPORT=80\nHOST=play.example.com\nENTRANCE=VPS\n").unwrap();
         assert_eq!(vps.entrance, "vps");
-        assert!(render(&vps).ends_with("ENTRANCE=vps\n"));
+        assert!(render(&vps).contains("\nENTRANCE=vps\n"));
+    }
+
+    #[test]
+    fn settings_secrets_and_limits() {
+        let a = parse(
+            "NAME=shop\nIMAGE=shop:v1\nPORT=3000\n\
+             ENV=API_URL=https://api.example.com/v1?a=1&b=2#top\n\
+             ENV = GREETING = \"  hello # world  \"\n\
+             env=NODE_ENV=production\n\
+             ENV=EMPTY=\n\
+             SECRET=DATABASE_URL, STRIPE_KEY\n\
+             SECRET=TOKEN   # the bot's token\n\
+             MEMORY=1Gi\nCPU=500m\n",
+        )
+        .unwrap();
+        assert_eq!(
+            a.run.env,
+            vec![
+                ("API_URL".to_string(), "https://api.example.com/v1?a=1&b=2#top".to_string()),
+                ("EMPTY".to_string(), String::new()),
+                ("GREETING".to_string(), "  hello # world  ".to_string()),
+                ("NODE_ENV".to_string(), "production".to_string()),
+            ]
+        );
+        assert_eq!(a.run.secrets, vec!["DATABASE_URL", "STRIPE_KEY", "TOKEN"]);
+        assert_eq!((a.run.memory_mib, a.run.cpu_milli), (1024, 500));
+        let text = render(&a);
+        assert_eq!(parse(&text).unwrap(), a, "{text}");
+        assert!(text.contains("ENV=GREETING=\"  hello # world  \"\n") && text.contains("MEMORY=1Gi\nCPU=500m\n"), "{text}");
+        // The defaults.
+        let d = parse("NAME=shop\nIMAGE=shop:v1\nPORT=3000\n").unwrap();
+        assert_eq!((d.run.memory_mib, d.run.cpu_milli, d.run.env.len(), d.run.secrets.len()), (512, 1000, 0, 0));
+        let base = "NAME=shop\nIMAGE=shop:v1\nPORT=3000\n";
+        for (text, why) in [
+            (format!("{base}ENV=NOVALUE\n"), "line 4: ENV: NAME=value after it"),
+            (format!("{base}ENV=1BAD=x\n"), "not starting with a digit"),
+            (format!("{base}ENV=A-B=x\n"), "letters, digits and _"),
+            (format!("{base}ENV=A=1\nENV=A=2\n"), "line 5: ENV: A is set twice (line 4 first)"),
+            (format!("{base}ENV=TOKEN=x\nSECRET=TOKEN\n"), "TOKEN is a SECRET too"),
+            (format!("{base}SECRET=\n"), "a name after the ="),
+            (format!("{base}SECRET=A\nSECRET=A\n"), "A is listed twice"),
+            (format!("{base}SECRET=TOKEN=abc\n"), "only the name goes in the app file; its value: dryserver app secret APP TOKEN"),
+            (format!("{base}SECRET=to-ken\n"), "letters, digits and _"),
+            (format!("{base}ENV=PORT=8080\n"), "they must agree"),
+            (format!("{base}MEMORY=lots\n"), "line 4: MEMORY"),
+            (format!("{base}MEMORY=100Gi\n"), "from 32Mi"),
+            (format!("{base}CPU=99\n"), "line 4: CPU"),
+            (format!("{base}MEMORY=1Gi\nMEMORY=2Gi\n"), "MEMORY is set twice"),
+        ] {
+            let e = parse(&text).unwrap_err().to_string();
+            assert!(e.contains(why), "{text:?}: {e}");
+        }
+        // The app's own PORT setting, when it agrees, is fine.
+        // ... and is one line less to compare: dryserver sets the same.
+        assert!(parse(&format!("{base}ENV=PORT=3000\n")).unwrap().run.env.is_empty());
+        // A bot or a worker listens on no port, and has no public names.
+        let bot = parse("NAME=bot\nIMAGE=bot:1\nPORT=none\nSECRET=TOKEN\n").unwrap();
+        assert_eq!(bot.port, apps::NO_PORT);
+        assert!(render(&bot).contains("PORT=none\n"));
+        assert_eq!(parse(&render(&bot)).unwrap(), bot);
+        let e = parse("NAME=bot\nIMAGE=bot:1\nPORT=None\nHOST=bot.example.com\n").unwrap_err().to_string();
+        assert!(e.contains("listens on no port has no public names"), "{e}");
+        let e = parse("NAME=bot\nIMAGE=bot:1\nPORT=0\n").unwrap_err().to_string();
+        assert!(e.contains("or none"), "{e}");
     }
 
     #[test]

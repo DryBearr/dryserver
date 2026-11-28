@@ -208,6 +208,16 @@ fn form_may_change(app: &App, now: &Overview) -> Result<()> {
         format!("it has {} public names", r.hosts.len())
     } else if r.hosts.iter().any(|h| h.port != r.port) {
         "its public name leads to a port of its own".to_string()
+    } else if r.port == crate::apps::NO_PORT {
+        "it listens on no port (PORT=none)".to_string()
+    } else if r.gh.source.is_some() {
+        "GitHub builds it".to_string()
+    } else if !r.run.env.is_empty() || !r.run.secrets.is_empty() {
+        "it has settings (ENV or SECRET lines)".to_string()
+    } else if ![0, crate::apps::DEFAULT_MEMORY_MIB].contains(&r.run.memory_mib)
+        || ![0, crate::apps::DEFAULT_CPU_MILLI].contains(&r.run.cpu_milli)
+    {
+        "it has limits of its own (MEMORY or CPU)".to_string()
     } else {
         return Ok(());
     };
@@ -288,6 +298,7 @@ impl Draft {
     }
 
     fn app(&self) -> App {
+        // The form checked it: 1 to 65535 (PORT=none takes an app file).
         let port = self.port.trim().parse().unwrap_or(0);
         // The form checked it; what is left is the name as DNS has it.
         let host = apps::clean_host(&self.host).unwrap_or_else(|_| self.host.trim().to_ascii_lowercase());
@@ -299,6 +310,9 @@ impl Draft {
             entrance: self.entrance.clone(),
             copies: if self.copies.trim().is_empty() { 1 } else { self.copies.trim().parse().unwrap_or(0) },
             image_id: String::new(),
+            run: apps::Runtime::default(),
+            source: None,
+            gh: Default::default(),
         }
     }
 }

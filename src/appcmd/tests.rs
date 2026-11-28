@@ -24,7 +24,7 @@ fn listing(apps: &[Listed], mark: &str) -> String {
     ];
     for (name, port, hosts) in apps {
         items.push(format!(
-            r#"{{"kind":"Deployment","metadata":{{"name":"{name}","namespace":"apps","labels":{{"app":"{name}"}},"annotations":{{"dryserver/format":"2"}}}},"spec":{{"replicas":1,"template":{{"spec":{{"containers":[{{"image":"{name}:v1","ports":[{{"containerPort":{port}}}]}}]}}}}}},"status":{{"readyReplicas":1}}}}"#
+            r#"{{"kind":"Deployment","metadata":{{"name":"{name}","namespace":"apps","labels":{{"app":"{name}"}},"annotations":{{"dryserver/format":"2"}}}},"spec":{{"replicas":1,"template":{{"spec":{{"containers":[{{"image":"{name}:v1","ports":[{{"containerPort":{port}}}],"resources":{{"limits":{{"memory":"512Mi","cpu":"1"}}}}}}]}}}}}},"status":{{"readyReplicas":1}}}}"#
         ));
         items.push(format!(
             r#"{{"kind":"Pod","metadata":{{"name":"{name}-1","namespace":"apps","labels":{{"app":"{name}"}}}},"spec":{{"nodeName":"node-a"}}}}"#
@@ -128,7 +128,7 @@ impl World {
 
     fn deploy(&self, file: &str, opts: Opts, yes: bool) -> (String, Result<()>) {
         let app = appfile::parse(file).unwrap();
-        let (out, _, res) = self.run(yes, |ctx, c, d, io| deploy(ctx, c, d, None, &app, &opts, io));
+        let (out, _, res) = self.run(yes, |ctx, c, d, io| deploy(ctx, c, d, None, None, &app, &opts, io));
         (out, res)
     }
 }
@@ -173,7 +173,7 @@ fn deploy_shows_first_then_makes_exactly_that() {
     assert_eq!(w.routed(), w.dns());
 
     // The same file again: nothing to change, nothing asked.
-    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, None, &appfile::parse(SHOP).unwrap(), &Opts::default(), io));
+    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, None, None, &appfile::parse(SHOP).unwrap(), &Opts::default(), io));
     res.unwrap();
     assert_eq!(out, "shop: nothing to change (applied again, as the file says).\n");
     assert_eq!(w.applies(), 2, "applied again: what was changed by hand is put back");
@@ -407,7 +407,7 @@ fn remove_says_what_goes() {
 fn a_newer_dryserver_is_left_alone() {
     let w = World::new();
     let newer =
-        listing(&[("shop", 80, &[("shop.example.com", 80)])], &w.mark).replace("\"dryserver/format\":\"2\"", "\"dryserver/format\":\"3\"");
+        listing(&[("shop", 80, &[("shop.example.com", 80)])], &w.mark).replace("\"dryserver/format\":\"2\"", "\"dryserver/format\":\"99\"");
     *w.cluster.listing.lock().unwrap() = newer;
     let (_, res) = w.deploy("NAME=blog\nIMAGE=b:1\nPORT=80\nHOST=blog.example.com\n", Opts::default(), true);
     assert!(res.unwrap_err().to_string().contains("shop was set up by a newer dryserver"));
@@ -515,29 +515,29 @@ fn an_image_of_your_own_goes_to_the_servers_first() {
     let file = "NAME=shop\nIMAGE=localhost/shop:v1\nPORT=80\n";
     let app = appfile::parse(file).unwrap();
     // Without a way to the servers: refused, nothing sent.
-    let (_, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, None, &app, &Opts::default(), io));
+    let (_, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, None, None, &app, &Opts::default(), io));
     assert!(res.unwrap_err().to_string().contains("cannot reach your servers"));
     // Asked first; no: nothing copied, nothing applied.
-    let (out, _, res) = w.run(false, |ctx, c, d, io| deploy(ctx, c, d, Some(&own), &app, &Opts::default(), io));
+    let (out, _, res) = w.run(false, |ctx, c, d, io| deploy(ctx, c, d, Some(&own), None, &app, &Opts::default(), io));
     res.unwrap();
     assert!(out.contains("  localhost/shop:v1 (30 MB): copy it to node-a") && out.contains("Nothing changed."), "{out}");
     assert!(servers.sent.lock().unwrap().is_empty() && w.applies() == 0);
     // Yes: copied, loaded, then applied with that build and never pulled.
     *w.cluster.after_apply.lock().unwrap() = vec![("localhost/shop:v1".into(), runs_own(&w, "shop", "localhost/shop:v1", ID))];
-    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own), &app, &Opts::default(), io));
+    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own), None, &app, &Opts::default(), io));
     res.unwrap();
     assert!(out.contains("node-a: has localhost/shop:v1.") && out.contains("shop: applied."), "{out}");
     let m = w.last_manifest();
     assert!(m.contains("imagePullPolicy: Never") && m.contains(&format!("dryserver/image-id: \"{ID}\"")), "{m}");
     // The same build again: nothing to copy, nothing to change.
-    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own), &app, &Opts::default(), io));
+    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own), None, &app, &Opts::default(), io));
     res.unwrap();
     assert!(out.contains("nothing to change"), "{out}");
     assert_eq!(servers.sent.lock().unwrap().len(), 1);
     // Built again under the same tag: copied, and the copies replaced.
     let desk2 = FakeDesk::with(ID2, "amd64");
     let own2 = Own { desk: &desk2, servers: &servers };
-    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own2), &app, &Opts::default(), io));
+    let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own2), None, &app, &Opts::default(), io));
     res.unwrap();
     assert!(out.contains("  image   localhost/shop:v1 rebuilt: 111111111111 -> 222222222222"), "{out}");
     assert!(out.contains("Its copies are replaced one at a time"), "{out}");
@@ -547,7 +547,7 @@ fn an_image_of_your_own_goes_to_the_servers_first() {
     *servers.refuse.lock().unwrap() = Some("not enough room on this server's disk".into());
     let desk3 = FakeDesk::with(&format!("sha256:{}", "3".repeat(64)), "amd64");
     let own3 = Own { desk: &desk3, servers: &servers };
-    let (_, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own3), &app, &Opts::default(), io));
+    let (_, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own3), None, &app, &Opts::default(), io));
     let e = res.unwrap_err().to_string();
     assert!(e.contains("shop was not applied, nothing changed in the cluster") && e.contains("refused it: not enough room"), "{e}");
     assert_eq!(w.applies(), applied);
@@ -556,7 +556,7 @@ fn an_image_of_your_own_goes_to_the_servers_first() {
     *servers.refuse.lock().unwrap() = None;
     let other = FakeServers::with(&["node-b"]);
     let own4 = Own { desk: &desk3, servers: &other };
-    let (_, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own4), &app, &Opts::default(), io));
+    let (_, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, Some(&own4), None, &app, &Opts::default(), io));
     let e = res.unwrap_err().to_string();
     assert!(e.contains("node-a run apps but is not in your server list") && e.contains("dryserver ssh-config"), "{e}");
     assert!(other.sent.lock().unwrap().is_empty());
@@ -569,4 +569,385 @@ fn an_image_of_your_own_goes_to_the_servers_first() {
     assert!(out.contains("on every server already") && asked.is_empty(), "{out}");
     // Without a tag it is refused: say which build is meant.
     assert!(appfile::parse("NAME=shop\nIMAGE=localhost/shop\nPORT=80\n").is_err());
+}
+
+#[test]
+fn secrets_reach_the_app_and_never_a_command_line() {
+    let w = World::new();
+    let file = "NAME=shop\nIMAGE=shop:v1\nPORT=80\nENV=NODE_ENV=production\nSECRET=DATABASE_URL\n";
+    // No value yet: refused before anything changes.
+    let (_, res) = w.deploy(file, Opts::default(), true);
+    let e = res.unwrap_err().to_string();
+    assert!(e.contains("shop has no value for DATABASE_URL yet") && e.contains("dryserver app secret shop NAME"), "{e}");
+    assert_eq!(w.applies(), 0);
+    // Set it: the Secret is made, the value goes on stdin only.
+    let value = b"postgres://u:p@db.example.com/shop".to_vec();
+    let (out, _, res) = w.run(true, |ctx, c, _, io| secret(ctx, c, "shop", SecretOp::Set("DATABASE_URL".into(), value.clone()), io));
+    res.unwrap();
+    assert!(out.contains("DATABASE_URL is set for shop"), "{out}");
+    let calls = w.cluster.calls.lock().unwrap().clone();
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&value);
+    assert!(
+        calls.iter().any(|(a, m)| a == "apply -f -"
+            && m.contains("kind: Namespace")
+            && m.contains("kind: Secret")
+            && m.contains("name: \"app-shop\"")
+            && !m.contains("\ndata:")),
+        "{calls:?}"
+    );
+    let patch = calls.iter().find(|(a, _)| a.contains("patch secret app-shop")).unwrap();
+    assert!(patch.0.contains("--type merge --patch-file /dev/stdin -o go-template=") && patch.1.contains(&encoded), "{patch:?}");
+    assert!(calls.iter().all(|(a, _)| !a.contains("postgres") && !a.contains(&encoded)), "never in a command line");
+    // The cluster has it now: deploy goes ahead, the copies note its version.
+    w.cluster.answers.lock().unwrap().push(("get secret app-shop".into(), "77 DATABASE_URL".into()));
+    // Asked for its version and names, never its values.
+    w.cluster.answers.lock().unwrap().push(("patch secret app-shop".into(), "78".into()));
+    let (out, res) = w.deploy(file, Opts::default(), true);
+    res.unwrap();
+    assert!(out.contains("  ENV NODE_ENV") && out.contains("  SECRET DATABASE_URL"), "{out}");
+    let m = w.last_manifest();
+    assert!(
+        m.contains("secretKeyRef:\n                  name: \"app-shop\"\n                  key: \"DATABASE_URL\"")
+            && m.contains("dryserver/secrets: \"77\""),
+        "{m}"
+    );
+    // A new value for a secret the running app uses replaces its copies.
+    let running = listing(&[("shop", 80, &[])], &w.mark).replace(
+        r#""resources":{"limits":{"memory":"512Mi","cpu":"1"}}"#,
+        r#""resources":{"limits":{"memory":"512Mi","cpu":"1"}},"env":[{"name":"DATABASE_URL","valueFrom":{"secretKeyRef":{"name":"app-shop","key":"DATABASE_URL"}}}]"#,
+    );
+    *w.cluster.listing.lock().unwrap() = running;
+    let (out, _, res) = w.run(true, |ctx, c, _, io| secret(ctx, c, "shop", SecretOp::Set("DATABASE_URL".into(), b"new".to_vec()), io));
+    res.unwrap();
+    assert!(out.contains("shop replaces its copies one at a time"), "{out}");
+    let calls = w.cluster.calls.lock().unwrap().clone();
+    let bump = calls.iter().rev().find(|(a, _)| a.contains("patch deployment shop")).unwrap();
+    assert!(bump.1.contains("\"dryserver/secrets\":\"78\""), "the version after the change: {bump:?}");
+    assert!(
+        calls.iter().filter(|(a, _)| a.contains("secret app-shop") && !a.contains("patch")).all(|(a, _)| a.contains("go-template=")),
+        "values are never read: {calls:?}"
+    );
+    // Removing one it uses is refused; listing names, never values.
+    let (_, _, res) = w.run(true, |ctx, c, _, io| secret(ctx, c, "shop", SecretOp::Remove("DATABASE_URL".into()), io));
+    assert!(res.unwrap_err().to_string().contains("shop uses DATABASE_URL"));
+    let (out, _, res) = w.run(true, |ctx, c, _, io| secret(ctx, c, "shop", SecretOp::List, io));
+    res.unwrap();
+    assert_eq!(out, "DATABASE_URL\n");
+    // Values that make no sense are refused before anything is sent.
+    let before = w.cluster.calls.lock().unwrap().len();
+    for (k, v, why) in [
+        ("DATABASE_URL", vec![], "an empty value"),
+        ("bad-name", b"x".to_vec(), "letters, digits"),
+        ("BIG", vec![b'x'; MAX_SECRET + 1], "at most 64 KiB"),
+    ] {
+        let (_, _, res) = w.run(true, |ctx, c, _, io| secret(ctx, c, "shop", SecretOp::Set(k.into(), v.clone()), io));
+        assert!(res.unwrap_err().to_string().contains(why), "{k}");
+    }
+    assert!(w.cluster.calls.lock().unwrap()[before..].iter().all(|(a, _)| !a.contains("patch")));
+    // Removing the app says its secrets go too.
+    let (out, _, _) = w.run(false, |ctx, c, d, io| remove(ctx, c, d, "shop", &Opts::default(), io));
+    assert!(out.contains("its secrets are deleted from the cluster"), "{out}");
+}
+
+#[test]
+fn only_names_are_read_of_a_secret() {
+    let s = secrets_of("4711 DATABASE_URL TOKEN TOKEN bad-name");
+    assert_eq!((s.version.as_str(), s.keys), ("4711", vec!["DATABASE_URL".to_string(), "TOKEN".to_string()]));
+    assert_eq!(secrets_of(""), Secrets::default());
+    assert_eq!(secrets_of("12;rm"), Secrets::default());
+}
+
+#[test]
+fn what_changes_in_settings_and_limits() {
+    let b = Running {
+        name: "shop".into(),
+        image: "shop:v1".into(),
+        port: 80,
+        run: apps::Runtime {
+            env: vec![("A".into(), "1".into()), ("B".into(), "2".into())],
+            secrets: vec!["S1".into()],
+            memory_mib: 0,
+            cpu_milli: 0,
+            secrets_version: "5".into(),
+        },
+        ..Running::default()
+    };
+    let mut a =
+        appfile::parse("NAME=shop\nIMAGE=shop:v1\nPORT=80\nENV=A=1\nENV=B=3\nENV=C=4\nSECRET=S2\nMEMORY=256Mi\nCPU=250m\n").unwrap();
+    a.run.secrets_version = "6".into();
+    let (lines, restart) = app_changes(Some(&b), &a);
+    let text = lines.join("\n");
+    for want in [
+        "limits  no limit -> 256Mi memory, 250m CPU",
+        "~ ENV B (new value)",
+        "+ ENV C",
+        "+ SECRET S2",
+        "- SECRET S1",
+        "replaced one at a time",
+    ] {
+        assert!(text.contains(want), "missing {want:?}:\n{text}");
+    }
+    assert!(restart && !text.contains("ENV A"), "{text}");
+    // Same settings, only the secret values moved on.
+    let same = Running {
+        run: apps::Runtime {
+            env: a.run.env.clone(),
+            secrets: a.run.secrets.clone(),
+            memory_mib: 256,
+            cpu_milli: 250,
+            secrets_version: "5".into(),
+        },
+        ..b
+    };
+    let (lines, restart) = app_changes(Some(&same), &a);
+    assert!(restart && lines.iter().any(|l| l.contains("a value changed since the copies started")), "{lines:?}");
+}
+
+mod from_github {
+    use super::*;
+    use crate::github::tests::{DIGEST, DIGEST2, OneProof, SHA, SaysGood, claims, fake_keys, fake_proof};
+    use crate::github::{self as g, Found};
+    use std::sync::Mutex;
+
+    const TOKEN: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+
+    fn proof_of(digest: &str, run: i64) -> Found {
+        let mut c = claims();
+        c["aud"] = format!("{}{digest}", g::AUDIENCE).into();
+        c["run_number"] = run.to_string().into();
+        Found { digest: digest.into(), proof: fake_proof(&c) }
+    }
+
+    /// Deploys file with the registry holding reg, as the CLI would.
+    fn deploy_gh(
+        w: &World,
+        file: &str,
+        reg: Option<std::result::Result<Option<Found>, String>>,
+        token: Option<&str>,
+    ) -> (String, Result<()>) {
+        let app = appfile::parse(file).unwrap();
+        let keys = fake_keys();
+        let make = |_: String| -> Box<dyn g::Registry> { Box::new(OneProof(Mutex::new(reg.clone().map(|r| r.map_err(|e| errf!("{e}")))))) };
+        let gh = GitHub { token: token.map(String::from), make: &make, keys: &keys, rsa: &SaysGood };
+        let (out, _, res) = w.run(true, |ctx, c, d, io| deploy(ctx, c, d, None, Some(&gh), &app, &Opts::default(), io));
+        (out, res)
+    }
+
+    /// The cluster runs shop, built from You/Shop main, image digest.
+    fn running(w: &World, digest: &str, ann: serde_json::Value) {
+        let mut l: serde_json::Value = serde_json::from_str(&listing(&[("shop", 80, &[])], &w.mark)).unwrap();
+        for it in l["items"].as_array_mut().unwrap() {
+            if it["kind"] == "Deployment" && it["metadata"]["name"] == "shop" {
+                it["spec"]["template"]["spec"]["containers"][0]["image"] = format!("ghcr.io/you/shop@{digest}").into();
+                let a = it["metadata"]["annotations"].as_object_mut().unwrap();
+                a.insert(g::A_REPO.into(), "You/Shop".into());
+                a.insert(g::A_BRANCH.into(), "main".into());
+                for (k, v) in ann.as_object().unwrap() {
+                    a.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        *w.cluster.listing.lock().unwrap() = l.to_string();
+    }
+
+    const FILE: &str = "NAME=shop\nREPO=github.com/You/Shop\nPORT=80\n";
+
+    #[test]
+    fn the_newest_proved_build_starts() {
+        let w = World::new();
+        // No token here: said how to get one; nothing sent.
+        let (_, res) = deploy_gh(&w, FILE, Some(Ok(Some(proof_of(DIGEST, 1000)))), None);
+        assert!(res.unwrap_err().to_string().contains("dryserver app github token"));
+        // No build yet: said what to do.
+        let (_, res) = deploy_gh(&w, FILE, Some(Ok(None)), Some(TOKEN));
+        let e = res.unwrap_err().to_string();
+        assert!(e.contains("no build of main on GitHub yet") && e.contains("dryserver app github init"), "{e}");
+        // A proof for another branch: refused, nothing applied.
+        let mut bad = claims();
+        bad["ref"] = "refs/heads/dev".into();
+        let (_, res) = deploy_gh(&w, FILE, Some(Ok(Some(Found { digest: DIGEST.into(), proof: fake_proof(&bad) }))), Some(TOKEN));
+        assert!(res.unwrap_err().to_string().contains("the branch refs/heads/dev"));
+        assert_eq!(w.applies(), 0);
+        // The newest build: its image by digest, where it came from, the
+        // token for the servers, and a note while the coordinator does not
+        // follow GitHub yet.
+        let (out, res) = deploy_gh(&w, FILE, Some(Ok(Some(proof_of(DIGEST, 1000)))), Some(TOKEN));
+        res.unwrap();
+        assert!(out.contains("start it: build 0123456 of main (github.com/You/Shop)"), "{out}");
+        assert!(out.contains("the coordinator does not follow GitHub yet"), "{out}");
+        let m = w.last_manifest();
+        for want in [
+            &format!("image: \"ghcr.io/you/shop@{DIGEST}\""),
+            "imagePullSecrets:\n        - name: dryserver-ghcr",
+            "dryserver/repo: \"You/Shop\"",
+            "dryserver/branch: \"main\"",
+            "dryserver/repo-id: \"123456\"",
+            "dryserver/run: \"1000\"",
+            &format!("dryserver/rolling: \"{DIGEST}\""),
+            &format!("dryserver/commit: \"{SHA}\""),
+        ] {
+            assert!(m.contains(want), "missing {want:?}:\n{m}");
+        }
+        let calls = w.cluster.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|(a, m)| *a == g::PULL_APPLY.join(" ") && m.contains("type: kubernetes.io/dockerconfigjson")));
+        assert!(calls.iter().all(|(a, _)| !a.contains(TOKEN)), "the token is never in a command line");
+    }
+
+    #[test]
+    fn a_running_build_is_kept_unless_a_newer_one_is_proved() {
+        let w = World::new();
+        let ann = serde_json::json!({g::A_RUN: "2000", g::A_COMMIT: SHA, g::A_REPO_ID: "123456"});
+        // The coordinator follows GitHub: no note.
+        w.cluster.answers.lock().unwrap().push((
+            "get configmap dryserver-github".into(),
+            serde_json::json!({"data": {"last": chrono::Utc::now().timestamp().to_string()}}).to_string(),
+        ));
+        // An older proof: the running build stays, nothing to change.
+        running(&w, DIGEST2, ann.clone());
+        let (out, res) = deploy_gh(&w, FILE, Some(Ok(Some(proof_of(DIGEST, 1500)))), Some(TOKEN));
+        res.unwrap();
+        assert!(out.contains("nothing to change") && !out.contains("does not follow"), "{out}");
+        assert!(out.contains("(run 1500) is older than the running one (run 2000)"), "a run of before, run again: {out}");
+        assert!(w.last_manifest().contains(&format!("ghcr.io/you/shop@{DIGEST2}")));
+        // GitHub down: the running build stays, and it is said.
+        let (out, res) = deploy_gh(&w, &format!("{FILE}COPIES=2\n"), Some(Err("no answer from ghcr.io".into())), Some(TOKEN));
+        res.unwrap();
+        assert!(out.contains("GitHub's newest build was not taken (no answer from ghcr.io); the running build stays"), "{out}");
+        // A newer one: deployed, the running one into the history.
+        let (out, res) = deploy_gh(&w, FILE, Some(Ok(Some(proof_of(DIGEST, 3000)))), Some(TOKEN));
+        res.unwrap();
+        assert!(out.contains("build   0123456 -> 0123456 of main"), "{out}");
+        let m = w.last_manifest();
+        assert!(
+            m.contains(&format!("ghcr.io/you/shop@{DIGEST}"))
+                && m.contains(&format!("dryserver/history: \"2000@{}@{SHA}\"", DIGEST2.trim_start_matches("sha256:"))),
+            "{m}"
+        );
+        // Held back (after a rollback): not deployed.
+        running(&w, DIGEST2, serde_json::json!({g::A_RUN: "1000", g::A_HOLD: "3000", g::A_COMMIT: SHA}));
+        let (out, res) = deploy_gh(&w, FILE, Some(Ok(Some(proof_of(DIGEST, 3000)))), Some(TOKEN));
+        res.unwrap();
+        assert!(out.contains("nothing to change"), "{out}");
+        // Another repository number: refused.
+        running(&w, DIGEST2, serde_json::json!({g::A_RUN: "1000", g::A_REPO_ID: "42", g::A_COMMIT: SHA}));
+        let (out, res) = deploy_gh(&w, FILE, Some(Ok(Some(proof_of(DIGEST, 3000)))), Some(TOKEN));
+        res.unwrap();
+        assert!(out.contains("not taken") && out.contains("made anew") && w.last_manifest().contains(DIGEST2), "{out}");
+        // Another repository: remove first.
+        running(&w, DIGEST2, serde_json::json!({g::A_RUN: "1000"}));
+        let (_, res) = deploy_gh(&w, "NAME=shop\nREPO=github.com/someone/other\nPORT=80\n", Some(Ok(None)), Some(TOKEN));
+        assert!(res.unwrap_err().to_string().contains("remove it first"));
+    }
+
+    #[test]
+    fn what_the_coordinator_did_meanwhile_is_not_undone() {
+        let w = World::new();
+        running(&w, DIGEST2, serde_json::json!({g::A_RUN: "2000", g::A_COMMIT: SHA, g::A_REPO_ID: "123456"}));
+        // While the preview is read, the coordinator deploys build 2500.
+        let app = appfile::parse(&format!("{FILE}COPIES=2\n")).unwrap();
+        let keys = fake_keys();
+        let make = |_: String| -> Box<dyn g::Registry> { Box::new(OneProof(Mutex::new(Some(Ok(Some(proof_of(DIGEST, 3000))))))) };
+        let gh = GitHub { token: Some(TOKEN.into()), make: &make, keys: &keys, rsa: &SaysGood };
+        let mut out = Vec::new();
+        let mut ask = |_: &str| {
+            running(&w, DIGEST2, serde_json::json!({g::A_RUN: "2500", g::A_COMMIT: SHA, g::A_REPO_ID: "123456"}));
+            true
+        };
+        let res = deploy(
+            &Ctx::new(),
+            w.cluster.as_ref(),
+            &w.doors,
+            None,
+            Some(&gh),
+            &app,
+            &Opts::default(),
+            &mut Io { out: &mut out, ask: &mut ask },
+        );
+        assert!(res.unwrap_err().to_string().contains("the coordinator changed it while the preview was shown"));
+        assert_eq!(w.applies(), 0);
+    }
+
+    #[test]
+    fn a_build_with_new_settings_is_not_taken_back_by_itself() {
+        let w = World::new();
+        running(&w, DIGEST2, serde_json::json!({g::A_RUN: "2000", g::A_COMMIT: SHA, g::A_REPO_ID: "123456"}));
+        // Only the build changes: the coordinator follows it.
+        let (_, res) = deploy_gh(&w, FILE, Some(Ok(Some(proof_of(DIGEST, 3000)))), Some(TOKEN));
+        res.unwrap();
+        assert!(w.last_manifest().contains(&format!("dryserver/rolling: \"{DIGEST}\"")));
+        // A setting too: it could not tell which one failed.
+        let (out, res) = deploy_gh(&w, &format!("{FILE}ENV=MODE=new\n"), Some(Ok(Some(proof_of(DIGEST, 3000)))), Some(TOKEN));
+        res.unwrap();
+        assert!(!w.last_manifest().contains("dryserver/rolling"), "{}", w.last_manifest());
+        assert!(out.contains("settings change too, so if build 0123456 does not start"), "{out}");
+    }
+
+    #[test]
+    fn rollback_goes_back_and_holds_newer_builds() {
+        let w = World::new();
+        let history = format!("1000@{}@{}", DIGEST.trim_start_matches("sha256:"), "f".repeat(40));
+        running(&w, DIGEST2, serde_json::json!({g::A_RUN: "2000", g::A_COMMIT: SHA, g::A_HISTORY: history}));
+        let (out, asked, res) = w.run(true, |ctx, c, _, io| rollback(ctx, c, "shop", &Opts::default(), io));
+        res.unwrap();
+        assert_eq!(asked, vec!["Go back? [y/N] "]);
+        assert!(out.contains("back from build 0123456 to build fffffff of main") && out.contains("going back to build fffffff"), "{out}");
+        let calls = w.cluster.calls.lock().unwrap().clone();
+        let p = calls.iter().find(|(a, _)| a.contains("patch deployment shop --type strategic")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&p.1).unwrap();
+        let a = &v["metadata"]["annotations"];
+        assert_eq!((a[g::A_RUN].as_str(), a[g::A_HOLD].as_str(), a[g::A_HISTORY].as_str()), (Some("1000"), Some("2000"), Some("")));
+        assert_eq!(v["spec"]["template"]["spec"]["containers"][0]["image"], format!("ghcr.io/you/shop@{DIGEST}"));
+        // Nothing before: said.
+        running(&w, DIGEST2, serde_json::json!({g::A_RUN: "2000", g::A_COMMIT: SHA}));
+        let (_, _, res) = w.run(true, |ctx, c, _, io| rollback(ctx, c, "shop", &Opts::default(), io));
+        assert!(res.unwrap_err().to_string().contains("no build before 0123456"));
+        // Not built by GitHub: said.
+        w.runs(&[("shop", 80, &[])]);
+        let (_, _, res) = w.run(true, |ctx, c, _, io| rollback(ctx, c, "shop", &Opts::default(), io));
+        assert!(res.unwrap_err().to_string().contains("not built by GitHub"));
+    }
+
+    #[test]
+    fn the_workflow_goes_into_the_repository() {
+        let t = TempDir::new();
+        let mut out = Vec::new();
+        let mut ask = |_: &str| true;
+        let e = github_init(t.path(), "main", false, &mut Io { out: &mut out, ask: &mut ask }).unwrap_err();
+        assert!(e.to_string().contains("not a git repository"));
+        std::fs::create_dir_all(t.join(".git")).unwrap();
+        std::fs::write(t.join(".git/config"), "[remote \"origin\"]\n\turl = https://github.com/DryBearr/shop.git\n").unwrap();
+        github_init(t.path(), "main", false, &mut Io { out: &mut out, ask: &mut ask }).unwrap();
+        let text = String::from_utf8(std::mem::take(&mut out)).unwrap();
+        assert!(text.contains("REPO=github.com/DryBearr/shop (no IMAGE line)") && text.contains("protect main"), "{text}");
+        assert_eq!(std::fs::read_to_string(t.join(g::WORKFLOW)).unwrap(), g::workflow("main"));
+        // Again: there already. Changed by hand: refused unless forced.
+        github_init(t.path(), "main", false, &mut Io { out: &mut out, ask: &mut ask }).unwrap();
+        assert!(String::from_utf8(std::mem::take(&mut out)).unwrap().contains("is there already"));
+        std::fs::write(t.join(g::WORKFLOW), "mine").unwrap();
+        assert!(github_init(t.path(), "main", false, &mut Io { out: &mut out, ask: &mut ask }).unwrap_err().to_string().contains("-force"));
+        github_init(t.path(), "release/v2", true, &mut Io { out: &mut out, ask: &mut ask }).unwrap();
+        assert!(std::fs::read_to_string(t.join(g::WORKFLOW)).unwrap().contains("branches: [\"release/v2\"]"));
+        assert!(String::from_utf8(out).unwrap().contains("and BRANCH=release/v2"));
+        assert!(github_init(t.path(), "bad..name", true, &mut Io { out: &mut Vec::new(), ask: &mut ask }).is_err());
+    }
+
+    #[test]
+    fn app_files_of_apps_github_builds() {
+        let a = appfile::parse("NAME=shop\nREPO=https://github.com/You/Shop.git\nBRANCH=release/v2\nPORT=80\n").unwrap();
+        let src = a.source.clone().unwrap();
+        assert_eq!((src.full(), src.branch.as_str(), a.image.as_str()), ("You/Shop".into(), "release/v2", "ghcr.io/you/shop"));
+        let text = appfile::render(&a);
+        assert!(text.contains("REPO=github.com/You/Shop\nBRANCH=release/v2\n") && !text.contains("IMAGE"), "{text}");
+        assert_eq!(appfile::parse(&text).unwrap().source, a.source);
+        for (text, why) in [
+            ("NAME=shop\nREPO=you/shop\nIMAGE=x:1\nPORT=80\n", "leave IMAGE out"),
+            ("NAME=shop\nIMAGE=x:1\nBRANCH=main\nPORT=80\n", "only with REPO"),
+            ("NAME=shop\nREPO=gitlab.com/you/shop\nPORT=80\n", "a GitHub repository"),
+            ("NAME=shop\nREPO=you/shop\nBRANCH=a..b\nPORT=80\n", "a branch name"),
+        ] {
+            let e = appfile::parse(text).unwrap_err().to_string();
+            assert!(e.contains(why), "{text:?}: {e}");
+        }
+    }
 }

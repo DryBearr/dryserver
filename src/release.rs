@@ -807,7 +807,7 @@ mod tests {
             assert!(err.contains("bad signature"), "{ns}: {err}");
         }
         // A release signature on a member list does not make it one.
-        let list = signed::List { version: 9, members: vec![], rejected: vec![], keys: vec![], people: vec![] };
+        let list = signed::List { version: 9, members: vec![], rejected: vec![], keys: vec![], people: vec![], ..Default::default() };
         let list_doc = serde_json::to_string(&list).unwrap();
         let as_release = Envelope { doc: list_doc.clone(), sig: key.sign(NS_RELEASE, &list_doc).unwrap() };
         let err = as_release.list(&key, |_| true).unwrap_err().to_string();
@@ -1298,8 +1298,11 @@ mod tests {
 
         // A member list signed for real does not pass as a release, nor a
         // release as a member list.
-        let list =
-            signed::seal(&signer, &signed::List { version: 3, members: vec![], rejected: vec![], keys: vec![], people: vec![] }).unwrap();
+        let list = signed::seal(
+            &signer,
+            &signed::List { version: 3, members: vec![], rejected: vec![], keys: vec![], people: vec![], ..Default::default() },
+        )
+        .unwrap();
         assert!(check(&v, &list, None, BRAIN, now()).unwrap_err().to_string().contains("bad signature"));
         let as_list = Envelope { doc: list.doc.clone(), sig: signer.sign(NS_RELEASE, &list.doc).unwrap() };
         assert!(as_list.list(&v, |_| true).unwrap_err().to_string().contains("bad signature"));

@@ -156,6 +156,9 @@ pub struct Node {
 
 /// What k3s keeps for the control plane; only the coordinator has it.
 const K3S_SERVER_DIR: &str = "/var/lib/rancher/k3s/server";
+/// Where the coordinator keeps what it needs to follow GitHub (its copy
+/// of GitHub's keys).
+const GITHUB_STATE: &str = "/var/lib/dryserver-github";
 /// Where k3s on the coordinator keeps the token agents join with.
 pub const K3S_AGENT_TOKEN: &str = "/var/lib/rancher/k3s/server/agent-token";
 /// The cgroups of what k3s runs: its own helpers (containerd and the
@@ -1495,6 +1498,21 @@ impl Node {
                 }
                 Err(e) => eprintln!("dryserver: the people's accounts are not in place yet: {e}"),
             }
+            // The VPN for the admin's devices: this machine is its gateway
+            // or not, as the signed list says.
+            let here = crate::vpn::Here {
+                root: &self.root,
+                run: self.run.as_ref(),
+                name: &mine.name,
+                coordinator: me == 1,
+                mesh_port: self.cfg.wg_port.parse().unwrap_or(0),
+                key_file: PathBuf::from(WG_KEY),
+                tmp: self.tmp_dir.clone().unwrap_or_else(|| PathBuf::from("/run/dryserver")),
+            };
+            let st = here.reconcile(&Ctx::new().with_timeout(std::time::Duration::from_secs(20)), list.vpn.as_ref(), &list.devices);
+            if !st.problem.is_empty() {
+                eprintln!("dryserver: the VPN's gateway is not up: {}", st.problem);
+            }
         }
         let members: Vec<Member> = list
             .members
@@ -2144,7 +2162,7 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
         r.lan = n.cfg.coord_lan_ip.clone();
         n.sign_report(ctx, 1, &mut r);
         rep = r;
-        let hb = Heartbeat { lan_ip: n.cfg.coord_lan_ip.clone(), switch: sw, cuts, report: Some(rep.clone()) };
+        let hb = Heartbeat { lan_ip: n.cfg.coord_lan_ip.clone(), switch: sw, cuts, report: Some(rep.clone()) }.fitted();
         let read = store.update(|s| {
             s.heartbeat(1, hb, Time::now())?;
             Ok((s.members.clone(), s.signed.clone()))
@@ -2218,7 +2236,7 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
         r.lan = lan.clone();
         n.sign_report(ctx, host, &mut r);
         rep = r;
-        let hb = Heartbeat { lan_ip: lan, switch: sw, cuts, report: Some(rep.clone()) };
+        let hb = Heartbeat { lan_ip: lan, switch: sw, cuts, report: Some(rep.clone()) }.fitted();
         let fetched = match n.fetch_members(ctx, &hb) {
             Ok(f) => f,
             Err(e) => {
@@ -2249,6 +2267,8 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
                 members
             }
             Err(e) if e.is(Kind::Removed) => {
+                // Not the VPN's gateway any more either.
+                crate::vpn::down(ctx, &n.root, n.run.as_ref());
                 n.leave(ctx, &env, &e);
                 return Err(e);
             }
@@ -2285,6 +2305,26 @@ pub fn sync(ctx: &Ctx, n: &Node, coordinator: bool, store: &Store) -> Result<boo
         }
         if signed {
             n.k3s_share(ctx, alone.is_none().then_some(store), &all, Time::now().0.timestamp());
+        }
+        // Apps GitHub builds: newer proved builds go out (github.rs). It
+        // needs nothing of the mesh, so also while the registry waits.
+        if n.root == Path::new("/") {
+            let tmp = n.tmp_dir.clone().unwrap_or_else(|| PathBuf::from("/run/dryserver-github"));
+            crate::github::run_on_coordinator(&ctx.with_timeout(crate::github::BUDGET), n.run.clone(), &n.path(GITHUB_STATE), &tmp);
+            // The VPN's ingress, as the newest signed list says (vpn.rs).
+            if signed && let Ok(Some((_, env))) = n.seen_list() {
+                let plan = serde_json::from_str::<signed::List>(&env.doc).ok().and_then(|l| l.vpn);
+                let c = crate::github::LocalKubectl { run: n.run.clone() };
+                for l in crate::vpn::cluster_on_coordinator(
+                    &ctx.with_timeout(std::time::Duration::from_secs(20)),
+                    &c,
+                    plan.as_ref(),
+                    &n.path(crate::vpn::STATE_DIR),
+                    Time::now().0.timestamp(),
+                ) {
+                    eprintln!("dryserver: {l}");
+                }
+            }
         }
         if let Some(why) = alone {
             // The rollout lives in the registry: it waits.
@@ -2451,8 +2491,18 @@ mod tests {
         // The change, in a list the new key signed.
         let change =
             signed::seal_key_change(&k1, &signed::KeyChange { serial: 9, from: k1.public(), to: k2.public(), login: true }).unwrap();
-        let v6 = seal(&k2, &List { version: 6, members: members.clone(), rejected: vec![], keys: vec![change.clone()], people: vec![] })
-            .unwrap();
+        let v6 = seal(
+            &k2,
+            &List {
+                version: 6,
+                members: members.clone(),
+                rejected: vec![],
+                keys: vec![change.clone()],
+                people: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap();
         n.signed_members(2, &[], &v6).unwrap();
         assert_eq!(n.verifier.key(), Some(k2.public()), "the list taken says who signs now");
         // The admin logs in with the new key, under the old label; others stay.
@@ -2466,18 +2516,23 @@ mod tests {
         let e = n.signed_members(2, &[], &sign(&k1, 7, members.clone())).unwrap_err().to_string();
         assert!(e.contains("bad signature"), "{e}");
         // Newer lists of the new key carry the change and are taken.
-        let v8 = seal(&k2, &List { version: 8, members: members.clone(), rejected: vec![], keys: vec![change], people: vec![] }).unwrap();
+        let v8 = seal(
+            &k2,
+            &List { version: 8, members: members.clone(), rejected: vec![], keys: vec![change], people: vec![], ..Default::default() },
+        )
+        .unwrap();
         n.signed_members(2, &[], &v8).unwrap();
         // A key change that does not log in leaves the login alone.
         let (_dir2, n2, _) = setup(vec![]);
         put(&n2.root, &keys, format!("{} desktop\n", k1.public()));
         let c = signed::seal_key_change(&k1, &signed::KeyChange { serial: 3, from: k1.public(), to: k2.public(), login: false }).unwrap();
-        n2.follow_login(&List { version: 1, members: vec![], rejected: vec![], keys: vec![c], people: vec![] }).unwrap();
+        n2.follow_login(&List { version: 1, members: vec![], rejected: vec![], keys: vec![c], people: vec![], ..Default::default() })
+            .unwrap();
         assert_eq!(get(&n2.root, &keys), format!("{} desktop\n", k1.public()));
     }
 
     fn sign(key: &Key, version: u64, members: Vec<Entry>) -> Envelope {
-        seal(key, &List { version, members, rejected: vec![], keys: vec![], people: vec![] }).unwrap()
+        seal(key, &List { version, members, rejected: vec![], keys: vec![], people: vec![], ..Default::default() }).unwrap()
     }
 
     fn coord_member() -> Member {

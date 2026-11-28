@@ -1212,6 +1212,12 @@ impl Admin {
             }
             gone = list.members.iter().filter(|e| e.name == name).map(|e| e.host).collect();
             list.members.retain(|e| e.name != name);
+            // The VPN's gateway goes with it: no VPN until another server is
+            // made the gateway (the devices stay listed).
+            if list.vpn.as_ref().is_some_and(|p| p.gateway == name) {
+                list.vpn = None;
+                eprintln!("note: {name} was the VPN's gateway: no VPN until another one is set (dryserver vpn on SERVER)");
+            }
             Ok(())
         })?;
         let mut retired = self.retired();
@@ -1274,6 +1280,93 @@ impl Admin {
                 bail!("{name} is not let in");
             }
             list.people.retain(|p| p.name != name);
+            Ok(())
+        })
+    }
+
+    /// The VPN as the signed list has it, as last loaded.
+    pub fn vpn(&self) -> Option<&crate::vpn::Plan> {
+        self.base.vpn.as_ref()
+    }
+
+    /// The devices on the VPN, as last loaded.
+    pub fn devices(&self) -> &[crate::vpn::Device] {
+        &self.base.devices
+    }
+
+    /// The WireGuard key the signed list has for a machine: a gateway's is
+    /// the one devices check it by.
+    pub fn machine_key(&self, name: &str) -> Option<String> {
+        self.base.members.iter().find(|e| e.name == name).map(|e| e.wg_key.clone())
+    }
+
+    /// Sets the VPN up (or changes it). The subnet may change only while
+    /// no device is listed: their addresses are in it.
+    pub fn vpn_on(&mut self, plan: &crate::vpn::Plan) -> Result<u64> {
+        plan.check()?;
+        plan.clashes("the mesh", &self.subnet)?;
+        let plan = plan.clone();
+        self.publish(|list, _| {
+            if !list.devices.is_empty()
+                && let Some(c) = plan.cidr()
+                && list.devices.iter().any(|d| d.addr.parse().is_ok_and(|ip| !c.contains(ip)))
+            {
+                bail!(
+                    "the devices have addresses in another subnet: keep it (leave --subnet out), or take them out first \
+                     (dryserver vpn remove NAME) and add them again"
+                );
+            }
+            list.vpn = Some(plan);
+            Ok(())
+        })
+    }
+
+    /// Takes the VPN away: the gateway's interface goes within a minute.
+    /// The devices stay listed, for when it is set up again.
+    pub fn vpn_off(&mut self) -> Result<u64> {
+        self.publish(|list, _| {
+            if list.vpn.is_none() {
+                bail!("the VPN is not set up");
+            }
+            list.vpn = None;
+            Ok(())
+        })
+    }
+
+    /// Adds a device with its public key, at the next free address.
+    /// Returns the device and the version that carries it.
+    pub fn vpn_add(&mut self, name: &str, key: &str) -> Result<(crate::vpn::Device, u64)> {
+        if !crate::vpn::valid_device_name(name) {
+            bail!("{name:?}: a device's name is lowercase letters, digits and -, at most 32 (like phone or ana-laptop)");
+        }
+        if !registry::valid_wg_key(key) {
+            bail!("not a WireGuard public key (44 characters of base64, ending in =)");
+        }
+        let mut made = None;
+        let version = self.publish(|list, _| {
+            let Some(plan) = &list.vpn else { bail!("set the VPN up first: dryserver vpn on SERVER --endpoint ADDRESS") };
+            if list.devices.iter().any(|d| d.name == name) {
+                bail!("there is a device called {name} already: dryserver vpn remove {name} first, or choose another name");
+            }
+            if list.devices.iter().any(|d| d.key == key) || list.members.iter().any(|e| e.wg_key == key) {
+                bail!("that key is another device's or a machine's: every device needs its own");
+            }
+            let addr = crate::vpn::next_addr(plan, &list.devices).ok_or_else(|| errf!("the VPN's subnet has no free address left"))?;
+            let d = crate::vpn::Device { name: name.into(), key: key.into(), addr: addr.to_string() };
+            list.devices.push(d.clone());
+            made = Some(d);
+            Ok(())
+        })?;
+        Ok((made.expect("added"), version))
+    }
+
+    /// Takes a device out: the gateway forgets its key within a minute.
+    pub fn vpn_remove(&mut self, name: &str) -> Result<u64> {
+        self.publish(|list, _| {
+            if !list.devices.iter().any(|d| d.name == name) {
+                bail!("there is no device called {name}");
+            }
+            list.devices.retain(|d| d.name != name);
             Ok(())
         })
     }
@@ -2398,6 +2491,8 @@ pub mod tests {
                 rejected: vec![],
                 keys: vec![],
                 people: vec![],
+                vpn: None,
+                devices: vec![],
             },
         )
         .unwrap();
@@ -2523,7 +2618,14 @@ pub mod tests {
         assert!(a.load().unwrap_err().to_string().contains("bad signature"), "the registry opened for a wrong key");
         let forged = signed::seal(
             a.signer.as_ref(),
-            &List { version: u64::MAX, members: vec![Entry::of(&s.members[0])], rejected: vec![], keys: vec![], people: vec![] },
+            &List {
+                version: u64::MAX,
+                members: vec![Entry::of(&s.members[0])],
+                rejected: vec![],
+                keys: vec![],
+                people: vec![],
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(a.link.call("publish", &serde_json::to_string(&forged).unwrap()).unwrap_err().to_string().contains("bad signature"));
@@ -2650,6 +2752,60 @@ pub mod tests {
         a.take_out("alice").unwrap();
         assert!(a.people().is_empty());
         assert!(a.take_out("alice").unwrap_err().to_string().contains("not let in"));
+    }
+
+    #[test]
+    fn the_vpn_and_its_devices_are_in_the_signed_list() {
+        let dir = TempDir::new();
+        let (mut a, store) = setup(&dir);
+        a.run = Arc::new(HostKeys);
+        let id = ask(&store, "node-a", 2);
+        a.load().unwrap();
+        a.approve(&by_id(&a, &id)).unwrap();
+        let phone = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let laptop = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=";
+        // Not before the VPN is set up; never on the coordinator.
+        assert!(a.vpn_add("phone", phone).unwrap_err().to_string().contains("set the VPN up first"));
+        let on = |gw: &str| crate::vpn::Plan::new(gw, "vpn.example.com");
+        assert!(a.vpn_on(&on("coord")).unwrap_err().to_string().contains("cannot be the coordinator"));
+        assert!(a.vpn_on(&on("nowhere")).unwrap_err().to_string().contains("not a machine of the swarm"));
+        let clash = crate::vpn::Plan { subnet: a.subnet.clone(), ..on("node-a") };
+        assert!(a.vpn_on(&clash).unwrap_err().to_string().contains("overlaps the mesh"));
+        a.vpn_on(&on("node-a")).unwrap();
+        let (d, v) = a.vpn_add("phone", phone).unwrap();
+        assert_eq!(d.addr, "10.99.0.2");
+        let list = store.read().unwrap().signed.list(&Key("admin"), |h| h < 255).unwrap();
+        assert_eq!((list.version, list.vpn.as_ref().map(|p| p.gateway.as_str()), list.devices.len()), (v, Some("node-a"), 1));
+        let (d2, _) = a.vpn_add("laptop", laptop).unwrap();
+        assert_eq!(d2.addr, "10.99.0.3");
+        for (name, key, why) in [
+            ("phone", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCA=", "a device called phone already"),
+            ("tablet", phone, "another device's or a machine's"),
+            ("tablet", &key32(1), "another device's or a machine's"),
+            ("Tab let", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCA=", "a device's name"),
+            ("tablet", "not-a-key", "not a WireGuard public key"),
+        ] {
+            let e = a.vpn_add(name, key).unwrap_err().to_string();
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        // The subnet stays while devices are in it.
+        let moved = crate::vpn::Plan { subnet: "10.98.0.0/24".into(), ..on("node-a") };
+        assert!(a.vpn_on(&moved).unwrap_err().to_string().contains("addresses in another subnet"));
+        // Off: the devices stay for when it is back.
+        a.vpn_off().unwrap();
+        assert!(a.vpn().is_none() && a.devices().len() == 2);
+        assert!(a.vpn_off().unwrap_err().to_string().contains("not set up"));
+        a.vpn_on(&on("node-a")).unwrap();
+        a.vpn_remove("phone").unwrap();
+        assert_eq!(a.devices().iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["laptop"]);
+        assert!(a.vpn_remove("phone").unwrap_err().to_string().contains("no device called phone"));
+        // The freed address is the next one handed out.
+        assert_eq!(a.vpn_add("tablet", phone).unwrap().0.addr, "10.99.0.2");
+        assert_eq!(a.machine_key("node-a"), Some(key32(2)));
+        // Removing the gateway (a hacked one, say) is never refused: the
+        // VPN goes with it, the devices stay.
+        a.remove("node-a").unwrap();
+        assert!(a.vpn().is_none() && a.devices().len() == 2);
     }
 
     #[test]

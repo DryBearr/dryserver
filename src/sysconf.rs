@@ -251,6 +251,11 @@ spec:
   valuesContent: |-
     deployment:
       kind: DaemonSet
+    # Ingresses of the VPN's own Traefik (vpn.rs) are never served here:
+    # what only the admin's devices may reach is never one Host header
+    # away through the tunnel.
+    additionalArguments:
+      - \"--providers.kubernetesingress.labelselector=!dryserver/vpn\"
 ";
 /// On the coordinator: keeps the cluster's DNS on two machines, and off
 /// the coordinator where it can (see coredns.rs). Every two minutes, so
@@ -600,11 +605,27 @@ table inet dryserver {{
 		timeout 1h
 	}}{coord_set}
 
+	# The port the VPN's gateway listens on for the admin's devices;
+	# "dryserver sync" fills it there, and it stays empty elsewhere.
+	set {vpn_ports} {{
+		type inet_service
+	}}
+	# Its address on the VPN, on the gateway only (filled the same way).
+	set {vpn_addrs} {{
+		type ipv4_addr
+	}}
+
 	chain input {{
 		type filter hook input priority filter; policy drop;
 		iifname "wg0" ip saddr @{offenders} drop{coord_block}
 		ct state vmap {{ established : accept, related : accept, invalid : drop }}
 		iif lo accept
+
+		# The VPN's devices (on its gateway): nothing on this machine is
+		# for them but a ping. They reach the VPN's ingress, and only it,
+		# through the forward chain.
+		iifname "{vpn_if}" icmp type echo-request limit rate 10/second accept
+		iifname "{vpn_if}" drop
 
 		# Pings, at most 10 a second from each address: a flood from one
 		# machine on the home network takes no other's (the pings over
@@ -625,6 +646,10 @@ table inet dryserver {{
 
 		# WireGuard from the WiFi/router network and the switch.
 		udp dport {wg_port} accept{switch_rule}
+
+		# The VPN's devices, from the internet through the router (on the
+		# VPN's gateway only: the set is empty elsewhere).
+		udp dport @{vpn_ports} accept
 
 		# SSH from the WiFi/router network, at most 10 new connections a
 		# minute per address. Logins need the admin SSH key.
@@ -660,7 +685,15 @@ table inet dryserver {{
 	chain output {{
 		type filter hook output priority filter; policy drop;
 		ct state vmap {{ established : accept, related : accept, invalid : drop }}
+		# Only root reaches the VPN's ingress here (on its gateway), by its
+		# address or its pod's: no account passes for a device. Before lo:
+		# what goes to a local address is "lo" here, rewritten or not.
+		ct original ip daddr @{vpn_addrs} meta skuid != 0 drop
+		meta skuid != 0 ip daddr {pod_cidr} tcp dport {{ {vpn_http}, {vpn_https} }} drop
 		oif lo accept
+		# Nothing on this machine starts a connection to a device on the
+		# VPN.
+		oifname "{vpn_if}" drop
 {to_mesh}
 		# This machine's own pods (health checks), the pod network and
 		# the cluster's service addresses. By address: a service address
@@ -676,6 +709,8 @@ table inet dryserver {{
 		udp sport 68 udp dport 67 accept
 		udp sport 546 udp dport 547 accept
 		udp dport {wg_port} accept{registry}
+		# The VPN's gateway answers its devices wherever they are.
+		udp sport @{vpn_ports} accept
 
 		limit rate 10/minute log prefix "dryserver-out-drop: "
 		reject with icmpx admin-prohibited
@@ -696,8 +731,18 @@ table inet dryserver {{
 	chain forward {{
 		type filter hook forward priority filter - 5; policy accept;
 		ct state established,related accept
+		# Nothing starts a connection to a device on the VPN: no pod, no
+		# container, no other device.
+		oifname "{vpn_if}" drop
 		iifname {{ "docker0", "br-*" }} jump containers
 		iifname "cni0" jump pods
+		# The VPN's devices reach the VPN's ingress on its gateway: what
+		# they sent to the gateway's VPN address, ports 80 and 443, which
+		# lead to its pod there. Nothing else: not the mesh, not the home
+		# network, not the cluster's own ingress or services.
+		iifname "{vpn_if}" oifname "cni0" ct original ip daddr @{vpn_addrs} ct original proto-dst {{ 80, 443 }} tcp dport {{ {vpn_http}, {vpn_https} }} accept
+		iifname "{vpn_if}" limit rate 10/minute log prefix "dryserver-vpn-drop: "
+		iifname "{vpn_if}" drop
 		# Nothing from outside the cluster starts a connection to a pod:
 		# a NodePort or hostPort is not a door from the home network.
 		# Pods are reached by other pods, by this machine, and through
@@ -761,6 +806,11 @@ table inet dryserver {{
         svc_cidr = K3S_SERVICE_CIDR,
         knocks = KNOCKS_PER_MINUTE,
         offenders = OFFENDERS_SET,
+        vpn_ports = crate::vpn::PORTS_SET,
+        vpn_addrs = crate::vpn::ADDRS_SET,
+        vpn_if = crate::vpn::IFACE,
+        vpn_http = crate::vpn::HTTP_PORT,
+        vpn_https = crate::vpn::HTTPS_PORT,
     )
 }
 
@@ -1419,7 +1469,14 @@ mod tests {
         // account there.
         let node = find(&render(&cs[0].1).unwrap(), "/etc/nftables.conf").content.clone();
         assert!(node.contains("\t\t# The mesh: the firewall on the other side decides.\n\t\toifname \"wg0\" accept\n"), "{node}");
-        assert!(!node.contains("skuid") && !node.contains("chain to_mesh"), "{node}");
+        // Only the VPN's address (on its gateway, where only root may reach
+        // the VPN's ingress) is kept from accounts.
+        let vpn_ports = format!("tcp dport {{ {}, {} }}", crate::vpn::HTTP_PORT, crate::vpn::HTTPS_PORT);
+        assert!(
+            !node.lines().any(|l| l.contains("skuid") && !l.contains("@vpn_addrs") && !l.contains(&vpn_ports))
+                && !node.contains("chain to_mesh"),
+            "{node}"
+        );
     }
 
     /// Servers count tries to open something, never late packets of a

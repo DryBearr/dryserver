@@ -94,6 +94,14 @@ pub struct List {
     /// own, a shell, no sudo, no forwarding (people.rs).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub people: Vec<Person>,
+    /// The VPN for the admin's devices: which server is its gateway, and
+    /// where devices find it (vpn.rs). None: no VPN.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vpn: Option<crate::vpn::Plan>,
+    /// The devices on the VPN, each with its key and address. They stay
+    /// listed while the VPN is off.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<crate::vpn::Device>,
 }
 
 /// More people than this in one list are not a home swarm's.
@@ -255,7 +263,8 @@ impl List {
                 bail!("{} is let in on a bad machine name: {n:?}", p.name);
             }
         }
-        Ok(())
+        let machines: Vec<(&str, u32, &str)> = self.members.iter().map(|e| (e.name.as_str(), e.host, e.wg_key.as_str())).collect();
+        crate::vpn::check(self.vpn.as_ref(), &self.devices, &machines)
     }
 }
 
@@ -884,7 +893,14 @@ mod tests {
     }
 
     fn list() -> List {
-        List { version: 3, members: vec![entry(1, "coord"), entry(2, "nodeb")], rejected: vec![], keys: vec![], people: vec![] }
+        List {
+            version: 3,
+            members: vec![entry(1, "coord"), entry(2, "nodeb")],
+            rejected: vec![],
+            keys: vec![],
+            people: vec![],
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1025,6 +1041,8 @@ mod tests {
             rejected: vec![],
             keys: vec![],
             people: vec![],
+            vpn: None,
+            devices: vec![],
         };
         let env = seal(&signer, &big).unwrap();
         assert_eq!(env.list(&v, fits).unwrap(), big);
@@ -1098,7 +1116,8 @@ mod tests {
     fn a_list_after_a_key_change_proves_its_signer() {
         use fake::Key;
         let (k1, k2) = (Key("k1"), Key("k2"));
-        let base = List { version: 5, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![], people: vec![] };
+        let base =
+            List { version: 5, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![], people: vec![], ..Default::default() };
         let old = seal(&k1, &base).unwrap();
         let with = List { version: 6, keys: vec![change(&k1, &k1, &k2, 10, true)], ..base.clone() };
         let new = seal(&k2, &with).unwrap();
@@ -1142,7 +1161,8 @@ mod tests {
         assert!(t.verify(NS_ADMIN, doc, &by2).is_err());
         // A list with the change, signed by k2, proves itself from k1...
         let c = seal_key_change(&s1, &KeyChange { serial: 7, from: p1.clone(), to: p2.clone(), login: true }).unwrap();
-        let list = List { version: 2, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![c], people: vec![] };
+        let list =
+            List { version: 2, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![c], people: vec![], ..Default::default() };
         let env = seal(&s2, &list).unwrap();
         assert_eq!(env.list_signed_by(&t, fits).unwrap(), (list.clone(), Some(p2.clone())));
         // ...and once it is the list taken, k2 is trusted and k1 no more.
@@ -1204,7 +1224,8 @@ mod tests {
         let trusted = dir.join("signing_ed25519.pub");
         std::fs::copy(ssh.join("id_ed25519.pub"), &trusted).unwrap();
         let v = SshVerifier { pubkey: trusted.clone(), tmp_dir: dir.path().to_path_buf() };
-        let list = List { version: 3, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![], people: vec![] };
+        let list =
+            List { version: 3, members: vec![entry(1, "coord")], rejected: vec![], keys: vec![], people: vec![], ..Default::default() };
 
         // No agent: the file in ~/.ssh signs.
         let file = OwnKeySigner { pubkey: trusted.clone(), ssh_dir: Some(ssh.clone()), agent: None };

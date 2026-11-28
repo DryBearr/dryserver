@@ -960,6 +960,26 @@ pub fn member_addresses(
 // ---- the SSH forced command ----
 
 const MAX_INPUT: u64 = 16 << 10;
+
+impl Heartbeat {
+    /// The heartbeat as sent: the VPN gateway's devices are left out from
+    /// the end while it would not fit well within what coordinators read
+    /// (a mesh of a thousand machines and a hundred devices); the rest of
+    /// the report always fits (the_largest_heartbeat_fits).
+    pub fn fitted(mut self) -> Heartbeat {
+        let budget = (MAX_INPUT * 3 / 4) as usize;
+        while serde_json::to_string(&self).map(|t| t.len()).unwrap_or(usize::MAX) >= budget {
+            match self.report.as_mut().and_then(|r| r.vpn.as_mut()) {
+                Some(v) if !v.devices.is_empty() => {
+                    let keep = v.devices.len() * 3 / 4;
+                    v.devices.truncate(keep);
+                }
+                _ => break,
+            }
+        }
+        self
+    }
+}
 /// A signed list of a full /24 mesh is about 100 KiB.
 const MAX_SIGNED_INPUT: u64 = 1 << 20;
 
@@ -1658,6 +1678,16 @@ mod tests {
             lan: "255.255.255.255".into(),
             // The longest signature kept; one by an ed25519 key is 300 bytes.
             sig: format!("-----BEGIN SSH SIGNATURE-----{}", "A".repeat(512 - 29)),
+            // The VPN's gateway with every device it may have.
+            vpn: Some(crate::vpn::Status {
+                gateway: true,
+                port: 65535,
+                devices: (0..crate::vpn::MAX_DEVICES)
+                    .map(|_| crate::vpn::Seen { key: "A".repeat(crate::vpn::KEY_PREFIX), handshake: i64::from(u32::MAX) })
+                    .collect(),
+                token: true,
+                problem: "\"".repeat(report::MAX_NOTE),
+            }),
             ..report(&[])
         }
         .sanitized(|_| true);
@@ -1665,7 +1695,23 @@ mod tests {
         let cuts = (0..MAX_CUT_REPORTS).map(|i| CutReport { name: format!("{i:02}{}", "n".repeat(61)), auto: true }).collect();
         let hb = Heartbeat { lan_ip: "255.255.255.255".into(), switch: true, cuts, report: Some(r) };
         let len = serde_json::to_string(&hb).unwrap().len() as u64;
+        assert!(len > MAX_INPUT * 3 / 4, "with every device it would not fit: {len} bytes");
+        // Fitted, as machines send it: the devices that do not fit are left
+        // out, everything else stays.
+        let sent = hb.fitted();
+        let len = serde_json::to_string(&sent).unwrap().len() as u64;
         assert!(len < MAX_INPUT * 3 / 4, "the largest heartbeat is {len} bytes");
+        let v = sent.report.as_ref().and_then(|r| r.vpn.as_ref()).unwrap();
+        assert!(v.gateway && v.token && v.devices.len() < crate::vpn::MAX_DEVICES, "{v:?}");
+        // A usual one keeps every device.
+        let small = Heartbeat {
+            report: Some(Report {
+                vpn: Some(crate::vpn::Status { devices: vec![crate::vpn::Seen::default(); 100], ..Default::default() }),
+                ..Report::default()
+            }),
+            ..Heartbeat::default()
+        };
+        assert_eq!(small.fitted().report.unwrap().vpn.unwrap().devices.len(), 100);
     }
 
     #[test]
@@ -2055,7 +2101,7 @@ mod tests {
         let (k1, k2, k3) = (signed::fake::Key("admin"), signed::fake::Key("admin2"), signed::fake::Key("admin3"));
         let members = vec![entry(1, "coord", 1, COORD_KEY)];
         let send = |key: &signed::fake::Key, version: u64, keys: Vec<Envelope>| {
-            let l = List { version, members: members.clone(), rejected: vec![], keys, people: vec![] };
+            let l = List { version, members: members.clone(), rejected: vec![], keys, people: vec![], ..Default::default() };
             call_chained(&st, "publish", &serde_json::to_string(&signed::seal(key, &l).unwrap()).unwrap())
         };
         send(&k1, 5, vec![]).unwrap();
@@ -2092,7 +2138,14 @@ mod tests {
         let st = coordinator(&dir);
         let coord = entry(1, "coord", 1, COORD_KEY);
         let node_a = entry(2, "node-a", 2, "ssh-ed25519 AAAAnodea");
-        let v5 = List { version: 5, members: vec![coord.clone(), node_a.clone()], rejected: vec![], keys: vec![], people: vec![] };
+        let v5 = List {
+            version: 5,
+            members: vec![coord.clone(), node_a.clone()],
+            rejected: vec![],
+            keys: vec![],
+            people: vec![],
+            ..Default::default()
+        };
 
         // Not signed with the admin's key: refused, nothing changes.
         assert!(publish(&st, &signed::fake::Key("thief"), &v5).is_err());
@@ -2110,23 +2163,35 @@ mod tests {
 
         // The same or an older list is refused: no way back to an old list.
         for old in [5, 4] {
-            let e =
-                publish(&st, &ADMIN, &List { version: old, members: vec![coord.clone()], rejected: vec![], keys: vec![], people: vec![] })
-                    .unwrap_err()
-                    .to_string();
+            let e = publish(
+                &st,
+                &ADMIN,
+                &List { version: old, members: vec![coord.clone()], rejected: vec![], keys: vec![], people: vec![], ..Default::default() },
+            )
+            .unwrap_err()
+            .to_string();
             assert!(e.contains("not newer"), "{e}");
         }
         assert_eq!(st.read().unwrap().members.len(), 2);
 
         // A newer list without node-a removes it.
-        publish(&st, &ADMIN, &List { version: 6, members: vec![coord.clone()], rejected: vec![], keys: vec![], people: vec![] }).unwrap();
+        publish(
+            &st,
+            &ADMIN,
+            &List { version: 6, members: vec![coord.clone()], rejected: vec![], keys: vec![], people: vec![], ..Default::default() },
+        )
+        .unwrap();
         assert_eq!(st.read().unwrap().members.len(), 1);
 
         // A list for another coordinator (other keys or name) is refused.
         for other in [entry(1, "coord", 9, COORD_KEY), entry(1, "coord", 1, "ssh-ed25519 AAAAother"), entry(1, "brain", 1, COORD_KEY)] {
-            let e = publish(&st, &ADMIN, &List { version: 7, members: vec![other], rejected: vec![], keys: vec![], people: vec![] })
-                .unwrap_err()
-                .to_string();
+            let e = publish(
+                &st,
+                &ADMIN,
+                &List { version: 7, members: vec![other], rejected: vec![], keys: vec![], people: vec![], ..Default::default() },
+            )
+            .unwrap_err()
+            .to_string();
             assert!(e.contains("own name and keys"), "{e}");
         }
         // Bad entries are refused even with a good signature.
@@ -2136,6 +2201,8 @@ mod tests {
             rejected: vec![],
             keys: vec![],
             people: vec![],
+            vpn: None,
+            devices: vec![],
         };
         assert!(publish(&st, &ADMIN, &bad).unwrap_err().to_string().contains("outside the mesh"));
         assert_eq!(st.read().unwrap().signed_version, 6);
@@ -2169,6 +2236,8 @@ mod tests {
             rejected: vec![],
             keys: vec![],
             people: vec![],
+            vpn: None,
+            devices: vec![],
         };
         publish(&st, &ADMIN, &list).unwrap();
         let s = st.read().unwrap();
@@ -2231,7 +2300,14 @@ mod tests {
         ask("n-other", 71, "192.168.1.67").unwrap();
         // The admin turns n0 down: a place is free again.
         let me = st.read().unwrap().members[0].clone();
-        let list = List { version: 1, members: vec![signed::Entry::of(&me)], rejected: vec![key32(60)], keys: vec![], people: vec![] };
+        let list = List {
+            version: 1,
+            members: vec![signed::Entry::of(&me)],
+            rejected: vec![key32(60)],
+            keys: vec![],
+            people: vec![],
+            ..Default::default()
+        };
         publish(&st, &ADMIN, &list).unwrap();
         ask("n-again", 72, "192.168.1.66").unwrap();
         // A refusal goes once its machine is signed.
@@ -2240,7 +2316,14 @@ mod tests {
         publish(
             &st,
             &ADMIN,
-            &List { version: 2, members: vec![signed::Entry::of(&me), z], rejected: vec![], keys: vec![], people: vec![] },
+            &List {
+                version: 2,
+                members: vec![signed::Entry::of(&me), z],
+                rejected: vec![],
+                keys: vec![],
+                people: vec![],
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(!state().refused.iter().any(|f| f.request.wg_key == key32(10)), "{:?}", state().refused);
@@ -2263,7 +2346,14 @@ mod tests {
         assert!(ask(&ADMIN, "other", now).is_err());
         assert!(call(&st, "admin", "192.168.1.9 5000 22", "{}").is_err());
         // A signed list is not an admin request and the other way round.
-        let list = List { version: 1, members: vec![entry(1, "coord", 1, COORD_KEY)], rejected: vec![], keys: vec![], people: vec![] };
+        let list = List {
+            version: 1,
+            members: vec![entry(1, "coord", 1, COORD_KEY)],
+            rejected: vec![],
+            keys: vec![],
+            people: vec![],
+            ..Default::default()
+        };
         let env = serde_json::to_string(&signed::seal(&ADMIN, &list).unwrap()).unwrap();
         assert!(call(&st, "admin", "192.168.1.9 5000 22", &env).is_err());
         let adm = serde_json::to_string(&signed::seal_admin(&ADMIN, "state", now).unwrap()).unwrap();
@@ -2280,6 +2370,8 @@ mod tests {
             rejected: vec![],
             keys: vec![],
             people: vec![],
+            vpn: None,
+            devices: vec![],
         };
         // Before anything is signed the field is there but empty.
         st.update(|s| {
@@ -2354,6 +2446,8 @@ mod tests {
             rejected: vec![],
             keys: vec![],
             people: vec![],
+            vpn: None,
+            devices: vec![],
         };
         publish(&st, &ADMIN, &list).unwrap();
         let out = call(&st, &format!("status {id}"), "192.168.1.23 5000 22", "").unwrap();

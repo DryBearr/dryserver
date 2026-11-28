@@ -85,10 +85,226 @@ pub struct App {
     /// another id, so its copies are replaced. Not in the app file: the
     /// desktop takes it from podman or docker when it deploys.
     pub image_id: String,
+    /// What the app gets to run with: settings, secrets, its share of a
+    /// machine.
+    pub run: Runtime,
+    /// The repository GitHub builds it from, when it is built there
+    /// (REPO and BRANCH in the app file).
+    pub source: Option<crate::github::Source>,
+    /// For an app built by GitHub: the build it runs and the ones before.
+    /// Not in the app file: from GitHub and the cluster when deployed.
+    pub gh: crate::github::State,
 }
 
 /// The annotation on an app's pods that names the build of its own image.
 pub const IMAGE_ID_ANNOTATION: &str = "dryserver/image-id";
+/// The annotation on an app's pods that names the version of its secrets:
+/// a new value replaces the copies, so they read it.
+pub const SECRETS_ANNOTATION: &str = "dryserver/secrets";
+
+/// What an app runs with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Runtime {
+    /// Settings (env variables), sorted by name, each once. Kept in the
+    /// app file, so nothing secret.
+    pub env: Vec<(String, String)>,
+    /// The names of its secrets, sorted: their values live only in the
+    /// cluster (Secret "app-NAME", encrypted there), set with dryserver
+    /// app secret.
+    pub secrets: Vec<String>,
+    /// The most memory a copy may use (MiB); the machine keeps half of it
+    /// for the copy in any case.
+    pub memory_mib: u32,
+    /// The most CPU a copy may use (thousandths of a core).
+    pub cpu_milli: u32,
+    /// The version of the app's secrets the copies run with (the Secret's
+    /// resourceVersion). Not in the app file: read from the cluster when
+    /// the app is deployed.
+    pub secrets_version: String,
+}
+
+impl Default for Runtime {
+    fn default() -> Runtime {
+        Runtime {
+            env: Vec::new(),
+            secrets: Vec::new(),
+            memory_mib: DEFAULT_MEMORY_MIB,
+            cpu_milli: DEFAULT_CPU_MILLI,
+            secrets_version: String::new(),
+        }
+    }
+}
+
+/// What an app gets when its file does not say: enough for a Node.js
+/// server under light load, and never a whole machine.
+pub const DEFAULT_MEMORY_MIB: u32 = 512;
+pub const DEFAULT_CPU_MILLI: u32 = 1000;
+pub const MIN_MEMORY_MIB: u32 = 32;
+pub const MAX_MEMORY_MIB: u32 = 16 * 1024;
+pub const MIN_CPU_MILLI: u32 = 50;
+pub const MAX_CPU_MILLI: u32 = 8000;
+/// Settings and secrets one app may have, and how large they may be.
+pub const MAX_ENV: usize = 100;
+pub const MAX_SECRETS: usize = 50;
+pub const MAX_ENV_VALUE: usize = 32 << 10;
+pub const MAX_ENV_TOTAL: usize = 128 << 10;
+
+/// A setting's or secret's name: what a program reads (letters, digits
+/// and _, not starting with a digit).
+pub fn valid_env_name(s: &str) -> Result<()> {
+    let ok =
+        !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && !s.as_bytes()[0].is_ascii_digit();
+    if ok { Ok(()) } else { Err(errf!("{s:?}: a name of letters, digits and _, not starting with a digit, like DATABASE_URL")) }
+}
+
+/// The name of the Secret that holds an app's secrets.
+pub fn secret_name(app: &str) -> String {
+    format!("app-{app}")
+}
+
+/// "512Mi", "1Gi", "1.5Gi" as MiB.
+pub fn parse_memory(s: &str) -> Result<u32> {
+    let t = s.trim();
+    let (num, unit) = if let Some(n) = t.strip_suffix("Gi") {
+        (n, 1024.0)
+    } else if let Some(n) = t.strip_suffix("Mi") {
+        (n, 1.0)
+    } else {
+        bail!("{t}: memory in Mi or Gi, like 512Mi or 1Gi");
+    };
+    let v: f64 = num.trim().parse().map_err(|_| errf!("{t}: memory in Mi or Gi, like 512Mi or 1Gi"))?;
+    let mib = (v * unit).round();
+    if !mib.is_finite() || mib < f64::from(MIN_MEMORY_MIB) || mib > f64::from(MAX_MEMORY_MIB) {
+        bail!("{t}: memory from {MIN_MEMORY_MIB}Mi to {}Gi", MAX_MEMORY_MIB / 1024);
+    }
+    Ok(mib as u32)
+}
+
+/// "500m", "1", "1.5" as thousandths of a core.
+pub fn parse_cpu(s: &str) -> Result<u32> {
+    let t = s.trim();
+    let milli = match t.strip_suffix('m') {
+        Some(n) => n.parse::<f64>().map_err(|_| errf!("{t}: CPU in cores (1, 0.5) or thousandths (500m)"))?,
+        None => t.parse::<f64>().map_err(|_| errf!("{t}: CPU in cores (1, 0.5) or thousandths (500m)"))? * 1000.0,
+    }
+    .round();
+    if !milli.is_finite() || milli < f64::from(MIN_CPU_MILLI) || milli > f64::from(MAX_CPU_MILLI) {
+        bail!("{t}: CPU from {MIN_CPU_MILLI}m to {} cores", MAX_CPU_MILLI / 1000);
+    }
+    Ok(milli as u32)
+}
+
+/// Memory as people write it: "512Mi", "1Gi", "1536Mi".
+pub fn memory_text(mib: u32) -> String {
+    if mib >= 1024 && mib.is_multiple_of(1024) { format!("{}Gi", mib / 1024) } else { format!("{mib}Mi") }
+}
+
+/// CPU as people write it: "1", "2", "500m".
+pub fn cpu_text(milli: u32) -> String {
+    if milli.is_multiple_of(1000) { format!("{}", milli / 1000) } else { format!("{milli}m") }
+}
+
+/// Whether a setting's name says it holds a secret.
+pub fn looks_secret(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    ["SECRET", "PASSWORD", "PASSWD", "TOKEN", "PRIVATE", "API_KEY", "APIKEY", "CREDENTIAL", "DATABASE_URL", "DSN"]
+        .iter()
+        .any(|w| n.contains(w))
+}
+
+impl Runtime {
+    pub fn validate(&self, port: u16) -> Result<()> {
+        if self.env.len() > MAX_ENV {
+            bail!("ENV: at most {MAX_ENV} settings");
+        }
+        if self.secrets.len() > MAX_SECRETS {
+            bail!("SECRET: at most {MAX_SECRETS} secrets");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut total = 0;
+        for (k, v) in &self.env {
+            valid_env_name(k).map_err(|e| e.wrap("ENV"))?;
+            if !seen.insert(k.as_str()) {
+                bail!("ENV: {k} is set twice");
+            }
+            if v.len() > MAX_ENV_VALUE {
+                bail!("ENV: {k} is longer than {} KiB", MAX_ENV_VALUE >> 10);
+            }
+            if v.chars().any(|c| c.is_control() && c != '\t') {
+                bail!("ENV: {k} has a control character in it");
+            }
+            // The two characters the cluster's YAML cannot carry.
+            if v.chars().any(|c| matches!(c, '\u{FFFE}' | '\u{FFFF}')) {
+                bail!("ENV: {k} has a character in it that is no character (U+FFFE or U+FFFF)");
+            }
+            if k == "PORT" && port != NO_PORT && *v != port.to_string() {
+                bail!("ENV: PORT is {v}, but the app's PORT is {port}: they must agree (dryserver sets PORT for the app by itself)");
+            }
+            total += k.len() + v.len();
+        }
+        if total > MAX_ENV_TOTAL {
+            bail!("ENV: more than {} KiB of settings in all", MAX_ENV_TOTAL >> 10);
+        }
+        for k in &self.secrets {
+            valid_env_name(k).map_err(|e| e.wrap("SECRET"))?;
+            if !seen.insert(k.as_str()) {
+                bail!("SECRET: {k} is a setting or a secret already");
+            }
+        }
+        if !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&self.memory_mib) {
+            bail!("MEMORY: from {MIN_MEMORY_MIB}Mi to {}Gi", MAX_MEMORY_MIB / 1024);
+        }
+        if !(MIN_CPU_MILLI..=MAX_CPU_MILLI).contains(&self.cpu_milli) {
+            bail!("CPU: from {MIN_CPU_MILLI}m to {} cores", MAX_CPU_MILLI / 1000);
+        }
+        if !self.secrets_version.bytes().all(|b| b.is_ascii_alphanumeric()) || self.secrets_version.len() > 64 {
+            bail!("the version of the secrets is not one");
+        }
+        Ok(())
+    }
+
+    /// The env lines of the container: PORT (the app's port, unless it
+    /// listens on none), then its settings, then its secrets from its
+    /// Secret. Every value as a JSON string, which YAML
+    /// reads as it is: nothing in a value can become YAML.
+    fn yaml(&self, app: &str, port: u16) -> String {
+        // JSON leaves the line and paragraph separators as they are, and
+        // YAML would read them as line breaks: written as escapes.
+        let q = |s: &str| {
+            serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into()).replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029")
+        };
+        let mut env: Vec<(String, String)> = Vec::new();
+        if port != NO_PORT && !self.env.iter().any(|(k, _)| k == "PORT") {
+            env.push(("PORT".into(), port.to_string()));
+        }
+        env.extend(self.env.iter().cloned());
+        let mut y = String::from("          env:\n");
+        for (k, v) in &env {
+            y += &format!("            - name: {}\n              value: {}\n", q(k), q(v));
+        }
+        let secret = secret_name(app);
+        for k in &self.secrets {
+            y += &format!(
+                "            - name: {}\n              valueFrom:\n                secretKeyRef:\n                  name: \"{secret}\"\n                  key: {}\n",
+                q(k),
+                q(k)
+            );
+        }
+        y
+    }
+
+    /// What a copy asks the machine for and may never pass: memory is
+    /// half reserved (so a machine fits more than one busy app), CPU a
+    /// tenth (idle apps use next to none).
+    fn resources(&self) -> String {
+        let req_mem = (self.memory_mib / 2).max(MIN_MEMORY_MIB);
+        let req_cpu = (self.cpu_milli / 10).max(MIN_CPU_MILLI / 2);
+        format!(
+            "          resources:\n            requests:\n              cpu: {req_cpu}m\n              memory: {req_mem}Mi\n            limits:\n              cpu: {}m\n              memory: {}Mi\n",
+            self.cpu_milli, self.memory_mib
+        )
+    }
+}
 
 /// A public name of an app, and the app's port it leads to.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -105,9 +321,23 @@ pub const MAX_PORTS: usize = 10;
 /// newer one may write what this one would get wrong, so this one then
 /// changes nothing (see Running::newer).
 pub const FORMAT_ANNOTATION: &str = "dryserver/format";
-/// 2: several public names, each with a port. An app without the
-/// annotation is from before (one name, the main port).
-pub const FORMAT: u32 = 2;
+/// 2: several public names, each with a port. 3: settings, secrets,
+/// limits, PORT=none, builds by GitHub. An app without the annotation is
+/// from before (one name, the main port).
+pub const FORMAT: u32 = 3;
+
+/// PORT=none: the app listens on no port.
+pub const NO_PORT: u16 = 0;
+
+/// The apps' namespace, as every app's manifest has it first. Whatever
+/// goes into it before the first app (a secret, the GitHub token) brings
+/// it along: on a new cluster it is not there yet.
+pub fn namespace_yaml() -> String {
+    format!(
+        "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: {NAMESPACE}\n  labels:\n    pod-security.kubernetes.io/enforce: baseline\n    \
+         pod-security.kubernetes.io/warn: restricted\n"
+    )
+}
 
 pub fn valid_image(s: &str) -> Result<()> {
     let ok = !s.is_empty()
@@ -180,14 +410,21 @@ impl App {
     pub fn validate(&self) -> Result<()> {
         valid_app_name(&self.name).map_err(|e| e.wrap("name"))?;
         valid_image(&self.image).map_err(|e| e.wrap("image"))?;
+        if let Some(src) = &self.source {
+            let base = src.image();
+            let ok = self.image == base || self.image.strip_prefix(&format!("{base}@")).is_some_and(crate::github::valid_digest);
+            if !ok {
+                bail!("image: an app GitHub builds runs {base} (from REPO), not {}", self.image);
+            }
+        }
         if crate::images::is_local(&self.image) {
             crate::images::local_name(&self.image).map_err(|e| e.wrap("image"))?;
             if !self.image_id.is_empty() && !crate::images::valid_id(&self.image_id) {
                 bail!("image: the id of {} is not one", self.image);
             }
         }
-        if self.port == 0 {
-            bail!("port: 1 to 65535");
+        if self.port == NO_PORT && !self.hosts.is_empty() {
+            bail!("PORT=none: an app that listens on no port has no public names (leave the HOST lines out)");
         }
         if self.hosts.len() > MAX_HOSTS {
             bail!("public host name: at most {MAX_HOSTS} per app, this one has {}", self.hosts.len());
@@ -232,6 +469,7 @@ impl App {
         if !(1..=20).contains(&self.copies) {
             bail!("copies: 1 to 20");
         }
+        self.run.validate(self.port)?;
         Ok(())
     }
 
@@ -253,17 +491,47 @@ impl App {
     /// The Kubernetes objects for this app.
     pub fn manifest(&self) -> Result<String> {
         self.validate()?;
-        let App { name, image, port, hosts, entrance, copies, image_id } = self;
+        let App { name, image, port, hosts, entrance, copies, image_id, run, source, gh } = self;
         // An image of the admin's own is on the servers, put there by
         // dryserver: it is never asked for anywhere else.
-        let (pod_annotations, pull) = if crate::images::is_local(image) {
-            (
-                format!("      annotations:\n        {IMAGE_ID_ANNOTATION}: \"{image_id}\"\n"),
-                "          imagePullPolicy: Never\n".to_string(),
-            )
-        } else {
-            (String::new(), String::new())
+        let mut marks = Vec::new();
+        if crate::images::is_local(image) {
+            marks.push(format!("        {IMAGE_ID_ANNOTATION}: \"{image_id}\"\n"));
+        }
+        if !run.secrets.is_empty() {
+            marks.push(format!("        {SECRETS_ANNOTATION}: \"{}\"\n", run.secrets_version));
+        }
+        let pod_annotations = if marks.is_empty() { String::new() } else { format!("      annotations:\n{}", marks.concat()) };
+        let env = run.yaml(name, *port);
+        // An app GitHub builds: where it comes from and which build runs,
+        // for the coordinator's watch; the token to pull with.
+        let (gh_annotations, pull_secrets) = match source {
+            None => (String::new(), String::new()),
+            Some(src) => {
+                use crate::github as g;
+                let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
+                let mut a = format!("    {}: {}\n    {}: {}\n", g::A_REPO, q(&src.full()), g::A_BRANCH, q(&src.branch));
+                if !gh.repo_id.is_empty() {
+                    a += &format!("    {}: \"{}\"\n", g::A_REPO_ID, gh.repo_id);
+                }
+                if gh.run > 0 {
+                    a += &format!("    {}: \"{}\"\n    {}: \"{}\"\n", g::A_RUN, gh.run, g::A_COMMIT, gh.commit);
+                }
+                if !gh.rolling.is_empty() {
+                    a += &format!("    {}: \"{}\"\n", g::A_ROLLING, gh.rolling);
+                }
+                if gh.hold > 0 {
+                    a += &format!("    {}: \"{}\"\n", g::A_HOLD, gh.hold);
+                }
+                let history: Vec<String> =
+                    gh.history.iter().map(|(t, d, c)| format!("{t}@{}@{c}", d.trim_start_matches("sha256:"))).collect();
+                a += &format!("    {}: \"{}\"\n", g::A_HISTORY, history.join(","));
+                (a, format!("      imagePullSecrets:\n        - name: {}\n", g::PULL_SECRET))
+            }
         };
+        let resources = run.resources();
+        let (_, pull) =
+            if crate::images::is_local(image) { ((), "          imagePullPolicy: Never\n".to_string()) } else { ((), String::new()) };
         let mark = entrance::ANNOTATION;
         let tolerations = tolerations();
         let extra = self.extra_ports();
@@ -271,15 +539,64 @@ impl App {
         let policy_ports: String = extra.iter().map(|p| format!("        - port: {p}\n")).collect();
         let service_ports: String =
             extra.iter().map(|p| format!("    - name: \"p{p}\"\n      port: {p}\n      targetPort: {p}\n")).collect();
+        // PORT=none: an app that takes no connections (a bot, a worker).
+        // Nothing reaches it; a new version takes over once it runs.
+        let listens = *port != NO_PORT;
+        // An app of the VPN: its own Traefik (namespace vpn) brings the
+        // devices' requests, never the cluster's.
+        let through_vpn = entrance == entrance::VPN && !hosts.is_empty();
+        let vpn_from = if through_vpn {
+            format!(
+                "        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: {}\n          \
+                 podSelector:\n            matchLabels:\n              app.kubernetes.io/name: {}\n",
+                crate::vpn::NAMESPACE,
+                crate::vpn::POD_LABEL
+            )
+        } else {
+            String::new()
+        };
+        let (policy_note, policy_ingress) = if listens && through_vpn {
+            (
+                format!(
+                    "# {name} is the VPN's: only the VPN's own ingress brings it anything, from\n# the admin's devices; no other app, no other ingress."
+                ),
+                format!("  ingress:\n    - from:\n{vpn_from}      ports:\n        - port: {port}\n{policy_ports}"),
+            )
+        } else if listens {
+            (
+                format!("# {name} takes connections on its port from the ingress and from the\n# other apps."),
+                format!(
+                    "  ingress:\n    - from:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: \
+                     kube-system\n          podSelector:\n            matchLabels:\n              app.kubernetes.io/name: traefik\n        \
+                     - podSelector: {{}}\n      ports:\n        - port: {port}\n{policy_ports}"
+                ),
+            )
+        } else {
+            (format!("# {name} listens on no port: nothing reaches it."), "  ingress: []\n".to_string())
+        };
+        let container_ports =
+            if listens { format!("          ports:\n            - containerPort: {port}\n{container_ports}") } else { String::new() };
+        let probe = if listens {
+            format!(
+                "          # Ready once it takes connections on its port: until then the\n          # ingress sends nothing to it, and an \
+                 update keeps the old copy.\n          readinessProbe:\n            tcpSocket:\n              port: {port}\n            \
+                 periodSeconds: 5\n            failureThreshold: 3\n"
+            )
+        } else {
+            String::new()
+        };
+        let service = if listens {
+            format!(
+                "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: \"{name}\"\n  namespace: {NAMESPACE}\n  labels:\n    app: \
+                 \"{name}\"\nspec:\n  selector:\n    app: \"{name}\"\n  ports:\n    - name: http\n      port: 80\n      targetPort: \
+                 {port}\n{service_ports}"
+            )
+        } else {
+            String::new()
+        };
+        let namespace = namespace_yaml();
         let mut y = format!(
-            r#"apiVersion: v1
-kind: Namespace
-metadata:
-  name: {NAMESPACE}
-  labels:
-    pod-security.kubernetes.io/enforce: baseline
-    pod-security.kubernetes.io/warn: restricted
----
+            r#"{namespace}---
 # Nothing reaches a pod in this namespace unless another policy allows it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -308,8 +625,7 @@ spec:
             cidr: 0.0.0.0/0
             except: {PRIVATE_RANGES}
 ---
-# {name} takes connections on its port from the ingress and from the
-# other apps.
+{policy_note}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -322,18 +638,7 @@ spec:
     matchLabels:
       app: "{name}"
   policyTypes: [Ingress]
-  ingress:
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: traefik
-        - podSelector: {{}}
-      ports:
-        - port: {port}
-{policy_ports}---
+{policy_ingress}---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -343,8 +648,19 @@ metadata:
     app: "{name}"
   annotations:
     {FORMAT_ANNOTATION}: "{FORMAT}"
-spec:
+{gh_annotations}spec:
   replicas: {copies}
+  # A new version starts beside the old one and takes over once it
+  # answers: no moment without a copy.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  progressDeadlineSeconds: 600
+  # A copy counts once it has kept running (and answering) this long: one
+  # that stops right after it starts never takes over.
+  minReadySeconds: 20
   selector:
     matchLabels:
       app: "{name}"
@@ -354,6 +670,10 @@ spec:
         app: "{name}"
 {pod_annotations}    spec:
       automountServiceAccountToken: false
+      # No variables about the other apps' services: they clash with an
+      # app's own (APP_PORT, ...).
+      enableServiceLinks: false
+{pull_secrets}
       securityContext:
         seccompProfile:
           type: RuntimeDefault
@@ -367,36 +687,26 @@ spec:
 {tolerations}      containers:
         - name: "{name}"
           image: "{image}"
-{pull}          ports:
-            - containerPort: {port}
-{container_ports}          securityContext:
+{pull}{container_ports}{env}          securityContext:
             allowPrivilegeEscalation: false
             # No raw packets: a taken-over app cannot pose as another
             # address on the pod network.
             capabilities:
               drop: ["NET_RAW"]
-          resources:
-            requests:
-              cpu: 50m
-              memory: 64Mi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: "{name}"
-  namespace: {NAMESPACE}
-  labels:
-    app: "{name}"
-spec:
-  selector:
-    app: "{name}"
-  ports:
-    - name: http
-      port: 80
-      targetPort: {port}
-{service_ports}"#
+{resources}{probe}{service}"#
         );
         if !hosts.is_empty() {
+            // The VPN's: its Traefik takes the label, the cluster's never
+            // does; https only, with its certificates.
+            let (vpn_label, vpn_annotations) = if through_vpn {
+                (
+                    format!("    {}: \"true\"\n", crate::vpn::LABEL),
+                    "    traefik.ingress.kubernetes.io/router.entrypoints: websecure\n    traefik.ingress.kubernetes.io/router.tls: \"true\"\n"
+                        .to_string(),
+                )
+            } else {
+                (String::new(), String::new())
+            };
             y += &format!(
                 r#"---
 apiVersion: networking.k8s.io/v1
@@ -406,10 +716,10 @@ metadata:
   namespace: {NAMESPACE}
   labels:
     app: "{name}"
-  annotations:
+{vpn_label}  annotations:
     {mark}: "{entrance}"
     {FORMAT_ANNOTATION}: "{FORMAT}"
-spec:
+{vpn_annotations}spec:
   rules:
 "#
             );
@@ -441,6 +751,9 @@ spec:
     /// The app as the cluster runs it, to change or keep as a file. None
     /// when the cluster's objects do not say enough (made by hand).
     pub fn of(r: &Running) -> Option<App> {
+        if r.port_unknown {
+            return None;
+        }
         let a = App {
             name: r.name.clone(),
             image: r.image.clone(),
@@ -449,6 +762,14 @@ spec:
             entrance: r.entrance.clone(),
             copies: r.copies,
             image_id: r.image_id.clone(),
+            // An app from before limits gets the ones every app gets.
+            run: Runtime {
+                memory_mib: if r.run.memory_mib == 0 { DEFAULT_MEMORY_MIB } else { r.run.memory_mib },
+                cpu_milli: if r.run.cpu_milli == 0 { DEFAULT_CPU_MILLI } else { r.run.cpu_milli },
+                ..r.run.clone()
+            },
+            source: r.gh.source.clone(),
+            gh: crate::github::State { watch: None, rolling: String::new(), ..r.gh.clone() },
         };
         a.validate().is_ok().then_some(a)
     }
@@ -483,9 +804,18 @@ pub struct Running {
     /// Written by a newer dryserver (its format annotation is higher than
     /// FORMAT): this one would read it wrong, so it changes nothing.
     pub newer: bool,
+    /// Runs without a port, but not as PORT=none (made by hand, or by a
+    /// dryserver from before it): no app file says what it is.
+    pub port_unknown: bool,
     /// The build of an image of the admin's own that its pods run ("" for
     /// other images, or when not known).
     pub image_id: String,
+    /// Its settings, secret names and limits, as its Deployment has them
+    /// (0 limits: none set, an app from before limits).
+    pub run: Runtime,
+    /// Where GitHub builds it from and which build runs (empty when it is
+    /// not built by GitHub).
+    pub gh: crate::github::State,
 }
 
 impl Running {
@@ -506,6 +836,39 @@ impl Running {
     pub fn has(&self, host: &str) -> bool {
         self.hosts.iter().any(|h| h.name == host)
     }
+}
+
+/// What an app's container runs with, as its Deployment says. Only what
+/// checks out is taken; PORT as dryserver sets it is not one of the app's
+/// own settings.
+fn runtime_of(app: &str, container: &serde_json::Value, annotations: &serde_json::Value, port: u16) -> Runtime {
+    let limits = &container["resources"]["limits"];
+    let memory_mib = limits["memory"].as_str().and_then(|m| parse_memory(m).ok()).unwrap_or(0);
+    let cpu_milli = limits["cpu"].as_str().and_then(|c| parse_cpu(c).ok()).unwrap_or(0);
+    let mut run = Runtime { memory_mib, cpu_milli, ..Runtime::default() };
+    let secret = secret_name(app);
+    for e in container["env"].as_array().map(Vec::as_slice).unwrap_or_default().iter().take(MAX_ENV + MAX_SECRETS + 2) {
+        let Some(name) = e["name"].as_str().filter(|n| valid_env_name(n).is_ok()) else { continue };
+        if let Some(v) = e["value"].as_str() {
+            let auto = name == "PORT" && port != NO_PORT && v == port.to_string();
+            if !auto && !run.env.iter().any(|(k, _)| k == name) {
+                run.env.push((name.to_string(), v.to_string()));
+            }
+        } else if e["valueFrom"]["secretKeyRef"]["name"].as_str() == Some(secret.as_str())
+            && e["valueFrom"]["secretKeyRef"]["key"].as_str() == Some(name)
+            && !run.secrets.iter().any(|k| k == name)
+        {
+            run.secrets.push(name.to_string());
+        }
+    }
+    run.env.sort();
+    run.secrets.sort();
+    run.secrets_version = annotations[SECRETS_ANNOTATION]
+        .as_str()
+        .filter(|v| v.len() <= 64 && v.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .unwrap_or("")
+        .to_string();
+    run
 }
 
 /// Whether a format annotation says a newer dryserver wrote the object.
@@ -726,6 +1089,14 @@ fn quiet(ctx: &Ctx, mut cmd: Command) -> bool {
     }
 }
 
+/// A word for a POSIX shell, quoted unless it is plain.
+pub fn sh_word(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./=:,@%+".contains(&b)) {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 impl Cluster for SshCluster {
     fn kubectl(&self, ctx: &Ctx, args: &[&str], stdin: &str) -> Result<String> {
         if !self.known_hosts.exists() {
@@ -755,7 +1126,10 @@ impl Cluster for SshCluster {
         }
         // kubectl gives up by itself too, so nothing stays behind on the
         // coordinator.
-        cmd.arg(&target).args(["k3s", "kubectl", "--request-timeout=60s"]).args(args);
+        // ssh hands the words to the coordinator's shell as one line:
+        // each is quoted, so it arrives as it is (a template's $ and
+        // spaces too).
+        cmd.arg(&target).args(["k3s", "kubectl", "--request-timeout=60s"]).args(args.iter().map(|a| sh_word(a)));
         let started = std::time::Instant::now();
         let ran = match run_child(ctx, cmd, stdin.as_bytes(), MAX_ANSWER) {
             Ok(r) => r,
@@ -853,7 +1227,12 @@ pub fn overview(ctx: &Ctx, c: &dyn Cluster) -> Result<Overview> {
         }
         let container = &it.spec["template"]["spec"]["containers"][0];
         let image = container["image"].as_str().unwrap_or("").to_string();
-        let port = container["ports"][0]["containerPort"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(0);
+        let port = container["ports"][0]["containerPort"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(NO_PORT);
+        // No port, and written by a dryserver that knows PORT=none: an app
+        // that listens on none. Without the mark (by hand, or from before):
+        // nothing an app file can say.
+        let format = it.metadata.annotations.get(FORMAT_ANNOTATION).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+        let port_unknown = port == NO_PORT && format < 3;
         o.apps.push(Running {
             name: it.metadata.name.clone(),
             image: if valid_image(&image).is_ok() { image } else { "?".into() },
@@ -867,6 +1246,9 @@ pub fn overview(ctx: &Ctx, c: &dyn Cluster) -> Result<Overview> {
                 .filter(|id| crate::images::valid_id(id))
                 .unwrap_or("")
                 .to_string(),
+            run: runtime_of(&it.metadata.name, container, &it.spec["template"]["metadata"]["annotations"], port),
+            port_unknown,
+            gh: crate::github::state_of(&serde_json::to_value(&it.metadata.annotations).unwrap_or_default()),
             ..Running::default()
         });
     }
@@ -941,6 +1323,10 @@ pub fn deploy(ctx: &Ctx, c: &dyn Cluster, app: &App) -> Result<()> {
         // Started again without a public name: the old way in goes.
         c.kubectl(ctx, &["-n", NAMESPACE, "delete", "ingress", &app.name, "--ignore-not-found"], "")?;
     }
+    if app.port == NO_PORT {
+        // Started again listening on no port: its service goes.
+        c.kubectl(ctx, &["-n", NAMESPACE, "delete", "service", &app.name, "--ignore-not-found"], "")?;
+    }
     Ok(())
 }
 
@@ -951,7 +1337,7 @@ pub fn remove(ctx: &Ctx, c: &dyn Cluster, name: &str) -> Result<()> {
         bail!("not an app name");
     }
     let sel = format!("app={name}");
-    c.kubectl(ctx, &["-n", NAMESPACE, "delete", "deployment,service,ingress,networkpolicy", "-l", &sel, "--ignore-not-found"], "")
+    c.kubectl(ctx, &["-n", NAMESPACE, "delete", "deployment,service,ingress,networkpolicy,secret", "-l", &sel, "--ignore-not-found"], "")
         .map(|_| ())
 }
 
@@ -969,12 +1355,93 @@ pub mod tests {
             entrance: crate::entrance::CLOUDFLARE.into(),
             copies: 2,
             image_id: String::new(),
+            run: Runtime::default(),
+            source: None,
+            gh: Default::default(),
         }
     }
 
     /// One public name for port.
     pub fn host(name: &str, port: u16) -> Host {
         Host { name: name.into(), port }
+    }
+
+    #[test]
+    fn an_app_that_listens_on_no_port() {
+        // A bot or a worker: nothing reaches it, nothing waits for a port.
+        let bot = App { name: "bot".into(), port: NO_PORT, hosts: vec![], ..app() };
+        let y = bot.manifest().unwrap();
+        for not in ["kind: Service", "readinessProbe", "containerPort", "name: \"PORT\"", "kind: Ingress"] {
+            assert!(!y.contains(not), "{not}:\n{y}");
+        }
+        let policy = &y[y.find("name: \"app-bot\"").unwrap()..y.find("kind: Deployment").unwrap()];
+        assert!(policy.contains("  ingress: []\n") && !policy.contains("port:"), "{policy}");
+        assert!(y.contains("maxUnavailable: 0"), "a new version still starts beside the old one");
+        // Its own PORT setting is its own business then.
+        App { run: Runtime { env: vec![("PORT".into(), "9999".into())], ..Runtime::default() }, ..bot.clone() }.manifest().unwrap();
+        // Deployed: an old service of it goes; so does its old way in.
+        let c = Fake::default();
+        deploy(&Ctx::new(), &c, &bot).unwrap();
+        let calls: Vec<String> = c.calls.lock().unwrap().iter().map(|(a, _)| a.clone()).collect();
+        assert!(calls.contains(&"-n apps delete service bot --ignore-not-found".to_string()), "{calls:?}");
+        assert!(calls.contains(&"-n apps delete ingress bot --ignore-not-found".to_string()), "{calls:?}");
+        // Read back: an app on no port again, as its file says.
+        let c = Fake::default();
+        let listing = serde_json::json!({"items": [{
+            "kind": "Deployment",
+            "metadata": {"name": "bot", "namespace": "apps", "labels": {"app": "bot"}, "annotations": {FORMAT_ANNOTATION: FORMAT.to_string()}},
+            "spec": {"replicas": 1, "template": {"spec": {"containers": [{"image": "ghcr.io/me/blog:v2", "resources": {"limits": {"memory": "512Mi", "cpu": "1"}}}]}}},
+            "status": {}
+        }]});
+        *c.listing.lock().unwrap() = listing.to_string();
+        let r = overview(&Ctx::new(), &c).unwrap().apps.remove(0);
+        assert_eq!(App::of(&r).unwrap(), App { copies: 1, ..bot.clone() });
+        // An app that listens keeps its service.
+        let c = Fake::default();
+        deploy(&Ctx::new(), &c, &App { hosts: vec![], ..app() }).unwrap();
+        assert!(!c.calls.lock().unwrap().iter().any(|(a, _)| a.contains("delete service")));
+    }
+
+    #[test]
+    fn an_app_of_the_vpn_is_served_by_the_vpns_traefik_only() {
+        let a = App { entrance: entrance::VPN.into(), ..app() };
+        let y = a.manifest().unwrap();
+        let ingress = &y[y.find("kind: Ingress").unwrap()..];
+        for want in [
+            "  labels:\n    app: \"blog\"\n    dryserver/vpn: \"true\"\n",
+            "    dryserver/entrance: \"vpn\"\n",
+            "    traefik.ingress.kubernetes.io/router.entrypoints: websecure\n",
+            "    traefik.ingress.kubernetes.io/router.tls: \"true\"\n",
+        ] {
+            assert!(ingress.contains(want), "{want:?}:\n{ingress}");
+        }
+        let policy = &y[y.find("name: \"app-blog\"").unwrap()..y.find("kind: Deployment").unwrap()];
+        assert!(
+            policy.contains("kubernetes.io/metadata.name: vpn\n          podSelector:\n            matchLabels:\n              app.kubernetes.io/name: dryserver-vpn"),
+            "{policy}"
+        );
+        // Only the VPN's ingress: not the cluster's, not the other apps.
+        assert!(!policy.contains("kube-system") && !policy.contains("podSelector: {}"), "{policy}");
+        // An app of the tunnel: neither the label nor the VPN's Traefik.
+        let y = app().manifest().unwrap();
+        assert!(!y.contains("dryserver/vpn") && !y.contains("dryserver-vpn") && !y.contains("router.tls"), "{y}");
+        // Inside only: nothing of the VPN either.
+        let y = App { entrance: entrance::VPN.into(), hosts: vec![], ..app() }.manifest().unwrap();
+        assert!(!y.contains("dryserver-vpn"), "{y}");
+    }
+
+    #[test]
+    fn words_reach_the_coordinator_as_they_are() {
+        assert_eq!(sh_word("--type"), "--type");
+        assert_eq!(sh_word("app=shop"), "app=shop");
+        assert_eq!(sh_word(""), "''");
+        assert_eq!(sh_word("go-template={{$k}} x"), "'go-template={{$k}} x'");
+        assert_eq!(sh_word("it's; rm -rf /"), "'it'\\''s; rm -rf /'");
+        // What sh makes of them: the words as they were.
+        for w in ["a b", "$HOME", "`id`", "it's", "x\ny", "{{range $k, $v := .data}} {{$k}}{{end}}"] {
+            let out = std::process::Command::new("sh").arg("-c").arg(format!("printf %s {}", sh_word(w))).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), w);
+        }
     }
 
     #[test]
@@ -998,8 +1465,8 @@ pub mod tests {
             "allowPrivilegeEscalation: false",
             "targetPort: 8080",
             "kind: Ingress",
-            "  annotations:\n    dryserver/entrance: \"cloudflare\"\n    dryserver/format: \"2\"\nspec:\n  rules:\n    - host: \"blog.example.com\"",
-            "kind: Deployment\nmetadata:\n  name: \"blog\"\n  namespace: apps\n  labels:\n    app: \"blog\"\n  annotations:\n    dryserver/format: \"2\"\n",
+            "  annotations:\n    dryserver/entrance: \"cloudflare\"\n    dryserver/format: \"3\"\nspec:\n  rules:\n    - host: \"blog.example.com\"",
+            "kind: Deployment\nmetadata:\n  name: \"blog\"\n  namespace: apps\n  labels:\n    app: \"blog\"\n  annotations:\n    dryserver/format: \"3\"\n",
             "  ports:\n    - name: http\n      port: 80\n      targetPort: 8080\n",
             "                port:\n                  number: 80\n",
         ] {
@@ -1039,7 +1506,7 @@ pub mod tests {
             (App { image: "nginx\"\n  privileged: true".into(), ..app() }, "image"),
             (App { image: String::new(), ..app() }, "image"),
             (App { image: "-evil".into(), ..app() }, "image"),
-            (App { port: 0, ..app() }, "port"),
+            (App { port: NO_PORT, ..app() }, "PORT=none: an app that listens on no port has no public names"),
             (App { hosts: vec![host("blog", 8080)], ..app() }, "public host name"),
             (App { hosts: vec![host("a b.example.com", 8080)], ..app() }, "public host name"),
             (App { hosts: vec![host("x.example.com\"\n", 8080)], ..app() }, "public host name"),
@@ -1102,6 +1569,9 @@ pub mod tests {
         /// The listing once a manifest with this text in it was applied
         /// (each is used once).
         pub after_apply: Mutex<Vec<(String, String)>>,
+        /// Fixed answers: a call whose arguments contain the first gets
+        /// the second (before the listing).
+        pub answers: Mutex<Vec<(String, String)>>,
     }
 
     impl Cluster for Fake {
@@ -1129,6 +1599,10 @@ pub mod tests {
                 if let Some(i) = next.iter().position(|(has, _)| stdin.contains(has.as_str())) {
                     *self.listing.lock().unwrap() = next.remove(i).1;
                 }
+            }
+            let joined = args.join(" ");
+            if let Some((_, a)) = self.answers.lock().unwrap().iter().find(|(k, _)| joined.contains(k.as_str())) {
+                return Ok(a.clone());
             }
             Ok(if args.contains(&"get") {
                 match self.listing.lock().unwrap().as_str() {
@@ -1227,7 +1701,7 @@ pub mod tests {
         // Every port the names lead to: on the container, in the wall, on
         // the service, each once.
         for want in [
-            "            - containerPort: 8080\n            - containerPort: 9000\n            - containerPort: 9100\n          securityContext:",
+            "            - containerPort: 8080\n            - containerPort: 9000\n            - containerPort: 9100\n          env:",
             "        - port: 8080\n        - port: 9000\n        - port: 9100\n---\n",
             "    - name: http\n      port: 80\n      targetPort: 8080\n    - name: \"p9000\"\n      port: 9000\n      targetPort: 9000\n    - name: \"p9100\"\n      port: 9100\n      targetPort: 9100\n",
         ] {
@@ -1260,7 +1734,7 @@ pub mod tests {
               {{"host":"example.com"}}
             ]}}}},
             {{"kind":"Ingress","metadata":{{"name":"extra","namespace":"apps","labels":{{"app":"shop"}}}},"spec":{{"rules":[{{"host":"sneaky.example.com"}}]}}}},
-            {{"kind":"Ingress","metadata":{{"name":"next","namespace":"apps","labels":{{"app":"next"}},"annotations":{{"dryserver/format":"3"}}}},"spec":{{"rules":[{{"host":"next.example.com"}}]}}}}
+            {{"kind":"Ingress","metadata":{{"name":"next","namespace":"apps","labels":{{"app":"next"}},"annotations":{{"dryserver/format":"4"}}}},"spec":{{"rules":[{{"host":"next.example.com"}}]}}}}
             ]}}"#,
             dep("shop", r#","ports":[{"containerPort":8080},{"containerPort":9000}]"#, ""),
             dep("old", r#","ports":[{"containerPort":3000}]"#, ""),
@@ -1287,8 +1761,122 @@ pub mod tests {
         assert_eq!((back.port, back.hosts.len(), back.image.as_str()), (8080, 3, "shop:v1"));
         let again = back.manifest().unwrap();
         assert!(again.contains("number: 9000") && again.contains("- host: \"www.example.com\""), "{again}");
-        // Without a port it cannot be made again.
+        // Without a port and without the mark of PORT=none: made by hand
+        // or from before; it cannot be made again from a file.
         assert!(App::of(o.apps.iter().find(|a| a.name == "odd").unwrap()).is_none());
+    }
+
+    #[test]
+    fn what_an_app_runs_with() {
+        let run = Runtime {
+            env: vec![
+                ("API".into(), "https://x.example.com/?a=1&b=#frag".into()),
+                ("QUOTE".into(), "he said \"hi\"\n- kind: Secret".replace('\n', " ")),
+            ],
+            secrets: vec!["DATABASE_URL".into(), "TOKEN".into()],
+            memory_mib: 1024,
+            cpu_milli: 500,
+            secrets_version: "4711".into(),
+        };
+        let a = App { run: run.clone(), ..app() };
+        let y = a.manifest().unwrap();
+        for want in [
+            "            - name: \"PORT\"\n              value: \"8080\"\n",
+            "            - name: \"API\"\n              value: \"https://x.example.com/?a=1&b=#frag\"\n",
+            "              value: \"he said \\\"hi\\\" - kind: Secret\"\n",
+            "            - name: \"TOKEN\"\n              valueFrom:\n                secretKeyRef:\n                  name: \"app-blog\"\n                  key: \"TOKEN\"\n",
+            "      annotations:\n        dryserver/secrets: \"4711\"\n",
+            "            requests:\n              cpu: 50m\n              memory: 512Mi\n            limits:\n              cpu: 500m\n              memory: 1024Mi\n",
+            "          readinessProbe:\n            tcpSocket:\n              port: 8080\n",
+            "      maxUnavailable: 0\n      maxSurge: 1\n",
+            "  minReadySeconds: 20\n",
+            "      enableServiceLinks: false\n",
+        ] {
+            assert!(y.contains(want), "missing {want:?}:\n{y}");
+        }
+        // Nothing dryserver sets but PORT: Node.js 20 and newer size their
+        // heap to the limit; an image's own NODE_OPTIONS stays its own.
+        // No LimitRange: it would limit apps of before at their next start.
+        assert!(!y.contains("NODE_OPTIONS") && !y.contains("LimitRange"), "{y}");
+        // The app's own PORT is the one; its NODE_OPTIONS goes as it is.
+        let own = App {
+            run: Runtime {
+                env: vec![("NODE_OPTIONS".into(), "--enable-source-maps".into()), ("PORT".into(), "8080".into())],
+                ..Runtime::default()
+            },
+            ..app()
+        };
+        let y = own.manifest().unwrap();
+        assert_eq!(y.matches("name: \"PORT\"").count(), 1);
+        assert!(y.contains("value: \"--enable-source-maps\"") && !y.contains("max-old-space-size"), "{y}");
+        // What is refused.
+        let bad = |r: Runtime| App { run: r, ..app() }.manifest().unwrap_err().to_string();
+        assert!(bad(Runtime { env: vec![("PORT".into(), "3000".into())], ..Runtime::default() }).contains("must agree"));
+        assert!(bad(Runtime { env: vec![("1X".into(), "a".into())], ..Runtime::default() }).contains("not starting with a digit"));
+        assert!(bad(Runtime { env: vec![("A".into(), "a\u{7}".into())], ..Runtime::default() }).contains("control character"));
+        assert!(bad(Runtime { env: vec![("A".into(), "a\u{FFFE}".into())], ..Runtime::default() }).contains("no character"));
+        // Line and paragraph separators reach the cluster as escapes, which
+        // YAML reads back as the same characters (not as line breaks).
+        let sep = App { run: Runtime { env: vec![("A".into(), "x\u{2028}y\u{2029}z".into())], ..Runtime::default() }, ..app() };
+        let y = sep.manifest().unwrap();
+        assert!(y.contains(r#"value: "x\u2028y\u2029z""#) && !y.contains('\u{2028}'), "{y}");
+        assert!(bad(Runtime { env: vec![("A".into(), "x".repeat(40 << 10))], ..Runtime::default() }).contains("longer than"));
+        assert!(
+            bad(Runtime { env: vec![("A".into(), "1".into())], secrets: vec!["A".into()], ..Runtime::default() })
+                .contains("a setting or a secret already")
+        );
+        assert!(bad(Runtime { memory_mib: 8, ..Runtime::default() }).contains("MEMORY"));
+        assert!(bad(Runtime { cpu_milli: 9000, ..Runtime::default() }).contains("CPU"));
+        assert!(bad(Runtime { secrets: vec!["A".into()], secrets_version: "1; rm".into(), ..Runtime::default() }).contains("version"));
+        // Read back from the cluster as written.
+        let listing = serde_json::json!({"items": [{
+            "kind": "Deployment",
+            "metadata": {"name": "blog", "namespace": "apps", "labels": {"app": "blog"}},
+            "spec": {"replicas": 2, "template": {
+                "metadata": {"annotations": {"dryserver/secrets": "4711"}},
+                "spec": {"containers": [{
+                    "image": "ghcr.io/me/blog:v2",
+                    "ports": [{"containerPort": 8080}],
+                    "env": [
+                        {"name": "PORT", "value": "8080"},
+                        {"name": "NODE_OPTIONS", "value": "--max-old-space-size=768"},
+                        {"name": "API", "value": "x=1\u{2028}y"},
+                        {"name": "TOKEN", "valueFrom": {"secretKeyRef": {"name": "app-blog", "key": "TOKEN"}}},
+                        {"name": "OTHER", "valueFrom": {"secretKeyRef": {"name": "someone-else", "key": "OTHER"}}}
+                    ],
+                    "resources": {"limits": {"memory": "1Gi", "cpu": "500m"}}
+                }]}
+            }},
+            "status": {}
+        }]})
+        .to_string();
+        let c = Fake::default();
+        *c.listing.lock().unwrap() = listing;
+        let r = overview(&Ctx::new(), &c).unwrap().apps.remove(0).run;
+        assert_eq!(
+            r,
+            Runtime {
+                env: vec![("API".into(), "x=1\u{2028}y".into()), ("NODE_OPTIONS".into(), "--max-old-space-size=768".into())],
+                secrets: vec!["TOKEN".into()],
+                memory_mib: 1024,
+                cpu_milli: 500,
+                secrets_version: "4711".into()
+            }
+        );
+        // Units as people write them.
+        assert_eq!((parse_memory("512Mi").unwrap(), parse_memory("1Gi").unwrap(), parse_memory("1.5Gi").unwrap()), (512, 1024, 1536));
+        assert_eq!((parse_cpu("1").unwrap(), parse_cpu("500m").unwrap(), parse_cpu("0.25").unwrap()), (1000, 500, 250));
+        for bad in ["512", "512MB", "1G", "", "-1Gi", "64Gi", "16Mi"] {
+            assert!(parse_memory(bad).is_err(), "{bad}");
+        }
+        for bad in ["", "x", "10", "20m", "1.5.2"] {
+            assert!(parse_cpu(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            (memory_text(1024), memory_text(1536), cpu_text(1000), cpu_text(250)),
+            ("1Gi".into(), "1536Mi".into(), "1".into(), "250m".into())
+        );
+        assert!(looks_secret("STRIPE_API_KEY") && looks_secret("db_password") && !looks_secret("NODE_ENV"));
     }
 
     #[test]
@@ -1308,7 +1896,17 @@ pub mod tests {
             o.apps,
             vec![
                 // Its Ingress names an entrance nobody knows.
-                Running { name: "api".into(), image: "?".into(), ready: 0, copies: 1, entrance: "?".into(), ..Running::default() },
+                Running {
+                    name: "api".into(),
+                    image: "?".into(),
+                    ready: 0,
+                    copies: 1,
+                    entrance: "?".into(),
+                    run: Runtime { memory_mib: 0, cpu_milli: 0, ..Runtime::default() },
+                    // No port, no mark: made by hand.
+                    port_unknown: true,
+                    ..Running::default()
+                },
                 // No annotation: Cloudflare, as before entrances.
                 Running {
                     name: "blog".into(),
@@ -1321,6 +1919,9 @@ pub mod tests {
                     nodes: vec!["node-a".into(), "node-b".into()],
                     newer: false,
                     image_id: String::new(),
+                    run: Runtime { memory_mib: 0, cpu_milli: 0, ..Runtime::default() },
+                    port_unknown: false,
+                    gh: Default::default(),
                 },
             ],
             "what the cluster says is checked before it is shown, and only the apps namespace counts"
@@ -1339,7 +1940,7 @@ pub mod tests {
         remove(&Ctx::new(), &c, "blog").unwrap();
         assert_eq!(
             c.calls.lock().unwrap().last().unwrap().0,
-            "-n apps delete deployment,service,ingress,networkpolicy -l app=blog --ignore-not-found"
+            "-n apps delete deployment,service,ingress,networkpolicy,secret -l app=blog --ignore-not-found"
         );
         assert!(remove(&Ctx::new(), &c, "blog -A").is_err(), "a name must not carry kubectl arguments");
 

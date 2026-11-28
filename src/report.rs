@@ -165,6 +165,10 @@ pub struct Report {
     /// "" from a dryserver before it, or the coordinator.
     #[serde(deserialize_with = "lenient", skip_serializing_if = "String::is_empty")]
     pub coord_ssh: String,
+    /// The VPN's gateway: its devices' last handshakes (vpn.rs); none on
+    /// any other machine.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub vpn: Option<crate::vpn::Status>,
 }
 
 /// What a server says of the coordinator's SSH at its LAN address: ok, it
@@ -321,6 +325,24 @@ impl Report {
             lan: if parse_ip4(&self.lan).is_some() { self.lan } else { String::new() },
             sig: if self.sig.len() <= MAX_SIG && self.sig.starts_with(SIG_BEGIN) { self.sig } else { String::new() },
             coord_ssh: if COORD_SSH_STATES.contains(&self.coord_ssh.as_str()) { self.coord_ssh } else { String::new() },
+            vpn: self.vpn.map(|v| crate::vpn::Status {
+                gateway: v.gateway,
+                port: v.port,
+                devices: v
+                    .devices
+                    .into_iter()
+                    .filter(|d| {
+                        !d.key.is_empty()
+                            && d.key.len() <= crate::vpn::KEY_PREFIX
+                            && d.key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+                    })
+                    .take(crate::vpn::MAX_DEVICES)
+                    .map(|d| crate::vpn::Seen { handshake: time(d.handshake), ..d })
+                    .collect(),
+                token: v.token,
+                // Short and plain: the report's size is counted.
+                problem: v.problem.chars().filter(|c| c.is_ascii_graphic() && !matches!(c, '"' | '\\') || *c == ' ').take(120).collect(),
+            }),
         }
     }
 
@@ -509,6 +531,7 @@ pub fn gather(ctx: &Ctx, run: &dyn Runner, root: &Path, wg_subnet: &str) -> Repo
         sig: String::new(),
         // Added by describe too.
         coord_ssh: String::new(),
+        vpn: serde_json::from_str(&fsx::read_or_empty(at(crate::vpn::STATUS_FILE))).ok(),
     };
     // What this machine sends is what every reader accepts, so nothing of
     // it is dropped on the way and it stays within the heartbeat's size.

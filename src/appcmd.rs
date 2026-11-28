@@ -24,7 +24,7 @@ use crate::ctx::Ctx;
 use crate::entrance::cloudflare::{Cloudflare, TARGET};
 use crate::entrance::{self, Entrance, Entrances, Report};
 use crate::err::{Error, Kind, Result};
-use crate::{appfile, bail, errf, images};
+use crate::{appfile, bail, errf, github, images};
 
 /// How long a look at the cluster or Cloudflare may take.
 pub const READ: Duration = Duration::from_secs(30);
@@ -260,11 +260,16 @@ fn refuse_unrouted(looks: &[Look], before: Option<&Running>, app: &App) -> Resul
 fn app_changes(before: Option<&Running>, app: &App) -> (Vec<String>, bool) {
     let mut lines = Vec::new();
     let port_of = |h: &apps::Host, main: u16| if h.port == main { String::new() } else { format!(" (port {})", h.port) };
+    let port_text = |p: u16| if p == apps::NO_PORT { "no port".to_string() } else { format!("port {p}") };
     let Some(b) = before else {
+        let what = match &app.source {
+            Some(src) => format!("build {} of {} ({})", app.gh.commit.get(..7).unwrap_or("?"), src.branch, src.text()),
+            None => app.image.clone(),
+        };
         lines.push(format!(
-            "  start it: {}, port {}, {} {}",
-            app.image,
-            app.port,
+            "  start it: {}, {}, {} {}",
+            what,
+            port_text(app.port),
             app.copies,
             if app.copies == 1 { "copy" } else { "copies" }
         ));
@@ -272,12 +277,75 @@ fn app_changes(before: Option<&Running>, app: &App) -> (Vec<String>, bool) {
             lines.push(format!("  + {}{}", h.name, port_of(h, app.port)));
         }
         if app.hosts.is_empty() {
-            lines.push(format!("  inside only: your other apps reach it as http://{}", app.name));
+            if app.port == apps::NO_PORT {
+                lines.push("  listens on no port: nothing reaches it".into());
+            } else {
+                lines.push(format!("  inside only: your other apps reach it as http://{}", app.name));
+            }
+        }
+        lines.push(format!(
+            "  each copy: up to {} memory, {} CPU",
+            apps::memory_text(app.run.memory_mib),
+            apps::cpu_text(app.run.cpu_milli)
+        ));
+        for (k, _) in &app.run.env {
+            lines.push(format!("  ENV {k}"));
+        }
+        for k in &app.run.secrets {
+            lines.push(format!("  SECRET {k}"));
         }
         return (lines, true);
     };
     let mut restart = false;
-    if b.image != app.image {
+    // Settings, secrets and limits are in the copies' template: any change
+    // replaces the copies (one at a time).
+    let (br, ar) = (&b.run, &app.run);
+    if (br.memory_mib, br.cpu_milli) != (ar.memory_mib, ar.cpu_milli) {
+        let was = if br.memory_mib == 0 {
+            "no limit".to_string()
+        } else {
+            format!("{} memory, {} CPU", apps::memory_text(br.memory_mib), apps::cpu_text(br.cpu_milli.max(1)))
+        };
+        lines.push(format!("  limits  {was} -> {} memory, {} CPU", apps::memory_text(ar.memory_mib), apps::cpu_text(ar.cpu_milli)));
+        restart = true;
+    }
+    for (k, v) in &ar.env {
+        match br.env.iter().find(|(x, _)| x == k) {
+            None => lines.push(format!("  + ENV {k}")),
+            Some((_, old)) if old != v => lines.push(format!("  ~ ENV {k} (new value)")),
+            Some(_) => {}
+        }
+    }
+    for (k, _) in &br.env {
+        if !ar.env.iter().any(|(x, _)| x == k) {
+            lines.push(format!("  - ENV {k}"));
+        }
+    }
+    for k in &ar.secrets {
+        if !br.secrets.contains(k) {
+            lines.push(format!("  + SECRET {k}"));
+        }
+    }
+    for k in &br.secrets {
+        if !ar.secrets.contains(k) {
+            lines.push(format!("  - SECRET {k}"));
+        }
+    }
+    if br.env != ar.env || br.secrets != ar.secrets {
+        restart = true;
+    }
+    if !ar.secrets.is_empty() && br.secrets_version != ar.secrets_version {
+        lines.push("  ~ secrets: a value changed since the copies started".into());
+        restart = true;
+    }
+    if let Some(src) = &app.source
+        && b.image != app.image
+    {
+        let was = b.gh.commit.get(..7).unwrap_or("?");
+        let new = app.gh.commit.get(..7).unwrap_or("?");
+        lines.push(format!("  build   {was} -> {new} of {}", src.branch));
+        restart = true;
+    } else if b.image != app.image {
         lines.push(format!("  image   {} -> {}", b.image, app.image));
         restart = true;
     } else if crate::images::is_local(&app.image) && b.image_id != app.image_id {
@@ -287,7 +355,11 @@ fn app_changes(before: Option<&Running>, app: &App) -> (Vec<String>, bool) {
         restart = true;
     }
     if b.port != app.port {
-        lines.push(format!("  port    {} -> {}", b.port, app.port));
+        lines.push(format!(
+            "  port    {} -> {}",
+            port_text(b.port).trim_start_matches("port "),
+            port_text(app.port).trim_start_matches("port ")
+        ));
         restart = true;
     }
     if b.copies != app.copies {
@@ -327,7 +399,7 @@ fn app_changes(before: Option<&Running>, app: &App) -> (Vec<String>, bool) {
     }
     if !lines.is_empty() {
         lines.push(if restart {
-            "  Its copies are replaced one at a time (the image or a port changed).".to_string()
+            "  Its copies are replaced one at a time (the image, a port, a setting or a limit changed).".to_string()
         } else {
             "  The running copies stay as they are.".to_string()
         });
@@ -382,7 +454,272 @@ pub fn push(ctx: &Ctx, c: &dyn Cluster, own: &Own, image: &str, opts: &Opts, io:
     Ok(())
 }
 
-pub fn deploy(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, own: Option<&Own>, app: &App, opts: &Opts, io: &mut Io) -> Result<()> {
+/// What this computer needs to deploy an app GitHub builds: the token
+/// (classic, read:packages only) and the ways to check GitHub's proof.
+pub struct GitHub<'a> {
+    pub token: Option<String>,
+    pub make: &'a dyn Fn(String) -> Box<dyn github::Registry>,
+    pub keys: &'a dyn github::Keys,
+    pub rsa: &'a dyn github::Rsa,
+}
+
+/// Whether the coordinator follows GitHub: it wrote its sign of life in
+/// the last ten minutes.
+fn follows(ctx: &Ctx, c: &dyn Cluster, now: i64) -> bool {
+    let out = c
+        .kubectl(
+            &ctx.with_timeout(READ),
+            &["-n", apps::NAMESPACE, "get", "configmap", github::HEARTBEAT, "-o", "json", "--ignore-not-found"],
+            "",
+        )
+        .unwrap_or_default();
+    let last =
+        serde_json::from_str::<serde_json::Value>(&out).ok().and_then(|v| v["data"]["last"].as_str().and_then(|l| l.parse::<i64>().ok()));
+    last.is_some_and(|l| now - l < 600)
+}
+
+/// Picks the build an app GitHub builds runs with: the newest one GitHub
+/// proved, unless the app runs a newer one or that one is held back
+/// (a rollback). Without an answer from GitHub, the running build stays.
+/// Sets the app's image and build state; returns notes for the preview.
+fn pick_build(ctx: &Ctx, gh: Option<&GitHub>, now: &crate::apps::Overview, app: &mut App) -> Result<Vec<String>> {
+    let Some(src) = app.source.clone() else { return Ok(Vec::new()) };
+    let Some(g) = gh else { bail!("{} is built by GitHub, and this computer cannot ask GitHub", app.name) };
+    let Some(token) = g.token.clone() else {
+        bail!("no GitHub token on this computer yet: dryserver app github token (a classic token with only read:packages)");
+    };
+    let running = now.apps.iter().find(|a| a.name == app.name);
+    let rgh = running.map(|r| r.gh.clone()).unwrap_or_default();
+    if let (Some(r), Some(rs)) = (running, &rgh.source)
+        && !rs.full().eq_ignore_ascii_case(&src.full())
+    {
+        bail!(
+            "{} runs builds of {}; to build it from {} instead, remove it first (dryserver app remove {}): its build history belongs to the other repository",
+            r.name,
+            rs.text(),
+            src.text(),
+            r.name
+        );
+    }
+    let running_digest = running.and_then(|r| r.image.rsplit_once('@')).map(|(_, d)| d.to_string()).filter(|d| github::valid_digest(d));
+    // Another branch starts its own line of builds.
+    let same_branch = rgh.source.as_ref().is_some_and(|s| s.branch == src.branch);
+    let (run, hold) = if same_branch { (rgh.run, rgh.hold) } else { (0, 0) };
+    let keep = |app: &mut App| {
+        if let (Some(d), true) = (&running_digest, same_branch) {
+            app.image = format!("{}@{d}", src.image());
+            // A rollout the coordinator follows stays followed.
+            app.gh = github::State { watch: None, ..rgh.clone() };
+            true
+        } else {
+            false
+        }
+    };
+    let pin = Some(rgh.repo_id.as_str()).filter(|p| !p.is_empty());
+    let reg = (g.make)(token);
+    let mut notes = Vec::new();
+    match github::newest(&ctx.with_timeout(READ), reg.as_ref(), g.keys, g.rsa, &src, pin) {
+        Ok(Some(b)) if b.run > run && b.run > hold => {
+            let history = match &running_digest {
+                Some(d) if same_branch => github::history_after(&rgh, d),
+                _ => Vec::new(),
+            };
+            app.image = format!("{}@{}", src.image(), b.digest);
+            // The coordinator follows the copies and says when they run.
+            let rolling = b.digest.clone();
+            app.gh = github::State {
+                source: Some(src.clone()),
+                repo_id: b.repo_id,
+                run: b.run,
+                commit: b.commit,
+                hold,
+                history,
+                rolling,
+                ..Default::default()
+            };
+        }
+        Ok(Some(b)) => {
+            if !keep(app) {
+                bail!("{}: GitHub's newest build of {} is held back here; nothing to start", app.name, src.branch);
+            }
+            if b.run < run {
+                notes.push(format!(
+                    "  note: the registry's build {} (run {}) is older than the running one (run {run}): a run of before was run \
+                     again; the running build stays",
+                    b.short(),
+                    b.run
+                ));
+            } else if b.run <= hold && b.run > run {
+                notes.push(format!("  note: build {} is held back (a rollback, or it did not start); the next push deploys", b.short()));
+            }
+        }
+        Ok(None) => {
+            if !keep(app) {
+                bail!(
+                    "no build of {} on GitHub yet. In the app's repository: dryserver app github init, commit the workflow, push to {}; when GitHub \
+                     has built it (Actions tab), deploy again",
+                    src.branch,
+                    src.branch
+                );
+            }
+        }
+        Err(e) => {
+            if !keep(app) {
+                return Err(e.wrap(format!("{}'s newest build", app.name)));
+            }
+            notes.push(format!("  note: GitHub's newest build was not taken ({e}); the running build stays"));
+        }
+    }
+    Ok(notes)
+}
+
+/// Goes back to the build before the running one, and holds back what
+/// came after until the next push.
+pub fn rollback(ctx: &Ctx, c: &dyn Cluster, name: &str, opts: &Opts, io: &mut Io) -> Result<()> {
+    apps::valid_app_name(name).map_err(|e| e.wrap("name"))?;
+    let now = look(ctx, c)?;
+    refuse_newer(&now)?;
+    let Some(r) = now.apps.iter().find(|a| a.name == name) else { bail!("no app named {name} runs (dryserver app list shows them)") };
+    let Some(src) = r.gh.source.clone() else {
+        bail!("{name} is not built by GitHub; to go back, deploy its file with the image you want");
+    };
+    let Some((t, digest, commit)) = r.gh.history.first().cloned() else {
+        bail!("{name} has no build before {} to go back to", r.gh.commit.get(..7).unwrap_or("this one"));
+    };
+    io.say(format!(
+        "{name}: back from build {} to build {} of {}. Newer builds wait until the next push to {}.",
+        r.gh.commit.get(..7).unwrap_or("?"),
+        &commit[..7],
+        src.branch,
+        src.branch
+    ));
+    if !agreed("Go back? [y/N] ", opts, io) {
+        io.say("Nothing changed.");
+        return Ok(());
+    }
+    let rest: Vec<String> = r.gh.history.iter().skip(1).map(|(t, d, c)| format!("{t}@{}@{c}", d.trim_start_matches("sha256:"))).collect();
+    let patch = serde_json::json!({
+        "metadata": {"annotations": {
+            github::A_RUN: t.to_string(),
+            github::A_COMMIT: commit,
+            github::A_HOLD: r.gh.run.max(r.gh.hold).to_string(),
+            github::A_HISTORY: rest.join(","),
+            github::A_ROLLING: digest,
+        }},
+        "spec": {"template": {"spec": {"containers": [{"name": name, "image": format!("{}@{digest}", src.image())}]}}}
+    })
+    .to_string();
+    c.kubectl(
+        &ctx.with_timeout(CHANGE),
+        &["-n", apps::NAMESPACE, "patch", "deployment", name, "--type", "strategic", "--patch-file", "/dev/stdin"],
+        &patch,
+    )
+    .map_err(|e| timed(e, CHANGE).wrap(format!("{name} did not go back")))?;
+    io.say(format!("{name}: going back to build {}; its copies are replaced one at a time.", &commit[..7]));
+    Ok(())
+}
+
+/// Writes the build workflow into the app's repository at dir.
+pub fn github_init(dir: &std::path::Path, branch: &str, force: bool, io: &mut Io) -> Result<()> {
+    if !github::valid_branch(branch) {
+        bail!("{branch}: a branch name, like main");
+    }
+    if !dir.join(".git").exists() {
+        bail!("{} is not a git repository (no .git there): run this in your app's repository, or name it with -dir", dir.display());
+    }
+    let path = dir.join(github::WORKFLOW);
+    let text = github::workflow(branch);
+    match std::fs::read_to_string(&path) {
+        Ok(old) if old == text => io.say(format!("{} is there already, as dryserver writes it.", github::WORKFLOW)),
+        Ok(_) if !force => bail!("{} is there, and differs from dryserver's; -force writes dryserver's over it", path.display()),
+        _ => {
+            crate::fsx::mkdir_all(path.parent().unwrap_or(dir), 0o755)?;
+            let tmp = path.with_extension("yml.tmp");
+            let _ = std::fs::remove_file(&tmp);
+            crate::fsx::write_new(&tmp, &text, 0o644)?;
+            crate::fsx::rename(&tmp, &path)?;
+            io.say(format!("Wrote {}: every push to {branch} builds the app on GitHub and proves it.", github::WORKFLOW));
+        }
+    }
+    // Where it is on GitHub, from git's own config: the REPO line to use.
+    let config = std::fs::read_to_string(dir.join(".git/config")).unwrap_or_default();
+    let mut origin = false;
+    let mut repo = None;
+    for l in config.lines() {
+        let t = l.trim();
+        if t.starts_with('[') {
+            origin = t == "[remote \"origin\"]";
+        } else if origin && let Some(u) = t.strip_prefix("url").map(|r| r.trim_start().trim_start_matches('=').trim()) {
+            repo = github::Source::parse(u, branch).ok();
+        }
+    }
+    io.say("Next:");
+    io.say(format!("  1. git add {} && git commit -m \"build with dryserver\" && git push", github::WORKFLOW));
+    io.say("  2. once: dryserver app github token (a classic GitHub token with only read:packages)");
+    match repo {
+        Some(r) => io.say(format!(
+            "  3. in the app file: REPO={}{} (no IMAGE line), then: dryserver app deploy FILE",
+            r.text(),
+            if branch == "main" { String::new() } else { format!(" and BRANCH={branch}") }
+        )),
+        None => io.say("  3. in the app file: REPO=github.com/YOU/REPO (no IMAGE line), then: dryserver app deploy FILE"),
+    }
+    io.say(format!("  On GitHub, protect {branch} (Settings, Branches): whoever can push to it can deploy."));
+    Ok(())
+}
+
+/// Checks a GitHub token, keeps it on this computer (store) and in the
+/// cluster (when it answers) for the servers to pull with.
+pub fn github_token(
+    ctx: &Ctx,
+    c: &dyn Cluster,
+    run: &dyn crate::runner::Runner,
+    token: &str,
+    store: &std::path::Path,
+    io: &mut Io,
+) -> Result<()> {
+    let token = token.trim();
+    github::valid_token(token)?;
+    let (login, scopes) = github::token_info(&ctx.with_timeout(READ), run, token)?;
+    if !scopes.iter().any(|s| s == "read:packages" || s == "write:packages") {
+        bail!(
+            "that token cannot read packages (its scopes: {}); make a classic token with read:packages",
+            if scopes.is_empty() { "none".to_string() } else { scopes.join(", ") }
+        );
+    }
+    let more: Vec<&String> = scopes.iter().filter(|s| *s != "read:packages").collect();
+    if !more.is_empty() {
+        io.say(format!(
+            "note: this token can do more than read packages ({}); one with only read:packages is safer, since the cluster keeps it",
+            more.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if let Some(dir) = store.parent() {
+        crate::fsx::mkdir_all(dir, 0o700)?;
+    }
+    let tmp = store.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    crate::fsx::write_new(&tmp, format!("{token}\n"), 0o600)?;
+    crate::fsx::rename(&tmp, store)?;
+    io.say(format!("The token of {login} is kept in {} (yours alone).", store.display()));
+    match c.kubectl(&ctx.with_timeout(CHANGE), &github::PULL_APPLY, &github::pull_secret(token)) {
+        Ok(_) => io.say("The cluster has it too: the servers pull your apps' images with it."),
+        Err(e) => io.say(format!("The cluster does not have it yet ({e}); the next app deploy brings it.")),
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn deploy(
+    ctx: &Ctx,
+    c: &dyn Cluster,
+    doors: &Entrances,
+    own: Option<&Own>,
+    gh: Option<&GitHub>,
+    app: &App,
+    opts: &Opts,
+    io: &mut Io,
+) -> Result<()> {
     let mut app = app.clone();
     app.hosts.sort();
     if app.hosts.is_empty() {
@@ -412,8 +749,60 @@ pub fn deploy(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, own: Option<&Own>, 
     } else {
         None
     };
+    // Its secrets: every name the file lists must have a value in the
+    // cluster before the app starts with it; the copies note the values'
+    // version, so a new value replaces them.
+    if !app.run.secrets.is_empty() {
+        let s = secret_state(ctx, c, &app.name)?;
+        let missing: Vec<&str> = app.run.secrets.iter().filter(|k| !s.keys.contains(k)).map(String::as_str).collect();
+        if !missing.is_empty() {
+            bail!(
+                "{} has no value for {} yet. Set {}: dryserver app secret {} NAME (it asks for the value). Nothing was changed",
+                app.name,
+                missing.join(", "),
+                if missing.len() == 1 { "it" } else { "each" },
+                app.name
+            );
+        }
+        app.run.secrets_version = s.version;
+    }
+    // An app GitHub builds: which build it runs.
+    let gh_notes = pick_build(ctx, gh, &now, &mut app)?;
+    app.validate()?;
     let before = now.apps.iter().find(|a| a.name == app.name);
-    let (lines, _) = app_changes(before, &app);
+    let (mut lines, _) = app_changes(before, &app);
+    lines.extend(gh_notes);
+    // A build the coordinator follows, and takes back when it does not
+    // start: only when the build is all that changes. With settings
+    // changed too, it could not tell which of them failed.
+    if let Some(b) = before
+        && !app.gh.rolling.is_empty()
+        && App::of(b).is_none_or(|o| o.run != app.run || o.port != app.port)
+    {
+        app.gh.rolling.clear();
+        lines.push(format!(
+            "  note: settings change too, so if build {} does not start the coordinator does not take it back by itself (dryserver \
+             app rollback does)",
+            app.gh.commit.get(..7).unwrap_or("?")
+        ));
+    }
+    if app.source.is_some() && !follows(ctx, c, chrono::Utc::now().timestamp()) {
+        lines.push(
+            "  note: the coordinator does not follow GitHub yet (it needs this dryserver: dryserver release publish); until then, deploy \
+             again after each push"
+                .into(),
+        );
+    }
+    // A setting whose name says secret: app files often go into git.
+    let risky: Vec<&str> = app.run.env.iter().map(|(k, _)| k.as_str()).filter(|k| apps::looks_secret(k)).collect();
+    if !risky.is_empty() && !lines.is_empty() {
+        lines.push(format!(
+            "  note: {} {} like {} secret; app files often end up in git. A SECRET= line keeps the value in the cluster only",
+            risky.join(", "),
+            if risky.len() == 1 { "looks" } else { "look" },
+            if risky.len() == 1 { "a" } else { "" }
+        ));
+    }
     let after = after_deploy(&now, &app);
     let ids = touched(before, Some(&app));
     let looks = dry_runs(ctx, c, doors, &after, &ids, &take_over);
@@ -421,7 +810,16 @@ pub fn deploy(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, own: Option<&Own>, 
 
     let cf_changes = looks.iter().any(|l| l.res.as_ref().is_ok_and(|r| !r.changes.is_empty() && r.held.is_none()));
     let copies = push.as_ref().is_some_and(|p| !p.todo.is_empty());
-    if lines.is_empty() && !cf_changes && !copies && looks.iter().all(|l| l.res.is_ok()) {
+    // Notes say something, but change nothing.
+    let changes = lines.iter().any(|l| !l.starts_with("  note:"));
+    if !changes && !cf_changes && !copies && looks.iter().all(|l| l.res.is_ok()) {
+        for l in &lines {
+            io.say(format!(
+                "{}:{}",
+                app.name,
+                l.trim_start_matches(' ').strip_prefix("note:").map(|n| format!(" note:{n}")).unwrap_or_default()
+            ));
+        }
         // Nothing that dryserver reads back differs; the objects are
         // applied again all the same, which changes nothing when they are
         // as the file says and puts back what was changed by hand or left
@@ -438,7 +836,7 @@ pub fn deploy(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, own: Option<&Own>, 
         return Ok(());
     }
     io.say(format!("{}{}:", app.name, if before.is_none() { " (new)" } else { "" }));
-    if lines.is_empty() {
+    if !changes {
         io.say("  no change to the app itself");
     }
     for l in &lines {
@@ -454,6 +852,27 @@ pub fn deploy(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, own: Option<&Own>, 
     if !agreed("Apply? [y/N] ", opts, io) {
         io.say("Nothing changed.");
         return Ok(());
+    }
+    // The coordinator may have deployed or taken back a build while the
+    // preview was read: then applying it would undo that.
+    if app.source.is_some()
+        && let Some(b) = before
+    {
+        let again = look(ctx, c)?;
+        let r = again.apps.iter().find(|a| a.name == app.name);
+        if r.map(|r| (&r.image, r.gh.run, r.gh.hold)) != Some((&b.image, b.gh.run, b.gh.hold)) {
+            bail!(
+                "{}: the coordinator changed it while the preview was shown (it deployed or took back a build); nothing was applied: \
+                 deploy again",
+                app.name
+            );
+        }
+    }
+    if app.source.is_some()
+        && let Some(token) = gh.and_then(|g| g.token.as_deref())
+    {
+        c.kubectl(&ctx.with_timeout(CHANGE), &github::PULL_APPLY, &github::pull_secret(token))
+            .map_err(|e| timed(e, CHANGE).wrap(format!("{} was not applied: the cluster did not take the GitHub token", app.name)))?;
     }
     if let (Some(p), Some(own)) = (&push, own) {
         let now = chrono::Utc::now().timestamp();
@@ -506,6 +925,157 @@ fn clean_names(names: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// The secrets an app has in the cluster: their names and the version of
+/// the values (the Secret's resourceVersion). Values are never read.
+#[derive(Debug, Default, PartialEq)]
+pub struct Secrets {
+    pub keys: Vec<String>,
+    pub version: String,
+}
+
+fn secret_state(ctx: &Ctx, c: &dyn Cluster, app: &str) -> Result<Secrets> {
+    let name = apps::secret_name(app);
+    // Only its version and the names: the values stay in the cluster.
+    let out = c
+        .kubectl(&ctx.with_timeout(READ), &["-n", apps::NAMESPACE, "get", "secret", &name, "-o", SECRET_NAMES, "--ignore-not-found"], "")
+        .map_err(|e| timed(e, READ).wrap("the app's secrets"))?;
+    Ok(secrets_of(&out))
+}
+
+/// The version of a Secret, then the names in it: never a value.
+const SECRET_NAMES: &str = "go-template={{.metadata.resourceVersion}}{{range $k, $v := .data}} {{$k}}{{end}}";
+
+fn secrets_of(out: &str) -> Secrets {
+    let mut words = out.split_whitespace();
+    let Some(version) = words.next() else { return Secrets::default() };
+    let version =
+        if version.len() <= 64 && version.bytes().all(|b| b.is_ascii_alphanumeric()) { version.to_string() } else { String::new() };
+    let mut keys: Vec<String> = words.filter(|k| apps::valid_env_name(k).is_ok()).map(String::from).collect();
+    keys.sort();
+    keys.dedup();
+    Secrets { keys, version }
+}
+
+/// The largest secret value: a certificate chain or a JSON key file fits.
+pub const MAX_SECRET: usize = 64 << 10;
+
+/// What app secret does.
+pub enum SecretOp {
+    /// List the names (never the values).
+    List,
+    /// Set one: its value.
+    Set(String, Vec<u8>),
+    Remove(String),
+}
+
+/// Sets, removes or lists an app's secrets. A value goes to the cluster
+/// on stdin, never in a command line (where every user of the machine
+/// could read it). Copies that use a changed secret are replaced one at a
+/// time, so they read the new value.
+pub fn secret(ctx: &Ctx, c: &dyn Cluster, app: &str, op: SecretOp, io: &mut Io) -> Result<()> {
+    apps::valid_app_name(app).map_err(|e| e.wrap("name"))?;
+    let name = apps::secret_name(app);
+    let now = look(ctx, c)?;
+    refuse_newer(&now)?;
+    let running = now.apps.iter().find(|a| a.name == app);
+    let key = match &op {
+        SecretOp::List => {
+            let s = secret_state(ctx, c, app)?;
+            let used: Vec<String> = running.map(|r| r.run.secrets.clone()).unwrap_or_default();
+            if s.keys.is_empty() && used.is_empty() {
+                io.say(format!("{app} has no secrets. Add one: a SECRET=NAME line in its app file, then dryserver app secret {app} NAME"));
+            }
+            for k in &s.keys {
+                io.say(format!("{k}{}", if used.contains(k) { "" } else { "  (set, but the app does not use it)" }));
+            }
+            for k in used.iter().filter(|k| !s.keys.contains(k)) {
+                io.say(format!("{k}  (used, but has no value: the app cannot start until it does)"));
+            }
+            return Ok(());
+        }
+        SecretOp::Set(k, v) => {
+            apps::valid_env_name(k).map_err(|e| e.wrap("secret"))?;
+            if v.is_empty() {
+                bail!("{k}: an empty value; nothing was changed");
+            }
+            if v.len() > MAX_SECRET {
+                bail!("{k}: at most {} KiB; nothing was changed", MAX_SECRET >> 10);
+            }
+            // The Secret first (once), then the value merged into it: the
+            // app's other secrets stay as they are.
+            let skeleton = format!(
+                "{}---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: \"{name}\"\n  namespace: {}\n  labels:\n    app: \"{app}\"\ntype: \
+                 Opaque\n",
+                apps::namespace_yaml(),
+                apps::NAMESPACE
+            );
+            c.kubectl(&ctx.with_timeout(CHANGE), &["apply", "-f", "-"], &skeleton)
+                .map_err(|e| timed(e, CHANGE).wrap("the app's secrets"))?;
+            use base64::Engine;
+            let patch = serde_json::json!({"data": {k: base64::engine::general_purpose::STANDARD.encode(v)}}).to_string();
+            // The answer is the Secret's new version, nothing of its values.
+            let out = c
+                .kubectl(
+                    &ctx.with_timeout(CHANGE),
+                    &[
+                        "-n",
+                        apps::NAMESPACE,
+                        "patch",
+                        "secret",
+                        &name,
+                        "--type",
+                        "merge",
+                        "--patch-file",
+                        "/dev/stdin",
+                        "-o",
+                        "go-template={{.metadata.resourceVersion}}",
+                    ],
+                    &patch,
+                )
+                .map_err(|e| timed(e, CHANGE).wrap(format!("{k} was not set")))?;
+            io.say(format!("{k} is set for {app} (kept encrypted in the cluster)."));
+            (k.clone(), secrets_of(&out).version)
+        }
+        SecretOp::Remove(k) => {
+            apps::valid_env_name(k).map_err(|e| e.wrap("secret"))?;
+            if running.is_some_and(|r| r.run.secrets.contains(k)) {
+                bail!("{app} uses {k}: take its SECRET={k} line out of the app file and deploy first, then remove the value");
+            }
+            let s = secret_state(ctx, c, app)?;
+            if !s.keys.contains(k) {
+                io.say(format!("{app} has no secret {k}; nothing to remove."));
+                return Ok(());
+            }
+            let patch = serde_json::json!({"data": {k: null}}).to_string();
+            c.kubectl(
+                &ctx.with_timeout(CHANGE),
+                &["-n", apps::NAMESPACE, "patch", "secret", &name, "--type", "merge", "--patch-file", "/dev/stdin"],
+                &patch,
+            )
+            .map_err(|e| timed(e, CHANGE).wrap(format!("{k} was not removed")))?;
+            io.say(format!("{k} is removed from {app}."));
+            return Ok(());
+        }
+    };
+    // Copies that read it start again with the new value.
+    let (key, version) = key;
+    if let Some(r) = running.filter(|r| r.run.secrets.contains(&key)) {
+        let version = if version.is_empty() { secret_state(ctx, c, app)?.version } else { version };
+        let patch =
+            serde_json::json!({"spec": {"template": {"metadata": {"annotations": {apps::SECRETS_ANNOTATION: version}}}}}).to_string();
+        c.kubectl(
+            &ctx.with_timeout(CHANGE),
+            &["-n", apps::NAMESPACE, "patch", "deployment", &r.name, "--type", "merge", "--patch-file", "/dev/stdin"],
+            &patch,
+        )
+        .map_err(|e| timed(e, CHANGE).wrap(format!("{key} is set, but {app} was not told: deploy it again to use the new value")))?;
+        io.say(format!("{app} replaces its copies one at a time, so they read the new value."));
+    } else if running.is_some() {
+        io.say(format!("{app} does not use {key} yet: add SECRET={key} to its app file and deploy."));
+    }
+    Ok(())
+}
+
 /// Stops an app and takes its names out of Cloudflare.
 pub fn remove(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, name: &str, opts: &Opts, io: &mut Io) -> Result<()> {
     apps::valid_app_name(name).map_err(|e| e.wrap("name"))?;
@@ -518,6 +1088,9 @@ pub fn remove(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, name: &str, opts: &
     let on = if before.nodes.is_empty() { String::new() } else { format!(" on {}", before.nodes.join(", ")) };
     io.say(format!("  its containers stop{on}; what they keep inside them is lost"));
     io.say(format!("  your other apps no longer reach http://{name}"));
+    if !before.run.secrets.is_empty() || !secret_state(ctx, c, name).map(|s| s.keys.is_empty()).unwrap_or(true) {
+        io.say("  its secrets are deleted from the cluster (set them again if you start it again)");
+    }
     let shared: Vec<&str> = before.names().into_iter().filter(|h| now.apps.iter().any(|o| o.name != name && o.has(h))).collect();
     let own: Vec<&str> = before.names().into_iter().filter(|h| !shared.contains(h)).collect();
     if !own.is_empty() {
@@ -656,6 +1229,14 @@ pub fn list(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, check: Option<Check>,
         let on = if a.nodes.is_empty() { "on no server yet".to_string() } else { format!("on {}", a.nodes.join(", ")) };
         let newer = if a.newer { "  (set up by a newer dryserver)" } else { "" };
         io.say(format!("{}  {state}  {on}  {}{newer}", a.name, a.image));
+        if let Some(src) = &a.gh.source {
+            let build = a.gh.commit.get(..7).map(|c| format!("build {c}")).unwrap_or_else(|| "no build yet".into());
+            io.say(format!("    built by GitHub: {} {}, {build}", src.text(), src.branch));
+            if let Some((t, w)) = &a.gh.watch {
+                let ago = (chrono::Utc::now().timestamp() - t).max(0);
+                io.say(format!("    coordinator, {} ago: {w}", crate::report::short_age(ago as u64)));
+            }
+        }
         if !a.public() {
             io.say("    inside only");
         }
@@ -663,7 +1244,12 @@ pub fn list(ctx: &Ctx, c: &dyn Cluster, doors: &Entrances, check: Option<Check>,
         for h in &a.hosts {
             let (_, said) = answer.next().unwrap_or((&"", String::new()));
             let port = if h.port == a.port { String::new() } else { format!(" -> port {}", h.port) };
-            let said = if said.is_empty() { String::new() } else { format!("  {said}") };
+            let said = match (said.is_empty(), a.entrance == entrance::VPN) {
+                (true, _) => String::new(),
+                (false, false) => format!("  {said}"),
+                // Only a device on the VPN reaches it.
+                (false, true) => format!("  {said} (from this computer; it answers on the VPN only)"),
+            };
             io.say(format!("    {}{port}  through {way}{said}", h.name));
         }
     }

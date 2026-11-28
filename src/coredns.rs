@@ -799,6 +799,9 @@ mod tests {
             entrance: String::new(),
             copies: 1,
             image_id: String::new(),
+            run: Default::default(),
+            source: None,
+            gh: Default::default(),
         };
         let tunnel = crate::entrance::cloudflare::tunnel_manifest(&"a".repeat(64)).unwrap();
         for m in [app.manifest().unwrap(), tunnel] {

@@ -1513,8 +1513,11 @@ PersistentKeepalive = 25
 
     /// A "signed" reply with the list sealed by key.
     fn signed_reply(key: &crate::signed::fake::Key, version: u64, members: Vec<crate::signed::Entry>) -> (String, crate::signed::Envelope) {
-        let env =
-            crate::signed::seal(key, &crate::signed::List { version, members, rejected: vec![], keys: vec![], people: vec![] }).unwrap();
+        let env = crate::signed::seal(
+            key,
+            &crate::signed::List { version, members, rejected: vec![], keys: vec![], people: vec![], ..Default::default() },
+        )
+        .unwrap();
         (serde_json::json!({ "signed": env }).to_string(), env)
     }
 

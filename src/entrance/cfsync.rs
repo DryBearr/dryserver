@@ -343,6 +343,17 @@ pub fn plan(seen: &Seen, want: &Want, open: bool) -> Plan {
             .iter()
             .filter(|r| r.zone == zone.id && r.name == *host && matches!(r.kind.as_str(), "A" | "AAAA" | "CNAME"))
             .collect();
+        // The VPN's records of dryserver's: the app moved from the VPN to
+        // the tunnel. They go first: a CNAME shares its name with nothing.
+        let (vpn, at): (Vec<&Record>, Vec<&Record>) = at.into_iter().partition(|r| super::vpndns::ours(r));
+        for r in &vpn {
+            fixes.push(Step::Delete {
+                zone: r.zone.clone(),
+                id: r.id.clone(),
+                name: r.name.clone(),
+                why: "the VPN's; the app comes in through the tunnel now".into(),
+            });
+        }
         let (mine, theirs): (Vec<&Record>, Vec<&Record>) = at.into_iter().partition(|r| seen.ours(r));
         if !theirs.is_empty() {
             if want.takeover.iter().any(|t| t == host) {
@@ -559,11 +570,18 @@ pub fn look(api: &Api, saved_token: Option<String>, cluster_mark: Option<String>
         cloudflare::valid_tunnel_token(&token).map_err(|_| errf!("Cloudflare sent a tunnel token that is not one"))?;
         seen.run_token = Some(token);
     }
-    for z in seen.zones.clone() {
+    seen.records = records(api, &seen.zones)?;
+    Ok(seen)
+}
+
+/// The A, AAAA and CNAME records of the zones, checked before use.
+pub fn records(api: &Api, zones: &[Zone]) -> Result<Vec<Record>> {
+    let mut out = Vec::new();
+    for z in zones {
         let records: Vec<ApiRecord> = api.list(&format!("/zones/{}/dns_records?per_page=1000", z.id), NEED_DNS)?;
         for r in records.into_iter().filter(|r| matches!(r.kind.as_str(), "A" | "AAAA" | "CNAME")) {
             let (Some(name), true) = (cfapi::host(&r.name), cfapi::valid_id(&r.id)) else { continue };
-            seen.records.push(Record {
+            out.push(Record {
                 zone: z.id.clone(),
                 id: r.id,
                 name,
@@ -574,7 +592,7 @@ pub fn look(api: &Api, saved_token: Option<String>, cluster_mark: Option<String>
             });
         }
     }
-    Ok(seen)
+    Ok(out)
 }
 
 #[derive(Deserialize, Default)]

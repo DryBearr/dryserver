@@ -256,7 +256,16 @@ dryserver app remove shop       # stops it, takes its names out of Cloudflare
 ```
 
 `deploy` copies an image you built to every server first, signed with
-your key, over your home network: no registry, nothing public. A new build
+your key, over your home network: no registry, nothing public. Or let
+GitHub build it: with `REPO=github.com/you/shop` instead of `IMAGE`, every
+push to `main` is built on GitHub and deployed by your coordinator, which
+checks GitHub's signature first ([Built by
+GitHub](docs/apps.md#built-by-github)). Settings (`ENV=`), secrets
+(`SECRET=`, values with `dryserver app secret`) and limits (`MEMORY=`,
+`CPU=`) go in the same file ([more](docs/apps.md#settings-and-secrets)).
+`ENTRANCE=vpn` keeps an app to your own devices: phone and laptop reach it
+over a WireGuard VPN to one of your servers, with nobody in between
+([VPN for your devices](docs/vpn.md)). A new build
 under the same tag is noticed and replaces the running copies. Your
 servers need this dryserver for that once: `dryserver release publish`.
 
@@ -632,6 +641,15 @@ On your desktop:
 | `dryserver app deploy FILE` | start or change an app from its file, with any number of public names; every change is shown first (`-yes`, `-take-over NAME`) |
 | `dryserver app push IMAGE` | copy an image you built (`localhost/NAME:TAG`) to every server, signed; `deploy` does it by itself |
 | `dryserver app list` | every app, its servers, its names and whether each one answers (`-no-check`) |
+| `dryserver app secret APP NAME` | set a secret (asked for, piped, or `-file`); `-remove`; `app secret APP` lists the names |
+| `dryserver app github init` | in an app's repository: the workflow that builds it on GitHub on every push (`-branch`) |
+| `dryserver app github token` | keep a classic GitHub token (only `read:packages`) here and in the cluster |
+| `dryserver app rollback APP` | an app GitHub builds: back to the build before |
+| `dryserver vpn` | the VPN for your own devices: its gateway, and when each device was last seen ([VPN](docs/vpn.md)) |
+| `dryserver vpn on SERVER --endpoint ADDRESS` | make SERVER the gateway (`--vpn-port`, `--public-port`, `--subnet`); forward the UDP port on your router |
+| `dryserver vpn add NAME` | a device and its config for the WireGuard app (`--key` when the device made its own, `--out FILE`) |
+| `dryserver vpn remove NAME` / `vpn off` | cut a device off / no VPN (devices stay listed) |
+| `sudo dryserver vpn token` | on the VPN's gateway: the Cloudflare token (DNS edit) its certificates are proven with |
 | `dryserver app show NAME` | the app as a file, to keep or edit |
 | `dryserver app remove NAME` | stop an app and take its names out of Cloudflare |
 | `dryserver app sync` | bring Cloudflare in step with the apps, and set up the tunnel |

@@ -34,11 +34,17 @@ HOST=admin.example.com:9000
 | Key | What | |
 |---|---|---|
 | `NAME` | the app's name: a-z, 0-9 and -, starting with a letter, at most 40 | needed |
-| `IMAGE` | an image you built on this computer, `localhost/NAME:TAG` (see below), or one from a registry, best pinned: `ghcr.io/you/shop@sha256:...` | needed |
-| `PORT` | the port the app listens on. Inside the cluster `http://shop` leads there, and so does every name without a port of its own | needed |
+| `IMAGE` | an image you built on this computer, `localhost/NAME:TAG` (see below), or one from a registry, best pinned: `ghcr.io/you/shop@sha256:...` | needed, unless `REPO` |
+| `REPO` | the GitHub repository that builds the app on every push: `github.com/you/shop` (see [Built by GitHub](#built-by-github)) | instead of `IMAGE` |
+| `BRANCH` | the branch whose pushes deploy | `main` |
+| `PORT` | the port the app listens on. Inside the cluster `http://shop` leads there, and so does every name without a port of its own. `none` for an app that takes no connections (a bot, a worker): then no `HOST` lines | needed |
 | `COPIES` | how many run, 1 to 20 | 1 |
 | `HOST` | public names, as many lines as you need, several per line (spaces or commas between). `name:port` leads that name to another port of the app | none: inside only |
-| `ENTRANCE` | the way in from outside: `cloudflare` (the VPS comes later) | `cloudflare` |
+| `ENTRANCE` | the way in from outside: `cloudflare`, or `vpn`: only your own devices, over the [VPN](vpn.md) (the VPS comes later) | `cloudflare` |
+| `ENV` | a setting the app reads: `ENV=NODE_ENV=production`, as many lines as you need. The value is taken as written, `#` and all; quotes around it keep spaces at its ends | none |
+| `SECRET` | the name of a secret the app reads, like `SECRET=DATABASE_URL`; its value never goes in the file (see [Settings and secrets](#settings-and-secrets)) | none |
+| `MEMORY` | the most memory one copy may use: `256Mi`, `1Gi` | `512Mi` |
+| `CPU` | the most CPU one copy may use: `1`, `0.5`, `250m` | `1` |
 
 Keys may be written in any case; `#` starts a comment. Anything else is
 refused with its line number, never passed over: an app started without a
@@ -173,6 +179,122 @@ that part. What the app sees of the visit:
 - Cookies and logins belong to one name: logged in on `example.com` is
   not logged in on `example.net`.
 
+## Settings and secrets
+
+`ENV=` lines are settings: they live in the app file, so put nothing secret
+there (app files often end up in git; `deploy` points at names like
+`*_TOKEN` or `*PASSWORD`). dryserver sets `PORT` to the app's `PORT`, and
+nothing else: an image's own settings (its `ENV` lines) stay as they are
+unless the file sets the same name. Node.js 20 and newer size their heap to
+`MEMORY` by themselves; to set it anyway:
+`ENV=NODE_OPTIONS=--max-old-space-size=384`.
+
+A secret's name goes in the file (`SECRET=DATABASE_URL`), its value only
+into the cluster, where it is kept encrypted:
+
+```sh
+dryserver app secret shop DATABASE_URL          # asks for it twice, not shown
+echo "$VALUE" | dryserver app secret shop TOKEN  # from a pipe
+dryserver app secret shop TLS_KEY -file key.pem  # a whole file
+dryserver app secret shop                        # the names, never the values
+dryserver app secret shop OLD_TOKEN -remove
+```
+
+A value never goes into a command line (where the shell's history and every
+process listing would keep it): it goes to the cluster on stdin. Setting a
+secret the running app reads replaces its copies one at a time, so they read
+the new one. `deploy` refuses an app whose secret has no value yet; removing a
+secret the app still lists is refused; `app remove` deletes the app's
+secrets. A value is at most 64 KiB and never empty.
+
+## Limits
+
+Every copy gets at most `MEMORY` and `CPU` (512Mi and 1 CPU unless the file
+says): a runaway app is stopped at its limit, never takes a machine. The
+machine sets half of `MEMORY` aside for the copy, so busy apps fit, and the
+cluster places copies only where that half fits. An app started by an older
+dryserver has no limits until its file is deployed again (`dryserver app
+show shop > shop.app`, then `deploy`: the preview says `limits  no limit ->
+512Mi memory, 1 CPU`).
+
+A new version starts beside the old one and takes over only once it takes
+connections on its `PORT` and has kept running for 20 seconds: no moment
+without a copy, and a version that never answers (or stops right after it
+starts) never takes over. An app with `PORT=none` takes over once it has
+run for 20 seconds.
+
+## Built by GitHub
+
+Push to `main`, and the app runs the new version a few minutes later (the
+build on GitHub, then a minute at most for the coordinator):
+
+```sh
+cd ~/code/shop
+dryserver app github init        # writes .github/workflows/dryserver.yml
+git add .github/workflows/dryserver.yml && git commit -m "build with dryserver" && git push
+dryserver app github token       # once: a classic token with only read:packages
+```
+
+```sh
+# shop.app
+NAME=shop
+REPO=github.com/you/shop
+PORT=3000
+HOST=shop.example.com
+SECRET=DATABASE_URL
+```
+
+```sh
+dryserver app deploy shop.app
+```
+
+What happens on each push to the branch:
+
+1. GitHub Actions builds the app on GitHub's machines: with its own
+   `Dockerfile`, or with [Railpack](https://railpack.com) when it has none
+   (Next.js, Vite, React, Express, ... detected by themselves). The image
+   goes to GitHub's registry, private.
+2. A second job, which runs none of the app's code, asks GitHub to sign a
+   statement about exactly that image: this repository, this branch, this
+   workflow file, this commit, a machine of GitHub's own. It puts the
+   statement next to the image.
+3. The coordinator asks the registry every minute (it dials out: no open
+   port, no webhook), checks GitHub's signature and every part of the
+   statement, and only then replaces the app's copies, one at a time.
+4. A version whose copies never answer within 10 minutes is taken back to
+   the last build that ran, by itself (by its image; settings and secrets
+   stay as they are now); that build is not tried again. A deploy that
+   changes settings and the build at once is not taken back by itself
+   (which of them failed?): `dryserver app rollback` does that.
+
+So only a push to the branch deploys. A pull request, another branch,
+another repository, another workflow file, a run started by hand, a
+self-hosted runner, or someone who can only write to the registry cannot:
+the statement would not check out. Builds are ordered by GitHub's run
+number, which a re-run keeps: running an old run again (Actions, "Re-run
+jobs") never brings its old version back, nor lifts a rollback. To build
+again, push: `git commit --allow-empty -m rebuild && git push`. Whoever can push to the branch can deploy, which is what push to deploy
+means: protect the branch on GitHub (Settings, Branches). A repository made
+anew under the same name is another one (GitHub's repository number is
+remembered from the first build).
+
+- `dryserver app list` shows which build runs and what the coordinator last
+  said ("deploying build 0123456 of main", "build ... did not start").
+- `dryserver app rollback shop` goes back to the build before; newer builds
+  wait until the next push.
+- `deploy` again after changing the file keeps the running build unless
+  GitHub proved a newer one; when GitHub does not answer, the running build
+  stays.
+- The token can only read packages; it is kept in
+  `~/.config/dryserver/secrets/github_token` (yours alone) and in the
+  cluster for the servers to pull with. GitHub's registry takes only classic
+  tokens. A token that can do more is taken, with a note.
+- Your servers need this dryserver to follow GitHub (`dryserver release
+  publish`); until then `deploy` says so, and deploying again after each push
+  does the same by hand.
+- Build-time settings (Next.js `NEXT_PUBLIC_*`) belong in the repository
+  (`.env.production`), since the build runs on GitHub.
+
 **Coming from dryserver 0.2.0**: run `make install` on every computer you
 run dryserver on. An older dryserver reads only an app's first name, and
 its next Cloudflare sync would delete the others' DNS records. The machines
@@ -260,6 +382,9 @@ dryserver outside        # or "Outside" in the menu, or o on the apps screen
 
 - **Cloudflare Tunnel**: two pods in the cluster dial out to Cloudflare,
   which sends what arrives for your host names through them to the ingress.
+- **VPN (your devices)**: your phone and laptop over WireGuard to one
+  gateway server, and only they; Cloudflare only answers the names (DNS
+  only). See [VPN for your devices](vpn.md).
 - **Your VPS**: not built yet. A server you rent will relay web and game
   ports (TCP and UDP) to the cluster over WireGuard.
 

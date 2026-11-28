@@ -21,6 +21,7 @@
 pub mod cfapi;
 pub mod cfsync;
 pub mod cloudflare;
+pub mod vpndns;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,10 +35,12 @@ use crate::{bail, errf};
 pub const ANNOTATION: &str = "dryserver/entrance";
 pub const CLOUDFLARE: &str = "cloudflare";
 pub const VPS: &str = "vps";
+/// The VPN for the admin's devices (vpn.rs): only they reach these apps.
+pub const VPN: &str = "vpn";
 /// The entrance of an Ingress without the annotation.
 pub const DEFAULT: &str = CLOUDFLARE;
 /// Every entrance this dryserver knows, in the order the screens show them.
-pub const IDS: [&str; 2] = [CLOUDFLARE, VPS];
+pub const IDS: [&str; 3] = [CLOUDFLARE, VPN, VPS];
 /// Where the entrances' pods live, apart from the apps.
 pub const NAMESPACE: &str = "edge";
 
